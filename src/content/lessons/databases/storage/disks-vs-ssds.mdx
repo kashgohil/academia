@@ -1,0 +1,156 @@
+---
+summary: "Why a random read costs 13 ms on a disk and 80 µs on an SSD: seek, rotation and transfer; NAND pages, blocks and erase; the flash translation layer and its write amplification; queue depth."
+---
+import { AccessTimeDemo, DiskPlatterDemo, FtlDemo, QueueDepthDemo } from "@/demos/db/StorageDemos";
+
+A database engine is mostly a machine that avoids I/O. The storage device decides which I/O is cheap. For 40 years that device was the **hard disk drive (HDD)**, a spinning platter with a moving head. Today it is usually a **solid-state drive (SSD)**, a controller in front of many NAND flash chips. The two devices have very different cost models, and that difference shaped every design in this track.
+
+<Predict
+  id="random-vs-seq"
+  question="A 7,200 rpm disk reads 200 MB/s when it reads sequentially. About how fast does it read 4 KiB pages at random addresses?"
+  options={["About 100 MB/s, half the sequential speed", "About 20 MB/s", "About 0.3 MB/s"]}
+  answer={2}
+  explain="Each random read first waits about 8.8 ms for the head to move and 4.2 ms for the sector to turn under it. The transfer itself takes only 0.02 ms. So the disk does 77 reads per second, which is 0.32 MB/s: about 630 times slower than a sequential read."
+>
+<AccessTimeDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **4 KiB** and **7,200 rpm**. Almost the whole bar is seek and rotation. The transfer is a thin line at the end.
+2. Move the request size up to 1 MiB. Now the transfer is 5.2 ms, and the disk reaches 58 MB/s. Large requests pay the fixed cost once for many bytes.
+3. Select **15k rpm**. The faster disk does 183 random reads per second, not thousands. Mechanics set a hard limit.
+4. Compare the solid blue line with the red line. At 4 KiB, the SSD reads one page at a time about 160 times faster than the disk.
+
+## The disk: seek, rotate, transfer
+
+A disk stores data on circular **tracks**. A **sector** is the smallest unit that the disk reads or writes, today usually 4 KiB. To read a sector, the drive does three things in sequence:
+
+<Steps>
+<div>**Seek.** The arm moves the head to the correct track. A short seek takes about 0.5 ms, and a full stroke about 16 ms. The head accelerates and then brakes, so the time grows with the square root of the distance. For two random positions, the average of the square root of the distance is 8/15, so the model disk has an average seek of 8.77 ms.</div>
+<div>**Rotate.** The head waits until the sector comes under it. At 7,200 rpm one turn takes 60,000 / 7,200 = 8.33 ms. On average the head waits half a turn: 4.17 ms.</div>
+<div>**Transfer.** The sector passes under the head. At 200 MB/s, 4 KiB takes 0.02 ms.</div>
+<div>The total is $T = t_{seek} + t_{rot}/2 + size/rate = 12.95$ ms. So the disk does $1/T = 77$ random reads per second. That number is about the same for every 7,200 rpm disk ever built.</div>
+</Steps>
+
+| Model disk | Average seek | Half a turn | Random 4 KiB reads per second |
+|---|---|---|---|
+| 5,400 rpm | 11.7 ms | 5.56 ms | 58 |
+| 7,200 rpm | 8.77 ms | 4.17 ms | 77 |
+| 10,000 rpm | 4.41 ms | 3.00 ms | 135 |
+| 15,000 rpm | 3.45 ms | 2.00 ms | 183 |
+
+A sequential read pays the seek and the rotation once. After that, the next sector is already under the head. So the gap between random and sequential access is about 630 times for 4 KiB requests. This one ratio explains B-trees with large pages, sequential logs, sorted files and the "read whole extents" habit of old databases.
+
+## Watch the head
+
+<DiskPlatterDemo />
+
+1. Keep **Random** with one request in the queue. Watch the head jump and then wait for the orange dot to come around. The averages show 8.6 ms of seek and 4.1 ms of rotation for 78 reads per second.
+2. Select **Elevator** and move the queue to 8. The head now serves the nearest request in its direction of travel, like an elevator. The average seek drops to 4.2 ms, and the disk does 123 reads per second.
+3. Look at the rotation wait in step 2. It stays near 3.9 ms. The elevator shortens the seeks, but it cannot make the platter turn faster.
+4. Select **Within 2% of the disk**, **Arrival order** and one request in the queue. The seeks are now short, but each read still waits half a turn. The disk does only 171 reads per second.
+5. Select **Sequential**. The seek and the rotation disappear, and only the green transfer remains.
+
+## The SSD: pages, blocks and erase
+
+An SSD stores bits as charge in NAND flash cells. The cells form **pages** of 4 to 16 KiB, and pages form **erase blocks** of hundreds of pages. NAND has three hard rules:
+
+- A page is the unit of read and of write (**program**). A typical TLC page read takes about 50 µs, and a program takes several hundred µs.
+- A page cannot be overwritten. The controller must **erase** it first, which sets all its bits to 1.
+- An erase works only on a whole block, and it takes milliseconds. Each block survives a limited number of program/erase cycles, a few thousand for TLC cells.
+
+So the SSD never updates a page in place. The **flash translation layer (FTL)** in the controller maps each logical block address to a physical page. A write goes to the next free page of an open block. The FTL then points the logical address to the new page, and the old page becomes **invalid**.
+
+<Predict
+  id="ftl-wa"
+  question="The host overwrites random 4 KiB pages on a full SSD with 7% spare space. In the long run, how many NAND page writes does the SSD do for each host page write?"
+  options={["1: each page is written once", "About 2", "About 7"]}
+  answer={2}
+  explain="Free blocks run out, so garbage collection must erase blocks that still hold valid pages. With little spare space, the best victim block is still mostly valid, so the FTL copies those pages before the erase. The plot under the grid shows 7.0 NAND page writes for each host page at 7% spare space."
+>
+<FtlDemo />
+</Predict>
+
+1. Press **Play** at one write per step. Each write turns one page blue in the open block and one old page red. No erase happens until the free blocks run out.
+2. Select **8** writes per step. When the free blocks run out, garbage collection picks the block with the fewest valid pages. It copies the valid pages (orange) and erases the block. Select **64** to reach the steady state faster: the write amplification settles at several times one.
+3. Select **50%** spare space. Victim blocks now hold fewer valid pages, so each erase needs fewer copies.
+4. Select **Sequential**. Each block becomes fully invalid before the FTL needs it, so it erases with no copies. The write amplification stays at 1.00.
+5. Select **Oldest block** as the victim choice. FIFO ignores how many valid pages a block holds, so it copies more than greedy does.
+
+**Garbage collection (GC)** makes free blocks: it chooses a victim block, copies its valid pages to the open block and erases it. The copies are writes that the host never asked for. The ratio of NAND writes to host writes is the **device write amplification (WA)**. It wears out the cells and uses bandwidth that the host cannot use.
+
+| Spare space (over-provisioning) | Random pages | 80% of writes to 20% of pages | Sequential |
+|---|---|---|---|
+| 7% | 7.02 | 7.38 | 1.00 |
+| 28% | 2.40 | 2.73 | 1.00 |
+| 100% | 1.23 | 1.48 | 1.00 |
+
+The 7% comes from units: a drive sold as 256 GB (10^9 bytes each) often carries 256 GiB (2^30 bytes each) of NAND. Enterprise drives reserve 28% or more to keep write amplification low. The **TRIM** command tells the FTL that a range is free, which has the same effect as more spare space. A file system that issues TRIM after deletes helps the drive.
+
+## Queue depth and parallelism
+
+An SSD has many NAND dies on several channels, and each die works alone. One request at a time uses one die. The **queue depth** is the number of requests in flight. With more requests in flight, more dies work at the same time.
+
+<QueueDepthDemo />
+
+1. Start at queue depth 1. The NVMe SSD does 12,300 random reads per second, which is 81 µs per read.
+2. Move to 32. The NVMe drive reaches 251,200 reads per second, and the latency stays almost the same. The disk with an elevator only goes from 76 to 152.
+3. Move past 32. The SATA SSD stops at 134,300, because SATA queues at most 32 commands. NVMe allows up to 65,535 queues of up to 65,536 commands each.
+4. Move to 256. The model NVMe drive stops at about 393,600 reads per second, and each extra request only waits longer.
+
+The latency follows **Little's law**: requests in flight = throughput × latency. So a single thread that waits for each read uses a tiny part of the drive. The fix is to have many reads in flight: several threads, or asynchronous I/O such as Linux `io_uring`.
+
+```go
+// Read 64 random pages with 64 requests in flight, not one at a time.
+func readPages(f *os.File, offs []int64, pageSize int) [][]byte {
+	out := make([][]byte, len(offs))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 64) // queue depth
+	for i, off := range offs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, off int64) {
+			defer wg.Done()
+			buf := make([]byte, pageSize)
+			f.ReadAt(buf, off) // pread(2): no shared file offset
+			out[i] = buf
+			<-sem
+		}(i, off)
+	}
+	wg.Wait()
+	return out
+}
+```
+
+## Why database design changed
+
+| | 7,200 rpm disk | NVMe SSD (model) |
+|---|---|---|
+| Random 4 KiB read, one at a time | 12.95 ms | 81 µs |
+| Random 4 KiB reads per second at depth 32 | 152 | 251,200 |
+| Sequential ÷ random bandwidth, one at a time | about 630× | about 64× |
+| Overwrite in place | yes | no: out of place, then garbage collection |
+| Main wear limit | mechanics | program/erase cycles |
+
+The old rule was "avoid random I/O at almost any cost". On an SSD, a random read is cheap when many reads are in flight. Writes are now the expensive part, because of erase blocks and wear. That change favours designs that write sequentially and rarely rewrite data, such as log-structured merge trees. PostgreSQL still assumes `random_page_cost = 4.0` by default. Its documentation suggests values near 1.1 for SSDs.
+
+<Callout kind="warn" title="The numbers are a model">
+The NAND timings, the 32 parallel units and the 3,200 MB/s limit describe a typical TLC NVMe drive, not a specific product. Real drives also have DRAM caches, SLC write caches and firmware that change the curves. The shapes stay the same.
+</Callout>
+
+## Connect
+
+- [Latency vs throughput](/performance/systems/latency-vs-throughput) explains Little's law in general.
+- [I/O performance](/performance/systems/i-o-performance) covers how to measure a drive.
+- [Read, write and space amplification](/databases/storage/read-write-and-space-amplification) multiplies the SSD write amplification by the engine's own.
+- [Compaction: leveled vs tiered](/databases/lsm/compaction-leveled-vs-tiered) shows a design that writes large sequential files.
+
+<Recall cards={[
+  { q: "What three parts make up the time of one random disk read?", a: "The seek, which moves the head to the track; the rotational wait for the sector, half a turn on average; and the transfer." },
+  { q: "How long is half a turn of a 7,200 rpm disk, and why does it matter?", a: "4.17 ms. Every random read waits that long on average, and no request order can remove it." },
+  { q: "Why can an SSD not overwrite a page in place?", a: "NAND must erase a page before it programs it again, and erase works only on whole blocks of hundreds of pages." },
+  { q: "What causes device write amplification in an SSD?", a: "Garbage collection copies the valid pages out of a victim block before it erases the block. These copies are writes the host never asked for." },
+  { q: "Name two ways to lower SSD write amplification.", a: "More spare space (over-provisioning or TRIM), and write patterns that invalidate whole blocks, such as large sequential files." },
+  { q: "Why does one thread with blocking reads use only a small part of an NVMe SSD?", a: "It keeps one request in flight, so only one NAND die works. Throughput is depth divided by latency, so more requests in flight give more throughput." },
+]} />

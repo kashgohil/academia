@@ -1,0 +1,139 @@
+---
+summary: "How an engine stores variable-length records in fixed-size pages: the slotted page, record IDs that survive compaction, the byte layout of a PostgreSQL tuple, alignment padding and TOAST."
+---
+import { SlottedPageDemo, TupleLayoutDemo } from "@/demos/db/StorageDemos";
+
+An engine never reads one record from disk. It reads a **page**: a fixed-size block, usually a few kilobytes, that holds many records. The page is the unit of I/O, of caching and of logging. PostgreSQL uses 8 KiB pages, InnoDB 16 KiB and SQLite 4 KiB by default.
+
+Records do not have a fixed size. A `text` column can hold 3 bytes or 3 megabytes, and rows are inserted, deleted and made longer all the time. Indexes must still point at each record with a stable address. The **slotted page** solves both problems.
+
+<Predict
+  id="compaction-rid"
+  question="A page holds records in slots 0 to 4. You delete the record in slot 1 and compact the page to remove the hole. Which record IDs change?"
+  options={["Slots 2, 3 and 4 move down by one", "None: compaction moves bytes, not slot numbers", "All of them, because every tuple moves"]}
+  answer={1}
+  explain="A record ID names a page and a slot, not a byte offset. Compaction moves the tuple bytes and writes the new offsets into the same slots. So every index entry that points at (page, slot) stays correct."
+>
+<SlottedPageDemo />
+</Predict>
+
+Things to try:
+
+1. Insert a few records. Each insert adds a 4-byte slot after the header and a tuple at the end of the page. The free gap shrinks from both sides.
+2. Click slot 1 and delete it. The slot becomes **dead**, and its tuple bytes turn red. The bytes still use space, because nothing has moved yet.
+3. Press **Compact**. The live tuples slide to the end of the page, and the gap is one piece again. Slot numbers 0, 2 and 3 still point at the same records.
+4. Insert again. The new record reuses slot 1, so the slot array does not grow.
+5. Select a record and grow it again and again. First it moves inside the page. When the page is full, the demo reports that the record must move to another page.
+
+## The slotted page
+
+A slotted page has four regions:
+
+```text
+0          24                 lower              upper                  8192
+| header   | slot 0 | slot 1 → |   free space    | ← tuple 1 | tuple 0 |
+```
+
+- The **header** has fixed fields: where the slot array ends (`lower`) and where the tuple area starts (`upper`).
+- The **slot array** (PostgreSQL calls each slot a **line pointer**) grows from the front. Slot *i* holds the offset and length of tuple *i*.
+- The **tuples** grow from the back of the page toward the front.
+- The **free space** is the gap between `lower` and `upper`. A new record needs its aligned length plus one 4-byte slot.
+
+A **record ID** (RID) is the pair (page number, slot number). PostgreSQL calls it a TID and shows it as the `ctid` column, for example `(0,1)`. Indexes store RIDs. The indirection through the slot lets the page move tuples freely, because only the slot changes.
+
+PostgreSQL defines the slot as a 32-bit field with three parts:
+
+```rust
+/// PostgreSQL ItemIdData: lp_off:15, lp_flags:2, lp_len:15 (little-endian bit order).
+#[derive(Clone, Copy)]
+struct LinePointer(u32);
+
+impl LinePointer {
+    fn off(self) -> usize { (self.0 & 0x7fff) as usize }         // byte offset of the tuple
+    fn flags(self) -> u32 { (self.0 >> 15) & 3 }                  // 0 unused, 1 normal, 2 redirect, 3 dead
+    fn len(self) -> usize { (self.0 >> 17) as usize }             // tuple length in bytes
+}
+```
+
+Fifteen bits of offset limit a PostgreSQL page to 32 KiB. The 24-byte page header also holds the page LSN, which recovery uses, and a checksum. The [durability lesson](/databases/storage/durability-fsync-torn-writes-and-checksums) covers both.
+
+### Delete, compact, update
+
+A delete only marks the slot. In PostgreSQL the slot must stay reserved while any index still holds its RID. Only VACUUM removes those index entries, and only then can a new row reuse the slot. The tuple bytes become free when the page is **compacted** (PostgreSQL: `PageRepairFragmentation`, run during page pruning). Compaction copies the live tuples to the end of the page and writes their new offsets into the same slots.
+
+A longer record has three outcomes:
+
+- It fits in its old space. The page overwrites it in place.
+- It fits in the free gap, perhaps after compaction. The page writes it there and changes the slot offset.
+- It does not fit. The record moves to another page, and its RID changes. SQL Server heaps leave a **forwarding pointer** in the old slot. PostgreSQL always writes a new row version for an update, because of MVCC.
+
+## The bytes of one row
+
+<Predict
+  id="column-order"
+  question="A PostgreSQL table has the columns bool, int8, bool, int8, int2, timestamptz. You create it again with the order int8, int8, timestamptz, int2, bool, bool. How much space per row does that save on the page?"
+  options={["None: PostgreSQL packs the bytes for you", "16 bytes per row, about 21%", "About half"]}
+  answer={1}
+  explain="Each int8 and timestamptz must start at a multiple of 8. After a 1-byte bool, the next 8-byte value needs 7 bytes of padding. The first order uses 76 bytes per row with the slot, and the second order uses 60. An 8 KiB page then holds 136 rows instead of 107."
+>
+<TupleLayoutDemo />
+</Predict>
+
+1. Look at the red cells in the first order. Each one is padding before an 8-byte value. The row has 21 bytes of padding.
+2. Select **Same, largest first**. The padding falls to 1 byte, and each page holds 136 rows instead of 107.
+3. Turn on **Make the second column NULL**. The null bitmap uses byte 23, so the data still starts at byte 24. The null column uses no bytes at all.
+4. Select **int8, text, int4** and move the text length from 20 to 200. At 126 bytes or less, the text has a 1-byte length and no alignment. Above that, the length takes 4 bytes and the value is aligned.
+5. Move the text length above 2,000. The value moves out of line to the TOAST table, and the row keeps an 18-byte pointer.
+
+A PostgreSQL heap tuple starts with a 23-byte header. It holds `xmin` and `xmax`, the transactions that created and deleted the version. It also holds a command ID, `t_ctid` (6 bytes), two flag words and `t_hoff`.
+
+If a column is NULL, a null bitmap with one bit per column follows. The data then starts at `t_hoff`, rounded up to 8 bytes (**MAXALIGN** on 64-bit machines). So with 8 columns or fewer, the data starts at byte 24. With 9 or more columns and a NULL, the bitmap needs a second byte, so the data starts at byte 32.
+
+Each type has an alignment: 1 for `bool` and `uuid`, 2 for `int2`, 4 for `int4` and long `text`, 8 for `int8`, `float8` and `timestamptz`. The engine pads before a value until its offset is a multiple of its alignment. The whole tuple is then padded to 8 bytes.
+
+| Row | Tuple length | Space on the page | Rows per 8 KiB page |
+|---|---|---|---|
+| No columns | 24 | 28 | 291 |
+| int4, int4 | 32 | 36 | 226 |
+| bool, int8, bool, int8, int2, timestamptz | 72 | 76 | 107 |
+| int8, int8, timestamptz, int2, bool, bool | 52 | 60 | 136 |
+
+The first row of the table is the PostgreSQL constant `MaxHeapTuplesPerPage`: (8192 − 24) / (24 + 4) = 291. Even an empty row costs 28 bytes, so narrow tables carry a large overhead. Column stores avoid this per-row header completely (see [column stores](/databases/olap/column-stores)).
+
+### Values larger than a page
+
+A slotted page cannot hold a value larger than the page. Each engine has an **overflow** scheme:
+
+- **PostgreSQL TOAST.** When a row is longer than 2,032 bytes, PostgreSQL first compresses wide values (pglz, or lz4 since version 14). If the row is still too long, it moves values to a separate TOAST table, in chunks of 1,996 bytes. The row keeps an 18-byte pointer. The limit 2,032 makes sure that 4 rows fit on one page.
+- **InnoDB.** With the DYNAMIC row format, a long variable-length column is stored on overflow pages, and the row keeps a 20-byte pointer.
+- **SQLite.** A cell that is too large for its B-tree page continues on a linked list of overflow pages.
+
+A query that does not read the wide column never touches the TOAST table or the overflow pages. So a large `jsonb` value costs little until a query reads it.
+
+## Choosing a page size
+
+| Engine | Default page | Range |
+|---|---|---|
+| PostgreSQL | 8 KiB | 1 to 32 KiB, set when the server is compiled |
+| InnoDB (MySQL) | 16 KiB | 4 to 64 KiB, set when the instance is created |
+| SQLite | 4 KiB | 512 B to 64 KiB, `PRAGMA page_size` before the first write |
+| RocksDB | 4 KiB data blocks | `block_size`, any size |
+| WiredTiger (MongoDB) | 32 KiB leaf, 4 KiB internal | per collection |
+
+A larger page makes fewer, larger I/Os and a shallower B-tree. It also reads more unneeded bytes per point lookup and writes more bytes for a small change. A page larger than the atomic write unit of the device can tear in a crash. The [amplification lesson](/databases/storage/read-write-and-space-amplification) puts numbers on these trade-offs.
+
+## Connect
+
+- [Heap files and free-space maps](/databases/storage/heap-files-and-free-space-maps) organizes many slotted pages into a table.
+- [B+ trees](/databases/btrees/b-trees) store keys in slotted pages too, in key order.
+- [MVCC](/databases/transactions/mvcc) explains why a PostgreSQL update writes a new tuple.
+- [Fragmentation](/systems/allocators/fragmentation) shows the same free-gap problem in a memory allocator.
+
+<Recall cards={[
+  { q: "What are the four regions of a slotted page, and which way do they grow?", a: "A fixed header, a slot array that grows from the front, tuples that grow from the back, and the free space between them." },
+  { q: "Why does compaction not break the record IDs in indexes?", a: "A record ID is (page, slot). Compaction moves the tuple bytes and writes the new offsets into the same slots, so the slot numbers stay the same." },
+  { q: "Why can PostgreSQL not reuse a deleted slot at once?", a: "Index entries still hold the record ID. The slot stays reserved until VACUUM removes those index entries." },
+  { q: "How many bytes does PostgreSQL spend on a row with two int4 columns, and why?", a: "36 bytes: a 23-byte header padded to 24, 8 bytes of data, and a 4-byte line pointer. So 226 rows fit in an 8 KiB page." },
+  { q: "Why can the column order change the size of a PostgreSQL row?", a: "Each value starts at a multiple of its type alignment. A 1-byte column before an 8-byte column adds 7 bytes of padding." },
+  { q: "What does PostgreSQL do with a row longer than 2,032 bytes?", a: "TOAST compresses wide values and, if that is not enough, moves them to a TOAST table in 1,996-byte chunks. The row keeps an 18-byte pointer." },
+]} />

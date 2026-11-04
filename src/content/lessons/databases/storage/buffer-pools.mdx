@@ -1,0 +1,142 @@
+---
+summary: "The buffer pool: frames, the page table, pins and dirty bits; LRU, Clock, LRU-K and 2Q; how one large scan floods the cache and how InnoDB and PostgreSQL stop it; O_DIRECT, double buffering and why mmap is a trap."
+---
+import { BufferPoolStepperDemo, PolicyRaceDemo } from "@/demos/db/StorageDemosB";
+
+Every page that the engine reads or changes passes through the **buffer pool** (also called the buffer cache or buffer manager). The pool is a large array of **frames**, each the size of one page. A **page table**, usually a hash map, maps a page ID to the frame that holds it. Three rules make the pool safe:
+
+- **Pin before use.** A thread that reads or changes a page **pins** it, which increments the frame's pin count. It unpins the page when it is done. The pool never evicts a pinned page, because a thread holds a pointer into it.
+- **Mark changes.** A thread that changes a page sets the frame's **dirty bit**. Memory then has newer data than the disk.
+- **Write back before reuse.** Before the pool reuses a dirty frame, it writes the page to disk. Its WAL records must reach the disk first (the [WAL rule](/databases/recovery/write-ahead-logging)).
+
+A pin is not a lock. Threads still take a short **latch** (a read-write lock) on the page while they read or change its bytes.
+
+<Predict
+  id="pinned-victim"
+  question="A pool has 4 frames. Three frames hold pinned pages, and the fourth holds an unpinned dirty page. A thread fetches a page that is not in the pool. What happens?"
+  options={["The fetch fails, because no frame is empty", "The pool writes the dirty page to disk, then reads the new page into that frame", "The pool evicts the least recently used page, pinned or not"]}
+  answer={1}
+  explain="Only unpinned frames can be victims, so the dirty frame is the only choice. Its page is newer than the disk copy, so the pool writes it back first. Then it reads the new page into the same frame. The fetch fails only when every frame is pinned."
+>
+<BufferPoolStepperDemo />
+</Predict>
+
+Things to try:
+
+1. Fetch pages 1, 2, 3 and 4. Each fetch misses and fills an empty frame. Fetch page 2 again: it is a hit, with no disk I/O.
+2. Fetch page 5. LRU evicts page 1, the page used longest ago. The "victim" labels show the order in which the policy will evict.
+3. Turn on **Change the page** and fetch page 2. The frame becomes dirty. Fetch new pages until page 2 is evicted, and watch the disk writes count go up.
+4. Turn on **Keep it pinned** and fetch four different pages. A fifth fetch fails: every frame is pinned. Press **Unpin all**.
+5. With LRU, fetch pages 1 to 4 a few times, then press **Scan pages 10–17**. The scan reads each page once, but it removes all four useful pages. Try the same with **Midpoint**.
+
+The fetch path is short, and it runs millions of times per second:
+
+```rust
+fn fetch(&mut self, page: PageId) -> Result<FrameId, PoolFull> {
+    if let Some(&f) = self.table.get(&page) {   // hit: no I/O
+        self.frames[f].pins += 1;
+        self.policy.hit(f);
+        return Ok(f);
+    }
+    let f = match self.free.pop() {             // miss: empty frame, or a victim
+        Some(f) => f,
+        None => {
+            let f = self.policy.victim(|f| self.frames[f].pins == 0).ok_or(PoolFull)?;
+            let old = &mut self.frames[f];
+            if old.dirty { self.disk.write(old.page, &old.data); }  // after its WAL is durable
+            self.table.remove(&old.page);
+            f
+        }
+    };
+    let fr = &mut self.frames[f];
+    self.disk.read(page, &mut fr.data);
+    (fr.page, fr.pins, fr.dirty) = (page, 1, false);
+    self.table.insert(page, f);
+    self.policy.load(f);
+    Ok(f)
+}
+```
+
+## Replacement policies
+
+The **replacement policy** chooses the victim. A good policy keeps the pages that will be used soon. A cheap policy does little work on a hit, because hits are the common case.
+
+| Policy | Work on a hit | Victim | Weakness |
+|---|---|---|---|
+| **LRU** | move the frame to the front of a list | the least recently used page | a lock on the list for every hit; scans flush it |
+| **Clock** | set a reference bit | the first frame with bit 0; the hand clears bits as it passes | only one bit of history |
+| **Clock sweep** (PostgreSQL) | add 1 to a usage count, at most 5 | the hand decrements counts and takes the first 0 | needs a ring for large scans |
+| **LRU-K** (O'Neil, 1993) | record the time | the page whose K-th most recent use is oldest | needs history for evicted pages |
+| **2Q** (Johnson and Shasha, 1994) | move the frame inside the main LRU | new pages wait in a FIFO; only pages used again enter the main LRU | queue sizes need tuning |
+
+Clock is LRU with one bit of memory: the bit says "used since the hand last passed". Clock sweep gives the bit more resolution. A page with usage count 5 survives five passes of the hand. LRU-K with K = 2 asks a different question: how long ago was the second-to-last use? A page that a scan read once has no second-to-last use, so it goes first.
+
+## Sequential flooding
+
+A scan reads each page of a large table once. With LRU, each new scan page becomes the "most recently used" page, so the pool evicts every hot page to make room. After the scan, every hot page misses once. This is **sequential flooding**.
+
+<Predict
+  id="flooding"
+  question="A pool of 150 frames serves 100 hot pages. After every 1,000 lookups, a scan reads 400 new pages, with 4 rows from each page. What hit rate does LRU get for the hot pages?"
+  options={["100%: the pool is larger than the hot set", "About 89%", "About 50%"]}
+  answer={1}
+  explain="Each scan pushes every hot page out. After the scan, each hot page misses once: about 100 extra misses for every 900 hot lookups. LRU gets 88.5% in this run. Without the scans, it gets 98.9%."
+>
+<PolicyRaceDemo />
+</Predict>
+
+1. Keep 150 frames and read the readouts. LRU and Clock lose their hot pages to every scan. PostgreSQL's clock sweep with a ring keeps all of them: 100%.
+2. Look at **Midpoint (InnoDB)**: 83.7%, worse than LRU. The scan reads 4 rows from each page, so each page gets a second access at once and moves into the protected part.
+3. Turn on **Ignore repeat accesses within 50 accesses**. Midpoint jumps to 99.3%, and LRU-2 from 78.0% to 100%. Both now see a scan page as used once.
+4. Select **1 row** per scanned page with the window off. LRU-2 and Midpoint work well again: the problem was the rows, not the scan.
+5. Move the pool to 200 frames. 2Q falls from 100% to 89.7%. Hot pages that entered the FIFO never got a chance to reach the main list, and a long scan pushed them out.
+
+The two production fixes are different:
+
+- **InnoDB midpoint insertion.** InnoDB keeps one LRU list. A new page enters at the head of the "old" sublist, which is the last 37% of the list (`innodb_old_blocks_pct = 37`). A later access moves the page to the young end only after `innodb_old_blocks_time`, 1,000 ms by default. Scan pages die in the old sublist.
+- **PostgreSQL ring buffers.** A sequential scan of a table larger than a quarter of `shared_buffers` uses a **buffer access strategy**. This is a small private ring of frames that the scan reuses. VACUUM and bulk writes such as `COPY` use their own rings. The scan only evicts its own pages.
+
+LRU-K has the same fix in its paper: a **correlated reference period**. Accesses close together count as one, so four rows from one page are one use, not four.
+
+## The operating system cache
+
+A file read with `read()` goes through the kernel's **page cache**. PostgreSQL uses buffered I/O, so a hot page is often in memory twice: in `shared_buffers` and in the page cache. This is **double buffering**. The PostgreSQL documentation suggests 25% of RAM for `shared_buffers` as a start. The page cache then works as a second-level cache.
+
+InnoDB usually opens its data files with **O_DIRECT** (`innodb_flush_method`), and MySQL 8.4 made it the default on Linux. Reads and writes then bypass the page cache, so the buffer pool can use most of the RAM. O_DIRECT needs buffers, offsets and lengths aligned to the device's logical block size:
+
+```rust
+use std::{alloc::{alloc_zeroed, Layout}, fs::OpenOptions, os::unix::fs::{FileExt, OpenOptionsExt}};
+
+let f = OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open("table.db")?;
+let layout = Layout::from_size_align(8192, 4096).unwrap();      // 4 KiB-aligned buffer
+let buf = unsafe { std::slice::from_raw_parts_mut(alloc_zeroed(layout), 8192) };
+f.read_exact_at(buf, 7 * 8192)?;                                  // aligned offset, aligned length
+```
+
+### Why not mmap the file?
+
+It is tempting to `mmap` the whole database and let the kernel be the buffer pool. Crotty, Leis and Pavlo (CIDR 2022) list the problems:
+
+- **Write order.** The kernel can write a dirty mapped page to disk at any time. The engine cannot hold the page back until its WAL is durable.
+- **Stalls.** A miss is a page fault. The thread blocks, and there is no asynchronous way to wait for it.
+- **Errors.** An I/O error arrives as a `SIGBUS` signal, not as a return value.
+- **Scale.** Evicting mapped pages needs TLB shootdowns on every core, which limits throughput on large machines.
+
+LMDB uses mmap safely because its copy-on-write B-tree never overwrites a live page, and it writes with `pwrite` by default. MongoDB dropped its mmap engine (MMAPv1) for WiredTiger. SQLite supports mmap for reads, but it is off by default (`PRAGMA mmap_size = 0`).
+
+## Connect
+
+- [Write policies](/architecture/caches/write-policies) shows write-back and dirty bits in a CPU cache.
+- [Multi-level caches](/architecture/caches/multi-level-caches) explains inclusive caches, like double buffering.
+- [Write-ahead logging](/databases/recovery/write-ahead-logging) gives the rule for when a dirty page may go to disk.
+- [Checkpoints](/databases/recovery/checkpoints) flush dirty pages in the background.
+- [Copy-on-write B-trees](/databases/btrees/copy-on-write-b-trees) explains how LMDB works with mmap.
+
+<Recall cards={[
+  { q: "What do the pin count and the dirty bit of a frame mean?", a: "The pin count is the number of threads that use the page now; a pinned page cannot be evicted. The dirty bit says that the page changed since it was read, so it must be written back before its frame is reused." },
+  { q: "How does Clock approximate LRU?", a: "Each frame has a reference bit that a hit sets. The hand clears bits as it passes and evicts the first frame whose bit is already 0." },
+  { q: "What is sequential flooding?", a: "A large scan reads many pages once. Under LRU each scan page is the most recent, so the pool evicts all the hot pages." },
+  { q: "How does InnoDB stop scans from flooding its buffer pool?", a: "New pages enter at the head of the old sublist (the last 37%). They move to the young part only if accessed again after innodb_old_blocks_time, 1,000 ms by default." },
+  { q: "How does PostgreSQL stop a large sequential scan from flooding shared_buffers?", a: "It gives the scan a buffer access strategy: a small ring of frames that the scan reuses, so it only evicts its own pages." },
+  { q: "Name two reasons why mmap is a poor buffer pool for a database.", a: "The kernel can write dirty pages before their WAL is durable, and a miss is a blocking page fault. Also I/O errors arrive as SIGBUS, and eviction needs TLB shootdowns." },
+]} />

@@ -1,0 +1,117 @@
+---
+summary: "How a table becomes a file of pages: heap files, the page directory, PostgreSQL's free-space map and its 32-byte categories, fill factor and HOT updates, and the real cost of a sequential scan."
+---
+import { HeapInsertDemo, FsmTreeDemo, SeqScanDemo } from "@/demos/db/StorageDemos";
+
+A **heap file** is a set of pages that holds the rows of one table in no particular order. Page *n* starts at byte *n* × 8192, so the engine finds any page with one multiplication. PostgreSQL stores every table this way, in segment files of 1 GiB. InnoDB and SQLite do not use heaps: their tables are B-trees ordered by the primary key or the rowid.
+
+A heap must answer three questions. Where is page *n*? Which page has room for a new row? How do we read every row? The first question is easy. The other two decide the cost of every insert and every full-table scan.
+
+## Finding room for a new row
+
+The textbook designs keep extra structure next to the pages:
+
+- **Linked lists.** A header page points to a list of full pages and a list of pages with free space. An insert walks the second list until it finds a page with enough room.
+- **A page directory.** A few directory pages hold one entry per data page: its number and its free bytes. An insert searches the directory, not the data pages.
+
+Without either, an insert must read data pages until one has room. Deleted rows leave holes in old pages, so a good design must find those holes cheaply.
+
+<Predict
+  id="first-fit"
+  question="A table fills 51 pages. You delete 30% of the rows and run VACUUM. Then you insert 900 rows, and each insert reads pages from page 0 until one has room. On average, how many pages does one insert read?"
+  options={["1 page", "About 25 pages", "All 51 pages, every time"]}
+  answer={1}
+  explain="The first inserts find room in the first pages. As those pages fill up, each insert must skip more full pages before it finds a hole. In this run, the average is 24.9 pages per insert, and the worst insert reads all 51."
+>
+<HeapInsertDemo />
+</Predict>
+
+Things to try:
+
+1. Select **Free-space map** and press **Play**. Each insert reads about one page (1.07 on average), and the file stays at 51 pages.
+2. Select **Scan from page 0**. The black marks show every page that an insert reads. The marks grow longer as the early pages fill up.
+3. Select **Append only**. Each insert reads one page, but the file grows from 51 to 66 pages. The holes from the deletes stay empty.
+4. Turn off **Run VACUUM** and select **Free-space map** again. The file also grows to 66 pages. The deleted rows are dead, but not free, until VACUUM reclaims them.
+5. With VACUUM off, select **Scan from page 0**. Each insert now reads 58 pages on average and still finds no room in the old pages.
+
+## The PostgreSQL free-space map
+
+PostgreSQL keeps a page directory in a separate file next to the table, the **free-space map (FSM)** fork (`<relfilenode>_fsm`). It stores one byte per heap page, a **category**: the free bytes divided by 32, rounded down. With 8 KiB pages there are 256 categories, so a page with 8,160 free bytes has category 255. A row that needs *n* bytes looks for category ⌈*n* / 32⌉ or more. Because the map rounds down and the request rounds up, a page that the map offers always has room, if the map is current.
+
+Inside each FSM page, the bytes form a binary **max-tree**. Each leaf is one heap page, and each parent holds the larger value of its children. A search for category *c* starts at the root. If the root is less than *c*, no page has room. Otherwise the search goes down to a child that is at least *c*, one node per level.
+
+<FsmTreeDemo />
+
+1. The default request of 2,400 bytes needs category 75. Follow the blue path down to the page that the search returns.
+2. Move the request to 8,000 bytes. It needs category 250, and the root holds 255, so one page still has room.
+3. Click pages to change their free space. The parents change at once, and the search can take another path.
+4. Count the nodes on the path: one per level, 5 for 16 pages. For a large table, PostgreSQL stacks FSM pages in three levels, so a search reads at most three FSM pages.
+
+```rust
+/// Find the leftmost leaf with value >= want in a max-tree stored as an array
+/// (node i has children 2i and 2i+1, leaves start at index `leaves`).
+fn fsm_search(tree: &[u8], leaves: usize, want: u8) -> Option<usize> {
+    if tree[1] < want {
+        return None; // no page has room: extend the file
+    }
+    let mut i = 1;
+    while i < leaves {
+        i = if tree[2 * i] >= want { 2 * i } else { 2 * i + 1 };
+    }
+    Some(i - leaves) // heap page number
+}
+```
+
+The FSM is **lossy**. An insert does not update it, because that would add a write to every insert. VACUUM records the true free space of each page. When an insert finds that a page has less room than the map says, it records the true value and searches again. PostgreSQL also remembers the last page that the session used, the **target block**, and tries it first. So most inserts read one heap page and no FSM page at all.
+
+Real searches add one more detail: they start from a moving position (`fp_next_slot`), not always from the left. This spreads concurrent inserts over different pages, so they do not all wait for the lock on one page.
+
+## Fill factor and HOT updates
+
+The table storage parameter **fillfactor** tells inserts to stop when a page is that full. The default is 100% for tables and 90% for B-tree indexes. The free part of each page is for updates.
+
+PostgreSQL writes a new row version for every update (see [MVCC](/databases/transactions/mvcc)). If no indexed column changes and the new version fits on the same page, the update is a **heap-only tuple (HOT)** update. The old version points to the new one, and the indexes do not change. A non-HOT update adds a new entry to every index of the table. So a fill factor of 70% to 90% can make update-heavy tables much cheaper to maintain.
+
+The price is space. With 100-byte rows, a page holds 75 rows at fill factor 100%, but only 52 at 70%. A table of one million rows then grows from 13,334 to 19,231 pages, and every full scan reads 44% more.
+
+## The cost of a sequential scan
+
+A **sequential scan** reads every page of the heap in order and checks every row version on it. PostgreSQL estimates its cost as:
+
+$$\text{cost} = \text{pages} \times \texttt{seq\_page\_cost} + \text{versions} \times \texttt{cpu\_tuple\_cost}$$
+
+The defaults are 1.0 per page and 0.01 per row version, plus 0.0025 per operator in the `WHERE` clause. The unit is "one sequential page read", so a random page read costs 4.0 by default.
+
+<Predict
+  id="dead-scan"
+  question="Half the row versions in a table are dead, and VACUUM has not run. How does the time of a full-table scan change?"
+  options={["It stays the same, because the scan skips dead rows", "It about doubles", "It halves, because half the rows are gone"]}
+  answer={1}
+  explain="Dead versions still fill the pages. The scan reads every page and checks each version against its snapshot before it can skip it. So the pages to read double, and so does the time."
+>
+<SeqScanDemo />
+</Predict>
+
+1. Keep the defaults: one million live rows of 100 bytes. The table has 13,334 pages, 104 MiB. A disk at 200 MB/s reads it in 546 ms, and an NVMe SSD in 34 ms.
+2. Move the dead versions to 50%. The page count and the cost estimate both double.
+3. Set the fill factor to 70%. The pages now have empty space at the end, and the scan reads 44% more pages.
+4. Select **40 B** rows. A page now holds 185 rows, so the table needs only 5,406 pages. The row part of the cost estimate (10,000) is now larger than the page part.
+
+Two more facts make scans fast or slow in practice. The operating system detects sequential reads and reads ahead, so the scan rarely waits for each page. And a large scan must not push the useful pages out of the buffer pool. PostgreSQL gives large scans a small ring of buffers, 256 KiB in most versions, as the [buffer pool lesson](/databases/storage/buffer-pools) shows.
+
+## Connect
+
+- [Pages and slotted records](/databases/storage/pages-and-slotted-records) shows the layout inside each heap page.
+- [Buffer pools](/databases/storage/buffer-pools) keeps hot pages in memory and protects them from scans.
+- [Secondary and covering indexes](/databases/indexes/secondary-and-covering-indexes) explains how an index finds a row in a heap by its record ID.
+- [Free lists](/systems/allocators/free-lists) solves the same "find a hole" problem for memory.
+- [Cost models](/databases/optimizer/cost-models) builds on the scan cost formula.
+
+<Recall cards={[
+  { q: "What is a heap file, and how does the engine find page n?", a: "An unordered set of fixed-size pages that holds a table's rows. Page n starts at byte n × page size." },
+  { q: "What does the PostgreSQL FSM store for each heap page?", a: "One byte: the free space divided by 32 (for 8 KiB pages), rounded down. 256 categories in total." },
+  { q: "Why does an FSM search read only a few nodes?", a: "The categories form a max-tree. The search goes from the root down to a child with a large enough value, one node per level." },
+  { q: "Why does PostgreSQL not update the FSM on every insert, and how does it fix wrong entries?", a: "It would add work to every insert. VACUUM records true values, and an insert that finds less room than promised records the truth and searches again." },
+  { q: "When is a PostgreSQL update a HOT update?", a: "When no indexed column changes and the new version fits on the same page. Then no index changes." },
+  { q: "Why does a table with 50% dead versions take twice as long to scan?", a: "The dead versions still fill the pages. The scan must read every page and check every version." },
+]} />

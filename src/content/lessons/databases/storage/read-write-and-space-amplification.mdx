@@ -1,0 +1,127 @@
+---
+summary: "Three numbers that describe any storage engine: read, write and space amplification. The RUM conjecture, the numbers for a B+ tree, leveled and tiered LSM trees and a log with a hash index, and how write amplification multiplies down to the SSD."
+---
+import { RumTriangleDemo, WaChainDemo } from "@/demos/db/StorageDemosB";
+
+Every storage engine pays three kinds of overhead. Each one is a ratio, so engines of different designs can be compared:
+
+- **Read amplification (RA)**: the I/Os (or bytes) that one lookup reads, compared with what it returns. Here: I/Os per point lookup, and I/Os for a range of 100 records.
+- **Write amplification (WA)**: the bytes written to storage for each byte the user changes. The WAL counts.
+- **Space amplification (SA)**: the bytes kept on disk and in memory indexes for each byte of live data.
+
+An ideal engine has 1 for all three. The **RUM conjecture** (Athanassoulis and others, EDBT 2016) says that no engine can. If a design bounds two of the read, update and memory overheads, it must pay more on the third.
+
+<Predict
+  id="btree-wa"
+  question="A B+ tree has 4 KiB pages. Users update random 100-byte records, and each update dirties a page that is written back alone. How many bytes reach the disk for each byte the user changed, with the WAL?"
+  options={["About 2: the WAL record and the record itself", "About 42", "About 4,096"]}
+  answer={1}
+  explain="The WAL gets the 100-byte change once, which is 1 byte per user byte. Then the whole 4 KiB page goes back to disk for a 100-byte change: 4096 / 100 = 40.96 more. The total is 1 + 40.96 = 42 bytes per user byte."
+>
+<RumTriangleDemo />
+</Predict>
+
+Things to try:
+
+1. Click the blue B+ tree point with **1 update per page write**. The write amplification is 42, but a point lookup costs one I/O.
+2. Drag along the blue line. When the buffer pool collects 8 updates per page before a write, the WA falls to 6.12. Caching is a write optimization.
+3. Click the orange **tiered** points. The WA is low (6 at T = 10), but the space amplification is 5 and a range needs 39 I/Os.
+4. Click the green **leveled** points. They lean toward the "little space" corner: 1.12 times the data at T = 10, with a WA of 24.
+5. Move the record size to 4 KiB. The B+ tree WA falls to 2, because a page holds one record. Small records make in-place pages expensive.
+
+## Computing the numbers
+
+All four models use 100-byte records, 4 KiB pages, 100 GB of data, a 64 MiB memtable and Bloom filters with 10 bits per key. The workload updates random keys over a fixed key set.
+
+<Steps>
+<div>**B+ tree, in place.** A lookup reads one leaf; the inner nodes are in memory. An update writes the WAL record and then the whole page: $WA = 1 + P/(r \cdot a)$, where $a$ is the number of updates that one page write carries. With $a = 1$, WA = 42. Random inserts leave pages 69% full on average (ln 2, Yao 1978), so SA = 1.45.</div>
+<div>**LSM tree, leveled, size ratio T = 10.** The data needs $L = \lceil \log_{10}(100\text{ GB} / 64\text{ MiB}) \rceil = 4$ levels below the memtable. Each byte is written to the WAL, flushed once, and then rewritten about $(T+1)/2$ times per level: $WA = 2 + 4 \cdot 5.5 = 24$. The upper levels are at most 1/9 of the last level, so SA = 1.12 with the filters.</div>
+<div>**LSM tree, tiered, T = 10.** Each level collects up to T − 1 runs and merges them once into the next level, so each byte is written once per level: WA = 2 + 4 = 6. With updates over a fixed key set, the last level holds about T / 2 runs that each cover all keys, so SA ≈ 5.</div>
+<div>**Log with a hash index (Bitcask).** Every write is appended to a log, and a hash table in memory maps each key to its offset. A segment is cleaned when only a fraction *u* of it is live: to free 1 − *u*, the cleaner copies *u*. So WA = 1/(1 − *u*) = 5 at 80%. The hash table costs about 32 bytes per key, so SA = 1.43.</div>
+</Steps>
+
+| Design | Point lookup I/Os | Range of 100 records, I/Os | WA | SA |
+|---|---|---|---|---|
+| B+ tree, 1 update per page write | 1 | 4 | 42 | 1.45 |
+| LSM, leveled, T = 10 | 1.03 | 7 | 24 | 1.12 |
+| LSM, tiered, T = 10 | 1.29 | 39 | 6 | 5.01 |
+| Log + hash, clean at 80% live | 1 | 100 | 5 | 1.43 |
+| Sorted file, no index | 25 | 28 | 500,000,000 | 1 |
+| Log, no index, clean at 50% live | 16,276,042 | 32,552,083 | 2 | 1.33 |
+
+The LSM point lookups cost a little more than 1 I/O. A Bloom filter with 10 bits per key gives a false positive 0.82% of the time, and each level adds that chance of one useless read. The last two rows are the extremes: one is nearly ideal on writes and space, the other on space and reads. Each is useless on the third axis.
+
+The leveled formula in code:
+
+```ts
+/** Write amplification of a leveled LSM tree with size ratio T. */
+function leveledWa(T: number, dataBytes: number, memtableBytes: number): number {
+  const levels = Math.max(1, Math.ceil(Math.log(dataBytes / memtableBytes) / Math.log(T)));
+  return 1 /* WAL */ + 1 /* flush */ + levels * (T + 1) / 2;
+}
+leveledWa(10, 100e9, 64 * 2 ** 20); // 24
+```
+
+These are first-order models. Real engines add compression, which divides SA. They add partial merges and caches, which change RA. The point is the shape: you can move a design along a curve, but not toward all three corners at once.
+
+## Write amplification multiplies
+
+The engine's WA is not the end. The file system can add its own (a journal, metadata updates), and the SSD adds device WA from garbage collection, as the [disks lesson](/databases/storage/disks-vs-ssds) showed. The factors multiply:
+
+$$\text{NAND bytes} = \text{user bytes} \times WA_{engine} \times WA_{fs} \times WA_{device}$$
+
+The device factor depends on the *pattern* of the engine's writes. A B+ tree writes 4 KiB pages at random addresses, so each erase block holds a mix of live and dead pages. An LSM tree writes large files and deletes whole files. With TRIM, whole erase blocks become invalid together, and the device WA stays near 1.
+
+<Predict
+  id="ssd-life"
+  question="A B+ tree engine (WA 42) runs on a 1 TB TLC SSD with 7% spare space and 3,000 program/erase cycles. The file system adds 10%. Users write only 1 MB/s. How long does the SSD last?"
+  options={["Decades: 1 MB/s is very little", "About 3.5 months", "About one week"]}
+  answer={1}
+  explain="The random page writes give a device WA of 7.02. The total is 42 × 1.1 × 7.02 = 324 NAND bytes per user byte, so 1 MB/s becomes 324 MB/s of NAND writes. The drive can absorb 1 TB × 3,000 = 3 PB in its life, which is 107 days at that rate."
+>
+<WaChainDemo />
+</Predict>
+
+1. Keep the defaults. The SSD writes 28 TB of NAND per day for 86 GB of user data per day.
+2. Select **28%** spare space. The device WA falls from 7.02 to 2.40, and the life grows to 0.86 years. Enterprise drives reserve this space for a reason.
+3. Select **LSM, leveled**. The engine WA is 24, but the device WA is 1.00, so the total is 26.4 and the SSD lasts 3.6 years.
+4. Select **LSM, tiered**. The total falls to 6.6 and the life to 14.4 years. The price is the space and the range reads of step 3 above.
+5. Move the user writes to 10 MB/s. Every line moves down by a factor of 10: the life is inversely proportional to the write rate.
+
+New interfaces attack the device factor directly. Zoned namespaces (ZNS) and flexible data placement (FDP) let the host tell the SSD which data dies together. An LSM tree that puts each file in its own zone gets a device WA close to 1 without spare space.
+
+## Measuring it on a real system
+
+Each factor has a counter, so you can measure the chain instead of guessing it:
+
+- **Engine.** RocksDB prints a compaction table with a `W-Amp` column for each level (`rocksdb.stats`). PostgreSQL 14 and later report `wal_bytes` and `wal_fpi` (the full-page images) in the `pg_stat_wal` view.
+- **File system and block layer.** `iostat` and `/proc/diskstats` count the bytes that the host sends to the device. Divide them by the engine's own write counter.
+- **Device.** The NVMe SMART log reports "Data Units Written", in units of 512,000 bytes. That counts host writes only. NAND writes, and so the device WA, are in vendor-specific logs.
+
+Measure over at least an hour of steady load. Compaction, checkpoints and garbage collection run in bursts, so short samples mislead.
+
+## Choosing a design
+
+| If your workload… | Prefer | Because |
+|---|---|---|
+| reads far more than it writes | B+ tree | 1 I/O per lookup, cheap ranges |
+| writes a lot, reads recent keys | leveled LSM | WA in the tens, SA near 1.1, device WA near 1 |
+| ingests a stream, rarely reads | tiered LSM | lowest WA; pays with space and range reads |
+| has keys that fit in memory and no ranges | log + hash | 1 I/O per lookup, low WA |
+
+## Connect
+
+- [Disks vs SSDs](/databases/storage/disks-vs-ssds) derives the device write amplification.
+- [B+ trees](/databases/btrees/b-trees) and [memtables and SSTables](/databases/lsm/memtables-and-sstables) build the two main designs.
+- [Compaction: leveled vs tiered](/databases/lsm/compaction-leveled-vs-tiered) explores the T and merge-policy knobs.
+- [Bloom filters](/databases/lsm/bloom-filters) explains the 0.82% false-positive rate.
+- [Tuning an LSM tree](/databases/lsm/tuning-an-lsm-tree) moves a real engine around this triangle.
+
+<Recall cards={[
+  { q: "Define read, write and space amplification.", a: "RA: storage read per lookup compared with the data returned. WA: bytes written to storage per byte the user changes. SA: bytes stored per byte of live data." },
+  { q: "What does the RUM conjecture say?", a: "An access method that bounds two of the read, update and memory overheads must pay more on the third. No design is ideal on all three." },
+  { q: "Why does a B+ tree with 4 KiB pages and 100-byte records have a write amplification near 42?", a: "Each update writes a 100-byte WAL record and then the whole 4 KiB page: 1 + 4096 / 100 ≈ 42." },
+  { q: "Why does leveling write more than tiering, and what does tiering pay instead?", a: "Leveling rewrites a byte about (T + 1) / 2 times per level, tiering once per level. Tiering keeps many overlapping runs, so it pays with space and with range reads." },
+  { q: "How do engine, file system and device write amplification combine?", a: "They multiply: NAND bytes = user bytes × engine WA × file system WA × device WA." },
+  { q: "Why does an LSM tree get a device WA near 1 while a B+ tree does not?", a: "The LSM tree writes large files and deletes whole files, so whole erase blocks become invalid. Random page writes leave mixed blocks that garbage collection must copy." },
+]} />

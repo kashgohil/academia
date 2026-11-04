@@ -1,0 +1,141 @@
+---
+summary: "What it takes for a write to survive a power cut: the page cache and the drive cache, fsync and its 2018 failure in PostgreSQL, directory fsync, torn pages, full-page writes, the InnoDB doublewrite buffer and CRC-32C checksums."
+---
+import { WriteStackDemo, TornPageDemo, ProtectionCostDemo } from "@/demos/db/StorageDemosB";
+
+A commit is a promise: the change survives a crash. The engine can keep that promise only if it knows exactly when bytes are on **stable media**, which keeps data without power. Between `write()` and the media there are two volatile caches:
+
+1. `write()` copies the bytes into the kernel's **page cache** and marks the pages dirty. It returns at once. Nothing is on disk yet.
+2. The kernel writes dirty pages to the device later (**writeback**), or now if the program calls `fsync()`.
+3. The device can hold the data in its own **volatile write cache**. Only a **FLUSH** command, or a write with the **FUA** (force unit access) flag, makes it durable.
+
+A power cut erases both caches. Data-center SSDs often have **power-loss protection (PLP)**: capacitors that hold enough energy to save the drive cache. Consumer drives usually do not.
+
+<Predict
+  id="new-file"
+  question="A program creates a new file, writes one block and calls fsync on the file. fsync returns ok. Then the power fails. What does the program find after the reboot?"
+  options={["The file with its data", "Maybe no file at all: nothing synced the directory entry", "The file, but with zero bytes"]}
+  answer={1}
+  explain="fsync on a file makes its data and its inode durable, but not the directory entry that names it. The Linux fsync(2) manual says that the directory needs its own fsync. The ext4 file system often saves the entry anyway, but portable code must not depend on it."
+>
+<WriteStackDemo />
+</Predict>
+
+Things to try:
+
+1. Select **write + fsync** and move the plug slider from 0 to 3. Before the fsync, the new data is only in RAM, and a crash loses it. After the fsync returns, the media holds it.
+2. Keep that program and select **Ignores FLUSH**. fsync still returns ok, but the data waits in the drive cache. A crash after step 3 loses data that the program was told is safe.
+3. Select **new file, no directory fsync**. The data block reaches the media, but the directory entry does not, so after the reboot the file is missing.
+4. Select **atomic replace**. At every crash point, a reader finds either the old config or the new one, never a mix and never nothing.
+5. Select **fsync error, then retry**. The first fsync reports EIO. The second fsync returns ok, but block 1 is lost. Then compare **fsync error, then PANIC**.
+
+## The system calls
+
+| Call | What it makes durable |
+|---|---|
+| `fsync(fd)` | the file's data and metadata, and a cache flush on the device |
+| `fdatasync(fd)` | the data and only the metadata that a read needs (such as the size), not times |
+| `open(…, O_DSYNC)` | each `write()` returns only after its data is durable |
+| `open(…, O_DIRECT)` | bypasses the page cache; says nothing about the drive cache |
+| `sync_file_range()` | starts writeback; it does not wait for the drive cache and gives no guarantee |
+| `fsync(dirfd)` | the directory entries: new names, renames and deletes |
+
+On macOS, `fsync()` does not flush the drive cache. A program must call `fcntl(fd, F_FULLFSYNC)`. PostgreSQL offers this as `wal_sync_method = fsync_writethrough`. On Linux its default is `fdatasync`.
+
+A new file needs two syncs: the file, then its directory. The classic way to replace a file atomically uses a temporary file and `rename()`:
+
+```go
+func replaceFile(dir, name string, data []byte) error {
+	tmp := filepath.Join(dir, name+".tmp")
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil { return err }
+	if _, err = f.Write(data); err == nil { err = f.Sync() } // 1. data durable
+	if cerr := f.Close(); err == nil { err = cerr }
+	if err != nil { return err }
+	if err = os.Rename(tmp, filepath.Join(dir, name)); err != nil { return err } // 2. atomic name swap
+	d, err := os.Open(dir)
+	if err != nil { return err }
+	defer d.Close()
+	return d.Sync() // 3. the new name is durable
+}
+```
+
+### fsyncgate (2018)
+
+In 2018, PostgreSQL developers found that their error handling for fsync was wrong. When a writeback fails on Linux, the kernel marks the failed pages as clean and reports the error once. PostgreSQL then retried the checkpoint. The second fsync had nothing to write, so it returned ok, and the checkpoint completed. The changed data was not on disk, and the WAL that described it was then recycled.
+
+The fix was simple and blunt. Since PostgreSQL 12 and the minor releases of February 2019, a failed fsync of a data file makes the server **PANIC**. On restart, recovery replays the WAL from the last checkpoint, so the lost writes happen again. The rule for every engine is the same: after a failed fsync, never trust the page cache for that file.
+
+## Torn pages
+
+A device writes some unit **atomically**: after a power cut it holds the old unit or the new one, never a mix. For disks this is one sector, 512 bytes or 4 KiB. NVMe drives report their power-fail atomic write unit, often 4 KiB. A database page is usually larger: 8 KiB in PostgreSQL, 16 KiB in InnoDB. If the power fails during a page write, the page can be **torn**: some sectors new, some old.
+
+<Predict
+  id="torn"
+  question="An engine has page checksums but no other torn-page protection. The power fails after the first 4 KiB of an 8 KiB page write reached the disk. The WAL holds a record of the change. What does recovery do?"
+  options={["It replays the WAL record and fixes the page", "It finds a bad checksum, but it cannot repair the page from the WAL record alone", "Nothing: the page is fine"]}
+  answer={1}
+  explain="A normal WAL record says what changed, such as 'set bytes 100 to 120 of page 7'. It needs a correct old page to apply to. The torn page is half old and half new, and the checksum detects that. But no copy of the full page exists, so the page is lost until a backup restores it."
+>
+<TornPageDemo />
+</Predict>
+
+1. Keep **None** and move the plug to step 2. Sector 0 is new and sector 1 is old. Recovery sees nothing wrong and applies redo to a broken page: **silent corruption**.
+2. Select **Checksum**. The same crash is now **detected**. That is much better, but the data is still lost.
+3. Select **Full-page writes** and try every crash point. The WAL record holds the whole page, so recovery writes it over whatever is on disk.
+4. Select **Doublewrite** and move the plug to step 5. The page in the data file is torn, but the doublewrite area holds a complete, synced copy.
+5. Select **8 KiB / 512 B**. With 16 sectors, there are many more torn states, and only full-page images and doublewrite repair all of them.
+
+Two production designs solve torn pages:
+
+- **Full-page writes (PostgreSQL).** The first time a page changes after a checkpoint, its WAL record includes an image of the whole page. Recovery starts at a checkpoint, so for every page it replays, it first restores a complete image. `full_page_writes = on` is the default. The image skips the free gap of the page, and `wal_compression` can compress it.
+- **Doublewrite buffer (InnoDB).** Before InnoDB writes dirty pages in place, it writes them to a separate doublewrite area and syncs it. If recovery finds a page with a bad checksum, it copies the good version from the doublewrite area. `innodb_doublewrite = ON` is the default.
+
+A file system that never overwrites in place, such as ZFS, cannot tear a page. Some devices also guarantee atomic 16 KiB writes. On such systems both protections can be turned off.
+
+## What the protection costs
+
+<ProtectionCostDemo />
+
+1. Keep the defaults: 100,000 updates on a table of 100,000 pages. They change 63,212 distinct pages. Full-page images grow the WAL from 9.54 MiB to 503 MiB, 52.8 times.
+2. Read the bytes per update. Without protection, each update costs about 5,300 bytes, because every changed page is flushed once. Both protections about double that, to about 10,500 bytes.
+3. Move the updates between checkpoints to 10,000,000. Pages now change many times between checkpoints, so each image and each extra page write is shared by many updates.
+4. Move the table size down. A small, hot table pays for each image only once per checkpoint.
+
+This is why PostgreSQL write-heavy systems often raise `max_wal_size` and `checkpoint_timeout` (5 minutes by default). Fewer checkpoints mean fewer full-page images. The price is a longer recovery after a crash.
+
+## Checksums
+
+A checksum detects damage. It cannot repair anything. It catches torn pages, bit rot, and pages that the storage wrote to the wrong place.
+
+- **InnoDB** stores a CRC-32C checksum in each page (`innodb_checksum_algorithm = crc32`).
+- **PostgreSQL** stores a 16-bit checksum in each page header. It mixes in the block number, so a page at the wrong place also fails. Data checksums are on by default since PostgreSQL 18; before that, `initdb --data-checksums` turned them on.
+- **PostgreSQL WAL records** carry a CRC-32C, so recovery stops at the first record that a crash cut short.
+- **ZFS** stores each block's checksum in the block pointer of its parent. A block cannot vouch for itself.
+
+CRC-32C uses the Castagnoli polynomial. x86 (SSE 4.2) and ARMv8 have instructions for it, so it runs at many gigabytes per second. Its standard test value is easy to check:
+
+```zig
+const std = @import("std");
+
+test "crc32c" {
+    const c = std.hash.crc.Crc32Iscsi.hash("123456789"); // iSCSI = Castagnoli
+    try std.testing.expectEqual(@as(u32, 0xE3069283), c);
+}
+```
+
+## Connect
+
+- [Write-ahead logging](/databases/recovery/write-ahead-logging) explains the WAL rule that all of this protects.
+- [Group commit](/databases/recovery/group-commit) shares one fsync among many transactions.
+- [Checkpoints](/databases/recovery/checkpoints) set where recovery starts, and so when full-page images are needed.
+- [Crash testing the engine](/databases/engine/crash-testing-the-engine) cuts the power at every step, like these demos.
+
+<Recall cards={[
+  { q: "Name the two volatile caches between write() and stable media.", a: "The kernel's page cache and the drive's volatile write cache. fsync must empty the first and flush the second." },
+  { q: "Why must a program fsync the directory after it creates a file?", a: "fsync on the file makes its data and inode durable, but not the directory entry that names the file." },
+  { q: "What went wrong in the 2018 PostgreSQL fsyncgate?", a: "After a failed writeback, Linux marked the pages clean and reported the error once. PostgreSQL retried fsync, which returned ok, so it believed lost data was durable." },
+  { q: "What is a torn page, and why can redo not fix it?", a: "A page that is partly old and partly new after a crash. A normal WAL record describes a change and needs a correct old page to apply to." },
+  { q: "How do PostgreSQL and InnoDB repair torn pages?", a: "PostgreSQL logs a full image of each page on its first change after a checkpoint. InnoDB writes pages to a doublewrite area and syncs it before it writes them in place." },
+  { q: "What can a page checksum do, and what can it not do?", a: "It detects torn pages, bit rot and misplaced pages. It cannot repair them; repair needs another full copy." },
+]} />

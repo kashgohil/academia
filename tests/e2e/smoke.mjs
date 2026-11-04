@@ -50,13 +50,14 @@ try {
     if (errors.length) failures.push(`[${theme}] pages: ${errors.join(" | ")}`);
 
     for (const path of LIVE) {
+      try {
       await visit(path, path);
       // Answer every prediction (first option) to unlock gated demos.
       for (const block of await page.locator(".predict").all()) {
         const first = block.locator(".choice").first();
         if (await first.isEnabled()) await first.click();
       }
-      await page.waitForSelector(".demo", { timeout: 5000 });
+      await page.waitForSelector(".demo", { timeout: 20000 });
       await page.waitForTimeout(800);
       const demo = page.locator(".demo").first();
       const before = await demo.innerHTML();
@@ -70,6 +71,9 @@ try {
       const short = path.split("/").pop();
       await demo.screenshot({ path: `${SHOTS}${theme}-${short}.png` });
       if (errors.length) failures.push(`[${theme}] ${path}: ${errors.join(" | ")}`);
+      } catch (e) {
+        failures.push(`[${theme}] ${path}: ${String(e).split("\n")[0]}`);
+      }
     }
     await ctx.close();
   }

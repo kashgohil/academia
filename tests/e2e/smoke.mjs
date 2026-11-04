@@ -23,7 +23,10 @@ await new Promise((res, rej) => {
 // Live lessons, read from the curriculum registry.
 const curriculum = readFileSync(new URL("../../src/content/curriculum.ts", import.meta.url), "utf8");
 const liveBlock = curriculum.slice(curriculum.indexOf("export const LIVE"), curriculum.indexOf("]);", curriculum.indexOf("export const LIVE")));
-const LIVE = [...liveBlock.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+const ALL_LIVE = [...liveBlock.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+// SMOKE_ONLY=a/b/c,d/e/f checks only lessons whose path contains one of the given strings.
+const only = process.env.SMOKE_ONLY?.split(",").filter(Boolean);
+const LIVE = only ? ALL_LIVE.filter((p) => only.some((o) => p.includes(o))) : ALL_LIVE;
 
 const browser = await chromium.launch();
 const failures = [];
@@ -66,6 +69,11 @@ try {
         await slider.focus();
         for (let i = 0; i < 40; i++) await page.keyboard.press("ArrowRight");
         await page.waitForTimeout(600);
+        // A slider may start at its maximum; then moving it left must change the demo.
+        if ((await demo.innerHTML()) === before) {
+          for (let i = 0; i < 80; i++) await page.keyboard.press("ArrowLeft");
+          await page.waitForTimeout(600);
+        }
         if ((await demo.innerHTML()) === before) failures.push(`[${theme}] ${path}: slider did not change the demo`);
       }
       const short = path.split("/").pop();

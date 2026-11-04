@@ -1,0 +1,59 @@
+---
+summary: Standalone fences, how they pair up, the one job only a seq_cst fence can do, and compiler-only fences.
+---
+import { LitmusDemo } from "@/demos/LitmusDemo";
+import { LESSON_PRESETS } from "@/sims/memmodel/presets";
+
+A fence (`std::atomic_thread_fence` in C++, `std::sync::atomic::fence` in Rust) is a memory-ordering instruction not attached to any particular atomic. (Zig removed `@fence` in 0.14; there you put the ordering on the atomic operations themselves.) It upgrades the *relaxed* atomics around it. Fences are useful when one ordering point should cover many operations, or when you only know after a loop that you need acquire semantics.
+
+<Predict
+  id="one-fence"
+  question="The writer does data.store(42, relaxed); fence(release); flag.store(1, relaxed). The reader does a relaxed flag load, then a relaxed data load, with no fence. Can the reader see flag = 1 and data = 0?"
+  options={["No: the release fence orders the writer's stores", "Yes: the reader isn't synchronized"]}
+  answer={1}
+  explain="Fences synchronize in pairs, just like release and acquire operations. The writer's release fence only matters to a reader that reads the flag and then executes an acquire fence (or uses an acquire load). Without that, the reader may still see the old data."
+>
+<LitmusDemo presets={LESSON_PRESETS.fences} />
+</Predict>
+
+1. **Message passing with fences**: release fence + relaxed store pairs with relaxed load + acquire fence. The stale outcome is gone.
+2. **Release fence only**: the stale outcome is back.
+3. **Store buffering with seq_cst fences**: the both-zero outcome is forbidden, and the x86 column agrees because this is `mfence`.
+4. **Store buffering with acq_rel fences**: both-zero is still allowed. Only seq_cst orders a store before a later load.
+
+## The rules
+
+<Steps>
+<div><b>Release fence F, then relaxed store S</b> in thread A. <b>Relaxed load L</b> reading S, <b>then acquire fence G</b> in thread B. Then F synchronizes-with G: everything A did before F happens-before everything B does after G.</div>
+<div>Mixed pairs work too: a release fence with an acquire load, or a release store with an acquire fence.</div>
+<div>A <b>seq_cst fence</b> is both, plus a place in the single total order of seq_cst operations. That extra part is what forbids store buffering.</div>
+<div>A fence with no relaxed atomic access to "carry" it to another thread does nothing across threads.</div>
+</Steps>
+
+## Why use a fence instead of stronger operations
+
+- **Acquire once, after a loop.** Spin with relaxed loads, then pay for acquire once:
+
+```rust
+while !ready.load(Ordering::Relaxed) { std::hint::spin_loop(); }
+fence(Ordering::Acquire); // synchronizes with the writer's release
+```
+
+- **Order many operations with one barrier.** Publish several relaxed flags after one release fence.
+- **Conditional synchronization.** Rust's `Arc` decrements its count with release on every drop. Only the thread that sees the count reach zero issues an acquire fence before freeing the object.
+- **Dekker / hazard-pointer patterns** need "my store, then your load" ordering, which needs seq_cst fences on both sides.
+
+## Hardware and compiler fences
+
+- x86: acquire and release fences cost nothing (TSO), and a seq_cst fence is `mfence` (or a locked instruction).
+- ARMv8: `dmb ish` (full), `dmb ishld` (load-load and load-store) for acquire.
+- **Compiler-only fences** (`atomic_signal_fence`, Rust's `compiler_fence`, `asm volatile("" ::: "memory")`) stop the *compiler* reordering but emit no instruction. They are correct only for a signal handler or interrupt on the same core, never between threads.
+- The Linux kernel names the same ideas `smp_mb()`, `smp_wmb()`, `smp_rmb()`, `smp_store_release()` and `smp_load_acquire()`.
+
+<Recall cards={[
+  { q: "When does a release fence synchronize with an acquire fence?", a: "When a relaxed store after the release fence is read by a relaxed load before the acquire fence." },
+  { q: "Which fence forbids the store-buffering outcome?", a: "Only a seq_cst fence (x86 mfence); acq_rel fences do not." },
+  { q: "Why spin with relaxed loads and then issue an acquire fence?", a: "To pay for acquire ordering once after the loop, instead of on every iteration." },
+  { q: "What is a compiler fence good for?", a: "Ordering against a signal handler or interrupt on the same core. It emits no hardware barrier, so it is useless between threads." },
+  { q: "What do x86 acquire and release fences compile to?", a: "Nothing: TSO already provides those orderings (only the compiler is restrained)." },
+]} />

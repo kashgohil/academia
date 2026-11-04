@@ -1,0 +1,137 @@
+---
+summary: Hash a key to a bucket page and read one page. Static, extendible and linear hashing, why they cannot scan a range, and where PostgreSQL, InnoDB and Bitcask use them.
+---
+import { ExtendibleDemo, LinearHashDemo, HashCostDemo } from "@/demos/db/IndexesHashDemos";
+
+A B+ tree finds a key in about $\log_F N$ page reads. A **hash index** tries to do better: it computes a hash of the key and goes to one page. That page is a **bucket**: a page that holds all keys whose hash maps to it. For an equality lookup such as `WHERE id = 42`, one bucket read is enough.
+
+The hard part is growth. A hash table in memory doubles its array and moves every key. A disk-based index cannot stop and rewrite gigabytes. This lesson shows three ways to grow: overflow chains, a directory that doubles, and a split pointer that moves one bucket at a time.
+
+## Static hashing
+
+**Static hashing** fixes the number of buckets $B$ when the index is built. Key $k$ goes to bucket $h(k) \bmod B$. When a bucket page is full, the engine links an **overflow page** behind it. A lookup reads the bucket page and then each overflow page in the chain.
+
+The **load factor** $\alpha$ is the number of keys divided by the number of key slots in the primary pages. Below about 80%, most lookups read one page. When the table grows past its planned size, the chains grow, and every lookup gets slower. The only fix is a full rebuild with a larger $B$.
+
+## Extendible hashing
+
+**Extendible hashing** (Fagin, Nievergelt, Pippenger and Strong, 1979) adds a **directory**: an array of $2^g$ pointers to buckets. The number $g$ is the **global depth**. The low $g$ bits of the hash select a directory slot, and the slot points to a bucket.
+
+Each bucket has a **local depth** $d \le g$. All keys in the bucket agree on their low $d$ bits, and $2^{g-d}$ slots point to it. When a bucket is full:
+
+- If $d < g$, split only the bucket. Keys with a 1 in bit $d$ move to a new bucket, and half of the slots move to it.
+- If $d = g$, double the directory first. Each new slot copies the pointer of its partner slot. Then split the bucket.
+
+<Predict
+  id="ext-double"
+  question="The directory has 4 slots (global depth 2). A bucket with local depth 1 is full, and a new key hashes to it. What happens?"
+  options={[
+    "The directory doubles to 8 slots, then the bucket splits",
+    "Only the bucket splits; the directory stays at 4 slots",
+    "The key goes to an overflow page",
+  ]}
+  answer={1}
+  explain="Two slots point to a bucket with local depth 1 in a directory of global depth 2. The split gives each of those slots its own bucket. The directory must double only when the full bucket has local depth equal to the global depth."
+>
+<ExtendibleDemo />
+</Predict>
+
+Things to try:
+
+1. Press **Insert next key** four times. Keys 64 and 90 have a 0 in their last hash bit and go to one bucket. Keys 12 and 50 end in 1 and go to the other.
+2. Press it again for key 7. Its bucket is full and its local depth equals the global depth, so the directory doubles to 4 slots. Then the bucket splits on bit 1.
+3. Insert 21. The directory doubles again to 8 slots. The split moves no old key, but key 21 then goes to the new bucket.
+4. Insert 19, then 31. Key 31 finds a full bucket with local depth 2 under global depth 3. Only the bucket splits, and the directory stays at 8 slots.
+5. Set **Keys per bucket page** to 1 and insert keys. The directory grows much faster than the number of buckets.
+
+A lookup reads one directory slot and one bucket page. The directory is small, so engines keep it in memory, and a lookup costs one page read. A split rewrites only two pages and part of the directory.
+
+The weak point is the directory. Keys whose hashes share many low bits force many doublings. In the demo at the end, 6,000 random keys with 4 keys per bucket need 2,175 buckets but 16,384 directory slots. With 16 keys per bucket, the same keys need 544 buckets and 1,024 slots. Bigger buckets keep the directory small.
+
+## Linear hashing
+
+**Linear hashing** (Witold Litwin, 1980) has no directory. It keeps a **split pointer** `next` and a round number $L$. With $N_0$ starting buckets, a round has $M = N_0 \cdot 2^L$ buckets. The address of a key with hash $h$ is:
+
+$$a = h \bmod M, \quad \text{and if } a < \text{next}: \quad a = h \bmod 2M.$$
+
+Buckets before `next` have already split in this round, so they use the finer function. When the load factor passes a limit, the bucket at `next` splits, and `next` moves one step. The split bucket is usually not the bucket that overflowed. That bucket keeps its overflow page until the pointer reaches it. When `next` reaches $M$, the round ends, $L$ grows by one, and `next` goes back to 0.
+
+<LinearHashDemo />
+
+Things to try:
+
+1. Press **Insert next key** four times. The fourth key, 90, makes the load factor 100%. Bucket 0 splits, although no bucket has an overflow page.
+2. Insert 7. Bucket 1 gets an overflow page, and the split pointer is now at bucket 1, so bucket 1 splits. The round ends.
+3. Insert 21 and 19. Key 21 adds an overflow page to bucket 1. Key 19 then splits bucket 0, and bucket 1 keeps its overflow page.
+4. Insert 33. Its address mod 4 is 1, which is before the split pointer, so the demo uses mod 8 and gets bucket 5.
+5. Move **Split when load factor passes** to 150%. Splits are rare, and the overflow chains grow long.
+
+```go
+// Address of a key in linear hashing: no directory, two hash functions.
+func (t *LinearHash) addr(h uint32) uint32 {
+	m := t.n0 << t.level // buckets in this round
+	a := h % m
+	if a < t.next { // this bucket has already split in this round
+		a = h % (2 * m)
+	}
+	return a
+}
+```
+
+Linear hashing grows by one bucket at a time, so growth is smooth. The bucket array can be one file that grows at its end. The cost is overflow pages on buckets that the pointer has not yet reached.
+
+## Cost against load factor
+
+<HashCostDemo />
+
+Things to try:
+
+1. Keep **on disk** and 4 keys per page. At a load factor of 100%, static hashing reads 1.21 pages for a key that is present and 1.40 for an absent key.
+2. Move the marker to 200%. Static hashing now reads 1.66 pages for a hit and 2.33 for a miss. The chains are long.
+3. Read the linear hashing line at 80%. It reads 1.16 pages per hit, and it keeps that cost as the table grows, because it splits. At the same load factor it is a little worse than static hashing. A bucket that has split holds half as many keys as one that has not.
+4. Read the extendible dot. Its buckets are 69.0% full on average, close to $\ln 2 = 69.3\%$, the fill of random splits.
+5. Select **in memory**. At 80%, a linear probing miss checks 11.78 slots, but a Robin Hood miss checks 3.19. Select **key absent** and **key present** to compare.
+
+For hash tables in memory, the cost is slot probes and cache misses, not pages. **Linear probing** puts a key in the next free slot. Its misses get slow near a full table: Knuth's estimate is $\frac{1}{2}(1 + 1/(1-\alpha)^2)$. **Robin Hood hashing** (Celis, 1986) lets a key that is far from home take the slot of a key that is closer to its home. The mean hit cost does not change, but the longest probe at 80% falls from 93 slots to 10. A miss can stop early.
+
+**Cuckoo hashing** (Pagh and Rodler, 2001) gives each key two possible slots, so a lookup checks at most two. An insert kicks the old key to its other slot. With one key per slot, the first insert fails at a load of 53.4% in the demo. Real cuckoo tables use buckets of 4 or 8 slots to fill much more. The algorithms track covers [Robin Hood hashing](/algorithms/hashing/robin-hood-hashing) and [cuckoo hashing](/algorithms/hashing/cuckoo-hashing) in depth.
+
+## Why a hash index cannot scan a range
+
+A good hash function scatters keys. Keys 41, 42 and 43 go to three unrelated buckets. So a query such as `WHERE id BETWEEN 40 AND 50` cannot use a hash index: it must read every bucket. The same is true for `ORDER BY`, `MIN`, `MAX` and prefix matches such as `LIKE 'abc%'`. A hash index answers only equality. A B+ tree answers equality with a few more page reads, and it also answers all of these.
+
+## Hash indexes in real engines
+
+**PostgreSQL** has `CREATE INDEX ... USING hash`. Before version 10, hash indexes were not WAL-logged. A crash could corrupt them, and replicas did not get them. The documentation told users not to use them. Since version 10, they are WAL-logged and crash-safe.
+
+A PostgreSQL hash index stores only the 4-byte hash code of each key, not the key. So a long text key costs the same 4 bytes, but every match must be checked against the row. The index supports only the `=` operator, only one column, and no `UNIQUE` constraint. Its buckets split one at a time, in the style of linear hashing.
+
+**InnoDB** has no hash index on disk. Its **adaptive hash index** is an in-memory hash table that InnoDB builds on top of B+ tree pages that queries read often. It maps a search key straight to a record in a buffer pool page, so a lookup skips the tree descent. Under heavy write load it can become a point of contention. MySQL 8.4 turns it off by default (`innodb_adaptive_hash_index=OFF`).
+
+**Bitcask**, the storage engine that Riak used by default, puts the hash table in memory and the data in a log. Every write appends the key and value to the active data file. An in-memory table, the **keydir**, maps each key to its file, offset and value size. A read is one hash lookup and one disk read. A background **merge** rewrites old files without the dead values, much like LSM compaction.
+
+The price is memory: the keydir must hold every key. In our model each entry holds the key plus 20 bytes of fields. With 100 million keys of 16 bytes, that is 3.35 GiB before hash table overhead. Bitcask also writes **hint files** next to merged data files, so a restart can rebuild the keydir without a full scan of the data.
+
+## When it breaks
+
+- **Skewed or duplicate keys**: many rows with one key all go to one bucket, and no split can separate them.
+- **Range queries and sorting**: a hash index cannot help. Use a B+ tree.
+- **A directory that explodes**: extendible hashing with small buckets and unlucky hashes can double the directory many times for one insert.
+- **Memory-only maps**: Bitcask and the InnoDB adaptive hash index need RAM for every key or page.
+
+## Connect
+
+- The tree that does both equality and ranges: [B+ trees](/databases/btrees/b-trees).
+- The same hash functions in another job: [Bloom filters](/databases/lsm/bloom-filters).
+- Logs plus an index, and merging old files: [memtables and SSTables](/databases/lsm/memtables-and-sstables) and [read, write and space amplification](/databases/storage/read-write-and-space-amplification).
+- Hash tables in memory: [chaining vs open addressing](/algorithms/hashing/chaining-vs-open-addressing).
+- Why one cache line per probe matters: [cache organization and access patterns](/architecture/caches/cache-organization-and-access-patterns).
+
+<Recall cards={[
+  { q: "In extendible hashing, when must the directory double?", a: "When a full bucket has a local depth equal to the global depth. If the local depth is smaller, several slots share the bucket, and only the bucket splits." },
+  { q: "Which bucket splits in linear hashing when the load factor passes the limit?", a: "The bucket at the split pointer, not the bucket that overflowed. The pointer then moves one step; at the end of a round it goes back to 0." },
+  { q: "How does linear hashing compute a bucket address without a directory?", a: "a = h mod M for M = N0 × 2^L. If a is less than the split pointer, that bucket has split, so use a = h mod 2M." },
+  { q: "Why can a hash index not answer WHERE x BETWEEN 10 AND 20?", a: "The hash scatters nearby keys to unrelated buckets, so the engine would have to read every bucket. Hash indexes answer only equality." },
+  { q: "What changed for PostgreSQL hash indexes in version 10, and what do they store?", a: "They became WAL-logged, so they are crash-safe and replicated. Each entry stores only the 4-byte hash code and a row pointer, not the key." },
+  { q: "What does Bitcask keep in memory, and what does a read cost?", a: "The keydir: every key with its file, offset and size. A read is one hash lookup in memory and one disk read." },
+]} />

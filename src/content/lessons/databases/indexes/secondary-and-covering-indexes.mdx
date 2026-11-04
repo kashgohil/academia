@@ -1,0 +1,148 @@
+---
+summary: Clustered vs heap tables, the double lookup, covering indexes, the leftmost-prefix rule, and the selectivity at which an index scan loses to a sequential scan.
+---
+import { PlannerToyDemo, SelectivityDemo, ClusteredLookupDemo } from "@/demos/db/IndexesSecondaryDemos";
+
+A table has one physical order. An index on another column must point from its own order into the table. How it points decides the cost of every lookup. This lesson covers the two designs that real engines use. It also shows indexes that skip the table, and the point where an index stops helping.
+
+## Clustered and heap tables
+
+A **clustered index** stores the rows themselves in its leaves, in key order. **InnoDB** stores every table this way, on the primary key. If a table has no primary key, InnoDB uses the first `UNIQUE NOT NULL` index, or else a hidden 6-byte row id.
+
+A **secondary index** is any other index. In InnoDB, its leaves hold the indexed columns and the **primary key** of the row. A lookup by a secondary key thus does two descents. The first finds the primary key in the secondary index. The second finds the row in the clustered index. This is the **double lookup**.
+
+**PostgreSQL** keeps rows in a **heap**: pages of rows in no special order (see [heap files](/databases/storage/heap-files-and-free-space-maps)). Every index, including the primary key, maps keys to a **TID**: a 6-byte tuple id made of a page number and a slot number. A lookup is one descent and one heap page read.
+
+<Predict
+  id="double-lookup"
+  question="Both engines have a 3-level index on email and a 3-level primary key tree. SELECT * WHERE email = ? reads how many pages in InnoDB and in PostgreSQL?"
+  options={["3 in both", "6 in InnoDB, 4 in PostgreSQL", "4 in InnoDB, 6 in PostgreSQL"]}
+  answer={1}
+  explain="InnoDB reads 3 pages of the secondary index to get the primary key, then 3 pages of the clustered index to get the row. PostgreSQL reads 3 index pages to get the TID, then 1 heap page."
+>
+<ClusteredLookupDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **InnoDB** and the email query. Step through: 3 reads in the secondary index, then 3 in the clustered index, 6 in total.
+2. Select **SELECT id**. The secondary leaf already holds the primary key, so the lookup stops after 3 reads. The index **covers** the query.
+3. Select **PostgreSQL** and **SELECT \***. The lookup reads 3 index pages and 1 heap page.
+4. With **SELECT id**, PostgreSQL reads the index and then the visibility map: 4 reads. Turn off **all-visible**, and it must read the heap page too: 5 reads.
+5. Select the range of emails from a to f. Six rows match. InnoDB reads 5 index pages and then does 6 descents of 3 pages: 23 reads. PostgreSQL reads 5 index pages and 6 heap pages: 11 reads.
+
+The two designs trade in opposite directions:
+
+| | InnoDB (clustered) | PostgreSQL (heap) |
+|---|---|---|
+| Lookup by primary key | one descent, row in the leaf | descent, then a heap page |
+| Lookup by secondary key | two descents | descent, then a heap page |
+| Range scan on primary key | rows are adjacent: few pages | rows can be anywhere |
+| A row moves (page split, update) | secondary indexes do not change: they hold the key | new TID, so every index gets a new entry |
+| Long primary key | copied into every secondary index | does not matter |
+
+PostgreSQL reduces the cost of moved rows with **HOT updates** (heap-only tuples). If no indexed column changes and the page has room, the new row version goes on the same page. The old version points to it, and no index entry changes. At scale, the demo's model with 100 million rows gives InnoDB 4 + 4 = 8 page reads for an email lookup and PostgreSQL 4 + 1 = 5. The upper levels are usually in the buffer pool, so the real I/O is less.
+
+## Covering indexes and index-only scans
+
+An index **covers** a query when it holds every column that the query needs. The engine then answers from the index alone and never reads the table. This is an **index-only scan**.
+
+In InnoDB, every secondary index implicitly holds the primary key columns. In PostgreSQL 11 and later, `INCLUDE` adds payload columns to the leaves. They are not part of the key, so they do not change the sort order, and they cannot be used to seek.
+
+```sql
+-- Seek on (customer_id, created_at); return amount without a heap read.
+CREATE INDEX orders_cust_time ON orders (customer_id, created_at) INCLUDE (amount);
+```
+
+PostgreSQL has one more problem. Its index entries carry no visibility information, so the index alone cannot say if a row version is visible to this transaction (see [MVCC](/databases/transactions/mvcc)). The **visibility map** solves this. It keeps 2 bits per heap page, and one bit says "all rows on this page are visible to everyone". `VACUUM` sets the bit, and any change to the page clears it. One 8 KiB map page covers 32,672 heap pages, so the map is tiny and stays in memory.
+
+An index-only scan checks the map for each entry. If the page is all-visible, it skips the heap. If not, it reads the heap page like a normal index scan. A table that `VACUUM` has not visited recently gets little benefit.
+
+## Composite indexes and the leftmost-prefix rule
+
+A **composite index** sorts by its first column, then by the second inside equal first values, and so on. It is like a phone book sorted by last name, then first name. A seek needs a known value or range for a prefix of the columns.
+
+The **leftmost-prefix rule**: walk the index columns from left to right. Each column with an equality predicate narrows the range and lets the walk go on. The first column with a range predicate narrows the range and stops the walk. The first column with no predicate stops the walk too. Predicates on columns after the stop can only filter entries inside the range.
+
+<Predict
+  id="leftmost"
+  question="The index is on (customer_id, created_at). The query has only WHERE created_at >= now() - '7 days'. Can the index seek to the last 7 days?"
+  options={[
+    "Yes: created_at is in the index",
+    "No: the entries for the last 7 days are spread over every customer_id",
+    "Yes, but only if the query also orders by created_at",
+  ]}
+  answer={1}
+  explain="The index is sorted by customer_id first. The last 7 days of each customer form a separate run, so the matching entries are not adjacent. The planner reads the whole index or the whole table."
+>
+<PlannerToyDemo />
+</Predict>
+
+Things to try:
+
+1. Read the default plan. customer_id has no predicate, so created_at can only filter. The planner picks **Seq Scan**: reading the whole index and then random heap pages costs more.
+2. Turn on **WHERE customer_id = 42**. Both columns now seek, and the plan reads about 2 rows.
+3. Swap the columns: column 1 = created_at, column 2 = customer_id. The range on created_at stops the walk, so customer_id only filters. The index range holds 1.9% of the entries, and the cost rises from about 13 to about 493.
+4. Go back to (customer_id, created_at). Select **SELECT customer_id, created_at, amount**. The index does not hold amount. Turn on **INCLUDE (amount)**: the plan becomes an **Index Only Scan**.
+5. Set the index to (created_at) only, turn off all predicates, and keep **ORDER BY created_at**. The index scan returns rows in order with no sort. Turn on **LIMIT 10**: it stops after 10 rows, and its cost falls to about 1.
+
+Rules of thumb follow from the walk. Put columns with equality predicates first and the range column last. An index can also give `ORDER BY` for free when the columns before the sort column all have equality predicates. PostgreSQL 18 and MySQL 8.0.13 add **skip scan**. If the leading column has few distinct values, the engine does one seek per value, and so it can use the later columns.
+
+## Selectivity: when the index loses
+
+The **selectivity** of a predicate is the share of rows that match it. An index scan fetches each matching row with a random page read. A sequential scan reads every page, but in order, and sequential reads are much cheaper (see [disks vs SSDs](/databases/storage/disks-vs-ssds)). So beyond some selectivity, reading the whole table is cheaper.
+
+A **bitmap scan** sits between them. It walks the index first and sets one bit per matching TID in a bitmap. Then it reads the heap pages in page order, each page once. It loses the index order, but it turns random reads into a forward sweep. PostgreSQL can also combine bitmaps from two indexes with AND and OR.
+
+<SelectivityDemo />
+
+Things to try:
+
+1. Keep the defaults: random_page_cost 4 and no correlation. The index scan loses to the sequential scan above 0.84% of the rows. The bitmap scan lasts until 35.2%.
+2. At a selectivity of 1%, read the costs: about 25,834 for the sequential scan, 29,424 for the index scan, and 13,337 for the bitmap scan.
+3. Move **Correlation** to 1. The heap is now in index order, so the matching rows are on adjacent pages. The index scan wins until 56.0%.
+4. Select **1.1 (SSD tuning)**. With correlation 0, the index scan now lasts until 51.5%. The model counts each heap page at most once, because the table fits in `effective_cache_size`.
+5. Look at the dashed index-only line. With all pages all-visible, it wins until 78.8%. Move **all-visible** to 50%, and it loses at 2.4%.
+
+The planner's model is in costsize.c, and this demo follows its shape. A sequential scan costs `seq_page_cost` (1.0) per page plus CPU per row. An index scan estimates the heap pages it fetches with the Mackert–Lohman formula. Then it charges `random_page_cost` (default 4.0) for each, and it moves toward sequential cost as the **correlation** between index order and heap order grows. A bitmap scan charges between the two, more sequential as it reads more of the table.
+
+So the right answer depends on the data, not only on the query. A clustered table, or a heap loaded in key order, makes range scans cheap. Many SSD users set `random_page_cost = 1.1`, and then the planner uses indexes much more often.
+
+## Partial and expression indexes
+
+A **partial index** indexes only the rows that match a predicate. `CREATE INDEX ON orders (created_at) WHERE status = 'open'` is small if few orders are open. The planner uses it only when the query implies the same predicate. MySQL does not have partial indexes.
+
+An **expression index** indexes a computed value, such as `CREATE INDEX ON users (lower(email))`. A query must use the same expression, `WHERE lower(email) = $1`, to use it. MySQL 8.0.13 and later support this as functional key parts.
+
+## The cost on writes
+
+Every index makes writes slower. An insert adds one entry to every index of the table. An update of an indexed column deletes or marks the old entry and adds a new one. In PostgreSQL, an update that is not HOT adds a new entry to every index, even indexes on columns that did not change. Each index entry is a possible page split, a WAL record and more pages for the buffer pool to hold.
+
+```sql
+-- PostgreSQL: find indexes that no query has used since the statistics were reset.
+SELECT indexrelid::regclass AS index, idx_scan
+FROM pg_stat_user_indexes WHERE idx_scan = 0;
+```
+
+## When it breaks
+
+- **Low selectivity**: an index on a column with few distinct values, such as a boolean, rarely beats a sequential scan.
+- **Wrong column order**: a range column before an equality column wastes the rest of the index.
+- **Stale visibility map**: index-only scans read the heap anyway until `VACUUM` runs.
+- **Too many indexes**: every write pays for all of them.
+
+## Connect
+
+- The tree under every index here: [B+ trees](/databases/btrees/b-trees).
+- Where the costs come from: [disks vs SSDs](/databases/storage/disks-vs-ssds) and [buffer pools](/databases/storage/buffer-pools).
+- Why PostgreSQL needs a visibility map: [MVCC](/databases/transactions/mvcc) and [MVCC garbage collection](/databases/transactions/mvcc-garbage-collection).
+- How the planner chooses: [cost models](/databases/optimizer/cost-models), [cardinality estimation](/databases/optimizer/cardinality-estimation) and [reading query plans](/databases/optimizer/reading-query-plans).
+
+<Recall cards={[
+  { q: "What does an InnoDB secondary index leaf hold, and what does a lookup by that key cost?", a: "The indexed columns and the primary key. A lookup descends the secondary index, then descends the clustered index with the primary key: two descents." },
+  { q: "What does a PostgreSQL index entry point to?", a: "A TID: a 6-byte page number and slot number in the heap. Every index, including the primary key, points into the heap this way." },
+  { q: "Why does a PostgreSQL index-only scan need the visibility map?", a: "Index entries carry no visibility information. The map says which heap pages are all-visible; for those pages the scan skips the heap read." },
+  { q: "State the leftmost-prefix rule.", a: "Walk the index columns from the left. Equality predicates narrow the range and continue. The first range predicate or missing predicate stops the walk; later columns can only filter inside the range." },
+  { q: "Why does an index scan lose to a sequential scan at high selectivity?", a: "It reads one random page per matching row, but a sequential scan reads every page in order at a much lower cost per page. The crossover in the default model is below 1% of the rows." },
+  { q: "What does a bitmap heap scan do differently from an index scan?", a: "It collects the matching TIDs in a bitmap first, then reads the heap pages in page order, each page once. It loses the index order but avoids random rereads." },
+]} />

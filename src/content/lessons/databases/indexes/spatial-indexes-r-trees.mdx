@@ -1,0 +1,143 @@
+---
+summary: Index rectangles and points by their bounding boxes. R-tree search, insert and quadratic split, kNN search, R*-trees, and space-filling curves that put 2D data on a B-tree.
+---
+import { RTreeDemo, CurveDemo } from "@/demos/db/IndexesSpatialDemos";
+
+A query such as "all shops inside this map window" has two range conditions: one on x and one on y. A B+ tree on x can find the rows in the x range quickly. But those rows have every y value, so the tree must read the whole strip and filter it. A composite index on (x, y) has the same problem, because the range on x stops the leftmost-prefix walk (see [secondary and covering indexes](/databases/indexes/secondary-and-covering-indexes)).
+
+A one-dimensional order cannot keep all points that are near in 2D near in the order. **Spatial indexes** solve this in two ways. Some index the shapes in 2D directly: R-trees, quadtrees and k-d trees. Others map 2D to 1D with a space-filling curve and use an ordinary B-tree.
+
+## The R-tree
+
+The **R-tree** (Antonin Guttman, 1984) is a balanced tree like a B+ tree, but its keys are rectangles. Each entry holds a **minimum bounding rectangle** (MBR): the smallest axis-aligned rectangle that contains a shape, or all shapes below a child. A leaf entry is the MBR of one object and a pointer to it. An inner entry is the MBR of a child node and a pointer to that node.
+
+Each node holds between $m$ and $M$ entries, and all leaves are at the same depth. Unlike B-tree key ranges, the MBRs of sibling nodes can overlap. That is the main difference, and the source of most of the cost.
+
+**Search** for a query box $Q$: start at the root. For each entry whose MBR intersects $Q$, go down into that child. At a leaf, report each object whose MBR intersects $Q$, then check its exact shape. Because MBRs overlap, a search can follow several paths.
+
+```rust
+fn search(node: &Node, q: &Rect, out: &mut Vec<u64>) {
+    for e in &node.entries {
+        if !e.mbr.intersects(q) { continue; }          // prune this whole subtree
+        match &e.child {
+            Child::Node(n) => search(n, q, out),       // overlapping MBRs: maybe several paths
+            Child::Object(id) => out.push(*id),        // candidate: check the exact shape later
+        }
+    }
+}
+```
+
+<Predict
+  id="rtree-paths"
+  question="A B+ tree point lookup reads exactly one node per level. How many nodes per level can an R-tree range search read?"
+  options={["Exactly one, as in a B+ tree", "Any number: every child whose MBR intersects the query", "At most two, because nodes split in two"]}
+  answer={1}
+  explain="Sibling MBRs can overlap, and a query box can also span several of them. The search must enter every child whose MBR intersects the box. Good insert and split rules keep the overlap small, so few nodes match."
+>
+<RTreeDemo />
+</Predict>
+
+Things to try:
+
+1. Read the default query box. The search visits 5 of the 15 nodes and makes 17 MBR and item tests. It finds 5 objects. A scan with no index tests all 28.
+2. Drag a new query box over an empty part of the map. The tests at the root prune almost every subtree, and the search visits few nodes.
+3. Move **M** to 8. The tree has 2 levels and 6 nodes. The same query visits 3 nodes but makes 15 tests, because each node is bigger.
+4. Select **find 3 nearest** and keep the point at (70, 30). The nearest objects are 4, 19 and 28. The search opens only 5 nodes.
+5. Select **add a rectangle** and drag a long, thin rectangle across the map. Watch the MBRs grow around it. Large objects make MBRs overlap.
+
+## Insert and split
+
+**Insert** goes down from the root to a leaf. At each level, **ChooseSubtree** picks the child whose MBR needs the **least enlargement** to include the new rectangle. Ties go to the child with the smaller area. The idea is to keep MBRs small, so that later searches enter fewer nodes.
+
+If the leaf now has $M + 1$ entries, it **splits** into two nodes. The split goes up like a B-tree split, and a root split adds a level. Each MBR on the path then grows to include the new entry.
+
+The split decides the quality of the tree. Guttman's **quadratic split**:
+
+<Steps>
+<div>**PickSeeds**: for every pair of entries, compute the area of their joint MBR minus their own areas. The pair that wastes the most area starts the two groups.</div>
+<div>**PickNext**: for each remaining entry, compute how much each group's MBR must grow to take it. Choose the entry with the biggest difference between the two groups.</div>
+<div>Put that entry in the group that grows less. Ties go to the smaller area, then to the group with fewer entries.</div>
+<div>If one group needs all remaining entries to reach $m$ entries, give them all to it. Repeat until no entry is left.</div>
+</Steps>
+
+PickSeeds costs $O(M^2)$, so the method is called quadratic. Guttman also gave a linear split, which is faster but makes worse trees.
+
+**The R\*-tree** (Beckmann, Kriegel, Schneider and Seeger, 1990) changes three things. At the leaf level, ChooseSubtree minimizes the growth of **overlap** with siblings, not only of area. The split chooses an axis by the sum of the group perimeters, then the split position by the least overlap. And before it splits a full node, it removes about 30% of the entries and **reinserts** them from the top. This moves entries to better nodes as the tree grows. Most modern R-tree code, such as the SQLite R\*Tree module, follows the R\*-tree.
+
+## Bigger nodes on disk
+
+On disk, a node is a page with dozens or hundreds of entries. The sim also measured a bigger tree: 2,000 random points, with square queries of 5% of the map side that find 6.2 points on average.
+
+| Max entries M | Height | Nodes | Nodes visited per query |
+|---|---|---|---|
+| 4 | 7 | 1,008 | 15.7 |
+| 16 | 3 | 193 | 6.7 |
+| 50 | 3 | 62 | 4.1 |
+
+A wider node means fewer levels and fewer page reads, as in a B-tree. The cost is more entry tests per node, which is cheap in memory.
+
+## Nearest neighbors
+
+A **k-nearest-neighbor** (kNN) query asks for the k objects closest to a point. The R-tree answers it with **best-first search** (Hjaltason and Samet, 1999). A priority queue holds nodes and objects, ordered by **MINDIST**: the smallest possible distance from the query point to an MBR.
+
+Pop the closest item. If it is an object, report it. If it is a node, push its entries. No unvisited node can hold anything closer than its MINDIST, so the first k objects popped are the answer. The search opens only the nodes whose MBRs come closer than the k-th result.
+
+## Other structures
+
+- A **quadtree** (Finkel and Bentley, 1974) splits a square into four equal quarters, again and again, until each cell holds few points. Its cells do not overlap, but its shape depends on the data.
+- A **k-d tree** (Bentley, 1975) is a binary tree that splits on x, then y, then x again, at a point of the data. It is good in memory, but it is hard to keep balanced on disk.
+- PostgreSQL **SP-GiST** supports these space-partitioning trees, and PostGIS can use it.
+
+## Space-filling curves on a B-tree
+
+A **space-filling curve** visits every cell of a $2^k \times 2^k$ grid once. Its position along the curve is a single integer key, so an ordinary B-tree can index it. A box query becomes a set of key ranges.
+
+- **Z-order** (Morton order) interleaves the bits of x and y: bit $i$ of x goes to bit $2i$ of the key, bit $i$ of y to bit $2i + 1$. It is cheap to compute, but the curve jumps across the grid at each power-of-two boundary.
+- The **Hilbert curve** turns so that consecutive cells are always neighbors. It needs more work to compute, but it keeps 2D neighborhoods together better.
+- A **geohash** is Z-order over longitude and latitude bits, written in base 32. The point (57.64911, 10.40744) has the geohash u4pruydqqvj. Keys that share a prefix lie in the same cell, so a prefix query on a B-tree finds a cell.
+
+<CurveDemo />
+
+Things to try:
+
+1. Read the default 6 × 5 box on the 16 × 16 grid. It holds 30 cells. Z-order covers it with 13 exact key ranges, and the Hilbert curve needs only 7.
+2. Read the mean ranges for random boxes of this size: 8.8 for Z-order and 5.3 for Hilbert.
+3. Move **Max ranges per query** to 4. The scan now merges ranges and reads cells outside the box. Z-order reads 26 false positives, and Hilbert reads 7.
+4. Move **Max ranges per query** to 1. Now Hilbert is worse: 155 false positives against 126 for Z-order. One range spans the lowest to the highest key in the box.
+5. Move the box across the middle of the grid. Both curves jump at the center, and the number of ranges rises.
+
+Each range costs one B-tree seek, and each false positive costs a wasted row. So engines cap the number of ranges and filter the false positives with the exact test. Google's S2 library numbers cells on a sphere along a Hilbert curve, and MongoDB's `2dsphere` index uses S2 cells. Delta Lake's `OPTIMIZE ... ZORDER BY` sorts the data files by a Z-order key, so data skipping works for filters on several columns.
+
+## Spatial indexes in real engines
+
+**PostGIS** indexes geometries with a **GiST** index. GiST (generalized search tree) is a PostgreSQL framework for balanced trees with custom keys, and PostGIS uses it as an R-tree of bounding boxes. The `&&` operator tests bounding box overlap with the index. Functions such as `ST_Intersects` use the index first and then run the exact test. The `<->` distance operator in `ORDER BY` gives index-assisted kNN.
+
+```sql
+CREATE INDEX shops_geom ON shops USING gist (geom);
+-- The 5 shops nearest to a point, using the index:
+SELECT id FROM shops ORDER BY geom <-> ST_SetSRID(ST_MakePoint(10.4, 57.6), 4326) LIMIT 5;
+```
+
+**InnoDB** builds an R-tree for a `SPATIAL INDEX`. **SQLite** has the R\*Tree virtual table module.
+
+## When it breaks
+
+- **Large or long objects**: a road across a country has a huge MBR that overlaps everything. Split long shapes into pieces, or use a grid index.
+- **Heavy overlap**: random insert order and poor splits make MBRs overlap, and searches visit many paths. Bulk loading, for example by sorting on a Hilbert key, builds much better trees.
+- **Many dimensions**: above about 10 dimensions, MBRs of most nodes intersect most queries, and a scan is as fast. Vector search uses other methods.
+
+## Connect
+
+- The balanced tree that R-trees copy: [B+ trees](/databases/btrees/b-trees) and [bulk loading](/databases/btrees/bulk-loading-and-fill-factor).
+- Why a composite index cannot do two ranges: [secondary and covering indexes](/databases/indexes/secondary-and-covering-indexes).
+- Skipping data files by min and max per column: [zone maps and data skipping](/databases/olap/zone-maps-and-data-skipping).
+- The geometry view: [spatial indexes: k-d trees, R-trees](/algorithms/geometry/spatial-indexes-k-d-trees-r-trees).
+
+<Recall cards={[
+  { q: "What is an MBR, and what does an inner R-tree entry store?", a: "A minimum bounding rectangle: the smallest axis-aligned box around a shape. An inner entry stores the MBR of a child node and a pointer to it." },
+  { q: "Why can an R-tree search read more than one node per level?", a: "Sibling MBRs can overlap, and a query box can intersect several of them. The search must enter every child whose MBR intersects the box." },
+  { q: "How does R-tree insert choose a child at each level?", a: "It picks the child whose MBR needs the least enlargement to include the new rectangle; ties go to the smaller area." },
+  { q: "What does the quadratic split do first?", a: "PickSeeds: for each pair of entries, it computes the area wasted by putting them in one MBR. The worst pair starts the two groups." },
+  { q: "How does best-first kNN search know when it can stop?", a: "The queue is ordered by MINDIST. When k objects have been popped, every remaining node is at least as far as them, so none can hold a closer object." },
+  { q: "Why does a Hilbert key need fewer ranges than a Z-order key for the same box?", a: "Consecutive Hilbert cells are always neighbors, so the cells of a box form longer runs of consecutive keys. Z-order jumps at power-of-two boundaries." },
+]} />

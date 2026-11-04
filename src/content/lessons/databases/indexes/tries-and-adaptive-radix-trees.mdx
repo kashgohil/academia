@@ -1,0 +1,144 @@
+---
+summary: Search by the bytes of the key, not by comparisons. Tries, path compression, the adaptive radix tree with Node4/16/48/256, and how to encode keys so that byte order is value order.
+---
+import { ArtBuilderDemo, KeyEncodingDemo, ArtMemoryDemo } from "@/demos/db/IndexesArtDemos";
+
+A B+ tree compares whole keys. Each comparison of two 16-byte keys reads both keys, and a lookup does about $\log_2 N$ of them. A **trie** never compares whole keys. It uses each byte of the key to choose a child, one level per byte. A lookup costs one step per key byte, so the height depends on the key length, not on the number of keys.
+
+In memory, this is fast. The cost of an index in memory is cache misses and branch mispredictions, not page reads. This lesson builds up to the **adaptive radix tree** (ART) of Leis, Kemper and Neumann (ICDE 2013), the index of the HyPer and DuckDB databases.
+
+## Tries and radix trees
+
+A trie node for byte keys has 256 child pointers, one for each byte value. This is a **radix tree** with a span of 8 bits. To find a 4-byte key, read the first byte and follow that pointer, then the second byte, and so on. A 4-byte key needs 4 steps for any number of keys.
+
+The problem is memory. A node of 256 pointers takes 2 KiB, and most of the pointers are empty in the lower levels. Two old ideas reduce the waste:
+
+- **Path compression**: a chain of nodes with one child each becomes one node that stores the shared bytes as a **prefix**. Morrison's PATRICIA tree (1968) does this.
+- **Lazy expansion**: if only one key is below a point, store a leaf there. Do not build the nodes for the remaining bytes.
+
+## Adaptive nodes
+
+ART also changes the node layout with the number of children. Each inner node has a 16-byte header (type, child count, prefix) and one of four layouts:
+
+| Node | Children | Layout | Bytes (8-byte pointers) |
+|---|---|---|---|
+| Node4 | 1–4 | 4 sorted key bytes, 4 pointers | 52 |
+| Node16 | 5–16 | 16 sorted key bytes, 16 pointers | 160 |
+| Node48 | 17–48 | 256-byte index from byte to slot, 48 pointers | 656 |
+| Node256 | 49–256 | 256 pointers, indexed by the byte | 2,064 |
+
+When a node is full, it grows to the next type. When it loses children, it shrinks. A leaf is a **tagged pointer**: a pointer with one low bit set that points to the row. The tree stores no separate leaf objects, and a lookup checks the full key against the row at the end.
+
+<Predict
+  id="art-grow"
+  question="You insert the integers 0, 1, 2, … as 4-byte big-endian keys. They differ only in the last byte. What does the tree look like after 49 keys?"
+  options={[
+    "A chain of 4 nodes, one per byte, with 49 leaves at the bottom",
+    "One node with a 3-byte prefix: a Node256 with 49 leaves",
+    "A Node4 root with 13 Node4 children",
+  ]}
+  answer={1}
+  explain="Path compression stores the 3 shared zero bytes as the prefix of one node. That node grows from Node4 to Node16 at the 5th key, to Node48 at the 17th and to Node256 at the 49th."
+>
+<ArtBuilderDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **integers 0, 1, 2, …** and 20 keys. One Node48 holds them all, with the prefix 00 00 00. It costs 656 bytes, 32.8 bytes per key.
+2. Move **Keys inserted** to 4 and then 5. At the 5th key, the Node4 is full and grows to a Node16. It grows again at 17 keys and at 49 keys.
+3. Set 256 keys. One Node256 holds them: 2,064 bytes, 8.06 bytes per key. Now set 257. Key 256 differs in the third byte, so a Node4 with a 2-byte prefix appears above the Node256.
+4. Select **random 32-bit integers** and 300 keys. The root is a Node256, and below it are 87 Node4 nodes. Many keys are leaves straight under the root: lazy expansion. The mean leaf depth is only 1.70.
+5. Select **words** and all 46 words. The root is a Node16 for the first letters. The four words that start with "ar" share one Node4 whose prefix is "r".
+
+## Search inside a node
+
+Node4 and Node16 keep their key bytes sorted. A Node4 search compares up to 4 bytes. A Node16 search uses one SIMD instruction to compare the search byte with all 16 key bytes at once:
+
+```cpp
+#include <emmintrin.h>
+// Find the child for byte b in a Node16 (keys[] sorted, count <= 16).
+Node* findChild16(const Node16* n, uint8_t b) {
+    __m128i key = _mm_set1_epi8(static_cast<char>(b));             // b in all 16 lanes
+    __m128i cmp = _mm_cmpeq_epi8(key, _mm_loadu_si128((const __m128i*)n->keys));
+    unsigned mask = _mm_movemask_epi8(cmp) & ((1u << n->count) - 1); // one bit per lane
+    return mask ? n->child[__builtin_ctz(mask)] : nullptr;
+}
+```
+
+A Node48 reads one byte of its index to find the slot. A Node256 reads the pointer directly. No layout has a loop with unpredictable branches, so a lookup is a few cache misses per level.
+
+## Binary-comparable keys
+
+A radix tree compares bytes from left to right, like `memcmp`. So the bytes of a key must sort in the same order as the values. Many key types do not do this in their memory layout. The same rule holds for any engine that compares raw bytes: RocksDB with its default comparator, FoundationDB, and the "memcomparable" key format of MyRocks.
+
+| Type | Encoding | Why |
+|---|---|---|
+| unsigned integer | big-endian | the most significant byte must come first |
+| signed integer | flip the sign bit, then big-endian | −2³¹ becomes 00 00 00 00, −1 becomes 7F FF FF FF, 0 becomes 80 00 00 00 |
+| IEEE 754 float | positive: flip the sign bit; negative: flip all bits; big-endian | negative floats have the sign bit set and a reversed magnitude order |
+| string | UTF-8, escape 00 as 00 FF, end with 00 00 | the terminator makes keys prefix-free; byte order is code point order, not a collation |
+| composite | concatenate the encoded parts | each part must be self-delimiting, or the next part leaks into the comparison |
+
+The tree also needs keys to be **prefix-free**: no key may be a prefix of another key. With "ab" and "abc", the search for "ab" ends inside the path of "abc". Fixed-length integers are prefix-free, and the string terminator makes strings prefix-free.
+
+<KeyEncodingDemo />
+
+Things to try:
+
+1. Keep **int32** and select **little-endian**. This is the layout in memory on x86 and ARM. Many rows are out of order, because the low byte is compared first.
+2. Select **big-endian**. Positive numbers are now in order, but negative numbers sort after them: their first byte starts with a 1 bit.
+3. Select **sign flip + BE**. Every row is in order. Move **Your integer** to check other values.
+4. Select **string** and **length first**. All one-byte strings sort before all two-byte strings. Select **no terminator**: the order is right, but "a" is a prefix of "ab".
+5. Select **(string, int32)** and **no terminator**. The int bytes after "ab" compare with the "c" of "abc", and the rows go out of order. The terminated encoding fixes it.
+
+```rust
+// Binary-comparable encodings (big-endian bytes).
+fn enc_i32(v: i32) -> [u8; 4] { ((v as u32) ^ 0x8000_0000).to_be_bytes() }
+fn enc_f64(v: f64) -> [u8; 8] {
+    let b = v.to_bits();
+    let b = if b >> 63 == 1 { !b } else { b | (1 << 63) }; // negative: flip all; positive: flip sign
+    b.to_be_bytes()
+}
+```
+
+## Memory per key
+
+<ArtMemoryDemo />
+
+Things to try:
+
+1. Read the dense line. Small sets jump between node types, but large sets fill Node256 nodes. At 4,096 keys the cost is 8.10 bytes per key: about one pointer per key.
+2. Read the marker at 4,096 keys. Random keys cost 24.3 bytes per key in ART, because the lower nodes are small node types that are only partly full. The B+ tree costs 20.9 and the hash table 24.0.
+3. Move **B+ tree page fill** to 100%. A tree that is bulk loaded and never updated costs 14.5 bytes per key.
+4. Follow the hash table line. It jumps up each time the table doubles, then falls as the new slots fill.
+
+ART adapts to the data. Dense keys cost almost nothing beyond one pointer each. Sparse keys cost more, but the paper proves a worst case of 52 bytes per key. A B+ tree in memory stores a copy of each key, so long keys cost more there. ART stores a key byte only once for all keys that share it.
+
+## What ART gives you
+
+- **Ordered scans**: an in-order walk returns keys in byte order. So ART answers range queries and prefix queries, which a hash table cannot.
+- **Fast point lookups**: a few nodes per lookup, each with a fixed search cost. The paper measured lookups faster than a B+ tree and close to a hash table.
+- **No rebalancing**: the shape depends only on the set of keys, not on the insert order.
+
+It also has limits. Long keys with long shared prefixes make deep trees. In this lesson's sim, the full prefix is stored in the node. The paper stores only up to 8 bytes and skips the rest, then checks the whole key at the leaf. Concurrent writers need a protocol, such as the optimistic lock coupling of Leis and others (2016).
+
+## Where it is used
+
+**HyPer** uses ART as its main index. **DuckDB** uses ART for primary keys, unique constraints and `CREATE INDEX`. Radix trees also appear outside databases. The Linux page cache finds pages with a radix tree (the XArray), and Redis keeps streams in one.
+
+## Connect
+
+- The comparison-based alternative: [B+ trees](/databases/btrees/b-trees), and suffix truncation of keys in its internal nodes.
+- Hash tables, which are fast but unordered: [hash indexes](/databases/indexes/hash-indexes).
+- The algorithms view of the same structure: [tries and radix trees](/algorithms/trees/tries-and-radix-trees).
+- Why cache misses decide the cost in memory: [locality](/architecture/caches/locality) and [cache organization and access patterns](/architecture/caches/cache-organization-and-access-patterns).
+
+<Recall cards={[
+  { q: "Why does the height of a radix tree not depend on the number of keys?", a: "Each level consumes one byte of the key. A k-byte key needs at most k steps, for any number of keys." },
+  { q: "Name the four ART node types and when each one grows.", a: "Node4 (up to 4 children), Node16 (up to 16), Node48 (up to 48, with a 256-byte index), Node256 (direct array). A full node grows to the next type." },
+  { q: "What do path compression and lazy expansion remove?", a: "Path compression merges chains of one-child nodes into a prefix stored in one node. Lazy expansion stores a leaf as soon as only one key is below, so no nodes are built for its remaining bytes." },
+  { q: "How do you encode a signed 32-bit integer so that memcmp order is numeric order?", a: "Flip the sign bit, then write the bytes big-endian. −1 becomes 7F FF FF FF and 0 becomes 80 00 00 00." },
+  { q: "Why must string parts of a composite key have a terminator?", a: "Without it, the bytes of the next part compare with the bytes of a longer string, so the order breaks. The terminator also keeps keys prefix-free." },
+  { q: "About how many bytes per key does ART use for dense integer keys, and why?", a: "About 8 bytes: the keys fill Node256 nodes, so each key costs one 8-byte pointer, plus a small share of the headers." },
+]} />

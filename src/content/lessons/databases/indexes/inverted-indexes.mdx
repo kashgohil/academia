@@ -1,0 +1,153 @@
+---
+summary: Map each term to a sorted list of documents. Tokenizing, posting lists with positions, fast intersection, delta and PForDelta compression, BM25 ranking, Lucene segments and PostgreSQL GIN.
+---
+import { InvertedQueryDemo, PostingCompressionDemo, Bm25Demo } from "@/demos/db/IndexesInvertedDemos";
+
+A B-tree on a text column answers "which rows equal this string?" or "which rows start with this prefix?". Search asks something else: "which documents contain the word *merge*?". The word can be anywhere in the text. An **inverted index** answers this. It maps each **term** to the list of documents that contain it, like the index at the back of a book.
+
+## Building the index
+
+A **document** is the unit of retrieval: a row, a web page or a log line. Each document gets a **doc id**, a small integer in the order of insertion. To index a document:
+
+1. **Tokenize**: split the text into tokens. The demo splits on anything that is not a letter or a digit.
+2. **Normalize**: lowercase each token. Real analyzers also remove accents and reduce words to a stem, so "merges" and "merged" both become "merg".
+3. **Drop stop words**: very common words such as "the" and "a" appear in every document and help no query.
+4. **Append** the doc id to the **posting list** of each term. The list holds one **posting** per document: the doc id, the **term frequency** (how often the term occurs) and the **positions** of the term.
+
+Doc ids grow as documents arrive, so each posting list is sorted for free. The set of all terms is the **dictionary**. Lucene finds terms with a finite-state transducer over its term blocks, and PostgreSQL GIN keeps them in a B-tree.
+
+## Queries are list operations
+
+- **AND**: intersect the posting lists of the terms.
+- **OR**: merge the lists into their union.
+- **Phrase** ("sorted runs"): intersect the lists, then keep the documents where "runs" sits at the position right after "sorted". That needs positions in the postings.
+
+<Predict
+  id="phrase"
+  question="Doc 5 contains both 'sorted' and 'runs'. Is it a match for the phrase query “sorted runs”?"
+  options={["Yes: it contains both words", "Only if 'runs' is at the position right after 'sorted'", "No: a phrase query needs a separate phrase index"]}
+  answer={1}
+  explain="An AND query only needs both doc ids. A phrase query also checks positions: some position p of 'sorted' must have 'runs' at p + 1. In doc 5, 'sorted' is at position 22 and 'runs' at 11, so doc 5 is not a phrase match."
+>
+<InvertedQueryDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **sorted AND runs**. Step through the merge. Each step compares the two heads and moves the smaller one. Five comparisons give docs 1, 2 and 5.
+2. Select **"sorted runs"**. The same intersection runs first, then a position check for each candidate. Doc 5 drops out.
+3. Select **hash OR lsm**. The union outputs each doc id once, in order: 1, 3 and 5.
+4. Select **galloping**. With such short lists it does about as many comparisons as the merge. Read the last statistic: for lists of 10 and 10,000 ids, the merge needs 9,961 comparisons and galloping needs 180.
+5. Open the dictionary. Most terms occur in one or two documents. That is typical: in real text, most terms are rare.
+
+## Fast intersection
+
+A **linear merge** of lists of length $m$ and $n$ costs $O(m + n)$ comparisons. That is fine for lists of similar length. But a query such as "postgresql AND the" pairs a short list with a list that covers most documents.
+
+**Galloping** (exponential search) walks the short list. For each of its ids, it jumps forward in the long list by 1, 2, 4, 8, … positions until it passes the id. Then it does a binary search inside the last jump. The cost is $O(m \log(n/m))$, which is much less than $m + n$ when $m \ll n$.
+
+```go
+// Galloping: first index >= lo in b with b[index] >= x.
+func gallop(b []uint32, lo int, x uint32) int {
+	step, hi := 1, lo
+	for hi < len(b) && b[hi] < x {
+		lo = hi + 1
+		hi += step
+		step *= 2
+	}
+	if hi > len(b) {
+		hi = len(b)
+	}
+	return lo + sort.Search(hi-lo, func(i int) bool { return b[lo+i] >= x })
+}
+```
+
+On disk, a list cannot be searched at random positions, because it is compressed in blocks. **Skip data** solves this. Lucene stores skip data for each block of 128 documents: the last doc id of the block and its file offset. A search jumps over whole blocks without decoding them.
+
+For ranked queries, engines go further. Lucene 8 and later use **block-max WAND**: each block stores the highest score any document in it can reach. If that maximum cannot get into the current top k results, the block is skipped.
+
+## Compressing posting lists
+
+A raw doc id takes 4 bytes. But a sorted list has small **gaps** between neighbors. A term that occurs in 10,000 of 1 million documents has a mean gap of about 100, which fits in 7 bits. So engines store gaps (**delta encoding**) and then pack the gaps tightly:
+
+- **Varint** (LEB128): 7 bits of value per byte, with the high bit set when more bytes follow. A gap of 100 takes 1 byte, and a gap of 300 takes 2.
+- **FOR** (frame of reference, bit packing): find the bit width of the largest gap in a block of 128 gaps. Pack all 128 at that width. Decoding has no branches, and it can use SIMD.
+- **PForDelta** (patched FOR, Zukowski and others, 2006): choose a width that fits about 90% of the gaps. Store the few large gaps as **exceptions** after the block. One outlier no longer forces a wide block.
+
+<PostingCompressionDemo />
+
+Things to try:
+
+1. Keep 10,000 documents spread over 1 million. Raw ids take 40,000 bytes. Varint takes 12,798 bytes (10.2 bits per id), FOR 9.6 and PForDelta 9.2 bits per id.
+2. Move the slider to 100,000 documents. The gaps shrink, and varint reaches its floor of 8 bits per id: one byte per gap. FOR needs 6.2 bits and PForDelta 5.7.
+3. Select **in bursts**. Most gaps are tiny, but every 20th gap is a jump of thousands. FOR must widen the whole block for the jumps and costs 14.0 bits per id. PForDelta stores the jumps as exceptions and costs 4.3.
+4. Read the varint bytes. A red leading 1 means "more bytes follow". Gaps below 128 take one byte.
+
+Lucene encodes doc id gaps in blocks of 128 with bit packing, and it encodes the last partial block with varints. PostgreSQL GIN has compressed its posting lists with a varbyte encoding since version 9.4. Compression also saves time, because a scan reads fewer bytes from storage and from memory.
+
+## Ranking with BM25
+
+A Boolean query returns a set. A search engine returns the best documents first. **BM25** (Robertson and others, 1990s) is the standard ranking function. It is the default in Lucene since version 6, and so in Elasticsearch and Solr. For a query with terms $t$, document $d$ of length $|d|$ and mean document length $\text{avgdl}$:
+
+$$\text{score}(d) = \sum_{t} \text{idf}(t) \cdot \frac{\text{tf}(t, d) \cdot (k_1 + 1)}{\text{tf}(t, d) + k_1 \left(1 - b + b \cdot \frac{|d|}{\text{avgdl}}\right)}$$
+
+$$\text{idf}(t) = \ln\left(1 + \frac{N - n_t + 0.5}{n_t + 0.5}\right)$$
+
+Here $N$ is the number of documents and $n_t$ the number that contain $t$. Each part has a job:
+
+- **idf** (inverse document frequency) rewards rare terms. In the demo, a term in 1 of 6 documents gets 1.54, and a term in 5 of 6 gets 0.24.
+- **tf saturation**: the fraction rises with tf but never passes $k_1 + 1$. The tenth occurrence of a word adds much less than the first. $k_1$ (default 1.2) sets how fast it saturates.
+- **Length normalization**: $b$ (default 0.75) scales tf down in long documents. A long document contains more words by chance, so one occurrence there means less.
+
+<Bm25Demo />
+
+Things to try:
+
+1. Keep **inverted index** and the defaults. Doc 4 (8 terms) ranks above doc 5 (21 terms), although doc 5 has "index" twice. Length normalization wins.
+2. Move **b** to 0. Length no longer counts, and doc 5 moves to the top with 1.983 against 1.723.
+3. Move **k1** to 0. Term frequency no longer counts either, and docs 4 and 5 tie at 1.723: only the idf of the two terms is left.
+4. Move **k1** to 3 and watch the curve. Saturation is slower, and repeated terms count for more.
+5. Select **sorted runs**. Docs 1 and 2 contain "runs" twice, and they lead. The rare term "runs" has a higher idf than "sorted".
+
+Lucene 8 and later drop the factor $(k_1 + 1)$ from the numerator. It multiplies every score by the same number, so the ranking does not change.
+
+## Segments: an LSM tree for text
+
+Updating a compressed, sorted posting list in place is expensive. So Lucene never does it. New documents go into an in-memory buffer. When the buffer is full, or at a **refresh**, Lucene writes it as a new **segment**. A segment is a small, complete, immutable index with its own dictionary and posting lists. Elasticsearch refreshes every second by default, so new documents become searchable within about one second.
+
+A query searches every segment and merges the results. A delete only sets a bit in the segment's **live docs** bitmap. A background **merge** combines small segments into bigger ones and drops deleted documents. The default `TieredMergePolicy` merges about 10 segments of similar size at a time, and it stops at segments of about 5 GB. This is the same design as an [LSM tree](/databases/lsm/memtables-and-sstables) with [tiered compaction](/databases/lsm/compaction-leveled-vs-tiered).
+
+## PostgreSQL GIN
+
+PostgreSQL's **GIN** (generalized inverted index) is an inverted index inside the database. Its keys can be words of a `tsvector`, elements of an array, or keys and values of a `jsonb` document.
+
+- The **entry tree** is a B-tree of the keys. A short posting list of TIDs is stored inline in the entry. A long one becomes a separate **posting tree**, a B-tree of TIDs.
+- Inserts are expensive, because one document adds many keys. With `fastupdate` on (the default), new entries go to an unsorted **pending list** first. VACUUM, or a pending list larger than `gin_pending_list_limit` (4 MB by default), moves them into the main tree in one batch.
+- GIN stores no term frequencies for ranking. `ts_rank` reads the `tsvector` values from the rows to compute a rank, so PostgreSQL full-text ranking is slower than a search engine.
+
+```sql
+CREATE INDEX docs_fts ON docs USING gin (to_tsvector('english', body));
+SELECT id FROM docs WHERE to_tsvector('english', body) @@ to_tsquery('merge & segment');
+```
+
+## When it breaks
+
+- **Very common terms**: their lists are huge. Stop words, block-max WAND and caching help.
+- **Heavy updates**: each update rewrites a whole document in a new segment and marks the old one deleted. Merges must keep up.
+- **Leading wildcards**: `*ing` cannot use the dictionary order. Engines use n-gram indexes, such as `pg_trgm`, for this.
+
+## Connect
+
+- The same write path for key-value data: [memtables and SSTables](/databases/lsm/memtables-and-sstables) and [compaction](/databases/lsm/compaction-leveled-vs-tiered).
+- Other compression schemes for sorted integers: [compression](/databases/olap/compression) in column stores.
+- The dictionary as a tree of bytes: [tries and adaptive radix trees](/databases/indexes/tries-and-adaptive-radix-trees).
+- Intersection is a merge join: [join algorithms](/databases/query/join-algorithms).
+
+<Recall cards={[
+  { q: "What does a posting hold, and why does a phrase query need more than an AND query?", a: "A doc id, the term frequency and the positions of the term. A phrase query must check that the terms sit at consecutive positions, not only that they share a document." },
+  { q: "When does galloping intersection beat a linear merge, and what does it cost?", a: "When one list is much shorter. It costs O(m log(n/m)) comparisons for lists of length m and n, against m + n for the merge." },
+  { q: "Why does PForDelta beat plain bit packing on lists with rare large gaps?", a: "Bit packing must use the width of the largest gap for the whole block. PForDelta picks a width that fits about 90% of the gaps and stores the rest as exceptions." },
+  { q: "What do k1 and b control in BM25?", a: "k1 sets how fast the term-frequency part saturates toward k1 + 1. b sets how much a long document is penalized; b = 0 ignores length." },
+  { q: "How does Lucene handle new and deleted documents?", a: "New documents go into immutable segments; a delete sets a bit in the segment's live-docs bitmap. Background merges combine segments and drop deleted documents, like LSM compaction." },
+  { q: "What is the pending list of a PostgreSQL GIN index?", a: "With fastupdate on, new entries go to an unsorted pending list. VACUUM or a list larger than gin_pending_list_limit moves them into the main entry tree in one batch." },
+]} />

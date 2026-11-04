@@ -1,107 +1,137 @@
 ---
-summary: Why averages become normal, how fast, and the heavy-tailed cases where they never do.
+summary: Why averages become normal, how fast this happens, and the heavy-tailed cases where it never happens.
 ---
 import { CltDemo } from "@/demos/CltDemo";
+import { DiceSumDemo, GaltonBoardDemo } from "@/demos/FlagshipExtras";
 
-Take any population, draw $n$ values, and average them. Repeat many times. The **central limit theorem** (CLT) says the histogram of those averages approaches a normal curve as $n$ grows, almost regardless of what the population looked like. It explains why the bell curve is everywhere, and why error bars shrink like $1/\sqrt{n}$. Its failures, when variance is infinite, explain why some risks are much worse than averages suggest.
+Take a population, draw $n$ values, and calculate their average. Do this many times. The **central limit theorem** (CLT) says that the histogram of these averages approaches a normal curve as $n$ grows. This is true for almost all populations, whatever their shape. The CLT explains why the bell curve occurs so often, and why error bars decrease like $1/\sqrt{n}$. Its failures, when the variance is infinite, explain why some risks are much worse than averages show.
 
 <Predict
   id="exp30"
-  question="The exponential distribution is strongly right-skewed. You average n = 30 draws from it, and repeat that 10,000 times. The histogram of the 10,000 averages looks…"
+  question="The exponential distribution has a long tail on the right. You average n = 30 draws from it, and you do this 10,000 times. What does the histogram of the 10,000 averages look like?"
   options={[
-    "Still clearly exponential: skewed, with its peak at zero",
-    "Roughly bell-shaped, with a slight right skew still visible",
-    "A perfect normal curve",
-    "Uniform",
+    "It is still clearly exponential, with its peak at zero",
+    "It is almost bell-shaped, with a small tail to the right",
+    "It is a perfect normal curve",
+    "It is flat (uniform)",
   ]}
   answer={1}
-  explain="The skewness of a mean of n draws is γ/√n. The exponential has γ = 2, so at n = 30 the skew is about 0.37: much reduced, but not zero. The Q-Q plot shows it as a gentle upward curve in the right tail."
+  explain="The skewness of a mean of n draws is γ/√n. The exponential has γ = 2, so at n = 30 the skewness is about 0.37. This is much smaller, but it is not zero. The Q-Q plot shows it as a small upward curve at the right end."
 >
 <CltDemo />
 </Predict>
 
-Things to try:
+**Skewness** $\gamma$ measures how much longer one tail of a distribution is than the other. The **standardized mean** is the mean minus $\mu$, divided by $\sigma/\sqrt n$. Things to try:
 
-1. **Exponential, n = 1 → 5 → 30 → 300.** Watch the histogram and the Q-Q plot straighten. The skew dies slowly, as $1/\sqrt{n}$.
-2. **Bimodal mixture, n = 2.** The mean of two draws is trimodal (both draws from the same hump, or one from each). By n ≈ 10 it is hard to tell apart from normal.
-3. **Bernoulli(0.1), n = 10.** The histogram is spiky because the mean can only take the values 0, 0.1, 0.2, … A *lattice* distribution converges in its overall shape, but never becomes smooth.
-4. **Pareto(α = 1.5) and Cauchy.** Push n to 500. Pareto improves slowly and keeps a long right tail. Cauchy never improves at all.
+1. **Exponential, n = 1, then 5, 30 and 300.** The histogram and the Q-Q plot become straighter. The skewness decreases slowly, as $1/\sqrt{n}$.
+2. **Bimodal mixture, n = 2.** The mean of two draws has three peaks. Both draws can come from the left peak, both from the right peak, or one from each. At n ≈ 10, it looks almost normal.
+3. **Bernoulli(0.1), n = 10.** The histogram has spikes, because the mean can only be 0, 0.1, 0.2, and so on. This is a **lattice** distribution. Its overall shape converges, but it never becomes smooth.
+4. **Pareto(α = 1.5) and Cauchy.** Increase n to 500. The Pareto histogram improves slowly and keeps a long right tail. The Cauchy histogram does not improve at all.
+
+## A normal curve from random bounces
+
+A Galton board makes the CLT visible. Each ball falls through rows of pegs. At each peg, it bounces right or left. Its final bin is the number of right bounces. So each bin count is a sum of independent 0/1 steps.
+
+<GaltonBoardDemo />
+
+1. Watch the bins fill. With 10 rows and p = 0.5, the mean bin is 5 and the SD is 1.58. The observed values come close to these numbers.
+2. Press **Drop 500** a few times. The bars come closer to the orange normal curve.
+3. Set the chance to bounce right to **0.1**. With 10 rows, most balls land in bins 0, 1 and 2. The histogram has a long right tail, like the Bernoulli(0.1) population.
+4. Keep p = 0.1 and increase the rows to **16**. The mean moves to 1.6, and the tail becomes less strong. More steps in each sum give a more normal shape.
 
 ## The statement
 
-Let $X_1, \dots, X_n$ be independent with mean $\mu$ and finite variance $\sigma^2$. Then
+Let $X_1, \dots, X_n$ be independent, with mean $\mu$ and finite variance $\sigma^2$. Then
 
 $$
 \frac{\bar X_n - \mu}{\sigma/\sqrt n} \;\xrightarrow{d}\; \mathcal N(0, 1).
 $$
 
-There are two separate claims here:
+This statement has two separate parts:
 
-- **Location and scale.** $\mathbb E[\bar X_n] = \mu$ and $\operatorname{SD}(\bar X_n) = \sigma/\sqrt n$. These are exact for every $n$ and need only finite variance and independence. Compare *SD of means (observed)* with *σ/√n (theory)* in the demo.
-- **Shape.** The standardized distribution tends to normal. This is the actual theorem, and it is only a statement about the limit.
+- **Location and scale.** $\mathbb E[\bar X_n] = \mu$ and $\operatorname{SD}(\bar X_n) = \sigma/\sqrt n$. These are exact for every $n$. They need only a finite variance and independence. In the first demo, compare *SD of means (observed)* with *σ/√n (theory)*.
+- **Shape.** The distribution of the standardized mean approaches the normal curve. This is the real theorem. It is only a statement about the limit.
 
-<Callout title="The √n law, in practice">
-To halve the standard error, you need **four times** the data. To gain one more decimal digit of precision, you need 100×. This is the main reason A/B tests are expensive and Monte Carlo methods converge slowly.
+<Callout title="The √n law in practice">
+To halve the standard error, you need **four times** the data. To get one more decimal digit of precision, you need 100 times the data. This is the main reason why A/B tests are expensive and Monte Carlo methods converge slowly.
 </Callout>
 
 ## Why it happens
 
-The neatest argument uses *cumulants*: the mean, variance, skewness, kurtosis and so on, suitably scaled. Cumulants of independent sums add.
+The clearest proof uses **cumulants**. The first cumulant is the mean, and the second is the variance. The third and fourth cumulants measure skewness and tail weight. For independent variables, the cumulants of a sum are the sums of the cumulants.
 
 <Steps>
-<div>Let $S_n = X_1 + \dots + X_n$. For independent variables, every cumulant adds: $\kappa_r(S_n) = n\,\kappa_r(X)$.</div>
-<div>Standardize: $Z_n = (S_n - n\mu)/(\sigma\sqrt n)$. Scaling by $c$ multiplies the $r$-th cumulant by $c^r$, so $\kappa_r(Z_n) = n\,\kappa_r(X)/(\sigma\sqrt n)^r \propto n^{1 - r/2}$.</div>
-<div>For $r = 2$ this is exactly 1, so the variance is fixed. For $r = 3$ it falls as $n^{-1/2}$, so skewness vanishes. For $r = 4$ it falls as $n^{-1}$, and higher cumulants vanish faster still.</div>
-<div>The normal distribution is the unique distribution whose cumulants above order 2 are all zero, so $Z_n$ tends to it. Every shape detail of the population except its mean and variance is averaged away.</div>
+<div>Let $S_n = X_1 + \dots + X_n$. For independent variables, each cumulant adds: $\kappa_r(S_n) = n\,\kappa_r(X)$.</div>
+<div>Standardize: $Z_n = (S_n - n\mu)/(\sigma\sqrt n)$. A scale factor $c$ multiplies the $r$-th cumulant by $c^r$. So $\kappa_r(Z_n) = n\,\kappa_r(X)/(\sigma\sqrt n)^r \propto n^{1 - r/2}$.</div>
+<div>For $r = 2$, the result is exactly 1, so the variance stays fixed. For $r = 3$, it decreases as $n^{-1/2}$, so the skewness goes away. For $r = 4$, it decreases as $n^{-1}$. Higher cumulants decrease even faster.</div>
+<div>The normal distribution is the only distribution with all cumulants above order 2 equal to zero. So $Z_n$ approaches it. The sum removes every detail of the population shape, except its mean and variance.</div>
 </Steps>
 
-This also tells you the **speed**: the leading error is skewness, of order $\gamma/\sqrt n$. The Berry–Esseen theorem makes it rigorous:
+The next demo calculates the exact distribution of a sum of dice. It uses **convolution**: the probability of each new sum adds up all the ways to reach it with one more die.
+
+<Predict
+  id="dice"
+  question="You add 30 dice. Die A is loaded: it shows 1 with probability 0.6, so it has skewness 1.47. Die B shows only 1 or 6, each with probability 0.5, so it has skewness 0. Which sum is closer to a normal curve?"
+  options={["The sum of die B, because it has no skewness", "The sum of die A", "They are equally close"]}
+  answer={1}
+  explain="The sum of die B can only take values 5 apart. Its CDF climbs in large jumps, and a smooth normal CDF cannot follow these jumps. At n = 30, the largest CDF gap is 0.072 for die B and 0.044 for die A."
+>
+<DiceSumDemo />
+</Predict>
+
+1. Select **Fair die** and press **Add a die**. One die is flat, two dice make a triangle, and three dice already look like a bell.
+2. Select **Loaded (mostly 1)**. Its skewness is 1.47. At n = 30, the skewness is 0.27, which is 1.47/√30.
+3. Look at the **largest CDF gap**. This is the largest difference between the cumulative distribution function (CDF) of the sum and the normal CDF. For the fair die, it decreases from 0.143 with one die to 0.021 with 30 dice.
+4. Select **Only 1 or 6**. The skewness is always 0, but the gap stays large: 0.072 at n = 30. The bars are 5 apart, so the CDF jumps in large steps.
+5. Compare the gap with the **Berry–Esseen limit**. The gap is always below the limit.
+
+The cumulants also give the **speed**. The largest error term is the skewness, of order $\gamma/\sqrt n$. The Berry–Esseen theorem gives a strict limit:
 
 $$
 \sup_x \left|P(Z_n \le x) - \Phi(x)\right| \le \frac{C\,\mathbb E|X-\mu|^3}{\sigma^3\sqrt n}, \qquad C < 0.48.
 $$
 
-Symmetric populations (uniform, bimodal) have $\gamma = 0$, so they converge visibly faster than skewed ones (exponential, Bernoulli with small p). Rules of thumb like "n ≥ 30" ignore this. For Bernoulli(0.1), you want $np \gtrsim 10$, which means n ≈ 100.
+Symmetric populations, such as the uniform and the bimodal mixture, have $\gamma = 0$. So they converge faster than skewed populations, such as the exponential or a Bernoulli with a small p. Rules such as "n ≥ 30" ignore this. Bernoulli(0.1) has skewness 2.67. For it, you need $np \gtrsim 10$, so n ≈ 100.
 
 ## Reading a Q-Q plot
 
-Sort the standardized means and plot each one against the normal quantile at the same rank. If the data are normal, the points fall on the diagonal.
+Sort the standardized means. Plot each one against the normal quantile at the same rank. If the data are normal, the points are on the diagonal.
 
-- **Curving up at the right end:** a heavier right tail than normal (right skew).
-- **An S shape:** heavier tails on both sides.
-- **Steps:** discreteness.
+- **The right end curves up:** the right tail is heavier than normal (right skew).
+- **An S shape:** both tails are heavier than normal.
+- **Steps:** the data are discrete.
 
-Q-Q plots show tail behavior that histograms hide. Use them when checking the assumptions behind a t-test or a regression.
+Q-Q plots show the behavior of the tails, which histograms hide. Use them to check the assumptions of a t-test or a regression.
 
 ## When the CLT fails
 
-The theorem needs **finite variance** and **independence**. Break either one and averaging stops working as expected.
+The theorem needs **finite variance** and **independence**. If one of them is missing, averages do not behave as expected.
 
-**Pareto with α = 1.5** has a finite mean (μ = 3) but *infinite* variance. The sample mean still converges to μ (the law of large numbers only needs a finite mean), but:
+**Pareto with α = 1.5** has a finite mean (μ = 3), but its variance is *infinite*. The sample mean still converges to μ, because the law of large numbers needs only a finite mean. But two things change:
 
-- the fluctuations shrink like $n^{1/\alpha - 1} = n^{-1/3}$ instead of $n^{-1/2}$;
-- the limiting shape is a skewed **α-stable** distribution, not a normal.
+- the fluctuations decrease like $n^{1/\alpha - 1} = n^{-1/3}$, not like $n^{-1/2}$;
+- the limit shape is a skewed **α-stable** distribution, not a normal distribution.
 
-This is the *generalized* CLT. File sizes, city populations, wealth, insurance losses and request latencies often look like this. A "mean ± 2σ" summary of such data is meaningless.
+This is the *generalized* CLT. File sizes, city populations, wealth, insurance losses and request latencies often have this shape. For such data, a summary such as "mean ± 2σ" has no meaning.
 
-**Cauchy** has no mean at all. The average of $n$ standard Cauchy draws is *exactly* standard Cauchy for every $n$. Averaging does nothing, because one enormous draw dominates every sum.
+**Cauchy** has no mean at all. The average of $n$ standard Cauchy draws is *exactly* standard Cauchy for every $n$. Averages do not help, because one very large draw controls each sum.
 
-<Callout kind="warn" title="Independence matters as much as variance">
-Positively correlated samples (users in the same session, adjacent time points, servers in the same rack) have a standard error much larger than σ/√n. With correlation ρ between all pairs, $\operatorname{Var}(\bar X) = \frac{\sigma^2}{n}\big(1 + (n-1)\rho\big)$, so it never goes to zero. Time series and clustered A/B tests have to account for this.
+<Callout kind="warn" title="Independence is as important as finite variance">
+Samples with a positive correlation have a standard error much larger than σ/√n. Examples are users in the same session, adjacent time points, and servers in the same rack. With correlation ρ between all pairs, $\operatorname{Var}(\bar X) = \frac{\sigma^2}{n}\big(1 + (n-1)\rho\big)$, so it never goes to zero. With n = 100 and ρ = 0.1, the variance is 10.9 times larger, and the standard error is 3.3 times larger. Time series and clustered A/B tests must include this effect.
 </Callout>
 
-## Why this matters elsewhere
+## Why this is important in other areas
 
-- **Confidence intervals and t-tests** rest on the normality of $\bar X$ (Hypothesis testing module).
-- **Measurement noise** is often roughly normal because it is the sum of many small independent effects.
-- **Minibatch SGD noise** is roughly normal for the same reason: a gradient averaged over a batch. Its scale is $\propto 1/\sqrt{B}$, which matters for learning-rate choice (Deep Learning → Optimization).
-- **Benchmarking**: the mean of a heavy-tailed latency distribution converges slowly. Report percentiles instead (Performance → Measurement).
+- **Confidence intervals and t-tests** need a normal $\bar X$ (hypothesis testing module).
+- **Measurement noise** is often almost normal, because it is the sum of many small independent effects.
+- **Minibatch SGD noise** is almost normal for the same reason: it is an average of gradients over a batch. Its scale is proportional to $1/\sqrt{B}$. This scale affects the choice of the learning rate (Deep Learning → Optimization).
+- **Benchmarks**: the mean of a heavy-tailed latency distribution converges slowly. Report percentiles instead (Performance → Measurement).
 
 <Recall cards={[
-  { q: "State the CLT and its two key assumptions.", a: "For iid X with mean μ and finite variance σ², (X̄ − μ)/(σ/√n) converges in distribution to N(0,1). It needs independence and finite variance." },
-  { q: "How does the standard error of a sample mean scale with n? How much more data halves it?", a: "σ/√n. Halving it takes 4× the data." },
-  { q: "At what rate does the skewness of a sample mean shrink?", a: "γ/√n, where γ is the population skewness. Skewed populations converge more slowly." },
-  { q: "What happens to the average of n standard Cauchy variables?", a: "It is exactly standard Cauchy for every n. Averaging does not concentrate it at all." },
-  { q: "Pareto with 1 < α < 2: does the sample mean converge? Is the limit normal?", a: "It converges to μ (the mean is finite), but the fluctuations scale like n^(1/α − 1) and the limit is an α-stable law, not normal." },
-  { q: "A Q-Q plot curves upward at the right end. What does that indicate?", a: "A heavier right tail than the normal: right skew." },
+  { q: "State the CLT and its two main assumptions.", a: "For iid X with mean μ and finite variance σ², (X̄ − μ)/(σ/√n) converges in distribution to N(0,1). It needs independence and a finite variance." },
+  { q: "How does the standard error of a sample mean change with n? How much more data halves it?", a: "It is σ/√n. You need 4 times the data to halve it." },
+  { q: "At what rate does the skewness of a sample mean decrease?", a: "As γ/√n, where γ is the skewness of the population. Skewed populations converge more slowly." },
+  { q: "Why can a sum of symmetric dice be further from normal than a sum of skewed dice?", a: "If the values are far apart on a lattice, the CDF of the sum climbs in large jumps. A smooth normal CDF cannot follow these jumps." },
+  { q: "What happens to the average of n standard Cauchy variables?", a: "It is exactly standard Cauchy for every n. The average does not concentrate at all." },
+  { q: "Pareto with 1 < α < 2: does the sample mean converge? Is the limit normal?", a: "It converges to μ, because the mean is finite. But the fluctuations decrease like n^(1/α − 1), and the limit is an α-stable law, not a normal law." },
 ]} />

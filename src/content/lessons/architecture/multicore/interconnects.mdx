@@ -1,0 +1,59 @@
+---
+summary: Buses, rings, meshes and chiplets; why broadcast snooping stops scaling; and how directories track who has each line.
+---
+import { InterconnectDemo } from "@/demos/MulticoreDemos";
+
+The coherence protocol in the MESI lesson assumed a **bus**: one shared set of wires on which every request is broadcast and seen by every cache in the same order. That's simple and makes ordering easy, but it scales badly. Every transaction occupies the whole bus, every cache must look up every request, and long shared wires are slow. Modern chips with tens of cores use **networks**, and replace broadcast snooping with **directories**.
+
+<Predict
+  id="hops"
+  question="64 cores. On average, how many hops apart are two cores on a bidirectional ring, and on an 8×8 mesh?"
+  options={["About 16 and about 5", "About 32 and about 8", "About 8 and about 3"]}
+  answer={0}
+  explain="On a ring the average distance grows like n/4 (16.3 for 64 cores). On a k×k mesh it grows like 2k/3 (5.3 for 8×8). That √n scaling is why many-core server chips use meshes."
+>
+<InterconnectDemo />
+</Predict>
+
+1. Compare ring, mesh and torus as cores grow. The legend shows the cost side: links needed at 64 cores.
+2. **Mostly private data**: a directory needs about 2 messages per transaction (request plus data). Snooping makes all 63 other caches check.
+3. **Shared counter**: around 4 per transaction, since the directory forwards to the single owner and invalidates one copy.
+4. **One writer, everyone reads**: each write invalidates every sharer, but that cost is proportional to the *actual* number of sharers, not the machine size.
+
+## Topologies
+
+| Topology | Hops | Links | Where |
+|---|---|---|---|
+| Bus | 1 | 1 (shared) | small SMPs; the conceptual model |
+| Crossbar | 1 | n² | small core counts, GPUs between SMs and L2 slices |
+| Ring | ~n/4 | n | Intel client CPUs and older Xeons (ring bus through L3 slices) |
+| 2D mesh | ~2√n/3 | ~2n | Intel Xeon since Skylake-SP, many-core research chips |
+| Chiplets + switch | 2 levels | — | AMD EPYC/Ryzen: core chiplets connected via an I/O die (Infinity Fabric) |
+
+Three numbers summarize a network: **latency** (hops × per-hop delay), **bisection bandwidth** (capacity across a cut through the middle: about √n links for a mesh), and **cost** (wires, area, power). Every design trades between them.
+
+## Directory protocols
+
+A directory keeps, for each line, the **state** and the **set of sharers** (often a bit vector with one bit per core), next to the L3 slice or memory controller that is the line's home. A miss goes to the home, which:
+
+- answers from memory or L3 if no core owns the line,
+- forwards the request to the single owner (M/E/O) if there is one,
+- sends invalidations only to the cores in the sharer set, collecting acknowledgements before granting write permission.
+
+Messages per miss then depend on how many cores **share** the line, not on how many cores **exist**. The costs are directory storage (N bits per line becomes large, so real designs use limited pointers or coarse vectors), an extra hop through the home node, and harder protocol verification, because messages can now race through an unordered network.
+
+**Snoop filters** are the hybrid used in most current servers: a directory-like structure that records which cores *might* hold a line, so that only those are snooped.
+
+## What this means for software
+
+- Core-to-core latency is not uniform even within one socket. Tools like `core-to-core-latency` measure it; mesh corners are farther apart than neighbors.
+- Sharing a line between cores on different chiplets (AMD CCDs) costs much more than within one. Keep tightly communicating threads on the same CCX.
+- Coherence traffic is paid per **sharer per write**. Read-mostly data shares cheaply; written-and-shared data doesn't scale.
+
+<Recall cards={[
+  { q: "Why does broadcast snooping stop scaling?", a: "Every transaction is seen by every cache, so traffic and lookups grow with core count even when only one or two cores share the line." },
+  { q: "Average hops on a ring vs a 2D mesh of n cores?", a: "Ring about n/4; mesh about 2√n/3." },
+  { q: "What does a directory store per line?", a: "The coherence state and the set of sharers (e.g. a bit vector), kept at the line's home node." },
+  { q: "Directory cost per miss depends on what?", a: "On the number of actual sharers to invalidate or forward to, not on the total number of cores." },
+  { q: "What is a snoop filter?", a: "A structure tracking which cores may hold each line, so that only those cores are snooped." },
+]} />

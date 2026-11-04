@@ -1,0 +1,56 @@
+---
+summary: Reading IPC, cache misses and branch mispredictions from the CPU's own counters, and using the top-down method to find what limits a loop.
+---
+import { CountersDemo } from "@/demos/MeasurementDemos";
+
+Timing tells you *that* code is slow. The CPU can tell you *why*. Every modern core has **performance monitoring counters** that count events (cycles, instructions retired, cache misses, branch mispredictions, and hundreds more) with almost no overhead. `perf stat` reads them for a whole run:
+
+```
+$ perf stat -e cycles,instructions,branch-misses,cache-misses ./app
+```
+
+The first number to read is **IPC** (instructions per cycle). A modern core can retire 4–6 instructions per cycle. IPC below 1 means it spends most cycles waiting.
+
+<Predict
+  id="sorted"
+  question="for each byte b in a: if b >= 128 { sum += b }. With 100,000 random bytes, and then with the same bytes sorted first (same instructions executed), how do the cycle counts compare?"
+  options={["About the same: same instructions", "Sorted is a few times faster", "Random is faster: less work"]}
+  answer={1}
+  explain="On random data the branch is a coin flip: the predictor misses about a quarter of all branches (half of the data-dependent ones), and each miss throws away about 16 cycles of work. Sorted, it predicts almost perfectly. The model gives IPC 0.53 vs 3.63: 6.8× more cycles for identical instructions."
+>
+<CountersDemo />
+</Predict>
+
+1. **Branch on random data** vs **sorted data**: the top-down bar is mostly red (bad speculation) for one and green (retiring) for the other.
+2. **Pointer chase**: IPC 0.01. Every iteration waits about 100 ns for DRAM, because the next address depends on the current load. All orange: backend memory bound.
+3. **Dependent FP chain**: IPC about 0.75 with no misses at all. Each multiply-add waits for the previous result (4-cycle latency): core bound. The ILP lesson breaks such chains.
+4. **Sequential sum**: IPC near 3. Memory streams in, the prefetcher keeps up, and the branch is always predicted.
+
+## Top-down analysis
+
+Intel's **top-down microarchitecture analysis** (Yasin, 2014) accounts for every pipeline *slot*: the core's width × cycles. Each slot is classified as one of:
+
+| Category | Meaning | Typical fixes |
+|---|---|---|
+| **Retiring** | useful work | fewer instructions: better algorithm, SIMD |
+| **Bad speculation** | work thrown away after mispredicted branches | predictable branches, branchless code, sorting or partitioning data |
+| **Frontend bound** | the core couldn't fetch or decode instructions fast enough | smaller hot code, fewer i-cache/iTLB misses, PGO and LTO |
+| **Backend: memory** | waiting on loads (cache and DRAM misses) | locality, prefetching, smaller data |
+| **Backend: core** | execution units or dependency chains | break dependency chains, more ILP |
+
+Start at the top level, then drill into the dominant category. `perf stat -M TopdownL1` (newer kernels, Intel and some AMD), `toplev` from pmu-tools, VTune and AMD uProf all report it.
+
+## Practicalities
+
+- Counting (`perf stat`) is cheap and exact. Sampling on an event (`perf record -e cache-misses`) attributes events to code, with skid (see Profilers).
+- There are only a few hardware counters (4–8 general-purpose per core). Ask for more events than that and `perf` time-multiplexes them, scaling the counts: you'll see percentages in brackets.
+- Virtual machines and containers often hide or virtualize counters. Measure on bare metal when you can.
+- `perf c2c` (false sharing), `perf mem` (load latency) and `perf stat -e L1-dcache-load-misses,LLC-load-misses` connect this lesson to the cache and coherence modules.
+
+<Recall cards={[
+  { q: "What does an IPC well below 1 tell you?", a: "The core spends most cycles stalled (memory, mispredictions or dependencies) rather than retiring instructions." },
+  { q: "The four top-level top-down categories?", a: "Retiring, bad speculation, frontend bound, backend bound (split into memory and core)." },
+  { q: "Why does sorting the data speed up `if (x >= 128)` over random bytes?", a: "Sorted data makes the branch predictable, removing mispredictions that each cost about 15–20 cycles." },
+  { q: "Why is a pointer chase memory bound with IPC near zero?", a: "Each load's address depends on the previous load, so DRAM latencies can't overlap." },
+  { q: "What does perf do when you request more events than there are counters?", a: "It time-multiplexes the counters and scales the counts, showing the fraction of time each was counted." },
+]} />

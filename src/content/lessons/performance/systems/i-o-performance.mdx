@@ -1,0 +1,63 @@
+---
+summary: The cost of a system call, why buffer size matters, why SSDs need many requests in flight, and how io_uring removes most system calls.
+---
+import { BufferSizeDemo, QueueDepthDemo, IoModelsDemo } from "@/demos/SystemsDemos";
+
+I/O is slow compared to the CPU. But a lot of I/O time is not in the device. It is in the software: system calls, context switches and copies. This lesson shows three common problems and their fixes.
+
+## 1. Too many system calls
+
+Each system call costs about 100 ns to 1 µs, even when it does almost no work. A loop that reads one byte per call spends almost all its time in system calls.
+
+<Predict
+  id="buffer"
+  question="You read a 64 MiB file with read() calls of 1 byte each, then with calls of 64 KiB each. How much faster are the 64 KiB calls?"
+  options={["About 2 times", "About 100 times", "About 3000 times"]}
+  answer={2}
+  explain="With 1-byte calls, the program makes 67 million system calls at about 300 ns each. With 64 KiB calls, it makes 1024. The copy time is the same in both cases. The model gives 0.003 GB/s against 9.6 GB/s."
+>
+<BufferSizeDemo />
+</Predict>
+
+1. Start at **4 B** per call. Almost all the time is in system calls.
+2. Increase to **4 KiB**. The throughput is now about 5.8 GB/s.
+3. Increase to **64 KiB**. More does not help much. The copy is now the limit.
+
+Use buffered I/O: `BufReader` / `BufWriter` in Rust, `std.io.bufferedReader` in Zig, `bufio` in Go, `fread` / `std::ifstream` in C and C++. For small writes, a buffer of 64 KiB or more removes most system calls.
+
+## 2. One request at a time
+
+An SSD has many internal parts that work in parallel. If you send one request and wait for it, most of the device is idle.
+
+<QueueDepthDemo />
+
+1. Set the queue depth to **1**. The NVMe SSD does about 12,500 random reads per second. That is 1 read per 80 µs.
+2. Set the queue depth to **128**. The same SSD does about 800,000 reads per second.
+3. Look at the hard disk. It has one head, so more requests in flight do not help. They only add waiting.
+
+This is Little's law again: requests in flight = IOPS × latency. To use a fast SSD, send many requests at the same time: use more threads, asynchronous I/O, or io_uring.
+
+## 3. One thread per connection
+
+<IoModelsDemo />
+
+- **Thread per connection**: simple to write. But each request sleeps in the kernel, and two context switches cost more than the work.
+- **Event loop with epoll**: one thread serves many connections. There are no context switches, but there are two system calls per request.
+- **io_uring**: the program and the kernel share two rings. The program puts many requests into the submission ring and makes one system call for all of them. The kernel puts the results into the completion ring.
+
+## Rules
+
+<Steps>
+<div>Do fewer, larger I/O operations: buffer reads and writes, and use vectored I/O (readv, writev).</div>
+<div>Keep many requests in flight to fast devices: queue depth 32 or more for NVMe.</div>
+<div>Use an event loop or io_uring for many connections. Tokio (Rust), libxev (Zig), Go's netpoller and libuv do this for you.</div>
+<div>Measure where the time goes: strace -c counts system calls, and perf trace and bpftrace show their latency.</div>
+</Steps>
+
+<Recall cards={[
+  { q: "About how much does a system call cost?", a: "About 100 ns to 1 µs, even when it does almost no work." },
+  { q: "Why do 1-byte reads run so slowly?", a: "Each byte costs one system call, so the call overhead is almost all the time." },
+  { q: "Why does an NVMe SSD need a high queue depth?", a: "It has many internal parts that work in parallel. With one request in flight, most of the device is idle." },
+  { q: "How does io_uring decrease system calls?", a: "The program puts many requests into a shared submission ring and makes one system call for all of them." },
+  { q: "Which tool counts system calls by type?", a: "strace -c." },
+]} />

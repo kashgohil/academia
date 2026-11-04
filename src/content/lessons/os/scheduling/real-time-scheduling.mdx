@@ -1,0 +1,145 @@
+---
+summary: "Hard and soft deadlines, SCHED_FIFO, SCHED_RR and SCHED_DEADLINE, rate monotonic and EDF with their utilization bounds, priority inversion and the Mars Pathfinder case, priority inheritance, RT throttling and PREEMPT_RT."
+---
+import { RtTimelineDemo, RmAcceptanceDemo, PriorityInversionDemo } from "@/demos/os/SchedulingRtDemos";
+
+A **real-time** system is correct only if it is also on time. In a **hard** real-time system, one missed deadline is a failure: a brake controller is an example. In a **soft** system, a miss only lowers quality: an audio dropout is an example. Fair schedulers aim at shares. Real-time schedulers aim at a proof that every deadline holds.
+
+The standard model is a set of **periodic tasks**. Task $i$ releases a **job** every $T_i$ (the period). Each job needs at most $C_i$ of CPU (the worst-case execution time) before the next release. The **utilization** of the set is $U = \sum C_i / T_i$. No scheduler can succeed on one CPU if $U > 1$.
+
+Two classic policies preempt on every release:
+
+- **Rate monotonic** (RM) gives each task a fixed priority. The shorter the period, the higher the priority.
+- **Earliest deadline first** (EDF) gives each job a priority from its deadline. The nearest deadline runs.
+
+<Predict
+  id="rm-edf"
+  question="T1 needs 2 ms every 5 ms. T2 needs 4 ms every 7 ms. U is 0.97. Which policy meets every deadline?"
+  options={["Both: U is below 1", "EDF only: RM makes T2 late", "Neither: U is too close to 1"]}
+  answer={1}
+  explain="RM always prefers T1, so T2 gets its 4 ms only by time 8, one past its deadline of 7. EDF lets T2 run at time 5, because its deadline of 7 is nearer than T1's new deadline of 10. It has no misses in the 35 ms hyperperiod."
+>
+<RtTimelineDemo />
+</Predict>
+
+Things to try:
+
+1. Read the default set. RM misses once in the 35 ms **hyperperiod** (the time after which the pattern repeats) and preempts 5 times. EDF has no misses and preempts once. EDF does not always preempt more.
+2. Select **Under the RM bound**. U is 0.71, below the bound of 0.78 for three tasks. Both policies pass.
+3. Select **Harmonic, U = 1**. Each period divides the next. RM has no misses at full utilization, so the bound is not a limit on this set.
+4. Select **Overload**, with U = 1.25. RM misses 80 deadlines, but only in T2 and T3: T1 is safe. EDF misses 139, across all three tasks. This is the **domino effect**.
+5. Edit a task in the table. Raise a C and watch the worst response under RM cross the period.
+
+## Why the bounds are what they are
+
+Liu and Layland proved two results in 1973 for implicit deadlines (each deadline equals the next release).
+
+**EDF: $U \le 1$ is enough.** The proof is by contradiction.
+
+Suppose that EDF misses a deadline at time $t$. Go back to the last time $t_0$ when the CPU was idle or ran a job with a later deadline. From $t_0$ to $t$, the CPU only ran jobs with deadlines at or before $t$. Those jobs need more than $t - t_0$ of CPU. But task $i$ can have at most $(t - t_0)/T_i$ such jobs, so their total need is at most $U(t - t_0)$. Then $U > 1$, which is a contradiction.
+
+**RM: a lower bound.** Fixed priorities waste some capacity when the periods do not divide each other. The bound is sufficient for $n$ tasks, but it is not necessary:
+
+$$U \le n\left(2^{1/n} - 1\right)$$
+
+| $n$ | 1 | 2 | 3 | 4 | 5 | 10 | limit |
+|---|---|---|---|---|---|---|---|
+| Bound | 1.000 | 0.828 | 0.780 | 0.757 | 0.743 | 0.718 | $\ln 2$ = 0.693 |
+
+The **exact** test is **response-time analysis** (Joseph and Pandya, 1986). The worst case is when all tasks release together. Iterate this to a fixed point, and compare the result with the deadline:
+
+$$R = C_i + \sum_{j \in hp(i)} \left\lceil \frac{R}{T_j} \right\rceil C_j$$
+
+For T2 in the default set, $R$ goes 4, 6, 8, 8. Since 8 is more than 7, T2 is late.
+
+<RmAcceptanceDemo />
+
+1. Keep 5 tasks. Every random set passes at U = 0.8, although the bound is 0.74. At U = 0.9, 91% pass. At U = 0.96, 48% pass. At U = 1, none pass.
+2. Move to 1 task, then 10 tasks. The bound falls, but the real curve moves much less.
+
+RM stays popular for three reasons. Priorities are fixed, so the implementation is simple. An overload hurts only the lowest priorities, and you can choose them. And the worst case is easy to analyze.
+
+## Linux real-time classes
+
+Linux checks its **scheduling classes** in a fixed order: `stop`, `deadline`, `rt`, `fair`, `idle`. A runnable task in an upper class always beats a task in a lower class.
+
+| Policy | Rule |
+|---|---|
+| `SCHED_FIFO` | Priority 1 to 99. The task runs until it blocks, yields, or a higher priority preempts it. |
+| `SCHED_RR` | The same, with a time slice among equal priorities. The default slice is 100 ms (`/proc/sys/kernel/sched_rr_timeslice_ms`). |
+| `SCHED_DEADLINE` | EDF with a bandwidth budget for each task. It has no priority number, and it beats both of the above. |
+
+```c
+struct sched_param p = { .sched_priority = 50 };
+sched_setscheduler(0, SCHED_FIFO, &p);     // needs CAP_SYS_NICE or RLIMIT_RTPRIO
+mlockall(MCL_CURRENT | MCL_FUTURE);        // a page fault is not a real-time event
+```
+
+From the shell, use `chrt -f 50 ./prog`. These tools are Linux only. On macOS, the nearest thing is `thread_policy_set()` with `THREAD_TIME_CONSTRAINT_POLICY`, which audio threads use.
+
+`SCHED_DEADLINE` (since Linux 3.14) takes three numbers: a runtime, a deadline and a period. The kernel does **admission control**: it refuses a task if the total bandwidth is too high. It enforces the budget with a **constant bandwidth server**, so a task that overruns is stopped until its next period and cannot harm others. That is the difference from plain EDF, and it removes most of the domino effect.
+
+```c
+struct sched_attr a = {
+    .size = sizeof a, .sched_policy = SCHED_DEADLINE,
+    .sched_runtime  =  2 * 1000000,    // 2 ms of CPU
+    .sched_deadline =  5 * 1000000,    // within 5 ms
+    .sched_period   = 10 * 1000000,    // every 10 ms
+};
+syscall(SYS_sched_setattr, 0, &a, 0);  // EBUSY if admission control refuses
+```
+
+**RT throttling** is the safety net. A `SCHED_FIFO` loop with a bug would otherwise lock a CPU for ever. By default, real-time tasks may use 950,000 µs of each 1,000,000 µs (`sched_rt_runtime_us` and `sched_rt_period_us`), which is 95%. Newer kernels (about 6.12) use a deadline server for normal tasks to give the same protection.
+
+## Priority inversion
+
+A priority alone does not give a guarantee when tasks share a lock. **Priority inversion** means that a high-priority task waits for a lower-priority task.
+
+<Predict
+  id="inversion"
+  question="L takes a mutex. H preempts L and then blocks on that mutex. Now M arrives. M does not need the mutex, and it has 8 ticks of work. How long is H blocked?"
+  options={["Only for the rest of L's critical section: 2 ticks", "For the rest of the critical section plus all of M's work: 10 ticks", "H is not blocked, because it has the highest priority"]}
+  answer={1}
+  explain="M has a higher priority than L, so M preempts L while L holds the mutex. H waits for L, and L waits for M. So a medium task with no link to H delays H: 2 + 8 = 10 ticks. With priority inheritance, H waits only 2 ticks."
+>
+<PriorityInversionDemo />
+</Predict>
+
+1. Step through with inheritance off. M runs while H is blocked. Move M's work to 20 ticks: H's blocked time grows with it, with no limit.
+2. Turn on **Priority inheritance** and step again. When H blocks, L's effective priority rises to 3. M cannot preempt L.
+3. Move M's work with inheritance on. H is blocked for 2 ticks at every value.
+
+**The Mars Pathfinder case.** Pathfinder landed in July 1997, and then it started to reset itself. A high-priority task managed the information bus. A low-priority meteorological task sometimes held a mutex that the bus task needed. Medium-priority communication tasks then preempted the meteorological task. A watchdog saw that the bus task had not finished on time, and it reset the whole system.
+
+The VxWorks mutex had priority inheritance as an option, and the option was off. Engineers reproduced the bug on Earth and changed the flag by an upload to Mars.
+
+**Priority inheritance** makes a lock owner run at the highest priority of its waiters, until it releases the lock. The boost must also pass along a chain of locks. On Linux, use `PTHREAD_PRIO_INHERIT`. It maps to `FUTEX_LOCK_PI` and the kernel's `rt_mutex`. It is a kernel path, so it is slower than a plain [futex](/os/sync/futexes). The alternative is a **priority ceiling** (`PTHREAD_PRIO_PROTECT`): the owner runs at a fixed high priority from the moment it takes the lock.
+
+```c
+pthread_mutexattr_t a;
+pthread_mutexattr_init(&a);
+pthread_mutexattr_setprotocol(&a, PTHREAD_PRIO_INHERIT);   // also on macOS
+pthread_mutex_init(&m, &a);
+```
+
+## PREEMPT_RT
+
+A real-time policy helps only if the kernel itself can be preempted. A task can be late because the kernel holds a spinlock with preemption off, or runs a long interrupt handler. **PREEMPT_RT** removes most of these cases. It turns most spinlocks into sleeping `rt_mutex` locks with inheritance, and it moves most interrupt handlers into threads that have priorities. It was developed out of tree for about two decades, and it was merged in Linux 6.12 for x86, arm64 and RISC-V. The standard measurement tool is `cyclictest`.
+
+Do not trust a table of latency numbers from another machine. Firmware, power states and drivers decide the worst case, so measure it on your hardware under load.
+
+## Connect
+
+- [Futexes](/os/sync/futexes) explain the fast path of a mutex and the PI path.
+- [CFS and EEVDF](/os/scheduling/cfs-and-eevdf) use virtual deadlines to order work. They give no real guarantee.
+- [Interrupts](/os/io/interrupts) are a source of delay that a task-level analysis does not see.
+- [Tail latency](/performance/systems/tail-latency) is the soft real-time problem in servers.
+
+<Recall cards={[
+  { q: "Give the utilization bounds for RM and EDF, and say which is exact.", a: "RM: n times (2^(1/n) - 1), which falls to ln 2. It is sufficient only. EDF: 1, which is exact for implicit deadlines." },
+  { q: "What is the exact test for RM, and what instant does it assume?", a: "Response-time analysis: R = C + sum of ceil(R/Tj) times Cj over higher priorities, iterated to a fixed point. It assumes that all tasks release together." },
+  { q: "How do RM and EDF fail differently under overload?", a: "RM misses only in the lowest-priority tasks. EDF can miss in all tasks, because each late job delays others: the domino effect." },
+  { q: "What does SCHED_DEADLINE add to plain EDF?", a: "Admission control, and a constant bandwidth server that stops a task when it uses up its runtime, so an overrun cannot harm other tasks." },
+  { q: "Explain the Mars Pathfinder resets in one chain.", a: "A low task held a mutex, a high bus task waited for it, and medium tasks preempted the low task. A watchdog saw the late bus task and reset the system. Priority inheritance fixed it." },
+  { q: "What two changes does PREEMPT_RT make?", a: "Most spinlocks become sleeping rt_mutex locks with priority inheritance, and most interrupt handlers run in threads with priorities." },
+]} />

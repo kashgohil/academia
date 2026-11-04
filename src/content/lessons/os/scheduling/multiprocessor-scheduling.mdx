@@ -1,0 +1,123 @@
+---
+summary: "Single queue or one queue per CPU, load balancing and work stealing, what a migration costs, cache and NUMA affinity, scheduling domains, wake-affine, pinning, SMT and big.LITTLE, with QoS classes on Apple Silicon."
+---
+import { MulticoreDemo, MigrationCostDemo } from "@/demos/os/SchedulingMulticoreDemos";
+
+Scheduling on one CPU is a question of order. On many CPUs it is also a question of place. A thread that returns to its last CPU finds its data in that CPU's caches. This is **cache affinity**. So a good scheduler keeps threads in place, and it also keeps all CPUs busy. These two goals conflict.
+
+The first design choice is the queue.
+
+- **A single shared queue.** Any CPU takes the next task. This balances load by itself. But each pick takes one global lock, and a task moves between CPUs at almost every turn. Linux had this design until the O(1) scheduler in 2.6.
+- **One queue per CPU.** Each CPU has its own runqueue (`struct rq` in Linux) and its own lock. A task stays on its CPU, so picks do not contend and caches stay warm. But one CPU can be idle while another has a long queue. This is **imbalance**, and it needs a **load balancer**.
+
+<Predict
+  id="pile"
+  question="8 CPUs have one queue each. 16 tasks all start on CPU 0, and a woken task returns to its last CPU. No balancer runs. What share of the total CPU capacity does useful work?"
+  options={["About 12.5%: one CPU does everything", "About 50%: there are 16 tasks for 8 CPUs", "About 90%: the tasks spread when they wake"]}
+  answer={0}
+  explain="No rule moves a task, so seven CPUs stay idle. The model gives 12.5%. A periodic balancer at 16 ms gives 91.8%. Stealing by idle CPUs gives 98.3%."
+>
+<MulticoreDemo />
+</Predict>
+
+Things to try:
+
+1. Press **Run 0.5 s**. Only CPU 0 works, and idle CPU is near 87.5%.
+2. Turn on **Periodic load balancer** and run again. The queues spread out. Useful CPU rises, but read the mean values only after a few presses, because they include the old idle time. Press **Reset** for a clean number.
+3. Turn off the balancer and turn on **Idle CPUs steal work**. Idle time almost disappears, because a CPU looks for work as soon as it has none.
+4. Press **Pile all on CPU 0** while it runs, and watch how fast each method recovers.
+5. Select **One shared queue**. There is no imbalance at all, but migrations per second jump, and more CPU goes to refills and locks.
+
+The demo has 8 CPUs and 16 tasks. Its model inputs are a 0.5 ms cache refill and 0.02 ms of lock time per sharer. The shared queue loses 7.5% of the CPU and migrates 892 times per second. Per-CPU queues with stealing lose 1.5% and migrate 208 times per second. The model does not include lock contention beyond this fixed cost, so the real gap at high core counts is wider.
+
+## How Linux balances
+
+Linux has no central balancer. Each CPU balances for itself, in two ways:
+
+- **Periodic pull.** The scheduler tick raises `SCHED_SOFTIRQ` when a balance is due, and `rebalance_domains()` runs `load_balance()`. It finds the busiest group and the busiest queue in it, and it pulls tasks to the local CPU.
+- **Newly idle pull.** A CPU that is about to go idle calls `newidle_balance()`. This is **work stealing**: the idle CPU pays the cost, and busy CPUs lose nothing.
+
+Recent kernels rename these functions with a `sched_balance_` prefix. User-space runtimes use the same idea. In Go, a `P` (a logical processor) with an empty run queue steals half of the queue of another `P`. Rayon uses work-stealing deques: the owner pushes and pops at one end, and thieves take from the other end.
+
+"Load" is not the queue length. Linux tracks a decaying average of each task's runnable time (**PELT**, per-entity load tracking), scaled by its weight. So a task that sleeps most of the time counts for little.
+
+## What a migration costs
+
+A migration has a direct cost: two runqueue locks and a few counters. The real cost comes later. The task must refill its caches and TLB on the new CPU, and on another NUMA node its memory is now remote.
+
+<Predict
+  id="balance-period"
+  question="Each migration costs 1 ms for cache refill, and a move to the other node costs 4 ms more. Which balancer period gives the most useful CPU: 1 ms, 16 ms, or 1,024 ms?"
+  options={["1 ms: the load is always even", "16 ms: it fixes large imbalances and ignores small ones", "1,024 ms: migrations are too costly to allow"]}
+  answer={1}
+  explain="At 1 ms, the balancer chases small differences that would go away by themselves, and useful CPU is about 70%. At 1,024 ms, CPU 0 stays overloaded and useful CPU is about 29%. In this model the best of the sweep is 16 ms, at about 78%."
+>
+<MigrationCostDemo />
+</Predict>
+
+1. Look at the green curve, where a migration is free. It keeps rising as the period falls.
+2. Look at the red curve. It has a peak. To the right of the peak, the CPUs sit idle. To the left, they spend time on migrations.
+3. Set both costs to 0. The three curves meet. If moves were free, you would balance all the time.
+4. Move the remote time up. The penalty uses the local and remote latencies from the [NUMA](/architecture/multicore/numa) lesson: 90 ns and 150 ns. A task runs at 60% speed until its pages follow.
+5. Turn on **Scheduling domains**. Cross-node moves fall about 4 times at the 1 ms period, and the red curve moves toward the orange curve.
+
+The two penalties are model inputs. Your real values depend on the size of the working set. A task with a small working set refills in microseconds. A task with a large working set can pay much more.
+
+## Scheduling domains
+
+The cost of a move depends on the distance. Sibling threads on a core share the L1 and L2 caches. Cores on a die usually share L3. Two sockets share nothing but the interconnect. Linux models this with a tree of **scheduling domains** (`struct sched_domain`), one tree for each CPU.
+
+| Level | CPUs in the domain | Balance |
+|---|---|---|
+| SMT | hardware threads of one core | very often, almost free |
+| MC | cores that share a last-level cache | often |
+| PKG | all cores in a socket | less often |
+| NUMA | CPUs across nodes | rarely, and only for a clear imbalance |
+
+Higher domains have longer intervals and larger thresholds. You can read the tree on Linux under `/sys/kernel/debug/sched/domains/`. Automatic NUMA balancing (`numa_balancing`) works from the other side: it moves pages toward the threads that use them.
+
+## Choosing a CPU at wake-up
+
+A wake-up happens far more often than a balance, so most placement happens here. `select_task_rq_fair()` makes this choice. **Wake-affine** logic (`wake_affine()`) decides between the CPU where the task last ran and the CPU of the task that wakes it. If a thread wakes a partner to read the data it just wrote, the waker's CPU has that data in cache. Then `select_idle_sibling()` looks for an idle CPU that shares a cache with the target.
+
+This has a failure mode too. A server thread that wakes many workers can pull them all toward one CPU. The cost plot above includes this: 5% of its wake-ups go to CPU 0, and that is why the long periods lose.
+
+## Pinning
+
+You can overrule all of this. **Affinity** is a mask of the CPUs that a thread may use.
+
+```c
+cpu_set_t set;
+CPU_ZERO(&set);
+CPU_SET(3, &set);
+sched_setaffinity(0, sizeof set, &set);    // this thread, CPU 3 only
+```
+
+From the shell, use `taskset -c 3 ./prog`. Linux also offers the `cpuset` cgroup and the `isolcpus` boot parameter, which keeps the balancer away from chosen CPUs. Pin for measurements and for latency-critical threads with their own NUMA memory. A pinned thread cannot escape a busy CPU, so careless pinning makes imbalance permanent.
+
+## SMT and heterogeneous cores
+
+**SMT** (simultaneous multithreading) shows one core as two logical CPUs. The two threads share execution units and caches, so two busy siblings do not give twice the work. The kernel prefers a fully idle core before it uses a sibling. A pair of threads that share data can gain from being siblings. A pair of unrelated hot threads usually loses.
+
+**Heterogeneous** chips (Arm big.LITTLE, Intel P-cores and E-cores) have cores of different speed. A fair share of time is then not a fair share of work. Linux gives each CPU a **capacity** value, and it scales load by that value. **Energy Aware Scheduling** then picks the CPU that costs the least energy and still has room. A task that needs more than a small core can give is a "misfit", and the balancer moves it to a big core.
+
+<Callout>
+macOS on Apple Silicon has no `sched_setaffinity` or `taskset`, and you cannot pin a thread to a chosen core. You state the purpose of the work with a **QoS class** instead: `USER_INTERACTIVE`, `USER_INITIATED`, `DEFAULT`, `UTILITY` or `BACKGROUND`. The scheduler uses it to choose between performance and efficiency cores. Background work usually stays on efficiency cores. Use `pthread_set_qos_class_self_np()` or Grand Central Dispatch queues in code, and `taskpolicy` from the shell.
+</Callout>
+
+## Connect
+
+- [NUMA](/architecture/multicore/numa) gives the memory costs behind the red curve.
+- [Cache coherence](/architecture/multicore/cache-coherence-mesi) explains why a migrated task misses and why shared data is costly.
+- [False sharing](/performance/concurrency/false-sharing) is a placement problem at the level of a cache line.
+- [CFS and EEVDF](/os/scheduling/cfs-and-eevdf) run on each per-CPU runqueue.
+- [cgroups](/os/isolation/cgroups) provide `cpuset` for placement by group.
+
+<Recall cards={[
+  { q: "What are the two main problems of a single shared run queue?", a: "Every pick takes one global lock, which limits scaling, and tasks move between CPUs often, so they lose cache affinity." },
+  { q: "What new problem do per-CPU queues create, and what fixes it?", a: "Imbalance: one CPU idles while another has a queue. Periodic load balancing and stealing by idle CPUs fix it." },
+  { q: "Why can a very short balancer period lower throughput?", a: "It moves tasks for small imbalances that would end by themselves, and each move costs cache refills and perhaps remote memory." },
+  { q: "What is a scheduling domain, and why have several levels?", a: "A group of CPUs that balance together, with SMT, core, socket and NUMA levels. A move costs more at a higher level, so higher levels balance less often and need a larger imbalance." },
+  { q: "What does wake-affine decide?", a: "It decides if a woken task goes near its waker's CPU, which may hold the shared data in cache, or stays near its previous CPU." },
+  { q: "How do you influence core choice on Apple Silicon?", a: "With a QoS class on the thread or queue. You cannot pin a thread to a core, and sched_setaffinity does not exist." },
+]} />

@@ -1,0 +1,116 @@
+---
+summary: "How a scheduler learns from history with no knowledge of burst lengths: the five MLFQ rules, priority boost, gaming and exact accounting, and the line from CTSS through BSD, Solaris, Windows and early Linux."
+---
+import { MlfqDemo, MlfqGamingDemo, BoostSweepDemo } from "@/demos/os/SchedulingMlfqDemos";
+
+[STCF](/os/scheduling/fifo-sjf-round-robin) gives short jobs good turnaround, and round-robin gives good response. STCF needs an oracle that does not exist. A **multilevel feedback queue** (MLFQ) replaces the oracle with history. It assumes that a job will behave as it has behaved so far. Corbató and his group built the first one for CTSS in 1962.
+
+An MLFQ has several ready queues, each with a priority level. A job's behavior moves it between queues, and this is the "feedback".
+
+<Predict
+  id="short-job"
+  question="At 60 ms, the job Long is in the lowest queue. At that moment a new 16 ms job arrives. The scheduler does not know its length. When does the new job finish?"
+  options={["After Long finishes, near 200 ms", "About 16 ms later: it starts at the top and preempts Long", "After a full quantum of the lowest queue, then it shares the CPU"]}
+  answer={1}
+  explain="A new job starts at the highest priority, and a higher priority always preempts. So it runs at once. Short has a turnaround of exactly 16 ms in this run. The scheduler treated it as short until it could prove otherwise."
+>
+<MlfqDemo />
+</Predict>
+
+Things to try:
+
+1. Press **Play**. Long moves down to Q1 at 10 ms and to Q2 at 36 ms. Chat runs 3 ms at a time, so it stays high for a long time. It moves to Q1 only at 56 ms, when its total use reaches the 10 ms allotment.
+2. Watch 60 ms. Short enters Q0 and preempts Long at once.
+3. Set the boost period to 50 ms. Dashed lines mark each boost. Short now has a turnaround of 45 ms, because a boost at 50 ms lifted Chat and Long to compete with it. A boost has a cost.
+4. Select **Long and two I/O jobs** and **Old 4a/4b**, with the boost off. The two I/O jobs keep Q0 busy, and Long gets almost nothing. Then turn the boost on.
+
+## The rules
+
+| Rule | Statement |
+|---|---|
+| 1 | If the priority of A is higher than the priority of B, A runs. |
+| 2 | If the priorities are equal, A and B run in round-robin with the quantum of that level. |
+| 3 | A new job enters at the highest priority. |
+| 4 | When a job uses up its allotment at a level, it moves down one level. The number of times it gave up the CPU does not matter. |
+| 5 | After each period $S$, all jobs move to the highest priority. |
+
+The **allotment** is the CPU time that a job may use at one level. This table is the final form from the book OSTEP (*Operating Systems: Three Easy Pieces*). Each rule fixes a failure of a simpler rule.
+
+The first attempt had a different rule 4. **Rule 4a**: a job that uses a whole time slice moves down. **Rule 4b**: a job that gives up the CPU before the slice ends stays at its level. This treats interactive jobs well, but it has three failures:
+
+- **Starvation.** Enough interactive jobs keep the top levels busy. A long job then gets no CPU.
+- **Gaming.** A job can yield just before its slice ends, and it stays at the top for ever.
+- **Change of behavior.** A CPU-bound job that becomes interactive stays at the bottom with no way up.
+
+Rule 5 fixes the first and the third. The new rule 4 fixes the second.
+
+## Gaming and accounting
+
+<Predict
+  id="gaming"
+  question="Under old rules 4a and 4b, a job runs 99% of each 10 ms quantum, sleeps 0.1 ms, and runs again. It competes with one CPU hog. What CPU share does it get?"
+  options={["About 50%: there are two jobs", "About 98%: it never leaves the top level", "About 66%: it gets a small advantage"]}
+  answer={1}
+  explain="Each yield clears the count, so the job never moves down. The hog runs only during the short sleeps. The gamer gets 98.0% over 1,000 ms. With rule 4, the same job gets 49.5%."
+>
+<MlfqGamingDemo />
+</Predict>
+
+1. Keep the yield point at 99%. The red curve stays near 98%, and the blue curve falls to about 50%.
+2. Read the levels. Under the old rules the gamer ends in Q0, and under rule 4 it ends in Q2.
+3. Move the yield point to 50%. With rule 4 the gamer's share falls to 34%. It uses less per turn, and it gains nothing from the yield.
+
+Rule 4 only needs one change: keep the count across yields.
+
+```rust
+fn on_cpu_stop(&mut self, job: &mut Job, ran: Duration, why: Stop) {
+    job.used_at_level += ran;                    // rule 4: yields do not clear this
+    if job.used_at_level >= self.allotment[job.level] {
+        job.level = (job.level + 1).min(self.levels - 1);
+        job.used_at_level = Duration::ZERO;
+    }
+    match why {
+        Stop::Blocked => self.waiting.push(job.id),
+        _ => self.queues[job.level].push_back(job.id),
+    }
+}
+```
+
+This also shows why accounting must be exact. Old systems charged CPU time from the timer tick: the job on the CPU at the tick paid for the whole tick. A job that sleeps just before each tick then pays nothing. Tsafrir and others showed this "cheat" attack against real systems in 2007. Linux now charges each task from a nanosecond clock when it stops or at a tick (`update_curr()`).
+
+## The boost period
+
+<BoostSweepDemo />
+
+1. Move $S$. Under the old rules, each boost gives Long one 10 ms quantum at the top. Its share is about 10 / $S$: 10% at $S$ = 100 ms.
+2. Read the last two values. With no boost, Long gets 1.1% under the old rules and 48.9% under rule 4. Rule 4 removes this starvation, because the I/O jobs also sink.
+
+$S$ has no correct value. If it is too large, long jobs starve and a job that changes its behavior waits a long time. If it is too small, interactive jobs lose their advantage. John Ousterhout called such numbers "voodoo constants": they need tuning, and nobody can derive them.
+
+## Real systems
+
+Most real schedulers in the 1980s to 2000s are variations on this idea. Quanta usually grow at lower levels, because a low level holds CPU-bound jobs that gain from fewer switches.
+
+| System | Form of MLFQ |
+|---|---|
+| **BSD Unix** | It computes priority from recent CPU use, which decays over time. A formula takes the place of a queue move, and nice values add to it. |
+| **Solaris** | Its time-sharing class has 60 levels. A table sets the quantum and the next level for each case. An administrator can change the table. |
+| **Windows NT and later** | It has 32 priority levels. Threads in the dynamic range get a boost after I/O completes, and a thread that has starved gets a boost from a kernel helper. |
+| **Linux O(1), 2.6.0 to 2.6.22** | It has 140 levels, with active and expired arrays. Heuristics guessed which tasks were interactive. |
+| **macOS (XNU)** | Timeshare threads lose priority as they use CPU and recover over time. Recent versions add the Clutch scheduler, which groups threads by application and QoS class. |
+
+Linux replaced the O(1) scheduler in 2.6.23, because its interactivity heuristics were fragile. The workloads that broke them were hard to predict and to debug. Its successor removes the guess: it does not classify tasks at all. It tracks how much CPU each task has had. The next lesson, [CFS and EEVDF](/os/scheduling/cfs-and-eevdf), explains this.
+
+## Connect
+
+- [FIFO, SJF and round-robin](/os/scheduling/fifo-sjf-round-robin) gives the two goals that MLFQ combines.
+- [Page replacement](/os/memory/page-replacement) uses the same assumption: the recent past predicts the near future.
+- [Buffer pools](/databases/storage/buffer-pools) have a similar scan problem. InnoDB's midpoint insertion makes a new page prove itself, and MLFQ does the opposite: it trusts a new job first.
+
+<Recall cards={[
+  { q: "State the five MLFQ rules.", a: "Higher priority runs. Equal priorities use round-robin. New jobs start at the top. A job moves down when it uses its allotment. Every period S, all jobs move to the top." },
+  { q: "How does MLFQ approximate SJF with no knowledge of job length?", a: "Every new job starts at the top. A short job finishes before it sinks. A long job sinks, so it soon yields to new jobs." },
+  { q: "What attack does the allotment rule stop, and how?", a: "A job that yields just before its slice ends stays at the top under rules 4a and 4b. The allotment keeps counting across yields, so the job still moves down." },
+  { q: "What two problems does the priority boost fix?", a: "Starvation of long jobs under many interactive jobs, and a CPU-bound job that later becomes interactive." },
+  { q: "Why is accounting from the timer tick unsafe?", a: "A job that sleeps just before each tick is never on the CPU at a tick, so it pays for nothing. Exact accounting uses a fine clock each time a task stops." },
+]} />

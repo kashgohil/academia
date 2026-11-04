@@ -1,0 +1,136 @@
+---
+summary: "Turnaround and response time, the convoy effect, why shortest job first is optimal, preemption and STCF, round-robin and the quantum trade-off, and how I/O-bound jobs change the picture."
+---
+import { PolicyCompareDemo, SjfOrderDemo, QuantumSweepDemo } from "@/demos/os/SchedulingClassicDemos";
+
+The **scheduler** is the kernel code that chooses which runnable thread gets a CPU next. This lesson uses a **job** as the unit of work: one thread that needs some CPU time. The policy has one decision to make, but two goals that conflict.
+
+- **Turnaround time** is $T_{finish} - T_{arrival}$. It tells how long a batch job takes.
+- **Response time** is $T_{first\,run} - T_{arrival}$. It tells how long a person waits for the first sign of life.
+
+<Predict
+  id="convoy"
+  question="Jobs A (100 ms), B (10 ms) and C (10 ms) arrive together, with A at the front of the queue. FIFO runs them in order. What is the mean turnaround time?"
+  options={["40 ms: the total work divided by the number of jobs", "110 ms: B and C wait behind A", "50 ms: the short jobs go first"]}
+  answer={1}
+  explain="A finishes at 100, B at 110 and C at 120. The mean is 110 ms. Shortest first gives 10, 20 and 120, so the mean is 50 ms. The work and the end time are the same in both cases. Only the order changes."
+>
+<PolicyCompareDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **Convoy**. FIFO has a mean turnaround of 110 ms and SJF has 50 ms. All four policies finish at 120 ms, because none of them changes the total work.
+2. Select **Short jobs arrive late**. A starts at time 0, and B and C arrive at 10 ms. SJF cannot help, because it never stops a running job: 103.3 ms. STCF stops A and gets 50 ms.
+3. Select **Equal jobs** and set the quantum to 1 ms. Round-robin has a mean response of 1 ms, against 5 ms for FIFO. Its mean turnaround is 14 ms, against 10 ms. This is the conflict in one line.
+4. Select **I/O and CPU**. Job A runs 10 ms, then waits 10 ms for I/O. FIFO leaves the CPU idle during that wait and finishes at 130 ms. STCF fills the gap with B and finishes at 100 ms.
+5. Change a job in the table. Then add a long job at time 0 and look at which column gets worse for each policy.
+
+## FIFO and the convoy effect
+
+**FIFO** (first in, first out) runs each job to completion in arrival order. It is simple and it is fair in a narrow sense. Its failure is the **convoy effect**: short jobs queue behind one long job, like cars behind a slow truck. The same effect appears at a contended lock and in a disk queue.
+
+## Why shortest first is optimal
+
+**SJF** (shortest job first) runs the shortest waiting job, and it does not preempt. When all jobs arrive together, SJF has the smallest possible mean turnaround. The proof is an exchange argument. It looks at two neighbors in any order.
+
+<Steps>
+
+Take jobs $a$ and $b$ next to each other, with $a$ first, and let $s$ be their start time. They finish at $s + a$ and $s + a + b$.
+
+Swap them. Now they finish at $s + b$ and $s + a + b$. No other job changes its finish time, because the pair takes the same total time.
+
+The sum of finish times changes by $b - a$. If $a > b$, the swap makes the sum smaller.
+
+So any order with a longer job before a shorter neighbor can be improved. The only order that cannot be improved is shortest first.
+
+</Steps>
+
+<SjfOrderDemo />
+
+1. Press **Swap** on a pair with the longer job first. The mean falls by the difference in length divided by 4.
+2. Press **Shortest first**. The mean is 30 ms, the best of all 24 orders. **Longest first** gives 51.25 ms, the worst.
+
+SJF has three problems. The kernel does not know burst lengths. A stream of short jobs **starves** a long job, so the long job never runs. And a short job that arrives just after a long job starts must still wait.
+
+## Preemption and STCF
+
+**Preemption** means that the kernel takes the CPU from a running thread. It needs a way to get control back. That way is the **timer interrupt**, which fires `CONFIG_HZ` times per second on Linux (usually 100, 250 or 1000). The handler does not switch at once. It sets the `TIF_NEED_RESCHED` flag, and the kernel calls `schedule()` at the next safe point, such as the return to user mode.
+
+**STCF** (shortest time to completion first, also called SRPT) is SJF with preemption. On each arrival, it runs the job with the least time left. Schrage proved in 1968 that this minimizes mean turnaround on one CPU for any arrival pattern. It still needs an oracle, and it still starves long jobs.
+
+## Round-robin and the quantum
+
+**Round-robin** (RR) runs each job for one **quantum** (a fixed time slice), then moves it to the back of the queue. It needs no knowledge of job length, and no job starves.
+
+For $n$ equal jobs that arrive together, the $i$-th job first runs after $i$ quanta and $i$ switches. With quantum $q$ and switch cost $c$:
+
+$$\bar{T}_{response} = \frac{(n-1)(q+c)}{2} \qquad \text{CPU lost to switches} = \frac{c}{q+c}$$
+
+Both terms use $q + c$, so a smaller quantum helps response only while $q$ is larger than $c$.
+
+<Predict
+  id="quantum"
+  question="Ten jobs of 100 ms each run under round-robin. A switch costs 1 ms. You change the quantum from 10 ms to 0.1 ms. What happens?"
+  options={["Response falls 100 times, and throughput stays almost the same", "Response falls 10 times, and throughput also falls 10 times", "Response does not change, and throughput falls 10 times"]}
+  answer={1}
+  explain="The time per turn falls from 11 ms to 1.1 ms, so response falls from 49.5 ms to 4.95 ms. The useful part of each turn falls from 10/11 to 0.1/1.1, so throughput falls from 9.1 to 0.91 jobs per second."
+>
+<QuantumSweepDemo />
+</Predict>
+
+1. Keep the 100 µs switch cost and move the marker to 10 ms. Switches use about 1% of the CPU, and the mean response is about 45 ms.
+2. Move the switch cost to 1 ms and the marker to 0.1 ms. Now 91% of the CPU goes to switches.
+3. Move the marker past 100 ms. Each job finishes in its first turn, so round-robin is FIFO. The response curve is flat there.
+4. Compare mean turnaround at 1 ms and at 100 ms with a 100 µs cost: about 1,095 ms and about 550 ms. For equal jobs, round-robin has the worst turnaround of all the policies.
+
+The switch cost here is a model input. The direct cost of a context switch is small: saved registers and a change of address space. The larger cost is often indirect, because the next job runs with cold caches and a cold TLB (the [context switching](/os/processes/context-switching) lesson measures this). So a real quantum must be much larger than the direct switch cost. Linux `SCHED_RR` uses 100 ms by default. The normal Linux scheduler uses slices of about 3 ms on a machine with 8 or more CPUs.
+
+## I/O-bound and CPU-bound jobs
+
+A **CPU-bound** job uses all the CPU it gets. An **I/O-bound** job runs for a short time and then blocks, for example in `read()`. While it waits, the kernel takes it off the runqueue, and `try_to_wake_up()` puts it back later.
+
+A good policy treats each CPU burst as a small job. This gives I/O-bound jobs a fast return to the CPU, and they soon block again. CPU-bound jobs then fill the gaps. The **I/O and CPU** preset shows the result: STCF has no idle time at all.
+
+You can see the two kinds of job from the shell. A voluntary switch means that the job blocked. An involuntary switch means that the kernel preempted it.
+
+```sh
+# Linux: GNU time, or read the counters of a live process
+/usr/bin/time -v ./prog 2>&1 | grep -i 'context switches'
+grep ctxt /proc/$PID/status      # voluntary_ctxt_switches, nonvoluntary_ctxt_switches
+
+# macOS: BSD time prints the same two counters
+/usr/bin/time -l ./prog
+```
+
+The core of round-robin is short. The hard part is what this loop assumes: a timer, a safe point for the switch, and a queue that is safe on many CPUs.
+
+```rust
+fn round_robin(ready: &mut VecDeque<Job>, quantum: u64, cpu: &mut Cpu) {
+    while let Some(mut job) = ready.pop_front() {
+        cpu.switch_to(&job);                      // costs c
+        let ran = cpu.run(&job, quantum.min(job.left));
+        job.left -= ran;
+        ready.extend(cpu.take_arrivals());        // new arrivals go first
+        if job.left == 0 { job.finish() }
+        else if job.at_io_point() { job.block() }
+        else { ready.push_back(job) }
+    }
+}
+```
+
+## Connect
+
+- [Multilevel feedback queues](/os/scheduling/multilevel-feedback-queues) approximate SJF with no oracle: they learn from history.
+- [Context switching](/os/processes/context-switching) gives the real cost behind $c$.
+- [Queueing theory](/performance/systems/queueing-theory-and-littles-law) explains how waiting time grows with load.
+- [Tail latency](/performance/systems/tail-latency) shows why the mean hides the worst waits.
+
+<Recall cards={[
+  { q: "Define turnaround time and response time.", a: "Turnaround is finish time minus arrival time. Response is first-run time minus arrival time." },
+  { q: "What is the convoy effect?", a: "Short jobs wait behind one long job under FIFO, so the mean turnaround is high although the total work is unchanged." },
+  { q: "Give the exchange argument for SJF.", a: "Swap neighbors a then b, with a longer than b. Only their finish times change, and the sum changes by b - a, which is negative. So only shortest-first order cannot be improved." },
+  { q: "What does STCF add to SJF, and what does it need?", a: "It adds preemption: on each arrival it runs the job with the least time left. It needs a timer or arrival event, and it needs to know the remaining time." },
+  { q: "For n equal jobs under round-robin, what are the mean response and the switch overhead?", a: "The mean response is (n - 1)(q + c) / 2. The overhead is c / (q + c)." },
+  { q: "Why does a good policy favor an I/O-bound job?", a: "It runs for a short time and then blocks, so it frees the CPU quickly. The device stays busy and a CPU-bound job fills the gaps." },
+]} />

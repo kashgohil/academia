@@ -1,0 +1,197 @@
+---
+summary: "Fair share and the ideal processor, nice values and the weight table, vruntime and the red-black tree, sleeper fairness, then EEVDF since Linux 6.6: lag, eligibility, virtual deadlines and slice requests. cgroup CPU shares in brief."
+---
+import { NiceRatioDemo, CfsSimDemo, SleeperDemo, CfsEevdfDemo } from "@/demos/os/SchedulingFairDemos";
+
+Think of an **ideal processor** that runs all $n$ runnable tasks at the same time, each at $1/n$ of full speed. No task ever waits, and each task always has its exact share. A real CPU runs one task at a time, so it can only approximate this. **Fair-share scheduling** keeps a count of how far each task is behind the ideal, and it runs a task that is behind.
+
+The **Completely Fair Scheduler** (CFS, Linux 2.6.23 to 6.5) did this with one number per task. **EEVDF** replaced it in Linux 6.6. Both use the same weights.
+
+## Nice values and weights
+
+A **nice value** runs from -20 to 19, and a lower value gets more CPU. The kernel maps nice to a **weight** with a fixed table. A task's CPU share is its weight divided by the sum of all runnable weights.
+
+```c
+// kernel/sched/core.c
+const int sched_prio_to_weight[40] = {
+ /* -20 */     88761,     71755,     56483,     46273,     36291,
+ /* -15 */     29154,     23254,     18705,     14949,     11916,
+ /* -10 */      9548,      7620,      6100,      4904,      3906,
+ /*  -5 */      3121,      2501,      1991,      1586,      1277,
+ /*   0 */      1024,       820,       655,       526,       423,
+ /*   5 */       335,       272,       215,       172,       137,
+ /*  10 */       110,        87,        70,        56,        45,
+ /*  15 */        36,        29,        23,        18,        15,
+};
+```
+
+Each step is a factor of about 1.25. So a share depends only on the difference of the nice values, not on the values themselves. The kernel comment gives the design goal: one nice step changes a task's CPU by about 10%. With nice 0 and nice 1, the shares are 55.5% and 44.5%. The difference between the two tasks is about 25%.
+
+<Predict
+  id="nice-five"
+  question="Two CPU-bound tasks run on one CPU, one at nice 0 and one at nice 5. What share does the nice 0 task get?"
+  options={["55%: nice 5 is a small change", "75%: five steps of 1.25 is a ratio of about 3", "99%: nice 5 is a background task"]}
+  answer={1}
+  explain="The weights are 1024 and 335, a ratio of 3.06. The shares are 75.3% and 24.7%. The extreme pair, nice -20 and nice 19, has a ratio of 5,917."
+>
+<NiceRatioDemo />
+</Predict>
+
+1. Move task A to nice 10 and task B to nice 15. The ratio is 3.06, the same as for 0 and 5: only the difference counts.
+2. Set A to -20 and B to 19. Task B gets almost nothing, but it still runs.
+3. Look at the vruntime rates. The next section uses them.
+
+## vruntime and the red-black tree
+
+The ideal processor gives each task time in proportion to its weight. So CFS scales the real run time of a task by the inverse of its weight. The result is **vruntime** (virtual runtime):
+
+$$\Delta v = \Delta t \cdot \frac{1024}{w}$$
+
+A nice 0 task has a vruntime that follows real time. A task with a higher weight has a slower clock. If every task has the same vruntime, each task has received exactly its share. So the rule is simple: **run the task with the smallest vruntime**.
+
+CFS keeps the waiting tasks in a **red-black tree** (a balanced binary search tree) ordered by vruntime. The leftmost node is the next task. The kernel caches a pointer to it (`rb_root_cached`), so the pick is O(1) and an insert is O(log n). The running task is not in the tree: `set_next_entity()` removes it, and `put_prev_entity()` inserts it again.
+
+```c
+// kernel/sched/fair.c, simplified. curr is a struct sched_entity.
+static void update_curr(struct cfs_rq *cfs_rq) {
+    u64 delta = rq_clock_task(rq_of(cfs_rq)) - curr->exec_start;
+    curr->exec_start += delta;
+    curr->sum_exec_runtime += delta;
+    curr->vruntime += calc_delta_fair(delta, curr);  // delta * 1024 / weight
+    update_min_vruntime(cfs_rq);
+}
+```
+
+The kernel avoids a division here. `sched_prio_to_wmult` holds $2^{32} / w$ for each weight (4,194,304 for nice 0), so `calc_delta_fair` multiplies and shifts.
+
+**`min_vruntime`** is a per-runqueue clock that only moves forward. It follows the smallest vruntime and gives new and waking tasks a reference point. A new task starts near it, with one virtual slice added, so that repeated `fork()` cannot take extra CPU.
+
+<Predict
+  id="cfs-rates"
+  question="A and B are at nice 0, and C is at nice 5. All three share one CPU. Whose vruntime grows fastest while it runs, and who gets the smallest CPU share?"
+  options={["A and B grow fastest, and C gets the smallest share", "C grows fastest, and C gets the smallest share", "All grow at the same rate, and C gets the smallest share"]}
+  answer={1}
+  explain="C's clock runs 3.06 times faster: it pays more virtual time per real millisecond. So it reaches the back of the line sooner and runs less often. The shares converge to 43.0%, 43.0% and 14.1%."
+>
+<CfsSimDemo />
+</Predict>
+
+1. Press **Next pick** a few times. The task with the smallest vruntime leaves the tree and runs. It stops after its slice and goes back into the tree.
+2. Press **Play**. The bars move toward the dark ticks, which are the weight shares. After 5 s of simulated time, the error is less than 0.2 of a percentage point.
+3. Add a task at nice -5. Its dot moves slowly along the number line. Its slice is long, and it dominates the Gantt chart.
+4. Press **Clear the CPU counters** after you add a task. The shares settle quickly to the new weights.
+
+### The tunables of the sysctl era
+
+CFS did not use a fixed quantum. It tried to run every task once in each **period**, and it gave each task a part of the period in proportion to its weight:
+
+$$\text{slice}_i = \text{period} \cdot \frac{w_i}{\sum w}$$
+
+| Tunable | Base | On 8 or more CPUs | Meaning |
+|---|---|---|---|
+| `sched_latency_ns` | 6 ms | 24 ms | the target period |
+| `sched_min_granularity_ns` | 0.75 ms | 3 ms | the smallest slice for an equal-weight task |
+| `sched_wakeup_granularity_ns` | 1 ms | 4 ms | how far behind a woken task must be to preempt |
+
+The kernel scales each base value by $1 + \lfloor\log_2 \text{CPUs}\rfloor$, with CPUs capped at 8. The period is the latency, until the tasks do not fit at the minimum slice. That limit is 8 tasks. On 8 or more CPUs, nine tasks stretch the period to 27 ms, and 16 tasks to 48 ms. Linux 5.13 moved these files from `/proc/sys/kernel/` to `/sys/kernel/debug/sched/`.
+
+### Sleeper fairness
+
+A task that sleeps does not advance its vruntime. If it wakes with the old value, it is far behind, and it holds the CPU until it catches up.
+
+<Predict
+  id="sleeper"
+  question="B sleeps for 200 ms while A runs alone. Then B wakes with its old vruntime, and no limit applies. How long does A wait?"
+  options={["One slice: CFS shares the CPU at all times", "About 200 ms: B must catch up with all the virtual time A used", "No time: A has the larger vruntime, so A goes first"]}
+  answer={1}
+  explain="B has the smallest vruntime until it catches up, so B keeps running. In this run B holds the CPU for 204 ms. CFS limits the credit: a woken task starts no lower than min_vruntime minus half the latency. Then B runs for only 3 ms."
+>
+<SleeperDemo />
+</Predict>
+
+1. Turn the limit off and on. The orange line climbs steeply for about 200 ms without the limit.
+2. Move the sleep time with the limit on. The longest run does not change. The credit has a fixed limit.
+
+This rule is `GENTLE_FAIR_SLEEPERS`, in `place_entity()`. It still favors a task that sleeps often, and that favor has no direct link to what the task needs. It is one reason why CFS kept growing heuristics.
+
+## EEVDF
+
+CFS has only one input: the weight. A task that needs low latency but little CPU cannot say so. A lower nice value gives it more CPU, which it does not want.
+
+**EEVDF** (Earliest Eligible Virtual Deadline First; Stoica and Abdel-Wahab, 1995) separates the two. The weight sets the share. A **slice request** sets how often the task runs. Peter Zijlstra's implementation was merged in Linux 6.6.
+
+Each task keeps its vruntime $v_i$, with the same rate as before. EEVDF adds these definitions:
+
+- $V = \sum w_i v_i / \sum w_i$ is the weighted mean vruntime. This is where the ideal processor would be (`avg_vruntime()`).
+- **Lag** is $w_i (V - v_i)$: the service that the task is owed. Positive lag means that the task is behind. The sum of all lags is zero.
+- A task is **eligible** if its lag is at least 0, that is, $v_i \le V$. A task that is ahead must wait.
+- The **virtual deadline** is $d_i = v_i + r_i \cdot 1024 / w_i$, where $r_i$ is the slice request.
+
+The rule: **among the eligible tasks, run the one with the earliest virtual deadline**. When a task uses up its request, the kernel sets a new deadline, one request ahead (`update_deadline()`).
+
+```rust
+fn pick_eevdf<'a>(rq: &'a [Entity]) -> Option<&'a Entity> {
+    let total: u64 = rq.iter().map(|e| e.weight).sum();
+    let v_avg = rq.iter().map(|e| e.weight as f64 * e.vruntime).sum::<f64>() / total as f64;
+    rq.iter()
+        .filter(|e| e.vruntime <= v_avg)                       // eligible: lag >= 0
+        .min_by(|a, b| a.deadline.total_cmp(&b.deadline))      // earliest virtual deadline
+}
+```
+
+The kernel does not scan a list. It uses an augmented red-black tree, so that the search is O(log n). Each part of the rule has a job. A short request gives an early deadline, so the task runs soon. Eligibility stops it from taking more than its share: after it runs, it is ahead of $V$, and it must wait.
+
+<Predict
+  id="eevdf"
+  question="L and three CPU hogs have equal weight. Under EEVDF, L requests a 1 ms slice, and the hogs use the 3 ms base slice. What CPU share does L get?"
+  options={["More than 25%: an early deadline means that L always wins", "25%: the same share, but in small pieces more often", "Less than 25%: short slices lose CPU time"]}
+  answer={1}
+  explain="The weights set the share, so L still gets 25%. L's longest wait falls from 18 ms under CFS to 3 ms under EEVDF. The hogs pay nothing in CPU share."
+>
+<CfsEevdfDemo />
+</Predict>
+
+1. Keep **always runnable** and read the table. Both schedulers give L about 25%. CFS makes L wait 18 ms between runs, and EEVDF makes it wait 3 ms.
+2. Move **Show virtual time at** slowly. A dot to the right of the green line is not eligible. L's short line means an early deadline.
+3. Set L's slice to 3 ms. L is now like a hog, and its wait is 9 ms. Under CFS the slider has no effect: there is no such input.
+4. Select **1 ms of work, then 7 ms asleep**. CFS wakes L at once, because L's vruntime is behind and wake preemption fires. EEVDF makes L wait 3 ms on average. It keeps L's lag across the sleep, and L slept with negative lag.
+5. Turn on **delayed dequeue**. L now wakes with zero lag, and its mean wait falls to 2 ms.
+
+Step 4 shows a real trade-off. CFS gave credit to any sleeper. EEVDF gives credit only for service that the task is owed. It saves the lag at dequeue, clamps it (`update_entity_lag()`), and restores it at wake-up (`place_entity()`). So a task cannot gain by sleeping, or escape a debt by sleeping.
+
+Linux 6.12 softened this in two ways. `DELAY_DEQUEUE` keeps a sleeping task with negative lag on the queue until its debt is gone. `PREEMPT_SHORT` lets a woken task with a shorter slice preempt the current task.
+
+### Using it
+
+The base slice is `/sys/kernel/debug/sched/base_slice_ns`. In Linux 6.6 it is 0.75 ms before the same CPU scaling, so 3 ms on 8 or more CPUs. Since Linux 6.12, a normal task can request its own slice with `sched_setattr()`. The kernel limits the value to the range 0.1 ms to 100 ms.
+
+```c
+struct sched_attr attr = { .size = sizeof attr, .sched_policy = SCHED_OTHER, .sched_runtime = 1000000 }; // 1 ms
+syscall(SYS_sched_setattr, 0, &attr, 0);
+```
+
+The model here ends a slice at its exact time. A real kernel usually notices at the next timer tick, unless `HRTICK` is on, so real waits have tick-sized noise. This is Linux only. XNU on macOS has no vruntime and no weight table. On a Mac you express latency needs with QoS classes, which [the multiprocessor lesson](/os/scheduling/multiprocessor-scheduling) describes.
+
+## cgroup CPU shares
+
+The kernel applies the same weights to groups. Each **cgroup** (a group of tasks with resource controls) has a scheduling entity on each CPU, and it competes as one task. Inside the group, its tasks share what the group gets.
+
+The interface file is `cpu.weight` (cgroup v2, default 100) or `cpu.shares` (v1, default 1024). So the share of a task is a product along the tree. Suppose that group A has 1 task and group B has 9 tasks, with equal group weights. Then the A task gets 50% and each B task gets 5.6%.
+
+This is why a container with many threads cannot crowd out a small one. `cpu.max` sets a hard limit, which is a separate mechanism. See [cgroups](/os/isolation/cgroups).
+
+## Connect
+
+- [Multilevel feedback queues](/os/scheduling/multilevel-feedback-queues) guess from behavior. CFS and EEVDF do not classify at all.
+- [Real-time scheduling](/os/scheduling/real-time-scheduling) has real deadlines. EEVDF's deadlines are only an ordering device, and it gives no guarantee.
+- [Multiprocessor scheduling](/os/scheduling/multiprocessor-scheduling) explains how each CPU's runqueue stays in balance.
+- [A simple scheduler](/os/kernel/a-simple-scheduler) builds one in a small kernel.
+
+<Recall cards={[
+  { q: "How does a nice value become a CPU share?", a: "The table sched_prio_to_weight maps nice to a weight, about 1.25 times per step. The share is the task's weight divided by the sum of runnable weights." },
+  { q: "What is the formula for vruntime, and what does CFS do with it?", a: "The increase is the real run time times 1024 divided by the weight. CFS runs the task with the smallest vruntime, the leftmost node of a red-black tree." },
+  { q: "What stops a long sleeper from holding the CPU under CFS?", a: "On wake-up, place_entity sets its vruntime to at least min_vruntime minus half the latency." },
+  { q: "Define lag and eligibility in EEVDF.", a: "Lag is w times (V - v), the service the task is owed, where V is the weighted mean vruntime. A task is eligible if its lag is at least zero." },
+  { q: "How does a shorter slice request help a task, and why does it not get more CPU?", a: "The virtual deadline is v plus r times 1024 over w, so a short request gives an earlier deadline. After it runs, v passes V, so it is not eligible until others catch up." },
+  { q: "Two groups have equal cpu.weight. One has 1 task and one has 9. What does each task get?", a: "The single task gets 50%. Each of the 9 tasks gets 1/18, about 5.6%." },
+]} />

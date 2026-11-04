@@ -92,7 +92,8 @@ function Table({ run }: { run: Run }) {
               return (
                 <tr key={k} style={{ background: weak ? "var(--accent-soft)" : undefined }}>
                   <td style={{ padding: "4px 6px", fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12 }}>
-                    {k}
+                    {k.split(" · ")[0]}
+                    {k.includes(" · ") && <div style={{ color: "var(--muted)", fontSize: 11 }}>{k.split(" · ").slice(1).join(" · ")}</div>}
                     {c?.racy && !c.clean && <span className="tag" style={{ marginLeft: 6, borderColor: "var(--c4)", color: "var(--c4)" }}>race</span>}
                   </td>
                   {MODELS.map((m) => (

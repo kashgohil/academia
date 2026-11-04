@@ -1,0 +1,71 @@
+---
+summary: How private caches agree on one value per address, what the M, E, S and I states buy, and why false sharing is so expensive.
+---
+import { CoherenceDemo, CoherenceWorkloadsDemo } from "@/demos/CoherenceDemos";
+
+Each core has its own L1 and L2. If two cores cache the same line and one writes it, the other's copy is stale. A **coherence protocol** keeps that from being observable. It maintains two invariants (Sorin, Hill and Wood's *Primer on Memory Consistency and Cache Coherence*):
+
+- **Single writer, multiple readers (SWMR)**: at any moment, a line is either writable by exactly one core, or readable by any number of cores, never both.
+- **Data value**: a read returns the value of the last write to that line.
+
+Every cache line carries a state, and cores keep the invariants by broadcasting requests on a shared bus that every other cache **snoops**.
+
+<Predict
+  id="mesi"
+  question="A core reads a line that no other core has, then writes it. How many bus transactions does that take under MSI, and under MESI?"
+  options={["2 and 2", "2 and 1", "1 and 1"]}
+  answer={1}
+  explain="MSI loads the line as Shared, so the write needs a second transaction to invalidate other copies, even though none exist. MESI loads it as Exclusive when nobody else has it, and the write upgrades E → M silently. Most data is private, so this saving is everywhere."
+>
+<CoherenceDemo />
+</Predict>
+
+Things to try:
+
+1. **Read, then write (one core)** under MSI vs MESI: 2 bus transactions vs 1.
+2. **Producer → consumer ×2** under MESI vs MOESI. MESI writes the dirty line back to memory every time a consumer reads it; MOESI keeps it dirty in the producer as **Owned** and supplies it cache-to-cache. Watch the memory row: "stale" means memory is out of date, which is allowed while some cache owns the line.
+3. **Everyone reads, one writes**: the write invalidates every other copy at once.
+4. **Ping-pong writes**: each write by a different core moves the line and invalidates the other copy. This is what a contended atomic or a shared counter costs.
+
+## The states
+
+| State | Meaning | Can read | Can write | Memory up to date |
+|---|---|---|---|---|
+| **M**odified | only copy, dirty | yes | yes | no |
+| **O**wned (MOESI) | dirty, but others may hold S copies; this cache answers requests | yes | no | no |
+| **E**xclusive (MESI) | only copy, clean | yes | yes, silently → M | yes |
+| **S**hared | one of possibly many clean copies | yes | needs upgrade | yes (or an O holds it) |
+| **I**nvalid | not present | no | no | — |
+
+The transactions: **BusRd** (read miss: get a shared copy), **BusRdX** (write miss: get the line and invalidate everyone), **BusUpgr** (write hit in S: invalidate the others, no data needed), and **writebacks** of dirty lines. Real CPUs add variants: Intel's **MESIF** designates one sharer as the **F**orwarder that answers requests; AMD's MOESI shares dirty data without writing it back.
+
+## Protocols on real workloads
+
+<CoherenceWorkloadsDemo />
+
+- **Private read-then-write**: MESI halves the bus traffic.
+- **Producer → consumers**: MOESI cuts memory writes from 8 to 0.
+- **False sharing** vs **padded counters**: 63 vs 4 bus transactions, and about 3.6× the cycles for the same work.
+
+## False sharing
+
+Coherence works on whole lines, not variables. Two threads updating *different* variables that share a 64-byte line make that line ping-pong between cores, exactly like a contended shared variable. Typical sources: per-thread counters in an array, a lock next to the data it protects, or fields of one struct written by different threads.
+
+```rust
+#[repr(align(128))]   // crossbeam's CachePadded uses 128 on x86-64: adjacent-line prefetch pairs lines
+struct PerThread { count: AtomicU64 }
+```
+
+```zig
+const PerThread = struct { count: std.atomic.Value(u64) align(std.atomic.cache_line) };
+```
+
+C++17 has `std::hardware_destructive_interference_size` for this. `perf c2c` on Linux finds false sharing by reporting cache lines with heavy cross-core "HITM" (hit-modified) traffic.
+
+<Recall cards={[
+  { q: "The two coherence invariants?", a: "Single-writer/multiple-reader per line, and every read returns the last written value." },
+  { q: "What does MESI's E state save over MSI?", a: "A private line loaded as E can be written silently (E → M) with no upgrade transaction." },
+  { q: "What does MOESI's O state save?", a: "Dirty lines can be shared cache-to-cache without writing them back to memory first." },
+  { q: "BusRd vs BusRdX vs BusUpgr?", a: "BusRd: read miss, get a shared copy. BusRdX: write miss, get data and invalidate others. BusUpgr: write hit in S, invalidate others without fetching data." },
+  { q: "What is false sharing, and the fix?", a: "Different variables written by different cores share a cache line, which ping-pongs between them. Fix: pad or align each to its own line (often 128 bytes)." },
+]} />

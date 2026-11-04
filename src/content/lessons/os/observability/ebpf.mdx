@@ -1,0 +1,224 @@
+---
+summary: "How eBPF runs user code safely in the kernel: the bytecode, a verifier that walks each path with register types and ranges, the JIT, maps, helpers, attach points, CO-RE, and the contrast with kernel modules."
+---
+import { BpfVerifierDemo, LatencyHistogramDemo } from "@/demos/os/ObservabilityBpfDemos";
+
+Suppose you want a latency histogram of a kernel function that runs a million times per second. [strace](/os/observability/ptrace-and-strace) is too slow. Sending each event to user space from a [tracepoint](/os/observability/tracepoints-and-ftrace) moves too much data. The best place to compute the histogram is in the kernel itself.
+
+A **kernel module** can do this, but one bad pointer panics the machine. **eBPF** takes a different approach. You write a small program for a simple virtual machine. The kernel proves that the program is safe before it runs. The proof is the central idea, and this lesson spends most of its time there.
+
+## The machine
+
+A program has 64-bit instructions on 11 registers. A real encoding is 8 bytes: an opcode, two 4-bit register numbers, a 16-bit offset, and a 32-bit immediate.
+
+| Register | Use | x86-64 register after the JIT |
+|---|---|---|
+| `r0` | Return value | `rax` |
+| `r1` to `r5` | Arguments. A call destroys them. | `rdi rsi rdx rcx r8` |
+| `r6` to `r9` | Saved over calls | `rbx r13 r14 r15` |
+| `r10` | Read-only frame pointer | `rbp` |
+
+The stack has 512 bytes. At entry, `r1` holds a pointer to the **context**, and `r10` points to the top of the stack. No other register has a value. After the JIT, `r1` to `r5` are the first five argument registers of the C convention on x86-64. So a helper call is a direct call with almost no cost.
+
+```text
+b7 00 00 00 00 00 00 00    r0 = 0
+95 00 00 00 00 00 00 00    exit
+07 01 00 00 f8 ff ff ff    r1 += -8
+7b 1a f8 ff 00 00 00 00    *(u64 *)(r10 - 8) = r1
+85 00 00 00 01 00 00 00    call map_lookup_elem
+```
+
+## The verifier
+
+The demo holds a real verifier and a real interpreter for a subset of eBPF. The bytes are real encodings. Pick a program, step through the walk, and watch what the verifier knows about each register. You can also edit the source.
+
+<Predict
+  id="xminusx"
+  question="A program sets r7 = r6, and then r7 -= r6. So r7 is always 0. It then adds r7 to a pointer into a map value, and it reads a byte. Before this, r6 was limited to [0, 7]. What does the verifier do?"
+  options={[
+    "It accepts the program, because r7 is always 0",
+    "It rejects the program, because it computes r7 as a range from -7 to 7",
+    "It accepts the program, but it adds a check at run time",
+  ]}
+  answer={1}
+  explain="The verifier tracks a range for each register, and not the relation between registers. [0, 7] minus [0, 7] is [-7, 7]. A negative index could read before the value, so the load fails. Select 'x - x is always 0' to see it. The interpreter shows that this program never does anything wrong at run time."
+>
+<BpfVerifierDemo />
+</Predict>
+
+Things to try:
+
+1. Step through **Index a value, with a mask**. After `r6 &= 63`, the register has the range [0, 63]. The value has 64 bytes, so the verifier accepts the read. It processes 14 instructions.
+2. Select **Off by one in the bound**. The check is `r6 > 64`, so index 64 is possible. The rejection is `invalid access to map value, value_size=64 off=64 size=1`. Set the run input to 64 and read the result of the run.
+3. Select **No null check**. A lookup returns `map_value_or_null`. Add a check with **Edit the source**, and watch the type change on one path.
+4. Select **Bounded loop with a range**. The walk does 7 forks and prunes 7 paths. Watch the range of `r2` narrow at each pass. Then select **Older: no loops**, and read the rejection.
+5. Select **An endless loop with an unknown value**. The second state at the loop head repeats, so the walk stops with `infinite loop detected`.
+6. Select **A long loop**. This program is correct, and the walk reaches its limit after 20,001 instructions.
+
+### Pass 1: control flow
+
+The first pass does not look at values. It treats the program as a graph. It refuses a jump out of the program, a last instruction that can fall through, and unreachable code. It also finds back-edges, which are jumps to an earlier point on the same path. Before Linux 5.3, any back-edge was an error, so programs could not have loops at all.
+
+### Pass 2: walk each path
+
+The second pass is an **abstract interpreter**. It runs the program with a description of each register in place of a value. `do_check` in `kernel/bpf/verifier.c` holds this loop.
+
+Each register has a **type**: a scalar, a pointer to the context, the stack, a map value, or a packet, and a few others. A pointer type comes with a known offset. A value with no type cannot be read, so old kernel data never reaches a program.
+
+A scalar has three descriptions, and each one narrows the others:
+
+- **Unsigned bounds**, `umin` and `umax`.
+- **Signed bounds**, `smin` and `smax`.
+- A **tnum**, or tristate number: each bit is 0, 1 or unknown. `r6 &= 63` makes all upper bits known to be 0.
+
+At a conditional jump, the verifier can often prove the answer, and then it walks one side. If it cannot, it **forks**. It saves one path for later, and each path learns from the condition. This is the source of the range in `if r6 > 63 goto out`: on the fall-through path, `umax` is 63.
+
+```text
+r6 = *(u64 *)(r1 + 112)    r6 is unknown
+r6 &= 63                   r6 is [0, 63], tnum (0x0; 0x3f)
+r0 += r6                   r0 is map_value, off=0, plus [0, 63]
+r1 = *(u8 *)(r0 + 0)       63 + 1 <= 64, so this is safe
+```
+
+The checks at each load and store depend on the type:
+
+| Pointer | The verifier requires |
+|---|---|
+| Stack | A constant offset inside 512 bytes, aligned, and bytes that have a value. |
+| Map value | Lowest and highest offset inside `value_size`. |
+| Map value or null | Nothing is allowed until a null check. |
+| Packet | The offset is below a range that a compare with `data_end` proved. |
+| Context | A field that this program type may read. |
+| Scalar | Nothing. A number is never a pointer. |
+
+The check on `data_end` shows how much the verifier learns from a compare. After `r4 = r2; r4 += 14; if r4 > r3 goto pass`, the fall-through path knows that 14 bytes are safe. It marks this on all registers with the same packet pointer.
+
+### Pruning and loops
+
+A walk of each path is exponential, so the verifier saves states at jump targets. If the current state is contained in a saved state that is proved safe, this path is safe too, and the walk stops here. This is **pruning**. Registers with wider ranges contain registers with narrower ones, so a safe wide state covers a narrow one.
+
+A state on the current path is different, because its proof is not finished. If the walk reaches a jump target with the same state as an earlier one on the same path, it has made no progress. So a real run may not either, and the verifier rejects the program.
+
+Linux limits a load to 1 million processed instructions. This also limits the length of any run. A run follows one path through a finite graph of states, so it cannot take more steps than the walk took. The tests in this project check that bound at random.
+
+A bounded loop is valid since Linux 5.3, because the walk simply runs it, one pass at a time. So a long loop is too costly even if it is correct. The `bpf_loop` helper takes a callback that the verifier checks once.
+
+### Why it rejects correct programs
+
+The verifier proves a safe subset of programs, and no such tool can be exact. So some correct programs fail. The demo has 3 of them:
+
+- **x − x.** Ranges do not hold a relation between registers.
+- **An index with `%`.** This verifier has no range for `%`, so the result is unknown. Many kernels have had the same gap. A mask is the usual fix.
+- **A long loop.** The walk reaches its limit.
+
+There are also unsafe programs that look fine. Of the presets, 20 are unsafe, and the verifier rejects each one for a stated reason. Compilers cause a further problem: an optimizer can move a bound check away from the register that uses it. This is why real eBPF programs sometimes need odd-looking code to pass.
+
+A real verifier has more than this subset. It also tracks BPF-to-BPF calls, spin locks, and references that must be released, and it adds speculation barriers against Spectre. Verifier bugs have been real security holes, so many systems turn off unprivileged use with `kernel.unprivileged_bpf_disabled`.
+
+## JIT, maps and helpers
+
+After the proof, the kernel translates the bytecode to machine code. On x86-64 and arm64, the **JIT** is on by default in most builds. Each instruction becomes one or a few native instructions, so the program runs near native speed. `bpftool prog dump jited` shows the result.
+
+A **map** is a data structure in the kernel that both programs and user space can reach. A program gets a pointer to a value and uses it directly. There are hash maps, arrays, per-CPU versions of both, LRU maps, and a ring buffer. A **helper** is a kernel function with a fixed interface, such as `bpf_map_lookup_elem`. The verifier checks each argument against the type that the helper declares. A call destroys `r1` to `r5`, so the verifier marks them as having no value.
+
+<Predict
+  id="bytes"
+  question="An event fires 100,000 times per second, and each event record is 32 bytes. A tool reads a 64-bucket histogram from a map once per second. How do the bytes per second compare with sending each event to user space?"
+  options={[
+    "About 10 times less",
+    "About 100 times less",
+    "About 6,000 times less",
+  ]}
+  answer={2}
+  explain="Shipping moves 3.2 MB per second. The map has 64 buckets of 8 bytes, so one read moves 512 bytes. The ratio is 6,250. The answer has the same histogram, because the program computes the same bucket in the kernel."
+>
+<LatencyHistogramDemo />
+</Predict>
+
+Things to try:
+
+1. Read the check under the histogram. The real program ran once for each of the 400 events, and all 64 buckets match. It used about 36 instructions per event.
+2. Move the event rate. The cost of shipping grows with the rate. The cost of the map stays flat, because it depends only on how often you read.
+3. Compare the CPU figures. At 100,000 events per second, this model gives 2.3% for shipping and 0.6% for the map.
+4. Raise the rate to 10 million. Shipping needs 320 MB per second and more than two full CPUs, so a real tool would lose events.
+
+The cost is that you must decide the question in advance. A histogram cannot tell you which request was slow. Many tools do both: they aggregate most events, and they ship the rare slow ones.
+
+## Attach points
+
+| Attach point | Runs at | Common use |
+|---|---|---|
+| kprobe, kretprobe | Entry or return of almost any kernel function | Tracing, with no stable interface |
+| fentry, fexit | The same place, through an ftrace-style trampoline | Tracing, at lower cost |
+| tracepoint | A static tracepoint | Stable tracing |
+| perf_event | A sample interrupt | Profilers |
+| XDP | In the network driver, before the kernel allocates an `sk_buff` | Fast packet drop and load balancing |
+| tc | The traffic control layer, with an `sk_buff` | Container networking |
+| LSM | Security hooks | Security policy |
+| uprobe | A user-space function | Tracing of applications |
+
+[seccomp](/os/isolation/seccomp-and-sandboxing) filters use the older classic BPF, not eBPF, and they have a much smaller instruction set.
+
+## CO-RE and BTF
+
+A tracing program reads kernel structures, and their layout changes across versions and configurations. In the past, tools such as bcc compiled the program on the target machine, against its headers. That needs a compiler and headers on each machine.
+
+**BTF** (BPF Type Format) is compact type data about the kernel. Most distributions ship it in `/sys/kernel/btf/vmlinux`. **CO-RE** (Compile Once, Run Everywhere) uses it. The compiler records each field access by name, and at load time `libbpf` looks up the real offset for this kernel and fixes the instruction.
+
+```c
+SEC("kprobe/vfs_read")
+int count_reads(struct pt_regs *ctx) {
+    struct task_struct *t = (void *)bpf_get_current_task();
+    u32 pid = BPF_CORE_READ(t, tgid);       // the field offset is fixed at load
+    u64 one = 1, *v = bpf_map_lookup_elem(&counts, &pid);
+    if (!v) { bpf_map_update_elem(&counts, &pid, &one, BPF_ANY); return 0; }
+    __sync_fetch_and_add(v, 1);             // the null check above is required
+    return 0;
+}
+```
+
+## Tools and real uses
+
+**bpftrace** is a small language for one-line tools. **bcc** is a set of ready tools, such as `execsnoop`, `opensnoop` and `biolatency`. Rust has `aya` and Go has `cilium/ebpf` for writing your own loaders.
+
+```bash
+bpftrace -e 'kretprobe:vfs_read { @bytes = hist(retval); }'
+bpftrace -e 'tracepoint:syscalls:sys_enter_openat { printf("%s %s\n", comm, str(args->filename)); }'
+```
+
+**Cilium** does Kubernetes networking and load balancing with XDP and tc programs, and it can replace the iptables rules of `kube-proxy`. **Katran**, from Meta, is an XDP load balancer. Continuous profilers such as Parca use a `perf_event` program that walks stacks in the kernel. Each of these depends on the same property: the program cannot crash the host, and you can load it with no reboot.
+
+## eBPF against kernel modules
+
+| | Kernel module | eBPF program |
+|---|---|---|
+| Can do | Anything | Only what its type, its helpers and the verifier allow |
+| A bug | Can panic the machine or corrupt memory | Rejected at load, except for verifier or helper bugs |
+| Loops | Any | Must be proved to end |
+| Portability | Built for one kernel version | CO-RE works across versions |
+| Access | Any kernel symbol | Helpers and kfuncs |
+| Failure | At run time, on your server | At load time, with a message |
+
+A module is still the only choice for much work, such as a new device driver or file system. Use eBPF for small programs at defined hooks.
+
+<Callout title="On macOS">
+macOS has no eBPF. DTrace has the same basic idea: a small virtual machine in the kernel, with safety checks and no general loops, and aggregations in the kernel. System Integrity Protection limits it. You can run the verifier on this page anywhere. To try real eBPF on a Mac, use a Linux virtual machine.
+</Callout>
+
+## Connect
+
+- [Tracepoints and ftrace](/os/observability/tracepoints-and-ftrace): the hooks and the ring buffers under these programs.
+- [ptrace and strace](/os/observability/ptrace-and-strace): the slow alternative that eBPF replaces in production.
+- [seccomp and sandboxing](/os/isolation/seccomp-and-sandboxing): the classic BPF filter at system call entry.
+- [Device drivers](/os/io/device-drivers): XDP runs here, and modules are still needed here.
+- [Flame graphs](/performance/measurement/flame-graphs): many eBPF profilers produce these.
+
+<Recall cards={[
+  { q: "What do r0, r1 to r5, r6 to r9 and r10 do in eBPF?", a: "The register r0 holds the return value. Registers r1 to r5 hold arguments, and a call destroys them. Registers r6 to r9 survive calls. The register r10 is the read-only frame pointer." },
+  { q: "What three descriptions does the verifier keep for a scalar?", a: "Unsigned bounds, signed bounds, and a tnum, in which each bit is 0, 1 or unknown." },
+  { q: "Why must a program check the result of bpf_map_lookup_elem?", a: "The type is map_value_or_null. All access is refused until a compare with 0 splits it into a map value and a zero." },
+  { q: "How does the verifier accept a loop since Linux 5.3?", a: "It walks the loop pass by pass. The state must change, because a repeat of the same state on the path is an infinite loop. The walk must also fit in the limit of 1 million instructions." },
+  { q: "When can a saved state prune the current path?", a: "When the saved state is proved safe and contains the current state: each range is inside the saved range, and types match." },
+  { q: "Give two correct programs that the verifier can reject, and the reason.", a: "x - x used as an index, because ranges do not hold relations. A very long loop, because the walk reaches its limit." },
+  { q: "What do BTF and CO-RE solve?", a: "Kernel structures change across versions. BTF describes the running kernel, and libbpf fixes field offsets at load, so one binary runs on many kernels." },
+]} />

@@ -1,0 +1,219 @@
+---
+summary: "How the kernel observes itself at low cost: static keys, tracepoints, kprobes and uprobes, nop sleds patched at runtime by ftrace, per-CPU ring buffers, and perf with sampling against tracing."
+---
+import { FunctionPatchDemo, RingBufferDemo, RingLossDemo, SamplingVsTracingDemo } from "@/demos/os/ObservabilityFtraceDemos";
+
+[ptrace](/os/observability/ptrace-and-strace) stops a program and asks another process to look at it. Kernel tracing takes the opposite approach. The code that records an event runs in the kernel, on the same CPU, with no switch. It writes a small record to a buffer, and it continues.
+
+The hard problem is the cost when nobody traces. A real kernel function can run millions of times per second. A test of a flag in each one would cost too much to leave in a production build. So Linux leaves almost nothing there, and it rewrites its own code when you ask for a trace.
+
+<Predict
+  id="off"
+  question="The ftrace function tracer can trace almost each function in the kernel. It is off now. What does each traceable function pay on each call?"
+  options={[
+    "One load and one branch on a global flag",
+    "One 5-byte nop",
+    "Nothing: the build removes the code, and a traced build is a different kernel",
+  ]}
+  answer={1}
+  explain="The compiler emits a call at the start of each function. At boot, the kernel replaces each call with a 5-byte nop. A distribution kernel has this code, so you can trace a production machine with no reboot."
+>
+<FunctionPatchDemo />
+</Predict>
+
+Things to try:
+
+1. Step through the first two frames. The compiler output is `e8` and an offset. At boot it becomes `0f 1f 44 00 00`.
+2. Step through **Turn on**. There are three writes. The first byte is `cc` during the change, so a CPU never decodes a half-written instruction.
+3. Select **byte by byte**. Between the first and the last write, three of the states are bytes from neither version. A CPU that fetches at that moment jumps to a wrong address.
+4. Compare the costs. In this model, a call costs 0.25 ns when off and 102 ns with the function tracer. At 5 million calls per second, that is 0.125% against 51% of one CPU.
+5. Select **function_graph**. The cost is 232 ns per call. At that rate, one CPU cannot keep up, so filter before you use it.
+
+## Static and dynamic probes
+
+| | Tracepoint | kprobe | uprobe |
+|---|---|---|---|
+| Where | A fixed place that a developer chose | Almost any kernel instruction | An instruction in a user program |
+| Set by | `TRACE_EVENT` in the source | A patch at runtime | A patch at runtime |
+| Off | One nop (static key) | The original code | The original code |
+| On, in the model | 110 ns | 350 ns | 1500 ns |
+| Stable | Mostly: a name and fields | No: it depends on the build | Only as stable as the program |
+
+A **tracepoint** is a named place in the source, such as `sched_switch`. Its fields are listed in a `format` file, so tools can parse them. It is the best choice if one exists at the right place.
+
+A **kprobe** can go where no tracepoint exists. It saves the first byte of the instruction and writes `int3`, as a debugger does. The trap handler then runs your probe. At a function entry, it can use the ftrace site in place of `int3`. A function can be inlined or renamed in the next kernel, so a kprobe can break after an update. Some functions are on a blocklist, because a probe in them could recurse.
+
+A **uprobe** writes `int3` in the code of a user program. Each hit traps into the kernel, so it costs much more than a kprobe at a function entry. These costs are model inputs. The order is what matters.
+
+```bash
+cd /sys/kernel/tracing
+echo 'p:myopen do_sys_openat2 dfd=%di' >> kprobe_events
+echo 1 > events/kprobes/myopen/enable
+cat trace_pipe
+```
+
+## Static keys
+
+A **static key** is a branch that the kernel rewrites. In the normal state it is a nop, so the slow path has no cost at all, not even a predicted branch.
+
+```c
+DEFINE_STATIC_KEY_FALSE(tracing_key);
+
+void hot_path(void) {
+    if (static_branch_unlikely(&tracing_key))   // a nop until the key is enabled
+        record_event();
+    do_work();
+}
+// static_branch_enable(&tracing_key) rewrites the nop into a jmp.
+```
+
+The compiler places `record_event` out of line, and a table in the `__jump_table` section lists each site. `static_branch_enable` walks the table and patches each site. The enable is slow, because it must synchronize all CPUs. That is the correct trade: reads are constant, and writes are very rare. A tracepoint is a static key, an out-of-line call, and a list of probes.
+
+## The function tracer
+
+The build compiles the kernel with `-pg -mfentry`, so each traceable function starts with `call __fentry__`. A build step records each address in the `__mcount_loc` section. Before `-mfentry`, the call was to `mcount`, and it came after the function set up its stack frame. The first instruction is better, because the arguments are still in their registers.
+
+At boot, the kernel changes each site to a nop. When you set a tracer, it patches the selected sites to call a trampoline such as `ftrace_caller`. The trampoline saves the argument registers and calls the tracer.
+
+The write is the difficult part. Other CPUs run this code during the change, and 5 bytes are not one atomic write. So x86 uses `text_poke_bp`:
+
+1. Write `int3` on the first byte, and sync all CPUs with an interrupt.
+2. Write the other 4 bytes, and sync all CPUs. No CPU can decode them, because each CPU stops at the `int3`.
+3. Write the first byte of the new instruction, and sync all CPUs.
+
+A CPU that hits the `int3` during the change goes to a handler. The handler emulates the instruction, and the CPU continues. The demo shows why each order other than this one fails.
+
+On arm64, each instruction is 4 bytes, and an aligned write of one instruction is atomic. So the build reserves nops with `-fpatchable-function-entry`, and the patch is simpler.
+
+**function_graph** also records the return. At entry it replaces the return address on the stack with `return_to_handler`, and it keeps the real address on a separate stack for this thread. So the tracer sees both ends, and it can print a call tree with times. It has more cost for each call, and a stack unwinder must know about the swap.
+
+```bash
+cd /sys/kernel/tracing
+cat available_tracers                 # function_graph function nop ...
+echo vfs_read > set_graph_function    # only this function and its callees
+echo function_graph > current_tracer
+head -30 trace
+echo nop > current_tracer             # the sites become nops again
+```
+
+`trace-cmd` wraps these files, so you do not have to write to them yourself:
+
+```bash
+trace-cmd record -p function_graph -g vfs_read -- ls
+trace-cmd report
+```
+
+Filter first. With a filter, only the selected sites are patched, and all other functions keep their nop.
+
+## The ring buffer
+
+<Predict
+  id="lost"
+  question="A CPU writes events faster than the reader takes them, and the buffer is full. By default, ftrace uses overwrite mode. What does the reader see?"
+  options={[
+    "The writer waits for the reader, so nothing is lost",
+    "The newest events are gone, and the old ones are all there",
+    "The oldest events are gone, whole pages at a time, and the reader sees a count of them",
+  ]}
+  answer={2}
+  explain="A tracer must not block the code that it observes, so the writer never waits. In overwrite mode, the writer moves the head on and loses the oldest page. A count of the lost events appears in trace_pipe. This keeps the most recent history, which is often the part that you want after a failure."
+>
+<RingBufferDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Burst 10, CPU 0** three times. The ring fills up, and then **head** moves as whole pages go. CPU 1 does not change, because each CPU has its own ring.
+2. Click **Read 1**. The reader takes a whole page out of the ring by a swap with its spare page, and it reports `[LOST n EVENTS]`.
+3. Select **drop the newest**, and repeat. Now the old events stay, and new ones are counted as dropped.
+4. Press **Play** with the writer faster than the reader. Watch the identity at the bottom hold at each moment.
+
+Each CPU has its own ring, so a writer needs no lock against other CPUs. It only needs protection from interrupts on its own CPU, and it uses atomic operations for that. A reader never reads in the ring. It swaps a spare page with the head page, so writers keep going. `trace_pipe` merges the CPUs by timestamp.
+
+<RingLossDemo />
+
+Things to try:
+
+1. Start with the defaults: 1 million events per second, a reader at 300,000 per second, and 1408 KiB. The buffer holds 44,704 events of 32 bytes. It fills in 63.9 ms, and 65.5% of the events in a 1-second burst are lost.
+2. Move the buffer up to 16 times the size. It holds 715,264 events. The same burst now loses nothing.
+3. Compare a short burst with a long one. A larger buffer helps with a burst. It cannot help if the reader is slower on average, because it only delays the loss.
+
+The formula is simple: lost = (write rate − read rate) × time − capacity. The tests compare it with a run of the real ring.
+
+| File in `/sys/kernel/tracing` | Purpose |
+|---|---|
+| `current_tracer` | `function`, `function_graph`, `nop` and others. |
+| `set_ftrace_filter` | Functions to patch. |
+| `tracing_on` | Stop recording, and keep the sites patched. |
+| `trace`, `trace_pipe` | Read a snapshot, or read and consume. |
+| `buffer_size_kb` | The size per CPU. |
+| `options/overwrite` | 1 overwrites the oldest, and 0 drops the newest. |
+| `per_cpu/cpu0/stats` | Counts for one CPU, with `overrun` for lost events. |
+| `events/sched/sched_switch/enable` | Turn on one tracepoint. |
+
+## perf and perf_events
+
+`perf_event_open` is the system call behind `perf`. One event can **count**, as in `perf stat`, with almost no cost. It can also **sample**: the kernel takes an interrupt each N events and writes a record. The tool maps this ring buffer into its own memory. The [hardware counters](/performance/measurement/hardware-performance-counters) lesson covers what to count. An event can also be a tracepoint, so one tool does both jobs.
+
+```bash
+perf record -F 99 -a -g -- sleep 10          # sample all CPUs at 99 Hz
+perf stat -e sched:sched_switch -a -- sleep 5 # count a tracepoint
+perf trace -s ./app                          # like strace, with no ptrace stops
+```
+
+## Sampling against tracing
+
+The [profilers](/performance/measurement/profilers) lesson shows how a sampler estimates time, and [flame graphs](/performance/measurement/flame-graphs) show how to read the result. This section is about what a sampler cannot see.
+
+<Predict
+  id="rare"
+  question="A function runs once per second, and each run takes 2 ms. A sampler runs at 99 Hz for 60 seconds. How many of the 60 runs get at least one sample?"
+  options={[
+    "All of them, because 99 Hz is much faster than one per second",
+    "About 1 in 5",
+    "Almost none",
+  ]}
+  answer={1}
+  explain="Samples are about 10.1 ms apart, and a 2 ms run covers about 19.8% of that gap. So each run has a 19.8% chance. The time share is still correct on average. But you cannot read the length or the count of a run from the samples."
+>
+<SamplingVsTracingDemo />
+</Predict>
+
+Things to try:
+
+1. With the defaults, this run has 69 events and 17 of them get a sample. The formula predicts 19.8% for each event.
+2. Set the length to 200 µs and the rate to 0.1 per second. The run can have only a few events, and each has a 1.98% chance. The chance to miss all 6 is 88.7%. A sampler is blind to this event.
+3. Turn on **an exact timer**, with 100 per second and 1 ms. The true share is 10%. Select **100 Hz**. The sampler stays in step with the timer, and it reports 0%. With another phase it reports 100%.
+4. Keep the timer, and select **99 Hz**. It reports 9.6%. This is why people use 99 and not 100.
+5. Raise the rate to 1000 per second. The tracer now records far more data than the sampler. At 200 ns per event, one million events per second takes 20% of one CPU. A 99 Hz sampler at 5 µs per sample takes about 0.05%.
+
+| Question | Use |
+|---|---|
+| Where does CPU time go? | Sampling. |
+| How long did this rare event take? | Tracing. |
+| What is the distribution of latency? | Tracing, with aggregation in the kernel. |
+| How many times did this run? | Tracing or a counter. |
+| Why did this one request stall? | Tracing, often of scheduler events. |
+
+A CPU sampler also does not see time off the CPU. A thread that sleeps gets no samples, so scheduler tracepoints give that answer. If the rate is too high to record each event, use [eBPF](/os/observability/ebpf).
+
+<Callout title="On macOS">
+None of `/sys/kernel/tracing`, ftrace, `perf` or kprobes exist on macOS. Instruments and `sample` do profiling there, and the `os_signpost` API gives your own static trace points in user code. DTrace has a function boundary provider, and System Integrity Protection limits it.
+</Callout>
+
+## Connect
+
+- [ptrace and strace](/os/observability/ptrace-and-strace): the same `int3` idea, with a much higher cost per hit.
+- [eBPF](/os/observability/ebpf): run your own safe code at a tracepoint or kprobe.
+- [Read-copy-update](/os/sync/read-copy-update): how a probe list can change while CPUs read it.
+- [Interrupts](/os/io/interrupts): the sync step sends an interrupt to each CPU.
+- [Profilers](/performance/measurement/profilers): the statistics of samples.
+
+<Recall cards={[
+  { q: "What does a static key cost on the hot path when it is off?", a: "One nop. There is no load and no conditional branch, because the kernel rewrites the code to enable it." },
+  { q: "Give the three writes of text_poke_bp, in order.", a: "int3 on the first byte, then the other four bytes, then the first byte of the new instruction. All CPUs sync after each write." },
+  { q: "Why is fentry better than mcount?", a: "It is the first instruction of the function, before the stack frame exists, so the arguments are still in their registers." },
+  { q: "What does function_graph change to see the return of a function?", a: "It replaces the return address with return_to_handler, and it keeps the real address on a separate stack." },
+  { q: "Why does each CPU have its own ring buffer?", a: "A writer needs no lock against other CPUs, and the writer never waits. A burst on one CPU also cannot erase the history of another." },
+  { q: "Why is the default perf rate 99 Hz in many examples, and not 100 Hz?", a: "A sampler at 100 Hz can stay in step with a 100 Hz timer. It then sees the timer work always or never. 99 Hz drifts across it." },
+]} />

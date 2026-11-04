@@ -1,0 +1,206 @@
+---
+summary: "How ptrace lets one process control another: the two stops per system call in strace, breakpoints with int3 and the trap flag, seccomp-bpf acceleration, and how to read strace output."
+---
+import { PtraceStepperDemo, BreakpointStepperDemo, TraceOverheadDemo } from "@/demos/os/ObservabilityPtraceDemos";
+
+**ptrace** is a system call that lets one process control another. The controlling process is the **tracer**. The controlled thread is the **tracee**. The tracer can stop the tracee, read and write its registers and memory, and start it again. Both strace and gdb use this one call.
+
+A tracee can only stop and start. So each event that a tracer wants to see must stop the tracee and wake the tracer. That one fact explains both the power and the cost of these tools.
+
+<Predict
+  id="switches"
+  question="strace traces a program on one CPU. The program calls getpid once. How many context switches does strace add for that one call?"
+  options={[
+    "None: the kernel records the call and strace reads it later",
+    "2: to strace, and back to the program",
+    "4: to strace and back, once before the call and once after it",
+  ]}
+  answer={2}
+  explain="strace needs the arguments before the call and the result after it. So the tracee stops twice, and each stop is a switch to the tracer and a switch back. The model below gives a cost of 4.51 µs per stop."
+>
+<PtraceStepperDemo />
+</Predict>
+
+Things to try:
+
+1. Step through the plain run. It has 22 steps and 6 stops: 1 at the start, 2 each for `getpid` and `write`, and 1 for `exit_group`. That last call does not return, so it has no second stop.
+2. Watch the ladder at the top. It shows who has the CPU. A short program call makes many changes between the two rows.
+3. Stop at **Read the registers** for `write`. `orig_rax` holds 1, and `rax` holds -38. The kernel sets `rax` to `-ENOSYS` before the entry stop, so the number must come from `orig_rax`.
+4. Select **-e trace=write**. The output is shorter, but the run still has 6 stops. The filter only controls what strace prints.
+5. Now select **--seccomp-bpf** as well. The run has 3 stops and 7 switches, against 6 and 13. The other calls no longer stop.
+
+## The API
+
+```c
+long ptrace(enum __ptrace_request op, pid_t pid, void *addr, void *data);
+```
+
+| Request | What it does |
+|---|---|
+| `PTRACE_TRACEME` | The child asks its parent to trace it. |
+| `PTRACE_ATTACH` | Trace a running thread. The kernel sends `SIGSTOP` to it. |
+| `PTRACE_SEIZE` | Trace a running thread with no stop. Modern tools prefer it. |
+| `PTRACE_SYSCALL` | Run until the next system call entry or exit. |
+| `PTRACE_CONT` | Run until the next signal or event. |
+| `PTRACE_SINGLESTEP` | Run one instruction. |
+| `PTRACE_GETREGS`, `PTRACE_SETREGS` | Read or write all general registers. |
+| `PTRACE_PEEKDATA`, `PTRACE_POKEDATA` | Read or write one word of memory. |
+| `PTRACE_GET_SYSCALL_INFO` | Read the system call data with no guess about the stop type. |
+
+Most requests work only when the tracee is in a **ptrace-stop**. A request on a running tracee fails with `ESRCH`. A thread can have one tracer only, so a second attach fails with `EPERM`. This is why gdb cannot attach to a program that strace already traces.
+
+A tracer also needs permission. The kernel checks this in `ptrace_may_access`. The rules compare user IDs and capabilities. On many distributions, the Yama module also limits attach to descendants, through `/proc/sys/kernel/yama/ptrace_scope`.
+
+### A small tracer
+
+```c
+// C, x86-64 Linux. Print each system call number and its result.
+#include <stdio.h>
+#include <sys/ptrace.h>
+#include <sys/user.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        execvp(argv[1], argv + 1);       // execve stops the child with SIGTRAP
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_TRACESYSGOOD);
+    for (int entering = 1;; entering = !entering) {
+        ptrace(PTRACE_SYSCALL, pid, 0, 0);
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) return 0;
+        struct user_regs_struct r;
+        ptrace(PTRACE_GETREGS, pid, 0, &r);
+        if (entering) fprintf(stderr, "syscall %lld", r.orig_rax);
+        else fprintf(stderr, " = %lld\n", r.rax);
+    }
+}
+```
+
+`PTRACE_O_TRACESYSGOOD` sets bit 7 of the signal number in a system call stop. Without it, a tracer cannot tell this stop from a real `SIGTRAP`. A real tracer must also handle signals and new threads. This is where most of the code in strace goes.
+
+### Inside the kernel
+
+`PTRACE_SYSCALL` sets a work flag on the thread. The flag sends each system call of this thread through the slow path. There, `syscall_trace_enter` calls `ptrace_report_syscall_entry`. This reaches `ptrace_stop`, which sets the state to `TASK_TRACED`, wakes the tracer, and calls the scheduler. `ps` shows this state as `t`.
+
+The exit path has the same shape, through `ptrace_report_syscall_exit`. A string argument is in the memory of the tracee, so the tracer must fetch it. `PTRACE_PEEKDATA` is one system call for each 8 bytes. strace prefers `process_vm_readv` for long data.
+
+## Breakpoints
+
+A debugger stops at a line in your code with no help from the kernel. It overwrites one byte of the code. The byte `0xCC` is the x86 instruction `int3`, which raises exception `#BP`, vector 3. The kernel turns this exception into a `SIGTRAP`, and a traced thread stops.
+
+<Predict
+  id="rewind"
+  question="The CPU runs a 0xCC that the debugger wrote at address A. The tracee stops, and the debugger reads RIP. What does it see?"
+  options={[
+    "A, because the instruction at A did not complete",
+    "A + 1, because int3 has completed",
+    "The address of the next real instruction",
+  ]}
+  answer={1}
+  explain="int3 is a trap, not a fault. A fault saves the address of the instruction, and a trap saves the address after it. So the debugger finds the breakpoint at RIP - 1, and it must set RIP back to A."
+>
+<BreakpointStepperDemo />
+</Predict>
+
+Things to try:
+
+1. Step through with no mistake. The session has 16 steps and 2 hits, because the program calls `f` twice. It exits with status 43, the same as with no debugger.
+2. Select **Forget to rewind RIP**. The breakpoint is in `48 89 e5`, so the CPU starts at `89 e5`. These bytes are a different real instruction: `mov ebp, esp`. It clears the upper half of `rbp`, so the next store crashes at address `0x1fac`.
+3. Select **Forget to restore the byte**. RIP goes back to the `0xCC`, and the CPU traps again. The program never moves.
+4. Select **Forget to put 0xCC back**. The first hit works and the program finishes, but the debugger misses the second call. There is no error of any kind.
+5. Put the breakpoint on `ret` or `push rbp`. Each instruction has a different length, but the steps do not change. That is the benefit of a one-byte patch.
+
+### Why it works this way
+
+**Why one byte.** `int3` fits over the shortest instruction. A longer patch could overwrite the next instruction, and a jump could land on that instruction.
+
+**Why read a word.** `PTRACE_POKETEXT` writes a full word. So the debugger reads 8 bytes, changes one, and writes 8 bytes. The page is read-only and shared, so the kernel uses [copy-on-write](/os/memory/copy-on-write) to give this process a private copy.
+
+**Why single-step.** The debugger must run the real instruction and then put the patch back. `PTRACE_SINGLESTEP` sets the **trap flag**, bit 8 of `RFLAGS`. The CPU then raises `#DB`, vector 1, after one instruction. The kernel clears the flag on the next resume.
+
+**When it breaks.** Another thread can run past the address while the byte is restored. So gdb stops all threads by default, or it runs a copy of the instruction in a scratch area. It also hides patches when you read memory, so you see the original bytes. A program that checksums its own code can still find them.
+
+**Hardware breakpoints.** x86 also has debug registers `DR0` to `DR3`. They watch 4 addresses and need no change to the code, and they can also watch data writes. Patches have no such limit.
+
+**arm64.** The breakpoint is `brk #0`, a 4-byte instruction, because all instructions have that size. The saved PC stays at the `brk`, so there is no rewind. The debugger must step over it. Single-step uses a debug control bit and `PSTATE.SS`, not a trap flag in the same form.
+
+## What it costs
+
+<Predict
+  id="filter"
+  question="You run strace -e trace=openat on a program in which 1% of the system calls are openat. strace prints only those. How much does the filter reduce the slowdown?"
+  options={[
+    "By about 100 times, because 99% of calls are now ignored",
+    "By about half",
+    "Almost nothing, because each call still stops twice",
+  ]}
+  answer={2}
+  explain="PTRACE_SYSCALL has no filter. The tracee stops at each call, and strace then decides not to print. In the model, the slowdown is 25.4 times with or without the print. A seccomp filter in the tracee removes the stops themselves."
+>
+<TraceOverheadDemo />
+</Predict>
+
+Things to try:
+
+1. Start with the defaults: 200 ns of user work, and 1% of calls recorded. strace gives 25.4×, the filter gives 1.38×, and eBPF gives 1.33×.
+2. Move the user work to 100 µs. strace falls to 1.09×. strace hurts programs that make many system calls, and it hurts others very little.
+3. Set the share to 100%. The filter gives 31.3×, a little worse than plain strace at 31.2×, because each call stops and also runs the filter. eBPF stays at 1.54×.
+
+One stop costs 4.51 µs in this model: 2 switches of 2 µs, and 3 tracer calls of 170 ns (`waitpid`, `PTRACE_SYSCALL`, `PTRACE_GETREGS`). The stepper counts these calls, and a test checks that the two agree. All these figures are model inputs, not measurements.
+
+`strace --seccomp-bpf` loads a [seccomp filter](/os/isolation/seccomp-and-sandboxing) in the child, before `execve`. The filter returns `SECCOMP_RET_TRACE` for selected calls and `SECCOMP_RET_ALLOW` for others. The tracer uses `PTRACE_CONT`, so other calls pass with no stop. The option needs `-f`, and it does not apply to a process attached with `-p`.
+
+## Reading strace output
+
+```bash
+strace -f -T -tt -y -e trace=openat,read,connect -o out.txt ./app
+```
+
+`-f` follows new threads and processes. `-T` adds the time in each call. `-tt` adds a timestamp. `-y` prints the path behind each file descriptor. `-c` prints a table of counts and times in place of each line.
+
+```text
+openat(AT_FDCWD, "/opt/app/lib/libz.so.1", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/usr/local/lib/libz.so.1", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libz.so.1", O_RDONLY|O_CLOEXEC) = 3
+```
+
+This output is a search path at work. The misses are normal here. If a program prints an error about a missing file, the last `ENOENT` before the error names the path that it wanted. This is often the fastest way to find a bad configuration.
+
+| What you see | What it means |
+|---|---|
+| Many `openat` calls return `ENOENT` | A long search path, or a wrong one. |
+| Many `write` calls with a return of 1 | Output with no buffer. Add a buffer in user space. |
+| Many `read` calls with a small size | The same problem on input. |
+| One call has a large `-T` value | The kernel waits for something. The name of the call says what. |
+| The last line never ends | The thread is blocked in that call now. Use `-p` to attach and see it. |
+| Many `futex` calls with `EAGAIN` | Lock contention. A sampling profiler may show nothing here. |
+| `EINTR` in a loop | A signal interrupts the call, and the program retries. |
+
+Be careful with timing under strace. The stops change the timing of the program, so a race may disappear and a thread may look slow. For a production system, use a [tracepoint](/os/observability/tracepoints-and-ftrace) or [eBPF](/os/observability/ebpf).
+
+<Callout title="On macOS">
+strace does not exist on macOS. The macOS `ptrace` man page lists no request for system call stops or for memory reads. lldb uses Mach calls in place of these: exception ports for stops, and `mach_vm_read` and `mach_vm_write` for memory. On Apple Silicon it writes a `brk` instruction, as on arm64 Linux. `lldb ./a.out` works on a program that you built. `dtruss` is a script on DTrace. With System Integrity Protection on, DTrace prints a warning and it cannot trace protected Apple programs, so expect `dtruss` to fail on system tools.
+</Callout>
+
+## Connect
+
+- [System calls](/os/processes/system-calls): the path that these stops interrupt, and the real cost of each call.
+- [Context switching](/os/processes/context-switching): what the 4 switches per call do.
+- [Tracepoints and ftrace](/os/observability/tracepoints-and-ftrace): observe with no stop, inside the kernel.
+- [Profilers](/performance/measurement/profilers): when a sample answers your question, you do not need a trace.
+- [Signals](/os/ipc/signals): `SIGTRAP` and `SIGSTOP` are real signals, and a tracer sees them first.
+
+<Recall cards={[
+  { q: "Why does strace stop the tracee twice for each system call?", a: "It reads the number and arguments before the call runs, and the result after the call returns. Each read needs the tracee stopped." },
+  { q: "At a syscall-enter-stop on x86-64, where is the number, and what does rax hold?", a: "The number is in orig_rax. rax holds -ENOSYS, which is -38." },
+  { q: "List the steps after a breakpoint trap, up to the next continue.", a: "Read RIP and find RIP - 1 in the table. Restore the byte. Set RIP back by 1. Single-step with the trap flag. Write 0xCC again." },
+  { q: "What happens if a debugger does not rewind RIP?", a: "The CPU decodes from the second byte of the instruction, which can be a different valid instruction. The program then fails in an unrelated place." },
+  { q: "Why does strace -e not remove the slowdown, and what does?", a: "PTRACE_SYSCALL stops at every call, and -e only limits the printing. --seccomp-bpf loads a filter, so that other calls do not stop." },
+  { q: "Why can a request such as PTRACE_PEEKDATA fail with ESRCH on a live thread?", a: "The thread is not in a ptrace-stop. Most requests work only on a stopped tracee." },
+]} />

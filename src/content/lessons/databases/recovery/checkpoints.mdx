@@ -1,0 +1,123 @@
+---
+summary: "Checkpoints bound recovery time and log size. Sharp and fuzzy checkpoints, how PostgreSQL spreads its writes and when it starts one, InnoDB's checkpoint age, and the trade-off between recovery time and I/O."
+---
+import { CheckpointTimelineDemo, FuzzyCheckpointDemo } from "@/demos/db/RecoveryAriesDemos";
+
+Without checkpoints, the log grows forever, and recovery must read it from the very start. A **checkpoint** gives recovery a later starting point. It also tells the engine which old log it can delete or reuse. The price is I/O: dirty pages must reach the disk before the log that describes them can go.
+
+The demo below models one hour of a PostgreSQL-like server. It does 500 row updates per second on an 8 GiB table of 8 KiB pages. Some pages are much hotter than others. It assumes that recovery replays 64 MiB of WAL per second.
+
+<Predict
+  id="spread"
+  question="checkpoint_completion_target spreads the page writes of a checkpoint over a part of the interval. You lower it from 0.9 to 0, so each checkpoint writes its pages as fast as the disk allows. What happens to the worst recovery time?"
+  options={["It gets longer", "It gets shorter", "It does not change"]}
+  answer={1}
+  explain="Recovery starts at the redo point of the last checkpoint that is complete. A checkpoint that finishes in 3 seconds moves that point forward sooner than one that takes 270 seconds. So the worst recovery falls from 12.7 s to 6.7 s. The price is a burst of page writes at 195 MiB/s."
+>
+<CheckpointTimelineDemo />
+</Predict>
+
+Things to try:
+
+1. Read the defaults: `checkpoint_timeout` = 300 s, target 0.9, `max_wal_size` = 1 GiB. Time starts all 11 checkpoints. Page writes stay flat at 1.52 MiB/s. Recovery time is a sawtooth with a worst case of 12.7 s.
+2. Set the target to 0. Each checkpoint becomes a spike of 195 MiB/s, which competes with the queries for the disk. The worst recovery falls to 6.7 s.
+3. Set the timeout to 60 s. The worst recovery falls to 3.3 s. But the server writes 6.2 GiB of data pages in place of 4.4 GiB, and 6.5 GiB of WAL in place of 5.0 GiB.
+4. Set the timeout to 1,800 s. Now the WAL size starts the checkpoints (orange lines), only 2 of them. The worst recovery grows to 48 s.
+5. Look at the orange WAL line after each checkpoint start. It jumps and then decays. The first change to each page after a checkpoint logs a full page image. In this model, these images are 97% of all WAL.
+
+## What a checkpoint must achieve
+
+Recovery needs the log from two points:
+
+- **Redo** needs it from the oldest change that may not be on disk: the smallest recLSN of a dirty page.
+- **Undo** needs it from the first record of the oldest transaction that is still running.
+
+The log before both points is garbage. A checkpoint records where recovery can start, and pushes that point forward. The log size and the recovery time both follow from the distance between the end of the log and that point.
+
+## Sharp and fuzzy checkpoints
+
+A **sharp** (consistent) checkpoint stops new updates, writes every dirty page, writes a checkpoint record, and lets work continue. Recovery starts at that record, and redo has nothing older to do. But the stop lasts as long as the page writes, which can be seconds or minutes with a large buffer pool.
+
+A **fuzzy** checkpoint, as in ARIES, writes no pages at all:
+
+1. Write a begin_checkpoint record.
+2. Copy the active transaction table and the dirty page table. Work continues during and after the copy.
+3. Write an end_checkpoint record with the copies, and flush the log.
+4. Only then, store the LSN of begin_checkpoint in the master record.
+
+```zig
+pub fn checkpoint(self: *Engine) !void {
+    // begin: note the position and copy the tables; workers keep running
+    const begin = try self.log.append(.begin_checkpoint);
+    var att = try self.att.clone(self.alloc);
+    defer att.deinit();
+    var dpt = try self.dpt.clone(self.alloc);
+    defer dpt.deinit();
+    // end: write the snapshot and make it durable
+    const end = try self.log.append(.{ .end_checkpoint = .{ .begin = begin, .att = att, .dpt = dpt } });
+    try self.log.flushTo(end);
+    // a crash before this line simply uses the previous checkpoint
+    try self.master.write(begin);
+}
+```
+
+A fuzzy checkpoint costs almost nothing, but it moves the redo start only as far as the oldest dirty page allows. So engines also write old dirty pages in the background, to keep the oldest recLSN recent.
+
+<FuzzyCheckpointDemo />
+
+1. Go to step 6, the begin_checkpoint. The snapshot holds pages B and C, and transaction T2. Page A is not there, because the background writer wrote it at step 5.
+2. Step to 9. Pages D and A became dirty during the checkpoint, so the live table has them and the snapshot does not. Analysis finds them anyway: it reads forward from the begin record.
+3. At step 10, read the plan. Analysis starts at LSN 6, but redo starts at LSN 2, before the checkpoint. Page B was in the snapshot with recLSN 2.
+4. Step to 13. The background writer writes C, and the live checkpoint age falls. The redo start stays at LSN 2 until the next checkpoint records a newer table.
+
+## PostgreSQL
+
+A PostgreSQL checkpoint is between the two kinds. It notes the current WAL position as the **redo point**. Then the checkpointer process writes every buffer that was dirty at that moment, while transactions continue. It calls `fsync` on the data files, writes a checkpoint record, and updates `pg_control`. Recovery replays the WAL from the redo point of the last complete checkpoint.
+
+A checkpoint starts for one of these reasons:
+
+- `checkpoint_timeout` passed since the last one (default 5 min).
+- The WAL since the last one reached about `max_wal_size / (1 + checkpoint_completion_target)`. With the defaults, 1 GiB and 0.9, that is 539 MiB.
+- A `CHECKPOINT` command, a shutdown, or the end of a recovery.
+
+`checkpoint_completion_target` spreads the writes over that part of the interval. Its default changed from 0.5 to 0.9 in PostgreSQL 14. If checkpoints come more often than `checkpoint_warning` (30 s), the server logs a warning to raise `max_wal_size`. The background writer also writes some dirty buffers ahead of time.
+
+## InnoDB
+
+InnoDB never stops for a checkpoint. Page cleaner threads write dirty pages from the **flush list**, which orders the dirty pages by the LSN of their oldest change. The checkpoint LSN is that oldest LSN. The **checkpoint age** is the current LSN minus the checkpoint LSN.
+
+The checkpoint age must stay below the redo log capacity, because the redo log is reused in a circle. Adaptive flushing raises the write rate as the age grows. If the age comes too near the capacity, InnoDB must write the oldest pages before it can reuse their part of the log. The MySQL manual calls this a **sharp checkpoint**. User writes stall until it ends, so a small `innodb_redo_log_capacity` causes periodic stalls under heavy writes.
+
+## The trade-off
+
+| checkpoint_timeout | Checkpoints in 1 hour | Worst recovery | Data pages written | WAL written |
+|---|---|---|---|---|
+| 60 s | 59, by time | 3.3 s | 6.2 GiB | 6.5 GiB |
+| 300 s | 11, by time | 12.7 s | 4.4 GiB | 5.0 GiB |
+| 900 s | 4, by WAL size | 29 s | 3.1 GiB | 4.1 GiB |
+| 1,800 s | 2, by WAL size | 48 s | 1.9 GiB | 3.5 GiB |
+
+All rows use a target of 0.9 and a `max_wal_size` of 1 GiB. The pattern is general:
+
+- **Recovery time** grows with the WAL since the redo point: about one interval, plus the time to complete the checkpoint.
+- **Page writes** fall with longer intervals, because a hot page that changes many times is written once for each checkpoint.
+- **WAL volume** falls with longer intervals, because each page needs a full image only once for each checkpoint.
+- **I/O smoothness** comes from spreading. A spread checkpoint completes later, so the redo point moves later.
+
+Most production systems choose long intervals, a large `max_wal_size`, and spread writes. They accept a recovery time of minutes, because a failover to a replica is faster than any recovery. SQL Server takes a different route. Its **indirect checkpoints** set a target recovery time, 60 s by default for new databases, and write pages to meet it.
+
+## Connect
+
+- [ARIES](/databases/recovery/aries): analysis starts at the checkpoint, and redo starts at the smallest recLSN.
+- [Buffer pools](/databases/storage/buffer-pools): the dirty pages that a checkpoint must write.
+- [Physical, logical and physiological logging](/databases/recovery/physical-logical-and-physiological-logging): why full page images follow each checkpoint.
+- [Group commit](/databases/recovery/group-commit): checkpoint writes compete with log flushes for the same device.
+
+<Recall cards={[
+  { q: "From which two points does recovery need the log?", a: "From the smallest recLSN of a dirty page (for redo), and from the first record of the oldest running transaction (for undo). The log before both points can be recycled." },
+  { q: "What does a fuzzy checkpoint write, and when does the master record change?", a: "A begin record, then an end record with copies of the transaction table and dirty page table. The master record changes only after the end record is durable." },
+  { q: "Why can redo start before the last checkpoint?", a: "Redo starts at the smallest recLSN in the dirty page table. A page that has been dirty since before the checkpoint has a recLSN older than the begin record." },
+  { q: "What two conditions start a PostgreSQL checkpoint automatically?", a: "checkpoint_timeout has passed (default 5 min), or the WAL since the last checkpoint reached about max_wal_size / (1 + checkpoint_completion_target)." },
+  { q: "What is the InnoDB checkpoint age, and what happens when it nears the redo capacity?", a: "Current LSN minus the oldest modification LSN of a dirty page. Near the capacity, InnoDB must flush the oldest pages before it reuses the log, and user writes stall." },
+  { q: "Why does a shorter checkpoint interval write more WAL?", a: "The first change to each page after a checkpoint logs a full page image. More checkpoints mean more first changes, and so more images." },
+]} />

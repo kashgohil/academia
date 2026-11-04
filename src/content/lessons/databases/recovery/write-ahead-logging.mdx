@@ -1,0 +1,140 @@
+---
+summary: "Why a database writes the log before the data: STEAL and NO-FORCE, the two parts of the WAL rule, LSNs, and what PostgreSQL and InnoDB put in their logs."
+---
+import { WalStepperDemo, PolicyMatrixDemo, PgLsnDemo } from "@/demos/db/RecoveryDemos";
+
+A database keeps hot pages in a [buffer pool](/databases/storage/buffer-pools): a cache of disk pages in memory. A transaction changes a page in memory, and the page goes back to disk later. Power can fail at any moment. After a restart, the database must show every committed change and no uncommitted change.
+
+Two wishes make this hard:
+
+- The buffer pool wants to write a **dirty page** when it needs the space. A dirty page is a cached page with changes that are not on disk yet. That page can hold changes of a transaction that has not committed.
+- Commit wants to be fast. A transaction can change many pages in random places. Writing all of them at commit costs one random write for each page.
+
+The answer is a **write-ahead log (WAL)**: an append-only file that describes every change. The database makes the log durable first, and it writes the data pages whenever it likes.
+
+<Predict
+  id="steal"
+  question="T1 moves 30 from page A to page B but has not committed. The buffer pool writes page A to disk to make space, and then the power fails. What does recovery need from the log?"
+  options={[
+    "Nothing: an uncommitted change never reaches disk",
+    "The old value of A, to undo the change",
+    "The new value of B, to redo the change",
+  ]}
+  answer={1}
+  explain="The buffer pool wrote a page with an uncommitted change. T1 never committed, so recovery must put back the old value of A. That old value must be in the log, and the log record must be on disk before page A was written."
+>
+<WalStepperDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **Follow it**. Click **Next** three times, click **Write A**, and then click **Crash**. The page write first forced the log to LSN 1. Recovery finds T1 uncommitted and puts A back to 100.
+2. Click **Reset**. Run all six steps without any page writes, and then crash. Every page on disk is old, but both commits forced their log records. Recovery redoes the changes from the log, and the total stays 170.
+3. Select **Break it**. Click **Next** three times, **Write A**, and **Next** (T1 commits). Then crash. The client was told that T1 committed, but its commit record was only in memory. Recovery shows a total of 140: 30 vanished.
+4. With **Break it**, click **Next** three times and **Write C**, and then crash. Page C on disk holds 30 from T2, which never committed. No log record exists to undo it.
+
+## STEAL and FORCE
+
+Two choices of the buffer pool decide what the log must hold:
+
+- **STEAL** means the pool may write a page that has uncommitted changes. Then recovery may need to **undo** a change, so the log needs the old value (the *before image*).
+- **NO-FORCE** means commit does not write the changed pages. Then a committed change may exist only in the log, so recovery may need to **redo** it. The log needs the new value (the *after image*).
+
+<PolicyMatrixDemo />
+
+1. Read the default cell, STEAL + NO-FORCE. The commit path has one sequential log flush. The pages go to disk later, and hot pages absorb many updates before that.
+2. Compare the page writes. With 4 pages for each transaction, FORCE writes 4,000 pages for each 1,000 commits. NO-FORCE writes about 982, because a page that several transactions change before the next checkpoint is written only once.
+3. Move **Pages each transaction changes** above 1,000. The NO-STEAL cells report that the transaction does not fit. Under NO-STEAL, every page that a live transaction changed must stay in memory until commit.
+4. Compare the log bytes for each update. STEAL + NO-FORCE stores both images, so with 100-byte rows a record is 224 bytes, and 124 bytes with one image.
+
+Almost every general-purpose engine picks STEAL + NO-FORCE. It gives the cheapest commit and a buffer pool with no limits on transaction size. The cost moves to recovery, which must do both redo and undo.
+
+| Engine | Policy | What the log holds |
+|---|---|---|
+| PostgreSQL | STEAL, NO-FORCE | Redo only. Old row versions stay in the table (MVCC), and `pg_xact` records which transactions committed. |
+| InnoDB (MySQL) | STEAL, NO-FORCE | A redo log, plus undo logs in undo tablespaces. Changes to undo pages also go to the redo log. |
+| SQLite, rollback journal | STEAL, FORCE | Undo only: original pages go to the journal before the database file changes. |
+| SQLite, WAL mode | NO-STEAL, NO-FORCE | Redo only: full page images in the `-wal` file. A checkpoint copies them into the database. |
+| LMDB | shadow paging | No log. Commit writes new copies of pages and then switches the root pointer. |
+
+PostgreSQL has no undo log because of **MVCC** (multi-version concurrency control). An aborted transaction leaves its row versions in the table. Readers check the commit status of the writer and ignore them, and `VACUUM` removes them later.
+
+## The WAL rule
+
+The rule has two parts:
+
+1. **Before a page goes to disk**, every log record that changed the page must be on disk. This makes undo possible after a steal.
+2. **Before commit returns**, every log record of the transaction must be on disk, up to and including its commit record. This makes redo possible under NO-FORCE.
+
+The engine does not trust the caller to follow the rule. The buffer pool enforces part 1 at each page write, and commit enforces part 2:
+
+```rust
+fn flush_page(&mut self, id: PageId) -> io::Result<()> {
+    let frame = &self.pool[id];
+    if frame.page_lsn > self.log.flushed_lsn() {
+        self.log.flush_to(frame.page_lsn)?;      // part 1: log first
+    }
+    self.disk.write_page(id, &frame.bytes)?;      // the data page can go now
+    Ok(())
+}
+
+fn commit(&mut self, txn: TxnId) -> io::Result<()> {
+    let lsn = self.log.append(Record::Commit { txn, prev_lsn: self.txns[txn].last_lsn });
+    self.log.flush_to(lsn)?;                      // part 2: durable before we answer
+    Ok(())
+}
+```
+
+Here `flush_to` writes the log buffer and calls `fdatasync`, or writes with `O_DSYNC`. It must reach stable storage, as the lesson on [fsync and torn writes](/databases/storage/durability-fsync-torn-writes-and-checksums) explains. A log flush is cheap per byte because it is sequential. It is expensive per call, because each call waits for the device. The next lesson, [group commit](/databases/recovery/group-commit), shares one flush among many commits.
+
+## LSNs
+
+A **log sequence number (LSN)** names a position in the log. LSNs only grow, so they also give an order to every change. The engine keeps several of them:
+
+- **pageLSN**: in each page header, the LSN of the last record that changed the page.
+- **flushedLSN**: in memory, the end of the durable log. The WAL rule is the check `pageLSN <= flushedLSN` before a page write.
+- **prevLSN**: in each record, the previous record of the same transaction. It links the records of one transaction into a chain for undo.
+- **recLSN**: for each dirty page, the first record that made it dirty. Recovery uses it to know where redo must start.
+
+In PostgreSQL and InnoDB, the LSN is the byte offset of the record in the log stream. So the next LSN is simply the current end of the log. The demos in this module number records 1, 2, 3 for clarity.
+
+<PgLsnDemo />
+
+1. Read the default position, 48 MiB plus 96 bytes. PostgreSQL prints this LSN as `0/3000060`. The record is in segment file `000000010000000000000003`, at offset 96.
+2. Move the slider past 4 GiB. The left half of the LSN text grows, and so does the middle part of the file name.
+3. Watch the bar move inside one file. A 16 MiB segment holds 2,048 WAL pages of 8 KiB.
+
+## What a log record holds
+
+| Field | Purpose |
+|---|---|
+| LSN, length, CRC | Position, framing, and a checksum to find a torn or partial record at the end of the log |
+| transaction ID, prevLSN | Which transaction, and the link to its previous record |
+| type | Update, commit, abort, end, checkpoint, compensation |
+| page ID (and slot or offset) | Which page the record changes |
+| redo information | The after image, or an operation that can be repeated |
+| undo information | The before image, or an operation that reverses the change |
+
+A **redo-only** log omits undo information. This works under NO-STEAL (SQLite in WAL mode), or when another mechanism hides uncommitted data (PostgreSQL's MVCC). An **undo/redo** log carries both images, as ARIES requires. InnoDB splits the two: undo records live in undo pages, and the redo log protects those pages like any other page.
+
+PostgreSQL writes WAL in 8 KiB pages into 16 MiB segment files in `pg_wal/`. The `initdb --wal-segsize` option changes the segment size. A record starts with a 24-byte header, then block references, then data. The InnoDB redo log is a stream of small records written by mini-transactions. A **mini-transaction** is a group of page changes that must become durable together, for example the pages of one B-tree split. Since MySQL 8.0.30, `innodb_redo_log_capacity` sets the redo log size, 100 MiB by default.
+
+<Callout kind="warn" title="The log is only as durable as the flush">
+A volatile write cache in the drive can acknowledge a flush before the data is safe. Then the WAL rule holds in the code but fails in the hardware. Use drives with power-loss protection, or make sure that the flush command reaches the media.
+</Callout>
+
+## Connect
+
+- The [buffer pool](/databases/storage/buffer-pools) decides when to steal. The WAL rule decides when a steal is safe.
+- The [write policies](/architecture/caches/write-policies) of a CPU cache are the same idea: write-back is NO-FORCE.
+- [ARIES](/databases/recovery/aries) uses everything here: LSNs, both images, and the prevLSN chain.
+- [MVCC](/databases/transactions/mvcc) is why PostgreSQL can skip the undo log.
+
+<Recall cards={[
+  { q: "What are the two parts of the WAL rule?", a: "A page goes to disk only after the log records that changed it are durable. Commit returns only after all records of the transaction, including the commit record, are durable." },
+  { q: "Which buffer pool policy makes undo necessary, and which makes redo necessary?", a: "STEAL (writing pages with uncommitted changes) makes undo necessary. NO-FORCE (not writing pages at commit) makes redo necessary." },
+  { q: "What is the pageLSN, and which check uses it?", a: "The LSN of the last record that changed the page, stored in the page header. Before a page write, the engine checks pageLSN <= flushedLSN." },
+  { q: "Why can PostgreSQL use a redo-only WAL with STEAL?", a: "MVCC keeps the old row versions in the table and pg_xact records commit status. Readers ignore versions of transactions that did not commit, so no undo is needed." },
+  { q: "Why is STEAL + NO-FORCE the usual choice?", a: "Commit needs only one sequential log flush, hot pages absorb many updates before a write, and transactions are not limited by the buffer pool size." },
+  { q: "What is an LSN in PostgreSQL and InnoDB?", a: "The byte offset of a record in the log stream. It only grows, so it orders all changes." },
+]} />

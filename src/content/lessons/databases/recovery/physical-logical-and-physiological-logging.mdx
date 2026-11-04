@@ -1,0 +1,136 @@
+---
+summary: "Three ways to describe a change in the log: bytes, operations, or operations inside one page. Their sizes, which ones survive a replay twice or a torn page, and why ARIES redoes physiologically and undoes logically."
+---
+import { LogFormsDemo, ReplayDemo } from "@/demos/db/RecoveryDemos";
+
+A log record must say what changed, so that recovery can do it again or reverse it. There are three styles:
+
+- **Physical** logging records bytes: "at offset 59 of page 7, write `7`". A **full page image** is the extreme case: the record holds the whole page.
+- **Logical** logging records an operation on a table: "UPDATE t SET qty = qty + 2 WHERE name = 'bob'". The record names no page.
+- **Physiological** logging is "physical to a page, logical within a page". The record names one page and an operation inside it: "page 7, slot 1: set qty to 7".
+
+The demos use one tiny 64-byte slotted page. The page has a 4-byte header: pageLSN, slot count, start of the record area, and checksum. A slot directory follows, and 4-byte records grow from the end. Real pages work the same way: see [pages and slotted records](/databases/storage/pages-and-slotted-records).
+
+<Predict
+  id="bytes"
+  question="Operation 3 is UPDATE SET qty = qty + 2 for the row of 'bob'. The qty field is one byte. How many bytes of the page does it change?"
+  options={["1: only the qty byte", "3", "All 64, because the page is rewritten"]}
+  answer={1}
+  explain="The qty byte changes, and so do two header bytes: the pageLSN, and the checksum, which covers every byte. A physical log must record all three. A physiological record only says 'slot 1: qty = 7' and lets redo update the header."
+>
+<LogFormsDemo />
+</Predict>
+
+Things to try:
+
+1. Move the slider to operation 1, an insert. Five header and slot bytes change at the start of the page, and four record bytes at the end. The physical record needs two byte ranges: 17 bytes in this toy encoding.
+2. Move to operation 3 and compare the forms. Physical needs 13 bytes. Physiological needs 7, because it names a slot and a value, not offsets.
+3. Select **Physio + FPW**. LSN 3 is the first change after the checkpoint, so it also carries a full image of the page. The log that replay reads grows from 22 bytes to 86.
+4. Select **Logical**. The records are short and do not depend on the page layout at all. But they say *how* to compute the result, not *what* the result is.
+
+## Replay twice
+
+Recovery cannot know how much of the work reached disk. The buffer pool may have written the page before the crash, after operation 4, or after operation 5. So redo must give the same result whether the page already has a change or not. A redo operation with this property is **idempotent**: doing it twice has the same effect as doing it once.
+
+<Predict
+  id="twice"
+  question="The page on disk already holds all five operations. Recovery replays the physiological records 3 to 5 on it, with no other check. What is the result?"
+  options={[
+    "The correct page: physiological records are idempotent",
+    "The row 'cyd' appears twice",
+    "Recovery stops with an error",
+  ]}
+  answer={1}
+  explain="'Set qty to 7' and 'delete slot 0' give the same result twice. 'Insert cyd into the page' does not: it adds a second slot. A physiological record becomes idempotent only with the pageLSN check: skip the record if pageLSN >= its LSN."
+>
+<ReplayDemo />
+</Predict>
+
+1. Keep **After op 5** and **Physiological**. The insert runs again and 'cyd' appears twice. Turn on the pageLSN check: all three records are skipped, and the page is correct.
+2. Select **Logical**, with the check on or off. The result is wrong both ways: bob has qty 9, and 'cyd' appears twice. A logical record names no page, so it cannot use a pageLSN.
+3. Select **Torn**. Only the first 16-byte sector of the final page reached disk. Physiological and logical replay refuse the page, because its checksum fails and its slot directory points at old bytes.
+4. Keep **Torn** and select **Physio + FPW**. The full image at LSN 3 replaces the whole page, and the later records apply to a good page.
+5. Keep **Torn** and select **Physical**, without and then with the check. Blind byte writes repair the page. With the check, the torn header claims pageLSN 5, so replay skips everything and the page stays broken.
+
+## Three forms compared
+
+| Form | Example record | Size | Twice | Torn page | Used by |
+|---|---|---|---|---|---|
+| Physical: byte diff | offset 59: `7` | small for small changes, large when a page is reorganized | idempotent | repaired if the log reaches back to the last whole copy | rarely alone |
+| Physical: full page image | all 8 KiB | very large | idempotent | repaired | PostgreSQL after each checkpoint, SQLite WAL frames |
+| Physiological | page 7, slot 1: qty = 7 | small | idempotent with the pageLSN check | needs a valid page | ARIES redo, InnoDB redo, PostgreSQL redo |
+| Logical | UPDATE ... qty + 2 | smallest | not idempotent | needs valid pages and indexes | ARIES undo, replication logs |
+
+A byte diff is small for a one-byte update. But some page operations move every byte, for example compacting the free space or splitting a B-tree node. A physiological record for "compact page 7" is a few bytes, and redo runs the same compaction code again.
+
+The sizes at real scale, under the assumptions in the sim, are about 146 bytes for a physiological update of a 100-byte row. A full image of an 8 KiB page costs 8,236 bytes, 56 times more.
+
+## The pageLSN check makes redo idempotent
+
+<Steps>
+<div>Each page stores the LSN of the last record applied to it, and the page write stores it together with the data.</div>
+<div>Records for one page are applied in LSN order, so the page contains exactly the records up to its pageLSN.</div>
+<div>So a record with LSN ≤ pageLSN is already in the page, and a record with LSN > pageLSN is not.</div>
+<div>Skip the first kind and apply the second. Any number of replays gives the same page.</div>
+</Steps>
+
+```cpp
+// Physiological redo of one record. Safe to run any number of times.
+void redo(const LogRecord& r, BufferPool& pool) {
+    if (r.type == RecType::FullPageImage) {      // needs no old page at all
+        pool.install(r.page_id, r.payload, r.lsn);
+        return;
+    }
+    Page& p = pool.fetch(r.page_id);             // fails if the checksum is wrong
+    if (p.page_lsn() >= r.lsn) return;           // the page already has this change
+    switch (r.type) {
+        case RecType::Insert:   p.insert(r.slot, r.payload); break;
+        case RecType::SetField: p.record(r.slot).write(r.offset, r.payload); break;
+        case RecType::Delete:   p.delete_slot(r.slot); break;
+        default: break;
+    }
+    p.set_page_lsn(r.lsn);
+    pool.mark_dirty(p, r.lsn);
+}
+```
+
+The check works only if the pageLSN is true. A torn page breaks that assumption.
+
+## Torn pages and full-page writes
+
+A device writes one sector atomically, 512 bytes or 4 KiB. A database page is larger: an 8 KiB PostgreSQL page spans 16 sectors of 512 bytes. If power fails during the page write, some sectors are new and some are old. This is a **torn page**. A checksum detects it, but detection does not repair it.
+
+Physiological redo must read the page to act on it, so it cannot start from a torn page. Engines use one of these fixes:
+
+- **Full-page writes (PostgreSQL)**: the first change to a page after a checkpoint logs an image of the whole page. Recovery starts at the checkpoint, so the image comes before any other record for that page. Replay copies the image in and never reads the torn bytes. PostgreSQL leaves out the free "hole" in the middle of the page, and `wal_compression` can shrink the image more.
+- **Doublewrite buffer (InnoDB)**: InnoDB first writes each batch of 16 KiB pages to a doublewrite area and flushes it. Then it writes the pages to their real places. After a crash, a torn page is restored from its good copy in the doublewrite area.
+- **Atomic storage**: a copy-on-write file system such as ZFS never overwrites a page in place. Some setups turn off `full_page_writes` there.
+
+Full-page writes make the WAL much larger just after each checkpoint. The [checkpoints](/databases/recovery/checkpoints) lesson measures this.
+
+## Physiological redo, logical undo
+
+ARIES combines the forms on purpose:
+
+- **Redo is physiological.** Redo repeats history page by page, in LSN order, with the pageLSN check. The records are small, and the page can reorganize itself freely.
+- **Undo is logical.** After T1 inserts key 42 into a B-tree leaf, T2 can split that leaf, and key 42 moves to another page. The undo of T1 must be "delete key 42 from the index", and it must find the key where it is now.
+
+Logical undo is not idempotent. ARIES makes sure that each undo runs exactly once: it logs each undo action in a compensation log record, which the [ARIES](/databases/recovery/aries) lesson explains.
+
+Logical logs are also the base of replication and change data capture. The MySQL binary log holds statements or row images. PostgreSQL with `wal_level = logical` decodes its physiological WAL into row changes. These logs describe the data, not the pages, so a replica with a different page layout can apply them.
+
+## Connect
+
+- [Pages and slotted records](/databases/storage/pages-and-slotted-records): the page layout that physiological records act on.
+- [Fsync, torn writes and checksums](/databases/storage/durability-fsync-torn-writes-and-checksums): why a page write is not atomic.
+- [Copy-on-write B-trees](/databases/btrees/copy-on-write-b-trees): a design that avoids torn pages and redo logs.
+- [Write-ahead logging](/databases/recovery/write-ahead-logging): the rules that all three forms must follow.
+
+<Recall cards={[
+  { q: "What does 'physical to a page, logical within a page' mean?", a: "A physiological record names one page exactly, and describes an operation inside that page, such as an insert into a slot, not exact byte offsets." },
+  { q: "How does the pageLSN check make physiological redo idempotent?", a: "A page contains exactly the records up to its pageLSN. Redo skips any record with LSN <= pageLSN and applies the others, so a second replay changes nothing." },
+  { q: "Why can a logical record not use the pageLSN check?", a: "A logical record names no page. One operation can change many pages, such as the table and its indexes, so there is no single pageLSN to compare with." },
+  { q: "What is a torn page, and how does PostgreSQL recover from one?", a: "A page write that stopped between sectors, so part of the page is old. PostgreSQL logs a full page image at the first change after each checkpoint, and replay copies that image in." },
+  { q: "Why is ARIES undo logical and not physiological?", a: "Other transactions can move a row to another page after the change, for example by a B-tree split. A logical undo finds the row where it is now." },
+  { q: "What does InnoDB use instead of full-page writes?", a: "The doublewrite buffer. Pages are first written and flushed to a doublewrite area, then to their real places. So a torn page always has a good copy." },
+]} />

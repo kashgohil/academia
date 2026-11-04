@@ -1,0 +1,144 @@
+---
+summary: "One log flush per commit caps throughput at one commit per flush time. Group commit shares each flush among many commits. Asynchronous commit removes the wait and accepts a small loss window."
+---
+import { CommitQueueDemo, CommitScalingDemo } from "@/demos/db/RecoveryDemos";
+
+The [WAL rule](/databases/recovery/write-ahead-logging) says that commit returns only after the commit record is durable. So each commit waits for a log flush: a `write` and an `fdatasync`, or a write with `O_DSYNC`. The flush is short in bytes but long in time. The device must confirm that the data is on stable media. On a disk that spins at 7,200 rpm, one rotation takes 8.33 ms, and a durable write often waits that long.
+
+<Predict
+  id="per-commit"
+  question="One log flush takes 8.33 ms. With one flush for each commit, one client gets about 117 commits per second. What do 32 clients get?"
+  options={[
+    "About 3,750: each client commits on its own",
+    "About 120: the flushes run one at a time",
+    "About 60: the clients slow each other down",
+  ]}
+  answer={1}
+  explain="There is one log, and its flushes run one after another. The device completes 1000 / 8.33 = 120 flushes per second, whatever the number of clients. More clients only make the queue longer: at 32 clients, each commit waits 266 ms."
+>
+<CommitQueueDemo />
+</Predict>
+
+Things to try:
+
+1. Select **fsync per commit**. Each flush carries one commit, and the device does 120 flushes per second. The clients in orange wait in a queue, and the mean commit latency is 66.5 ms with 8 clients.
+2. Select **Group commit**. One flush now carries all commits that are waiting, and throughput rises to 480 commits/s. But each flush carries only 4 of the 8 clients. Watch why: a client that commits during a flush must wait for the next one.
+3. Set **commit_delay** to 1 ms. The leader waits a little before it flushes, so the second half of the clients joins. Now 8 commits share each flush, throughput is 846 commits/s, and latency falls from 16.5 ms to 9.3 ms.
+4. Select **Async**. Commit returns before the flush, so no client waits. Throughput reaches the CPU limit of 40,000 commits/s. The readout shows the price: about 8,000 acknowledged commits are not durable yet at the worst moment.
+
+## The cost of one flush
+
+Let $F$ be the time of one flush. If each commit needs its own flush and flushes run one at a time, then:
+
+$$\text{commits/s} \le \frac{1}{F}, \qquad \text{latency} \approx F \times (\text{commits in the queue} + 1)$$
+
+| Device | Flush time F | Limit of 1/F |
+|---|---|---|
+| HDD, 7,200 rpm | about 8.33 ms (one rotation) | 120 /s |
+| Consumer SSD (no power-loss protection) | about 1 ms | 1,000 /s |
+| SSD with power-loss protection | about 0.05 ms | 20,000 /s |
+
+These flush times are rough inputs to the model, not measurements. An SSD with **power-loss protection (PLP)** has capacitors that hold enough energy to save its write cache. So the drive can confirm a flush as soon as the data is in its cache.
+
+## Group commit: leader and followers
+
+**Group commit** lets one flush serve many commits. The log already holds the records of all transactions in one stream. A flush up to LSN $L$ makes every record before $L$ durable, whatever transaction wrote it. So a commit only has to wait until some flush covers its record.
+
+The usual protocol uses a **leader** and **followers**:
+
+1. A committing thread appends its commit record and notes its LSN.
+2. If no flush is running, the thread becomes the leader. It takes everything in the log buffer, writes it, and calls `fsync` once.
+3. If a flush is running, the thread becomes a follower and sleeps.
+4. When the flush ends, the leader wakes all followers. A follower whose LSN is now durable returns. The others elect the next leader.
+
+```go
+// Commit appends rec and returns when it is durable.
+func (w *WAL) Commit(rec []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf = append(w.buf, rec...)
+	w.end += int64(len(rec))
+	mine := w.end
+	for w.flushed < mine {
+		if w.flushing { // a leader is busy: be a follower
+			w.cond.Wait()
+			continue
+		}
+		w.flushing = true // be the leader for everything in buf
+		batch, upTo := w.buf, w.end
+		w.buf = nil
+		w.mu.Unlock()
+		_, err := w.f.Write(batch)
+		if err == nil {
+			err = w.f.Sync() // one fsync for the whole batch
+		}
+		w.mu.Lock()
+		w.flushing = false
+		w.cond.Broadcast()
+		if err != nil {
+			return err
+		}
+		w.flushed = upTo
+	}
+	return nil
+}
+```
+
+## Why the batches are half the clients
+
+In the demo, 8 clients give batches of 4, not 8. Assume that the CPU work of a transaction is much shorter than $F$. While the leader flushes cohort A, cohort B arrives and waits. When the flush ends, cohort B is flushed at once, and cohort A starts new transactions. Cohort A then waits for the whole next flush.
+
+So the two cohorts take turns, and each flush carries $N/2$ commits:
+
+$$\text{commits/s} \approx \frac{N}{2F}, \qquad \text{latency} \approx 2F$$
+
+With 32 clients and $F = 8.33$ ms, this gives 1,920 commits/s, which is what the simulation shows. A **commit delay** $d$ breaks the pattern. The leader waits for $d$, so the other cohort joins the same flush:
+
+$$\text{commits/s} \approx \frac{N}{F + d + t_{cpu}}$$
+
+With $d$ = 1 ms, the simulation gives 3,384 commits/s and a latency of 9.0 ms. The delay makes commits faster, because each commit now waits for one flush, not two.
+
+<CommitScalingDemo />
+
+1. Keep **HDD**. The red line stays at 120 for any number of clients. Group commit grows with the clients: 1,920 commits/s at 32 clients, with 16 commits in each flush.
+2. Look at the purple line. From 8 clients up, the delay almost doubles throughput. At 2 and 4 clients it does nothing, because fewer than 5 other transactions are active.
+3. Select **Commit latency**. With one flush for each commit, latency grows with the queue: 266 ms at 32 clients. Group commit stays near two flush times.
+4. Select **SSD with PLP**. Group commit and asynchronous commit meet the CPU limit of 40,000 commits/s. The flush is no longer the bottleneck.
+
+## In real engines
+
+**PostgreSQL** gets group commit from its WAL flush code. A backend that wants a flush takes `WALWriteLock`. If another backend flushed its record in the meantime, it returns at once. Otherwise it writes all WAL up to the current insert position, which includes the records of other backends. `commit_delay` (in microseconds, default 0) adds the leader's wait. It applies only when at least `commit_siblings` (default 5) other transactions are active.
+
+**MySQL** must make two logs durable: the InnoDB redo log and the binary log for replication. It uses two-phase commit between them. Since MySQL 5.6, binary log group commit has three stages, flush, sync and commit, and each stage has its own leader and queue. `binlog_group_commit_sync_delay` is the delay of the sync stage. `innodb_flush_log_at_trx_commit = 1` (the default) flushes the redo log at each commit, and `sync_binlog = 1` does the same for the binary log.
+
+## Asynchronous commit
+
+**Asynchronous commit** returns before the commit record is durable. In PostgreSQL, this is `synchronous_commit = off`. A background process, the WAL writer, flushes the log every `wal_writer_delay` (default 200 ms). PostgreSQL documents the risk window as at most three times that: 600 ms of recent commits.
+
+A crash can lose those commits, but it cannot corrupt the database. The WAL rule still holds for data pages, so recovery still produces a consistent state. It simply ends a little earlier in time. `fsync = off` is different: it breaks the WAL rule itself and can corrupt the database.
+
+| Setting | Commit waits for | A crash can lose |
+|---|---|---|
+| PostgreSQL `synchronous_commit = on` | WAL flush | nothing that was acknowledged |
+| PostgreSQL `synchronous_commit = off` | nothing | up to 3 × `wal_writer_delay` of commits |
+| InnoDB `innodb_flush_log_at_trx_commit = 1` | redo flush | nothing that was acknowledged |
+| InnoDB `innodb_flush_log_at_trx_commit = 2` | write to the OS | about 1 s of commits, on an OS crash or power loss |
+| InnoDB `innodb_flush_log_at_trx_commit = 0` | nothing | about 1 s of commits, even on a server crash |
+
+PostgreSQL can set `synchronous_commit` for each transaction. So an application can make a page-view counter asynchronous and keep payments synchronous.
+
+## Connect
+
+- [Latency vs throughput](/performance/systems/latency-vs-throughput): batching trades one for the other, but here a short delay improved both.
+- [I/O performance](/performance/systems/i-o-performance): queue depth and device flush behavior.
+- [Fsync and torn writes](/databases/storage/durability-fsync-torn-writes-and-checksums): what a flush promises.
+- [Checkpoints](/databases/recovery/checkpoints): the other source of writes that competes with the log.
+
+<Recall cards={[
+  { q: "With one flush for each commit and a flush time F, what is the commit limit?", a: "1/F commits per second, for any number of clients. On a 7,200 rpm disk with F = 8.33 ms, that is 120 commits per second." },
+  { q: "How does group commit work?", a: "The first committer becomes the leader and flushes the log up to the current end, which covers every waiting commit record. Followers sleep and return when a flush covers their LSN." },
+  { q: "Why does group commit without a delay often flush only half of the clients at a time?", a: "Clients that commit during a flush must wait for the next flush. The clients split into two cohorts that take turns, so each flush carries N/2 commits and latency is about 2F." },
+  { q: "What do commit_delay and commit_siblings do in PostgreSQL?", a: "commit_delay makes the flush leader wait before it flushes, so more commits join. It applies only when at least commit_siblings other transactions are active." },
+  { q: "What can a crash lose with synchronous_commit = off, and what can it not do?", a: "It can lose recent acknowledged commits, up to about 3 × wal_writer_delay. It cannot corrupt the database, because the WAL rule still holds for data pages." },
+  { q: "What two logs does MySQL make durable at commit?", a: "The InnoDB redo log and the binary log. Binary log group commit groups their flushes in three stages: flush, sync and commit." },
+]} />

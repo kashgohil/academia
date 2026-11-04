@@ -1,0 +1,133 @@
+---
+summary: "ARIES restart recovery in three passes: analysis rebuilds the tables, redo repeats history, and undo rolls back losers with compensation log records, so a crash during recovery is also safe."
+---
+import { AriesDemo, UndoCrashDemo } from "@/demos/db/RecoveryAriesDemos";
+
+**ARIES** (Algorithms for Recovery and Isolation Exploiting Semantics) is the recovery method that C. Mohan and his colleagues at IBM published in 1992. Db2 and SQL Server use it, and InnoDB follows the same plan. It works with the most flexible buffer pool, STEAL + NO-FORCE, from the [write-ahead logging](/databases/recovery/write-ahead-logging) lesson. After a crash, the disk can hold uncommitted changes, and it can miss committed changes. ARIES fixes both in three passes over the log.
+
+The demo uses four pages, A to D, with one value each. Four transactions run, a fuzzy checkpoint happens in the middle, the buffer pool writes some pages, and T2 aborts. Then the power fails.
+
+<Predict
+  id="repeat-history"
+  question="T3 wrote A, C and D and never committed, so it is a loser. During the redo pass, does ARIES apply the changes of T3 to the pages?"
+  options={[
+    "No: redo applies only committed changes",
+    "Yes: redo repeats all history, and undo then removes the changes of T3",
+    "Only the changes of T3 that were already on disk",
+  ]}
+  answer={1}
+  explain="Redo repeats history: it brings every page to its exact state at the crash, losers included. Then undo rolls back the losers from a known state. This makes redo simple, and it lets undo work with any page layout."
+>
+<AriesDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Finish analysis**. The master record points to begin_checkpoint at LSN 4. Analysis loads the tables from end_checkpoint and reads 13 records. T3 is a loser. T4 committed, but its end record at LSN 18 was lost. Redo must start at LSN 2, before the checkpoint.
+2. Click **Finish redo**. Redo applies 6 records and skips 3. It skips LSN 3 because page C on disk has pageLSN 12. It applies the CLRs of T2 and the updates of T3: it repeats history.
+3. Step through undo. ARIES writes three CLRs for T3, for LSN 16, 12 and 9, newest first. Each CLR points to the next record to undo. The final pages are A = 11, B = 41, C = 12, D = 0.
+4. Click **Restart**. Finish analysis and redo, Step once, click **Flush log**, Step again, and then click **Crash now**. The first CLR survives and the second is lost. In attempt 2, undo reaches that CLR and jumps to its undoNextLSN. LSN 16 is not undone twice.
+5. Move the slider to 13. T2 aborted and undid D before the crash, but did not finish. Recovery treats T2 as a loser and continues its rollback from the CLR at LSN 11.
+
+## The three passes
+
+| Pass | Reads the log | Builds or does |
+|---|---|---|
+| Analysis | forward, from the last checkpoint to the end | the transaction table (ATT) and dirty page table (DPT) at the crash |
+| Redo | forward, from the smallest recLSN in the DPT | every page as it was at the crash |
+| Undo | backward, following the chains of the losers | rolls back the losers and writes CLRs |
+
+### Analysis
+
+A known place on disk holds the **master record**: the LSN of the last complete checkpoint. In PostgreSQL this is the `pg_control` file. Analysis loads the **ATT** (active transaction table) and **DPT** (dirty page table) from that checkpoint, and then reads forward:
+
+- A record of a transaction that is not in the ATT adds it. Every record updates its lastLSN.
+- A commit record marks the transaction committed. An abort record marks it aborting. An end record removes it.
+- An update or CLR for a page that is not in the DPT adds the page, with recLSN = this LSN.
+
+At the end, the ATT holds the **losers** (running or aborting) and the committed transactions that have no end record yet. The DPT holds every page that *may* be dirty. It can list too many pages, but never too few. Redo starts at the smallest recLSN in the DPT.
+
+### Redo
+
+Redo reads forward and looks at each update and CLR. It skips a record in three cases:
+
+1. The page is not in the DPT. The change reached disk before the checkpoint.
+2. The record's LSN is smaller than the page's recLSN. The page was written after this change and dirtied again later.
+3. The page's pageLSN is greater than or equal to the record's LSN. The page already has the change. Only this check reads the page from disk.
+
+Otherwise redo applies the record and sets pageLSN to its LSN. Redo is **physiological** and idempotent, as the lesson on [logging forms](/databases/recovery/physical-logical-and-physiological-logging) shows. It repeats history for losers too, because undo is logical and needs the pages in their real state at the crash.
+
+### Undo
+
+Undo rolls back all losers in one backward pass. It keeps the set ToUndo, which holds the next LSN to undo for each loser. It always takes the largest LSN, so the log is read backward only once:
+
+```ts
+// The undo pass of ARIES (src/sims/db/recovery/aries.ts, simplified).
+const toUndo = new Set(losers.map((t) => att.get(t)!.lastLSN));
+while (toUndo.size > 0) {
+  const lsn = Math.max(...toUndo);
+  toUndo.delete(lsn);
+  const r = log.record(lsn);
+  let next: Lsn;
+  if (r.kind === "update") {
+    // Undo the change and log the undo as a redo-only CLR.
+    log.append({ kind: "clr", txn: r.txn, prevLSN: att.get(r.txn)!.lastLSN,
+                 page: r.page, slot: r.slot, after: r.before, undoNextLSN: r.prevLSN });
+    next = r.prevLSN;
+  } else if (r.kind === "clr") {
+    next = r.undoNextLSN;      // skip work that an earlier undo already did
+  } else {
+    next = r.prevLSN;          // abort record: keep walking the chain
+  }
+  if (next === 0) log.append({ kind: "end", txn: r.txn });
+  else toUndo.add(next);
+}
+```
+
+A **compensation log record (CLR)** describes one undo action. It is redo-only: recovery can repeat it, but never reverses it. Its **undoNextLSN** is the prevLSN of the record that it undid. So it points to the next record of the transaction that still needs undo.
+
+## Why CLRs make recovery safe to repeat
+
+Recovery can crash too. Redo is idempotent, so repeating it is harmless. Undo is the hard part: some undo actions reached the disk or the log, and others did not.
+
+<UndoCrashDemo />
+
+1. Keep **CLRs (ARIES)** and move **Crashes during undo** from 0 to 4. The loser has 6 updates, and recovery always does exactly 6 undo actions in total. Each pass continues where the last durable CLR stopped.
+2. Select **Normal update records** with 2 crashes. Each pass also undoes the records that the earlier passes wrote. The work grows to 22 undo actions, and to 58 with 4 crashes.
+3. Look at the lines in the CLR view. Each CLR in a later pass undoes an original update, never another CLR.
+
+The argument has three steps:
+
+<Steps>
+<div>Redo replays CLRs like any update, so after redo, every durable undo action is in the pages again.</div>
+<div>Undo never undoes a CLR. When it meets one, it jumps to the CLR's undoNextLSN, past the work that is already undone.</div>
+<div>So each update of a loser is undone exactly once over all attempts. The log grows by at most one CLR for each update, and recovery always ends.</div>
+</Steps>
+
+The same mechanism serves normal rollback. A transaction that aborts writes CLRs as it goes. If the system crashes during the rollback, recovery continues it from the last CLR. ARIES also uses CLRs for **partial rollback** to a savepoint: undo back to the savepoint's LSN and stop.
+
+## What the passes cost
+
+Analysis and redo read the log from the checkpoint, or from the oldest recLSN if that is earlier. The cost of these passes depends on the checkpoint interval, which the [checkpoints](/databases/recovery/checkpoints) lesson explores. Undo depends on the work of the losers. One transaction that ran for an hour without a commit can mean an hour of log to undo.
+
+Engines reduce that cost in different ways:
+
+- **InnoDB** does redo first and then opens the database. Background threads roll back the incomplete transactions, and their row locks protect the rows meanwhile.
+- **SQL Server** follows ARIES. Since SQL Server 2019, **accelerated database recovery** keeps row versions in a persistent version store. Undo then only marks the loser aborted, so it takes constant time.
+- **PostgreSQL** has no undo pass at all. Redo replays the WAL from the redo point of the last checkpoint. MVCC makes the rows of losers invisible, because the commit log never says that the losers committed.
+
+## Connect
+
+- [Write-ahead logging](/databases/recovery/write-ahead-logging): the LSNs, prevLSN chains and the WAL rule that ARIES depends on.
+- [Physical, logical and physiological logging](/databases/recovery/physical-logical-and-physiological-logging): why redo is physiological and undo is logical.
+- [Checkpoints](/databases/recovery/checkpoints): where analysis starts, and why redo can start earlier.
+- [Two-phase locking](/databases/transactions/two-phase-locking-and-deadlocks): locks keep the rows of a loser safe until its undo finishes.
+
+<Recall cards={[
+  { q: "What do the three passes of ARIES do?", a: "Analysis rebuilds the transaction table and dirty page table from the last checkpoint. Redo repeats history from the smallest recLSN. Undo rolls back the losers, newest record first, writing CLRs." },
+  { q: "Name the three cases in which redo skips a record.", a: "The page is not in the DPT. The record's LSN is smaller than the page's recLSN. The page's pageLSN is at least the record's LSN." },
+  { q: "What does 'repeating history' mean, and why does ARIES do it?", a: "Redo applies every logged change, losers included, so the pages are exactly as they were at the crash. Logical undo then works on a known state." },
+  { q: "What is a CLR, and what does its undoNextLSN hold?", a: "A redo-only record of one undo action. undoNextLSN is the prevLSN of the undone record: the next record of that transaction that still needs undo." },
+  { q: "Why does recovery always finish, even with crashes during undo?", a: "A CLR is never undone. Undo jumps over finished work with undoNextLSN, so each update is undone exactly once and the log grows by at most one CLR per update." },
+  { q: "Why does PostgreSQL recovery have no undo pass?", a: "MVCC leaves the row versions of losers in place, and the commit log never marks the losers committed. So readers ignore those versions, and VACUUM removes them later." },
+]} />

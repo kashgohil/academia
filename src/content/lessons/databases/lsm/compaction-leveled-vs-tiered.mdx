@@ -1,0 +1,144 @@
+---
+summary: "Why an LSM tree merges its files, and the two main ways to do it. Leveled compaction writes more and reads less; tiered compaction writes less and reads more. Also write stalls, tombstones and FIFO."
+---
+import { CompactionRaceDemo, WaVsTDemo, StallDemo } from "@/demos/db/LsmCompactionDemos";
+
+Each flush adds one more sorted run to the tree. If nothing merges the runs, three problems grow without limit:
+
+- **Reads get slower.** A lookup may have to check every run.
+- **Space grows.** Old versions and tombstones stay on disk for ever.
+- **Deletes never finish.** A tombstone hides data, but the data still uses space.
+
+**Compaction** is the background job that fixes this. It reads some sorted runs, merges them like the merge step of merge sort, and drops versions that no reader can see. Then it writes the result as new files and deletes the inputs. The input files never change, so readers can use them until the new files are ready.
+
+Three numbers describe the cost of a design:
+
+- **Write amplification (WA)**: bytes written to disk per byte that the user writes.
+- **Read amplification**: sorted runs, or block reads, per lookup.
+- **Space amplification (SA)**: bytes on disk per byte of live data.
+
+No design makes all three small at the same time. This is the RUM conjecture (Athanassoulis and others, EDBT 2016). The [amplification lesson](/databases/storage/read-write-and-space-amplification) shows it for all storage engines.
+
+## Two shapes
+
+**Leveled compaction** is the default in LevelDB and RocksDB. L0 holds the flush output, and its files can overlap. Each deeper level Li is one sorted run, cut into files of `target_file_size_base` (64 MiB in RocksDB).
+
+Each level has a byte budget. In RocksDB, L1 gets `max_bytes_for_level_base` (256 MiB), and each next level gets $T$ times more. $T$ is the **size ratio** (`max_bytes_for_level_multiplier`, default 10). When a level is over its budget, the engine picks one file. It merges the file with the files of the next level that overlap its key range.
+
+**Tiered compaction** lets each level collect up to $T$ runs of about the same size. When a level has $T$ runs, all of them merge into one run in the next level. Cassandra's size-tiered strategy (by default, 4 similar runs merge) and RocksDB's universal compaction work like this.
+
+<Predict
+  id="who-writes-more"
+  question="Both trees take the same 20,000 random writes, with size ratio T = 4. Which tree writes more bytes to disk?"
+  options={[
+    "The tiered tree, because it keeps more runs",
+    "The leveled tree, because it rewrites parts of each level many times",
+    "Both write the same bytes, because the data is the same",
+  ]}
+  answer={1}
+  explain="In the leveled tree, a byte that moves down merges with the overlapping data of the next level. That data can be up to T times bigger. In the tiered tree, a byte is written about once per level. The real engine measures 9.67 against 4.66 bytes per user byte."
+>
+<CompactionRaceDemo />
+</Predict>
+
+Things to try:
+
+1. Watch the leveled tree. Each level fills to its budget, then pushes files to the next level. The tiered tree collects runs side by side, then merges them all at once.
+2. Wait for about 20,000 writes. Compare **write amp**: the leveled tree writes about twice as much. Compare **sorted runs**: the tiered tree has more.
+3. Set **T** to 10. The leveled tree gets fewer levels, but each move down rewrites more data. The tiered tree writes even less, and it keeps up to 9 runs per level.
+4. Select **updates to 2,000 keys**. The same keys come back again and again. **Space amp** of the tiered tree climbs above 2, because it keeps old copies in separate runs.
+
+## Write amplification
+
+<Steps>
+<div>**Tiered.** A merge writes each byte once into the next level. A byte moves through about $L = \log_T(D/W)$ levels, where $D$ is the data size and $W$ the memtable size. So $\text{WA} \approx L$.</div>
+<div>**Leveled, one level.** A byte that moves from Li to Li+1 merges with the overlapping part of Li+1. When Li+1 is full, that part is $T$ times bigger, so the merge writes $T + 1$ bytes per byte moved.</div>
+<div>While Li+1 fills from empty to full, the overlap grows from 0 to $T$. On average, a byte that moves down costs about $T/2$.</div>
+<div>Add the flush (1 byte) and the L0 → L1 merge ($1 + B/(F_0 W)$, with $B$ the L1 budget and $F_0$ the L0 trigger). So $\text{WA} \approx 2 + B/(F_0 W) + (T/2) \log_T(D/B)$.</div>
+<div>Example: RocksDB defaults and 100 GiB of data. $\log_{10}(400) = 2.6$ levels below L1 give 13.0, so the total is 16.0. Every user byte becomes 16 bytes of disk writes.</div>
+</Steps>
+
+The model is simple, but the real engine follows it. The next demo runs the real LSM tree for each $T$ and draws the model next to it.
+
+<WaVsTDemo />
+
+Things to try:
+
+1. Read the write amp. At $T = 10$, the leveled tree writes 11.37 bytes per user byte and the tiered tree only 2.77.
+2. Follow the leveled dots from $T = 2$ to 16. The write amp grows from 8.71 to 12.63. In the model, the factor $(T/2)/\ln T$ is smallest near $T = e \approx 2.7$. But a small $T$ needs many levels, and each level is one more sorted run.
+3. Select **sorted runs**. At $T = 10$, the leveled tree has 5.3 runs on average and the tiered tree 11.3. Each run can cost a lookup a filter check or a block read.
+4. Select **space amp** and **updates**. At $T = 10$, the leveled tree stores 1.13 bytes per live byte and the tiered tree 2.61. The dashed lines are the worst cases.
+
+## The trade-off
+
+| | Leveled | Tiered |
+|---|---|---|
+| Write amp | about $T/2$ per level, up to $T + 1$ | about 1 per level |
+| Sorted runs | L0 files plus 1 per level | up to $T - 1$ per level |
+| Space amp, worst case | $T/(T-1)$: 1.11 for $T = 10$ | up to $T$ copies of hot keys |
+| Good for | reads, scans, space | heavy writes, write-once data |
+
+Leveled space amplification is small for a reason. With $T = 10$, the last level holds about 90% of the data. Even if all upper levels hold only old versions, they add at most 11%. RocksDB's `level_compaction_dynamic_level_bytes` (the default since version 8.4) sets the level budgets from the real size of the last level. It keeps this bound true when the data size changes.
+
+Tiered compaction has a worse problem. A full merge of the last level needs free space for a full copy of the data while it runs. RocksDB's universal compaction limits the space with `max_size_amplification_percent` (default 200). Above that limit, it merges all runs.
+
+## Which compaction runs next
+
+The engine computes a **score** for each level. For L0, it is the number of files divided by `level0_file_num_compaction_trigger` (default 4). For a deeper level, it is the level size divided by its budget. The level with the highest score of at least 1 goes first.
+
+In that level, the engine must choose a file. LevelDB walks the key space round-robin. Newer RocksDB versions prefer the file with the smallest overlap ratio below it (`kMinOverlappingRatio`), so they write less.
+
+If a file overlaps nothing in the next level, the engine only changes the metadata. This is a **trivial move**, and it costs no I/O. With keys that only grow, such as time stamps, every compaction is a trivial move. The write amp then stays at 1.
+
+```cpp
+// RocksDB: leveled compaction with dynamic level sizes and the default priority.
+options.compaction_style = rocksdb::kCompactionStyleLevel;
+options.level_compaction_dynamic_level_bytes = true;
+options.compaction_pri = rocksdb::kMinOverlappingRatio;
+options.max_background_jobs = 8;   // flushes and compactions run in parallel
+options.max_subcompactions = 4;    // split one big L0 -> L1 job into parallel ranges
+```
+
+## Tombstones
+
+Compaction can drop a tombstone only when two conditions are true. First, no lower level can hold an older version of the key. In practice, the tombstone must reach the bottom of the data for its key range. Second, no live snapshot must need the old version. Until then, the tombstone uses space, and every scan must read and skip it.
+
+This hurts queues and other delete-heavy patterns. A scan from the head of a queue can read thousands of tombstones before the first live key. RocksDB has tools for this. `DeleteRange` writes one range tombstone in place of many point tombstones. `NewCompactOnDeletionCollectorFactory` marks a file for compaction when it holds many tombstones. `SingleDelete` removes a key that was written only once, and it can drop both entries early.
+
+## L0 and write stalls
+
+L0 files overlap, so a lookup must check all of them. If flushes add L0 files faster than compaction removes them, reads slow down.
+
+RocksDB then protects itself in two steps. At `level0_slowdown_writes_trigger` (20 files), it limits writes to `delayed_write_rate`. At `level0_stop_writes_trigger` (36 files), it stops writes. LevelDB uses 8 and 12 files. RocksDB also stalls when the bytes that wait for compaction pass 64 GiB (soft limit) or 256 GiB (hard limit).
+
+<StallDemo />
+
+Things to try:
+
+1. Keep 20 MiB/s of writes. L0 never passes the trigger by much, and no write waits. Compaction below L1 already needs 520 MiB/s of the 1000 MiB/s.
+2. Move the writes to 40 MiB/s. The deep levels now take almost all the bandwidth. L0 grows to the slowdown limit, and the engine spends 16% of the time slowed down. The average falls to 36.1 MiB/s.
+3. Move **Compaction bandwidth** up until the stalls stop. A write rate needs about $2 \times \text{WA}$ times that rate in disk bandwidth.
+4. Select a 256 MiB write buffer. L0 gets fewer, larger files, but each L0 → L1 job takes longer.
+
+A stall is a symptom. The cause is that compaction cannot keep up with the write rate times the write amplification. More compaction threads, faster disks, a lower WA or a lower write rate fix it. A higher stall trigger only delays it.
+
+## FIFO compaction
+
+Some data only expires: logs, metrics, cache entries. For these, RocksDB has `kCompactionStyleFIFO`. All files stay in L0, and the engine never merges them. When the total size passes `compaction_options_fifo.max_table_files_size`, it deletes the oldest file. A time-to-live option can delete files by age. The write amp is 1, but a lookup must check every file, so filters are important.
+
+## Connect
+
+- [Memtables and SSTables](/databases/lsm/memtables-and-sstables) describes the runs that compaction merges.
+- [Bloom filters](/databases/lsm/bloom-filters) make many runs cheap for point lookups, but not for scans.
+- [Tuning an LSM tree](/databases/lsm/tuning-an-lsm-tree) chooses $T$, budgets and triggers for a workload.
+- [External sorting](/databases/query/external-sorting-and-aggregation) uses the same k-way merge.
+- [Fragmentation](/systems/allocators/fragmentation) is the allocator view of space amplification.
+
+<Recall cards={[
+  { q: "What three problems grow without compaction?", a: "Lookups must check more sorted runs, old versions and tombstones use more space, and deleted data never leaves the disk." },
+  { q: "What is the write amplification of tiered compaction, and why?", a: "About one write per level, so about log_T(D/W) in total. A merge writes each byte once into the next level." },
+  { q: "Why does leveled compaction cost up to T + 1 writes per level?", a: "A byte that moves down merges with the overlapping part of the next level. When that level is full, the part is T times bigger." },
+  { q: "What is the worst-case space amplification of leveled compaction with T = 10, and why?", a: "About 1.11, which is T/(T−1). The last level holds about 90% of the data, so old versions in the upper levels add at most about 11%." },
+  { q: "When can compaction drop a tombstone?", a: "When no lower level can hold an older version of the key, and no live snapshot needs the old version." },
+  { q: "What do level0_slowdown_writes_trigger and level0_stop_writes_trigger do in RocksDB?", a: "At 20 L0 files (default), RocksDB limits the write rate. At 36 files, it stops writes until compaction removes L0 files." },
+]} />

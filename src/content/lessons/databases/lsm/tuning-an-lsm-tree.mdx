@@ -1,0 +1,136 @@
+---
+summary: "The knobs of an LSM tree and what each one costs: memtable size, size ratio, L0 trigger, block size, cache, filter bits, compression and rate limits. A cost model, a worked RocksDB example, and a comparison with a B+ tree."
+---
+import { TuningPanelDemo, BtreeVsLsmDemo } from "@/demos/db/LsmTuningDemos";
+
+Tuning an LSM tree means choosing where to pay. Each knob moves cost between writes, reads, space and memory. The RUM conjecture says that no setting makes all of them small. So start from the workload: which operations are frequent, and which ones must be fast?
+
+## The knobs
+
+| RocksDB option | Default | Larger value gives | Larger value costs |
+|---|---|---|---|
+| `write_buffer_size` | 64 MiB | fewer, larger L0 files; less write amp | memory; longer WAL replay after a crash |
+| `max_write_buffer_number` | 2 | more time for a flush before writes stall | memory |
+| `level0_file_num_compaction_trigger` | 4 | fewer L0 → L1 merges | more L0 files for each read to check |
+| `max_bytes_for_level_base` | 256 MiB | fewer levels | larger, slower L0 → L1 merges |
+| `max_bytes_for_level_multiplier` | 10 | fewer levels and runs | more write amp per level |
+| `block_size` | 4 KiB | smaller index, better compression, faster scans | more bytes read for each point lookup |
+| `block_cache` | (your choice) | more cache hits | memory |
+| Bloom `bits_per_key` | (no filter) | fewer wasted reads on misses | 1 bit per key per extra bit |
+| `compression`, `compression_per_level` | Snappy, if built in | less space and I/O | CPU on every read and compaction |
+| `rate_limiter` | (none) | smooth compaction I/O, stable read latency | compaction falls behind if set too low |
+
+Two rules connect these knobs. First, make L1 about as large as L0 at its trigger: `max_bytes_for_level_base` ≈ `level0_file_num_compaction_trigger` × `write_buffer_size`. With the defaults, that is 4 × 64 MiB = 256 MiB. Then each L0 → L1 merge rewrites about as much L1 data as it reads from L0.
+
+Second, compress where the data is. With $T = 10$, the last level holds about 90% of the bytes, and the upper levels are rewritten most often. So many setups use no compression or LZ4 on the upper levels and ZSTD on the last level (`bottommost_compression`).
+
+## A cost model
+
+The demo below uses a small model of a tree with 100 million keys of 16 bytes and values of 100 bytes. With the 8-byte trailer, each entry has 124 bytes, and the data has 11.5 GiB. The model uses the formulas from the earlier lessons:
+
+- **Write amp**: leveled $2 + B/(F_0 W) + (T/2) \log_T(D/B)$, tiered $\log_T(D/W)$.
+- **Sorted runs**: the memtable, half of the L0 trigger and one per level for leveled. For tiered, $(T-1)/2$ per level.
+- **Block reads**: $1 + (\text{runs} - 1)\,\varepsilon$ for a key that exists, $\text{runs} \cdot \varepsilon$ for a missing key, and one seek per run plus the result blocks for a scan.
+- **Cache**: a uniform share of the stored bytes. The filters and the index stay in memory.
+- **Throughput score**: one divided by the average time per operation on an NVMe-class disk. The disk does 400,000 random reads per second and 2 GiB/s of sequential I/O.
+
+The score is not a benchmark. It shows the direction and the rough size of each change.
+
+<Predict
+  id="best-change"
+  question="A point-lookup workload (90% reads, half of them for keys that do not exist) runs on the RocksDB defaults. Which change raises the throughput score the most?"
+  options={[
+    "Bloom filter: 10 → 16 bits per key",
+    "Block cache: 1 GiB → 8 GiB",
+    "write_buffer_size: 64 → 256 MiB",
+  ]}
+  answer={1}
+  explain="With 10 bits per key, a miss already costs only 0.041 block reads. But each lookup of an existing key must read the block that holds it, and only the cache can remove that read. In the model, 16 bits give 1.7% more and an 8 GiB cache gives 19% more."
+>
+<TuningPanelDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **write-heavy log**. With the defaults, the write amp is 11.3, and writes take 87% of the time. The score is 286k operations per second.
+2. Set `write_buffer_size` to 256 MiB and `max_bytes_for_level_base` to 1024 MiB. The write amp falls to 8.3, and the score rises 10%. The memtables now use 512 MiB.
+3. Select **tiered**. The write amp falls to 2.3, but a lookup may now check 14.5 runs. For this workload the score still rises to 366k.
+4. Select **point lookups** and try the three choices from the prediction. Then set Bloom bits to 0 and watch the block reads for a missing key jump to 5.
+5. Select **range scans** and set `block_size` to 16 KiB. A 100-row scan reads 5.8 blocks in place of 8.0, and the score rises 25%. The index shrinks from 61 MiB to 15 MiB.
+
+## Workload-driven choices
+
+| Workload | Main cost | First moves |
+|---|---|---|
+| Write-heavy log, events, metrics | compaction bandwidth, write stalls | larger memtables and L1; tiered or FIFO compaction if reads are rare; time-ordered keys get trivial moves |
+| Point lookups | the last block read | a large block cache; 10 bits per key; `optimize_filters_for_hits` if most lookups find their key |
+| Point lookups for missing keys | wasted reads in every run | more filter bits or Ribbon filters; Monkey-style allocation |
+| Range scans | one seek per run, then sequential blocks | leveled compaction; fewer L0 files; larger blocks; prefix filters for prefix scans |
+| Mixed with a size limit | space amplification | leveled with `level_compaction_dynamic_level_bytes`; ZSTD on the last level |
+
+## A worked example: tuning for log ingest
+
+A service writes 30,000 events per second and reads few of them. The keys are random IDs, so compaction cannot use trivial moves. The defaults give a write amp of 11.3. The [stall demo](/databases/lsm/compaction-leveled-vs-tiered) showed that compaction needs about $2 \times \text{WA}$ times the write rate in disk bandwidth.
+
+```cpp
+rocksdb::Options options;
+options.write_buffer_size = 256 << 20;                // 4x the default memtable
+options.max_write_buffer_number = 3;                  // one fills while two flush
+options.level0_file_num_compaction_trigger = 4;
+options.max_bytes_for_level_base = 1024ull << 20;     // = 4 x 256 MiB, as the rule says
+options.max_bytes_for_level_multiplier = 10;
+options.level_compaction_dynamic_level_bytes = true;
+options.compression_per_level = {rocksdb::kNoCompression, rocksdb::kNoCompression,
+                                 rocksdb::kLZ4Compression, rocksdb::kLZ4Compression,
+                                 rocksdb::kLZ4Compression, rocksdb::kLZ4Compression,
+                                 rocksdb::kZSTD};
+options.max_background_jobs = 8;
+options.rate_limiter.reset(rocksdb::NewGenericRateLimiter(400 << 20)); // 400 MiB/s
+
+rocksdb::BlockBasedTableOptions table;
+table.block_size = 16 << 10;
+table.filter_policy.reset(rocksdb::NewBloomFilterPolicy(10));
+table.block_cache = rocksdb::NewLRUCache(1ull << 30);
+options.table_factory.reset(rocksdb::NewBlockBasedTableFactory(table));
+```
+
+The larger memtables and L1 cut the write amp from 11.3 to 8.3 in the model. That is 27% less flush and compaction I/O for the same data. The cost is 768 MiB of memtables in place of 128 MiB, and a longer WAL replay after a crash. The rate limiter keeps compaction from taking all the disk bandwidth from reads. If the writes grow, check the stall counters (`rocksdb.stats`, `stall_micros`) before you raise any trigger.
+
+## B+ tree or LSM tree?
+
+A B+ tree updates in place. Each update reads the leaf page and later writes the whole page back. The LSM tree writes each entry many times, but always in large sequential runs. The next demo compares both with the same data, workload and memory.
+
+The B+ tree side uses a simple model of our own:
+
+- Leaves are 69% full on average after random inserts ($\ln 2$, Yao 1978). Inner nodes hold a key and a 6-byte child pointer.
+- The buffer pool keeps all inner nodes first, then a uniform share of the leaves.
+- A point read costs one leaf read on a cache miss.
+- An update reads the leaf (on a miss) and writes one full page later. This is the worst case: a page can absorb several updates before it is written.
+- The LSM side uses the RocksDB defaults. Its memtables, filters and index come from the same memory budget, and the rest is block cache.
+
+<BtreeVsLsmDemo />
+
+Things to try:
+
+1. Read the table at 50% writes, 16 KiB pages and 4 GiB. The B+ tree writes 132 bytes per user byte: a 16 KiB page for a 124-byte entry. The LSM tree writes 11.3.
+2. Move **Share of writes** to 0%. The B+ tree wins, 212k to 198k. The LSM tree reads about as many blocks, but it checks 6 runs per lookup.
+3. Read the crossover: above 3.8% writes, the LSM tree has the higher score. Select 4 KiB pages: the B+ tree writes less per update, but its tree is taller. The crossover moves to 1.7%.
+4. Select 1 GiB and 16 GiB. The crossover moves only a little: 5.2% and 4.1%.
+
+The model is hard on the B+ tree. A real buffer pool combines many updates to a hot page into one write, and a checkpoint writes pages in large batches. On the other side, the model ignores compaction's effect on read latency and the CPU cost of a merge. Use the model to find the main cost, then measure your own workload.
+
+## Connect
+
+- [Compaction: leveled vs tiered](/databases/lsm/compaction-leveled-vs-tiered) derives the write-amp formulas used here.
+- [Bloom filters](/databases/lsm/bloom-filters) explain the miss cost and its memory price.
+- [B+ trees](/databases/btrees/b-trees) and [buffer pools](/databases/storage/buffer-pools) are the other side of the comparison.
+- [Read, write and space amplification](/databases/storage/read-write-and-space-amplification) puts both designs on one map.
+- [I/O performance](/performance/systems/i-o-performance) explains why sequential writes are cheap on SSDs too.
+
+<Recall cards={[
+  { q: "How should max_bytes_for_level_base relate to the memtable size and the L0 trigger?", a: "Make it about level0_file_num_compaction_trigger × write_buffer_size, so that each L0 → L1 merge rewrites about as much L1 data as it reads from L0." },
+  { q: "Why do many setups compress only the lower levels, and with ZSTD at the bottom?", a: "The last level holds about 90% of the data and changes least. The upper levels are small and rewritten often, so cheap or no compression saves CPU there." },
+  { q: "For point lookups of keys that exist, why does a larger block cache help more than more filter bits?", a: "The lookup must read the block that holds the key. Filters only remove wasted reads in other runs, and those are already rare at 10 bits per key." },
+  { q: "What does a larger write_buffer_size cost?", a: "Memory for each memtable, times max_write_buffer_number, and a longer WAL replay after a crash." },
+  { q: "Why does a B+ tree write much more than an LSM tree for random updates in the simple model?", a: "Each update writes a full page, for example 16 KiB for a 124-byte entry. The LSM tree writes each entry about 11 times, in large sequential runs." },
+]} />

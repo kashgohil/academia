@@ -1,0 +1,158 @@
+---
+summary: "How an LSM tree writes: a WAL append and a skip-list insert. How it reads: memtables, then sorted files, newest first. Also tombstones, sequence numbers and the SSTable byte format."
+---
+import { LsmStepperDemo, SkipListDemo, BlockLayoutDemo } from "@/demos/db/LsmDemos";
+
+A B+ tree changes pages in place. A random write must find its page, change it and write the page back. A **log-structured merge tree (LSM tree)** never changes data on disk in place. It collects writes in memory and writes them out as new sorted files. Later, background work merges these files. LevelDB, RocksDB, Cassandra, ScyllaDB and HBase all use this design.
+
+The idea comes from O'Neil and others (1996). It changes many small random writes into a few large sequential writes. The cost moves to reads and to background merges. This module shows where each cost goes and how to tune it.
+
+## The write path
+
+A put has two steps, and both are cheap:
+
+1. The engine appends a record to the **write-ahead log (WAL)**. The WAL is a file that is only appended to. After a crash, the engine replays it to rebuild memory.
+2. The engine inserts the entry into the **memtable**. The memtable is a sorted structure in memory.
+
+Then the put returns. No data file on disk changes. In LevelDB and RocksDB, the WAL is a sequence of 32 KiB blocks. Each record has a 7-byte header: a 4-byte checksum, a 2-byte length and a 1-byte type. By default, `WriteOptions::sync` is false, so the put does not wait for `fsync`. A machine crash can then lose the most recent writes, but a process crash cannot.
+
+Each write also gets a **sequence number**: a counter that increases by one for each write. LevelDB adds an 8-byte trailer to every user key. The trailer holds the 56-bit sequence number and a 1-byte type: put or delete. The result is the **internal key**. Internal keys sort by user key first, then by sequence number from new to old.
+
+```rust
+// Internal-key order, as in LevelDB's InternalKeyComparator.
+fn cmp(a: &Entry, b: &Entry) -> std::cmp::Ordering {
+    a.key.cmp(&b.key)             // user key ascending
+        .then(b.seq.cmp(&a.seq))  // then newest first
+}
+```
+
+A delete does not remove anything. It writes a **tombstone**: an entry with type delete. The tombstone hides all older versions of the key.
+
+<Predict
+  id="miss-path"
+  question="Key grape was never written. The tree has a memtable and two files on disk. How does get(grape) answer 'not found'?"
+  options={[
+    "It checks only the memtable, because the memtable knows every key",
+    "It checks the memtable, then each file that can hold grape, newest first",
+    "It reads every block of every file",
+  ]}
+  answer={1}
+  explain="An LSM tree has no global index. Any structure can hold the newest version of a key, so a miss must ask every candidate. Key ranges and Bloom filters make most of these checks free."
+>
+<LsmStepperDemo />
+</Predict>
+
+Things to try:
+
+1. Select **grape** and press **Get**. The memtable does not have it. File 2 covers apple to date, so the read skips that file by its range. File 1 covers grape, but its Bloom filter says no. The read loads 0 blocks.
+2. Select **apple** and press **Get**. File 2 holds apple #5 and file 1 holds apple #1. The newer file answers first, so the read never looks at the old version.
+3. Select **fig** and press **Get**. The memtable holds the tombstone #8, so the answer is "not found". File 1 still holds fig = purple, but no read can see it.
+4. Press **Snapshot**, then **Put** apple twice. Turn on **Read at snapshot** and get apple. You see the value from before the snapshot.
+5. Press **Reset**, then **Flush** and **Compact L0 → L1**. The merge drops 2 old versions and 1 tombstone. L1 is the last level here, so nothing older can exist below the tombstone.
+
+## The memtable is a skip list
+
+LevelDB and RocksDB use a **skip list** for the memtable by default. A skip list is a sorted linked list with extra "express" links. Each node gets a random height. A coin with probability $p$ of heads decides each extra level. LevelDB uses $p = 1/4$ and a maximum height of 12.
+
+<SkipListDemo />
+
+Things to try:
+
+1. Move **Search for key**. The search starts at the top of the head node. It moves right while the next key is smaller. Then it moves down one level.
+2. Press **Insert a random key** a few times. Read the coin flips. Each heads adds one level, and the first tails stops the node.
+3. Set **Keys in the list** to 40. The average number of comparisons grows slowly, near the formula.
+4. Change **P(heads)** to 1/4. Nodes get shorter, so the list needs fewer pointers. The search makes a few more moves on each level.
+
+<Steps>
+<div>Look at the search path backwards, from the target to the head. At each node, the path went up if the node had one more level. That happens with probability $p$.</div>
+<div>So the path makes on average $1/p$ moves on each level before it climbs.</div>
+<div>The list has about $\log_{1/p} n$ levels. The total cost is about $\log_{1/p}(n)/p$ comparisons.</div>
+<div>For $n = 10^6$, this is 39.9 comparisons for $p = 1/2$ and also 39.9 for $p = 1/4$. Both values equal $2 \log_2 n$.</div>
+<div>The pointers per node are $1/(1-p)$: 2 for $p = 1/2$, and 1.33 for $p = 1/4$. LevelDB keeps the same search cost and uses a third fewer pointers.</div>
+</Steps>
+
+Why a skip list and not a balanced tree? An insert changes only a few local pointers, with no rotations. LevelDB lets readers run with no lock while one writer inserts. RocksDB's `InlineSkipList` also allows concurrent inserts with compare-and-swap. The memtable never deletes a node, because a delete is just another entry. Memory comes from an arena, and the whole arena is freed after the flush.
+
+## Immutable memtables and flush
+
+A memtable has a size limit: `write_buffer_size`. The default is 64 MiB in RocksDB and 4 MiB in LevelDB. When the memtable is full, it becomes **immutable**: it accepts no more writes. A new memtable and a new WAL file start at once. A background thread **flushes** the immutable memtable. It walks the skip list in order and writes one sorted file. Then the engine deletes the old WAL file.
+
+RocksDB allows `max_write_buffer_number` memtables at the same time (default 2). If the flush is too slow and all memtables are full, writes stop. This is a **write stall**. The [compaction lesson](/databases/lsm/compaction-leveled-vs-tiered) shows when stalls happen.
+
+## The SSTable format
+
+A flush writes a **sorted string table (SSTable)**: a file of entries sorted by internal key that never changes after it is written. A LevelDB or RocksDB SSTable has these parts:
+
+| Part | Content |
+|---|---|
+| Data blocks | entries in key order, about `block_size` bytes each (default 4 KiB) |
+| Filter block | a Bloom filter over the keys of the file |
+| Metaindex block | the name and location of the filter block |
+| Index block | for each data block: a separator key and the block's offset and size |
+| Footer | 48 bytes: the locations of the index and metaindex blocks, then a magic number |
+
+Each block is followed by a 5-byte trailer: a compression type byte and a CRC32C checksum. A reader opens the file, reads the footer, then loads the index and the filter. The index entries are **fence pointers**: they give the key range of each block. One binary search over them finds the only block that can hold a key.
+
+Sorted neighbors often share a long prefix. So a data block stores each key as the length of the prefix that it shares with the previous key, plus the rest of the key. Every 16 entries (`block_restart_interval`), the block stores a full key. That position is a **restart point**. The block ends with an array of the offsets of its restart points.
+
+<BlockLayoutDemo />
+
+Things to try:
+
+1. Keep **user:id:field** and interval 16. Prefix compression saves 32.0% of the block: 1,200 bytes in place of 1,766.
+2. Read the seek cost: 2.0 binary-search steps over the restart points, then 9.3 entries scanned on average.
+3. Set the interval to 1. Every key is full again, and the restart array grows to 4 bytes per entry. A seek now scans only about two entries.
+4. Select **random hex**. The keys share almost nothing, so the saving is small at any interval.
+5. Look at the index keys below the file bar. They are short **separators**, not full keys. Each one is between the last key of one block and the first key of the next.
+
+## The read path
+
+A point read checks each place that can hold a newer version, and it stops at the first match:
+
+1. the active memtable,
+2. the immutable memtables, newest first,
+3. the L0 files, newest first, because their key ranges overlap,
+4. one file in each deeper level, found by a binary search over the file ranges.
+
+In each file, the read checks the key range, then the Bloom filter, then the index. Only then does it read one data block. If the first match is a tombstone, the answer is "not found".
+
+```go
+func (t *Tree) Get(key []byte, snap uint64) ([]byte, bool) {
+	for _, src := range t.sourcesNewestFirst() { // memtables, L0 files, one file per level
+		if e, ok := src.Seek(key, snap); ok { // newest version with seq <= snap
+			return e.Value, e.Kind == Put // a tombstone ends the search: not found
+		}
+	}
+	return nil, false
+}
+```
+
+A **snapshot** is only a sequence number. A read at snapshot $s$ ignores every entry with a sequence number above $s$. Old versions stay readable for as long as a snapshot needs them. Compaction keeps an old version if a live snapshot can still see it. It drops a tombstone only when no older data for that key can exist in a lower level.
+
+## Costs and failure modes
+
+| Operation | Cost |
+|---|---|
+| Put or delete | one WAL append plus $O(\log n)$ memtable comparisons; no random disk I/O |
+| Point read, key in memory | no disk I/O |
+| Point read, key on disk | about one data-block read with filters; one per sorted run without filters |
+| Range scan | one seek in every sorted run, then a merge of all of them |
+
+The design can break in three ways. Too many sorted runs make reads slow. Background merges that fall behind cause write stalls. Tombstones that never reach the bottom level waste space and slow scans. The next lessons cover each of these.
+
+## Connect
+
+- [Bloom filters](/databases/lsm/bloom-filters) explain why a miss in a file usually costs no I/O.
+- [Compaction: leveled vs tiered](/databases/lsm/compaction-leveled-vs-tiered) explains how the files merge, and what each merge costs.
+- [B+ trees](/databases/btrees/b-trees) are the update-in-place alternative. [Write-ahead logging](/databases/recovery/write-ahead-logging) covers the WAL in depth.
+- [MVCC](/databases/transactions/mvcc) uses the same idea as sequence numbers: versions plus a snapshot timestamp.
+- [Compare-and-swap](/concurrency/atomics/compare-and-swap) is how RocksDB inserts into its skip list from many threads.
+
+<Recall cards={[
+  { q: "What two things happen on an LSM put before it returns?", a: "The engine appends a record to the WAL and inserts the entry into the memtable. No data file on disk changes." },
+  { q: "In what order does a point read check the structures of an LSM tree?", a: "The active memtable, the immutable memtables newest first, the L0 files newest first, then one file in each deeper level. It stops at the first match." },
+  { q: "What does a LevelDB internal key contain, and how does it sort?", a: "The user key plus an 8-byte trailer with a 56-bit sequence number and a type byte. It sorts by user key, then by sequence number from new to old." },
+  { q: "Why does a delete write a tombstone instead of removing the key?", a: "Older versions of the key can be in files that never change. The tombstone hides them until compaction removes them all." },
+  { q: "What are restart points in an SSTable data block?", a: "Every 16 entries the block stores a full key and records its offset. A seek binary-searches these points, then scans forward, because the other keys are prefix-compressed." },
+  { q: "Why does LevelDB use p = 1/4 for its skip list?", a: "The expected search cost is about the same as for p = 1/2, but each node needs 1.33 pointers on average in place of 2." },
+]} />

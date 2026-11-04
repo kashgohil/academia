@@ -1,0 +1,135 @@
+---
+summary: "A bit array and k hash functions that answer 'definitely not here' or 'maybe'. Why 10 bits per key give about 1% false positives, cache-line filters, and how to share filter memory across LSM levels."
+---
+import { BloomPlayDemo, BloomSweepDemo, MissIoDemo } from "@/demos/db/LsmBloomDemos";
+
+An LSM tree has many sorted runs, and any of them can hold a key. Without help, a lookup for a missing key reads one block from every run that covers the key. With 8 runs, that is 8 random reads for the answer "not found". Many workloads ask about missing keys all the time: "does this user exist?", "is this ID new?".
+
+A **Bloom filter** (Burton Bloom, 1970) is a small summary of a set. It answers "definitely not in the set" or "maybe in the set". It never says "no" for a member. It sometimes says "maybe" for a key that is not a member. That is a **false positive**, and it costs one wasted block read.
+
+## How it works
+
+The filter is an array of $m$ bits, all 0 at the start. It uses $k$ hash functions. Each one maps a key to a bit position.
+
+- To **insert** a key, set its $k$ bits to 1.
+- To **query** a key, check its $k$ bits. If any bit is 0, the key was never inserted. If all bits are 1, the key is maybe a member.
+
+Real filters do not compute $k$ independent hashes. They use **double hashing**: two hashes $h_1$ and $h_2$ give the positions $g_i = h_1 + i \cdot h_2 \bmod m$ (Kirsch and Mitzenmacher, 2006). LevelDB computes one 32-bit hash and derives $h_2$ by rotating it.
+
+```zig
+fn mayContain(bits: []const u8, k: u32, h1: u32, h2: u32) bool {
+    const m: u32 = @intCast(bits.len * 8);
+    var i: u32 = 0;
+    while (i < k) : (i += 1) {
+        const pos = (h1 +% i *% h2) % m; // wrapping add and multiply
+        if (bits[pos / 8] & (@as(u8, 1) << @intCast(pos % 8)) == 0) return false;
+    }
+    return true; // all k bits set: "maybe"
+}
+```
+
+<Predict
+  id="no-false-negatives"
+  question="You keep adding keys to a Bloom filter of fixed size. What happens to queries for keys that you did insert?"
+  options={[
+    "Some of them start to answer 'not here': false negatives",
+    "They still always answer 'maybe'; only the false positives become more frequent",
+    "The filter rejects new inserts when it is full",
+  ]}
+  answer={1}
+  explain="An insert only sets bits to 1, and no operation sets a bit back to 0. So the bits of an inserted key stay set. More keys only make more bits 1, so more absent keys find all their bits set."
+>
+<BloomPlayDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **plum** as the query. One of its bits is 0, so the filter answers "definitely not here". The engine skips the file with no I/O.
+2. Press **Find a false positive**. The demo finds a word that was never inserted, but all its bits are set by other keys.
+3. Move **Keys inserted** to 12. More bits become 1, and the measured false positive rate rises.
+4. With 12 keys, move **Hash functions** from 1 to 6. The rate falls at first, then rises again. Too many hashes fill the array too fast.
+5. Select **apple**. A member always answers "maybe", for any setting.
+
+## The false positive rate
+
+<Steps>
+<div>One insert sets one given bit with probability $1/m$ for each of its $k$ hashes. After $n$ inserts, a bit is still 0 with probability $(1 - 1/m)^{kn} \approx e^{-kn/m}$.</div>
+<div>A key that was never inserted is a false positive if all its $k$ bits are 1: $\varepsilon \approx (1 - e^{-kn/m})^k$.</div>
+<div>Set the derivative in $k$ to zero. The best $k$ is $(m/n) \ln 2$. Then half of the bits are 1, and $\varepsilon = 2^{-k} = 0.6185^{m/n}$.</div>
+<div>Solve for the size: $m/n = -\ln \varepsilon / (\ln 2)^2 \approx 1.44 \log_2(1/\varepsilon)$ bits per key.</div>
+</Steps>
+
+So the rate depends only on **bits per key**, not on the number of keys. Each extra bit per key multiplies the rate by 0.6185. A 10 times lower rate costs 4.79 more bits per key. Some reference points:
+
+| Bits per key | Best k | False positive rate |
+|---|---|---|
+| 5 | 3 | 9.18% |
+| 9.59 | 7 | 1% |
+| 10 | 7 | 0.82% |
+| 14.38 | 10 | 0.1% |
+
+LevelDB and the older RocksDB filters choose $k$ as $\lfloor 0.69 \times \text{bits per key} \rfloor$. For 10 bits per key, this gives $k = 6$ and 0.84%, almost the same as the best $k = 7$. RocksDB users usually call `NewBloomFilterPolicy(10)`.
+
+<BloomSweepDemo />
+
+Things to try:
+
+1. Keep **best k**. The measured dots sit on the formula line. At 10 bits per key the formula gives 0.82%, and the demo measures 0.80%.
+2. Move **Fixed k** to 1. The line is much higher at large bits per key. One hash cannot use the extra space well.
+3. Move **Fixed k** to 12. Now small filters are much worse: 12 hashes per key fill a small array.
+4. Compare the orange line with the blue line. The blocked filter is a little worse, and the gap grows with bits per key.
+
+## Faster filters: one cache line
+
+A standard filter query touches $k$ random positions. For a large filter, that can be $k$ cache misses. A **blocked Bloom filter** uses the first hash to pick one 64-byte cache line (512 bits). All $k$ probes stay in that line, so a query costs one cache miss. RocksDB's `format_version=5` filter works like this.
+
+The cost is a slightly higher rate. Keys do not spread evenly over the blocks, and a full block gives more false positives. At 10 bits per key and $k = 7$, the blocked filter has 0.96% in place of 0.82%. At 16 bits per key, it has 0.086% in place of 0.046%.
+
+A Bloom filter also uses more space than necessary. Any filter with rate $\varepsilon$ needs at least $\log_2(1/\varepsilon)$ bits per key. For 1%, that is 6.64 bits, but a Bloom filter needs 9.59. A Bloom filter is thus 1.44 times larger than the minimum. RocksDB's **Ribbon filter** (`NewRibbonFilterPolicy`) comes close to that minimum. It can save up to 31% of filter memory, but it uses more CPU to build.
+
+## Filters in an LSM tree
+
+Each SSTable stores a filter over its keys, and the engine keeps the filters in memory. A point lookup checks the filter before it reads the index or a data block. For a missing key, each run costs one wasted read only with probability $\varepsilon$. For an existing key, the lookup still reads the block that holds it. The filters only remove the wasted reads in the other runs.
+
+Memory is the price. At 10 bits per key, 100 million keys need 119 MiB of filters. In a leveled tree with size ratio 10, the last level holds about 90% of all keys. RocksDB's `optimize_filters_for_hits` leaves the last level without filters. It saves most of the filter memory, and lookups for existing keys still find their key in the last level.
+
+<MissIoDemo />
+
+Things to try:
+
+1. Read the defaults: 4 L0 files and 4 levels. Without filters, a miss costs 8 block reads. With 10 bits per key everywhere, it costs 0.0655.
+2. Compare the two columns. **Monkey** (Dayan and others, SIGMOD 2017) gives small runs more bits per key and the big last level fewer. With the same memory, the cost falls to 0.0118, which is 81.9% less.
+3. Look at the last row. Monkey gives the last level 9.5 bits per key and a rate of 1.06%. The L0 files get 26.7 bits per key, but they hold few keys.
+4. Set **Filter bits per key** to 2. Both methods get worse, but Monkey still wins by a large factor.
+
+Why does this work? The total cost is the sum of the rates, $\sum_i \varepsilon_i$. The memory is $\sum_i n_i \cdot (-\ln \varepsilon_i)/(\ln 2)^2$. A Lagrange multiplier gives $\varepsilon_i \propto n_i$. A run with few keys can get a very low rate for very little memory.
+
+## Range queries and prefix filters
+
+A Bloom filter answers only "is this exact key here?". A range scan asks "is any key between a and b here?", so it cannot use the filter. A scan must seek in every sorted run.
+
+Many range scans share a prefix, for example all keys of user 42. RocksDB's `prefix_extractor` (for example `NewFixedPrefixTransform(8)`) builds the filter over key prefixes. A scan inside one prefix can then skip every file without that prefix. Set `whole_key_filtering` to keep point lookups fast too. `memtable_prefix_bloom_size_ratio` adds the same kind of filter to the memtable. Research filters such as SuRF (Zhang and others, SIGMOD 2018) also answer general range questions.
+
+## When filters do not help
+
+- **Existing keys**: the last read is needed in all cases. Use the block cache for these lookups.
+- **Range scans**: use prefix filters, or accept one seek per sorted run.
+- **Few runs**: with one big sorted run, the fence pointers already find the only candidate block.
+- **Memory pressure**: filters that do not fit in memory must be read from disk. That costs the I/O that they try to save. RocksDB can partition the filters and keep only the hot partitions in the cache.
+
+## Connect
+
+- [Memtables and SSTables](/databases/lsm/memtables-and-sstables) shows where the filter sits in a file and on the read path.
+- [Compaction: leveled vs tiered](/databases/lsm/compaction-leveled-vs-tiered) decides how many runs a lookup must check.
+- [Tuning an LSM tree](/databases/lsm/tuning-an-lsm-tree) puts filter memory into the full cost model.
+- [Hash indexes](/databases/indexes/hash-indexes) use the same hash functions for a different job.
+- [Cache organization](/architecture/caches/cache-organization-and-access-patterns) explains why one cache line per query is faster.
+
+<Recall cards={[
+  { q: "Can a Bloom filter give a false negative? Why?", a: "No. An insert only sets bits to 1 and nothing sets them back to 0, so all bits of an inserted key stay set." },
+  { q: "What is the false positive rate of a Bloom filter with m bits, n keys and k hashes?", a: "About (1 − e^(−kn/m))^k. With the best k = (m/n) ln 2, it is 0.6185^(m/n)." },
+  { q: "About how many bits per key give a 1% false positive rate?", a: "9.59 bits per key with k = 7. In practice people use 10 bits per key, which gives about 0.82%." },
+  { q: "What does a blocked (cache-line) Bloom filter trade?", a: "All k probes stay in one 64-byte line, so a query costs one cache miss. The false positive rate is a little higher, for example 0.96% in place of 0.82% at 10 bits per key." },
+  { q: "How does Monkey allocate filter memory across LSM levels?", a: "It makes each run's false positive rate proportional to its number of keys. Small runs get many bits per key, the big last level gets fewer, and the sum of the rates falls." },
+  { q: "Why can a plain Bloom filter not help a range scan, and what does RocksDB offer?", a: "It only answers exact-key questions. A prefix_extractor builds filters over key prefixes, so a scan inside one prefix can skip files." },
+]} />

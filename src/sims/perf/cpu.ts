@@ -86,15 +86,19 @@ export interface CoreConfig { width: number; ports: Record<Unit, number> }
 export const CORE: CoreConfig = { width: 4, ports: { load: 2, fadd: 2, fmul: 2, alu: 4 } };
 export const LAT: Record<Unit, number> = { load: 5, fadd: 4, fmul: 4, alu: 1 };
 
-/** Greedy list scheduling: each cycle, issue ready ops (oldest first) up to the width and per-unit port limits. */
-export function schedule(ops: Op[], core: CoreConfig = CORE): { start: number[]; cycles: number } {
+/**
+ * Greedy list scheduling within a reorder-buffer window: each cycle, issue ready ops (oldest first)
+ * up to the width and per-unit port limits, looking at most `window` ops past the oldest unissued one.
+ */
+export function schedule(ops: Op[], core: CoreConfig = CORE, window = 224): { start: number[]; cycles: number } {
   const start = new Array<number>(ops.length).fill(-1);
   const done = (i: number) => start[i]! + ops[i]!.lat;
-  let issued = 0, cycle = 0;
+  let issued = 0, cycle = 0, head = 0;
   while (issued < ops.length) {
+    while (head < ops.length && start[head]! >= 0) head++;
     const used: Record<string, number> = {};
     let slots = core.width;
-    for (let i = 0; i < ops.length && slots > 0; i++) {
+    for (let i = head; i < Math.min(ops.length, head + window) && slots > 0; i++) {
       if (start[i]! >= 0) continue;
       const op = ops[i]!;
       if (!op.deps.every((d) => start[d]! >= 0 && done(d) <= cycle)) continue;

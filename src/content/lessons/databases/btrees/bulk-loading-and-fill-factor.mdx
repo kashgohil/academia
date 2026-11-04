@@ -1,0 +1,139 @@
+---
+summary: How insert order decides how full B+ tree pages are, why building a tree bottom-up from sorted data is much cheaper, and how fill factor trades space now for fewer splits later.
+---
+import { FillOrderDemo, BulkLoadDemo, FillFactorDemo } from "@/demos/db/BtreeDemos";
+
+The rules of a B+ tree only say that pages are between half full and full. Where a real tree falls in that range depends on how the keys arrived. The **fill** of a page is the fraction of its capacity that holds keys. Fill matters twice. A tree with emptier pages has more pages to cache and to scan. A tree with full pages splits on the next insert into almost any page.
+
+## Insert order decides the fill
+
+<Predict
+  id="ascending"
+  question="You insert keys 1, 2, 3, … in ascending order. Each overfull leaf splits in half, as in the classic algorithm. How full are the leaves at the end?"
+  options={[
+    "About 69%, the same as for random keys",
+    "About 50%",
+    "Nearly 100%, because sorted input packs well",
+  ]}
+  answer={1}
+  explain="Every new key goes to the rightmost leaf. When that leaf splits, the left half never gets another key, so it stays half full for ever. Only the rightmost leaf grows. Random keys reach about 69% instead."
+>
+<FillOrderDemo />
+</Predict>
+
+1. Keep **random** order. The histogram spreads from 50% to 100%, with more leaves near the low end. The mean is close to the dashed line at ln 2 = 69.3%.
+2. Select **ascending**. All leaves except the last sit at one bar, at about half full. Then select **descending**: the same happens at the left edge of the tree.
+3. With ascending order, select **rightmost split**. The split now keeps the left page full and puts only the new key in the right page. The mean jumps to the value of the slider.
+4. Move **Rightmost split: left page keeps** to 90%. This is what PostgreSQL does for its default index fillfactor of 90.
+5. Compare **node writes** with the bulk-load numbers. One-by-one inserts write some pages many times.
+
+**Why ln 2 for random keys?** A split makes two half-full pages. A page with more keys covers a wider key range, so it receives random inserts faster, and it fills and splits sooner. So pages spend more time near half full than near full. For a large order, the share of pages at fill x is proportional to $1/x^2$ on $[\tfrac12, 1]$. The mean fill is then
+
+$$\bar f = \frac{\int_{1/2}^{1} x \cdot x^{-2}\,dx}{\int_{1/2}^{1} x^{-2}\,dx} = \frac{\ln 2}{1} \approx 0.693.$$
+
+Andrew Yao published this analysis of random B-trees in 1978. In the sim, 200,000 random keys into leaves of 100 keys give a mean fill of 69%.
+
+**Why 50% for sorted keys?** Every insert goes to the rightmost leaf, so only that leaf ever grows. When it splits, its left half is finished. With 100 keys per leaf, ascending inserts leave 51% fill and descending inserts leave 50%. So the tree needs about twice as many pages as necessary, and range scans read twice as many pages.
+
+**The rightmost-split fix.** Engines detect inserts at the right edge and split there unevenly. The left page keeps almost all keys, and the new page starts nearly empty. In the sim, this gives 100% fill when the left page stays full, and 90% when it keeps 90%.
+
+- **PostgreSQL** splits the rightmost leaf so that the left page is left at the index **fillfactor** (default 90 for B-tree indexes; internal pages use 70).
+- **InnoDB** remembers the direction of recent inserts in a page. When the inserts are sequential, it splits at the insert point, not in the middle.
+- **SQLite** has a fast path for an append at the right edge of a table tree: the new key goes alone into a new page.
+
+## Bulk loading: build from the bottom
+
+When all the keys are known and sorted, there is no need to search, split or rewrite pages. **Bulk loading** builds the tree bottom-up:
+
+1. Sort the input. An external sort works for data larger than memory.
+2. Fill leaf pages one after another, each to the target fill, and link each leaf to the previous one.
+3. Each finished leaf adds its first key and its page number to a list for the level above.
+4. Build that level the same way, from the list. Repeat until one node remains: the root.
+5. If the last node of a level is below the minimum, share its keys evenly with its left neighbor.
+
+<Predict
+  id="bulk"
+  question="You load 100,000 sorted keys into a tree with order 64. Bulk loading writes each page once. How many times more node writes does inserting the same keys one by one need?"
+  options={["About 2 times", "About 10 times", "More than 50 times"]}
+  answer={2}
+  explain="Bulk loading writes 1,614 pages once each. One-by-one inserts write the rightmost leaf on every insert, plus every split: 109,654 node writes with 3,218 splits. That is about 68 times more, and every page write is a random write unless a buffer pool absorbs it."
+>
+<BulkLoadDemo />
+</Predict>
+
+1. Press **Play** with 30 keys, order 4 and fill 100%. Ten leaves fill from left to right, then the internal level, then the root. The build writes 14 nodes and does no splits.
+2. Compare the numbers below the tree. Ascending inserts of the same 30 keys need 87 node writes and 19 splits.
+3. Set **Fill factor** to 50%. Each leaf now gets fewer keys, and the tree needs more leaves and maybe more levels.
+4. Set **Keys** to 31 and play to the end. The last leaf would get only 1 key, so it shares keys with its left neighbor: both get 2.
+
+Bulk loading is also good for the layout on disk. The engine writes the leaves in key order, so they sit in file order, and a range scan reads the file sequentially. After many splits, the next leaf in key order can be anywhere in the file. This is **fragmentation**: the logical order and the physical order differ, and a scan does random reads.
+
+```rust
+// Bottom-up build. `level` holds (first key, page) pairs; the result is the root page.
+fn bulk_load(sorted: &[(u64, u64)], per_leaf: usize, per_inner: usize, w: &mut Writer) -> PageId {
+    let mut level: Vec<(u64, PageId)> = sorted
+        .chunks(per_leaf)
+        .map(|c| (c[0].0, w.write_leaf(c)))      // one sequential page write per leaf
+        .collect();
+    while level.len() > 1 {
+        level = level
+            .chunks(per_inner)
+            .map(|c| (c[0].0, w.write_inner(c)))  // separators = first keys of kids 1..
+            .collect();
+    }
+    level[0].1
+}
+```
+
+The real engines do this. PostgreSQL `CREATE INDEX` sorts the rows and builds the B-tree bottom-up. InnoDB uses a **sorted index build** for `CREATE INDEX` and `ALTER TABLE`, and `innodb_fill_factor` sets how full it makes the pages. Its default of 100 still leaves 1/16 of each clustered index page free for growth. LMDB has `MDB_APPEND` for keys that arrive in sorted order, and it then fills pages completely.
+
+## Fill factor: free space as a reserve
+
+A **fill factor** is the target fill for pages at build time. Free space in each page absorbs later inserts without a split. It costs more pages now.
+
+<FillFactorDemo />
+
+1. Keep 90%. The load makes 111 leaf pages. The first 5% of new keys cause only one split, but after 10% the tree has 141 pages.
+2. Look at the red dashed line for 100%. The 100 full pages become 198 pages after only 5% more keys. Almost every page splits at the same time: a **split storm**.
+3. Look at the green dashed line for 70%. The 143 pages absorb 25% more keys with no split at all.
+4. Move the slider to 50%. The 200 pages never split in this range, because each page has room to double.
+
+Splits are expensive. Each one writes three pages: the old page, the new page and the parent. With a write-ahead log, each change is also logged, and the new page is often far away in the file. A split also leaves two half-full pages, so space use goes down. A fill factor below 100% spreads those costs over time.
+
+| Setting | Default | What it does |
+|---|---|---|
+| PostgreSQL B-tree `fillfactor` | 90 (range 10–100) | fill of leaf pages at `CREATE INDEX`, and of the left page in a rightmost split |
+| PostgreSQL table `fillfactor` | 100 | lower values keep room in heap pages for updates of rows in the same page |
+| InnoDB `innodb_fill_factor` | 100 | fill of pages in a sorted index build |
+| InnoDB `MERGE_THRESHOLD` | 50 (range 1–50) | merge a page with a neighbor when its fill drops below this percent |
+
+Set `MERGE_THRESHOLD` for one table or index with a comment, for example `COMMENT 'MERGE_THRESHOLD=45'`. A low threshold prevents **merge-split thrashing**: a page that merges after a delete and splits again after the next insert. PostgreSQL never merges half-empty index pages. It deletes a page only when it is completely empty.
+
+Choose the fill factor from the expected inserts. For keys that only grow, such as a sequence or a timestamp, new keys go to the right edge, so use 100. For random keys into an existing range, leave room. For a read-only table, use 100: free space then only makes the tree bigger.
+
+## Rebuilds
+
+Deletes and random inserts slowly lower the fill and scatter the leaves. A rebuild runs the bulk load again: it gives dense pages in file order.
+
+- PostgreSQL: `REINDEX` (with `CONCURRENTLY` to keep writes running). The `pgstatindex()` function of the `pgstattuple` extension reports `avg_leaf_density` and `leaf_fragmentation`.
+- MySQL: `OPTIMIZE TABLE` or `ALTER TABLE ... FORCE` rebuilds an InnoDB table and its indexes.
+- SQLite: `VACUUM` rebuilds the whole database file. `REINDEX` rebuilds indexes.
+
+A rebuild is not free. It reads and writes the whole index, and after it, a random-insert workload splits the dense pages again. So rebuild for scans and space, not as a habit.
+
+## Connect
+
+- The tree itself: [B+ trees](/databases/btrees/b-trees).
+- Sorting more data than memory for the build: [external sorting and aggregation](/databases/query/external-sorting-and-aggregation).
+- Space in heap pages and free-space maps: [heap files and free-space maps](/databases/storage/heap-files-and-free-space-maps).
+- Bytes written versus bytes changed: [read, write and space amplification](/databases/storage/read-write-and-space-amplification).
+- The same trade-off of space now against work later in memory allocators: [fragmentation](/systems/allocators/fragmentation).
+
+<Recall cards={[
+  { q: "What is the mean leaf fill after many random inserts, and why is it not 75%?", a: "About ln 2 = 69%. Fuller pages cover wider key ranges, so they receive inserts faster and split sooner. So pages spend more time near half full." },
+  { q: "Why do ascending inserts with half splits leave pages about 50% full?", a: "Every insert goes to the rightmost leaf. After a split, the left half never gets another key, so every page except the last stays half full." },
+  { q: "What does the rightmost-split optimization do, and which engines use it?", a: "An insert overflows the rightmost page at its right end. The split keeps the left page full, or at the fillfactor, and puts the new key in a new page. PostgreSQL, InnoDB and SQLite do this." },
+  { q: "List the steps of a bottom-up bulk load.", a: "Sort the keys. Fill leaves one after another to the target fill and link them. Collect the first key and page of each node, and build the level above from that list. Repeat until one root remains." },
+  { q: "What is a split storm, and how does a fill factor prevent it?", a: "When all pages are full, new keys make almost every page split at about the same time. Free space in each page absorbs inserts, so splits are fewer and spread over time." },
+  { q: "What does InnoDB MERGE_THRESHOLD control, and what is its default?", a: "The fill percent below which InnoDB tries to merge a page with a neighbor after deletes or updates. The default is 50, and a lower value can stop merge-split thrashing." },
+]} />

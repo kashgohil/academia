@@ -1,0 +1,143 @@
+---
+summary: Shadow paging for B+ trees, as in LMDB, btrfs and CouchDB. Never overwrite a page, copy the path to the root, switch roots atomically, and pay for it in write amplification and free-page bookkeeping.
+---
+import { CowStepperDemo, WriteAmpDemo, LongReaderDemo } from "@/demos/db/BtreeCowDemos";
+
+An in-place B+ tree overwrites pages. So a crash in the middle of a split can leave a torn tree, and the engine needs a write-ahead log to repair it. Readers also need latches, because a writer changes the pages that they read. A **copy-on-write** (COW) B+ tree avoids both problems with one rule: never overwrite a page that a committed version uses.
+
+This idea is **shadow paging**. To change a leaf, write a changed copy of it to a free place in the file. The parent must now point to the copy, so copy the parent too, and so on up to the root. The result is a new root. One atomic write that names the new root commits the whole transaction.
+
+## Copy the path
+
+<Predict
+  id="path"
+  question="The tree has 3 levels. A transaction changes one value in one leaf and commits. How many pages does a copy-on-write tree write?"
+  options={[
+    "One: the changed leaf",
+    "Three copied pages (leaf, parent, root), plus one meta page that names the new root",
+    "Every page of the tree",
+  ]}
+  answer={1}
+  explain="The leaf copy has a new page number, so its parent must change, and then the root must change. Every other page is shared with the old version. Then the commit writes a meta page that points to the new root."
+>
+<CowStepperDemo />
+</Predict>
+
+1. Press **Write key 22**. The new version has new pages for the root, one internal node and one leaf. The other pages keep their numbers: the new version shares them with the old one.
+2. Press **Start a reader**, then write key 22 again. The reader still sees the previous version. Its old root, internal node and leaf stay alive, shown in purple.
+3. Write a few more keys while the reader runs. The file grows, because the pages that the reader can see cannot be reused.
+4. Press **End reader 1**, then write two more keys. Freed pages turn gray, and the next transactions reuse them. Watch **reused pages so far** go up.
+5. Look at the two meta pages. Each commit writes the older one, so the two pages hold the two newest versions.
+6. Select **append only (CouchDB)**. No page is ever reused, and each commit adds a header page at the end. Press **Compact** to copy the live pages into a new, small file.
+
+## Commit with two meta pages
+
+LMDB keeps two **meta pages** at the start of the file, page 0 and page 1. Each holds a transaction id and the page number of a root. A commit does this:
+
+1. Write all the new pages to free places in the file, and `fsync`.
+2. Write the next transaction id and the new root into the *older* meta page, and `fsync` again.
+
+At startup, LMDB reads both meta pages and uses the valid one with the higher transaction id. If the crash happened before step 2 was complete, the other meta page still names the previous root, and all its pages are intact. So there is no log and no recovery step. The newest meta page is the database.
+
+```zig
+const Meta = extern struct { magic: u32, version: u32, txnid: u64, root: u64 };
+
+// Startup: the newer valid meta page wins. A torn meta page fails the magic check.
+fn pickMeta(m0: *const Meta, m1: *const Meta) *const Meta {
+    const ok0 = m0.magic == MAGIC and m0.version == VERSION;
+    const ok1 = m1.magic == MAGIC and m1.version == VERSION;
+    if (ok0 and ok1) return if (m0.txnid > m1.txnid) m0 else m1;
+    return if (ok0) m0 else m1;
+}
+```
+
+Other systems use the same pattern. The **btrfs** file system keeps all its metadata in COW B-trees. Its superblock points to the root of a tree of tree roots. A snapshot in btrfs is cheap: it is one more pointer to an existing root, and the snapshot shares every page. **CouchDB** writes a header at the end of its database file. At startup, it searches back from the end of the file for the last valid header.
+
+## Readers get snapshots for free
+
+A reader copies the root of the newest committed version when it starts. Committed pages never change, so the reader sees one consistent **snapshot** for as long as it runs, with no latches. A writer can commit new versions at the same time. This is MVCC at the page level: multiple versions, each one a different root. LMDB allows only one writer at a time, so writers do not need to coordinate with each other either.
+
+The cost is in **free-page reuse**. The pages that a transaction replaced are free in the new version, but an older reader may still read them. So LMDB records the freed pages together with the id of the transaction that freed them. A freed page can be reused only when no running reader started before that transaction. LMDB also keeps the two newest versions whole, so that both meta pages stay valid.
+
+LMDB tracks readers in a **reader table** in its lock file. Each slot holds the snapshot transaction id of one reader. A writer reads the table to find the oldest snapshot in use.
+
+<Predict
+  id="reader"
+  question="A read transaction starts and stays open for 200 single-key updates. Then it ends. What happens to the file size?"
+  options={[
+    "Nothing: the file stays the same size",
+    "It grows by about one path of pages per update while the reader is open, then stops growing, but it does not shrink",
+    "It grows while the reader is open, and shrinks back when the reader ends",
+  ]}
+  answer={1}
+  explain="While the reader runs, no page freed after its start can be reused, so every update takes new pages from the end of the file. When the reader ends, those pages become free for reuse. The file does not give them back, so it stays large."
+>
+<LongReaderDemo />
+</Predict>
+
+1. Keep the defaults: a reader from update 50 to update 250. While it is open, every update adds 3 pages to the file: one path. The file grows from 215 to 818 pages.
+2. After the reader ends, the red line goes flat. Later updates reuse the freed pages, but the file keeps its size.
+3. Compare the green line: with no reader, the file stays at 221 pages.
+4. Compare the orange dashed line: append-only storage never reuses pages, so the file grows by 4 pages per update, to 1,814 pages.
+5. Move **Reader stays open for** to 0. The red line now stays close to the green one.
+
+This is the main way to break LMDB in production. A read transaction that stays open for a long time stops all page reuse. A crashed process that left its slot in the reader table does the same. The file grows until it hits the map size limit, and writes fail with `MDB_MAP_FULL`. `mdb_reader_check()` clears the slots of dead processes. Short read transactions prevent the rest.
+
+## Write amplification
+
+A COW update writes a whole path of pages, not one record. **Write amplification** is the ratio of bytes written to bytes changed.
+
+<WriteAmpDemo />
+
+1. Keep 32-byte records, one update per transaction and 1 M keys. With 4 KiB pages, the tree has 3 levels. Each update writes 3 pages plus the meta page: 16 KiB for 32 bytes, an amplification of 512.
+2. Read the 16 KiB line. The height is the same, but every page is 4 times bigger: 64 KiB per update, 2,048 times the record.
+3. Move **Updates per transaction** to 100. Inside one transaction, a page that was already copied is changed in place. The updates share the copies of the upper levels, and the cost drops to 6,521 bytes per update with 4 KiB pages.
+4. Move **Keys in the tree** to the right. Every new level adds one page to each path.
+5. Make the records 1 KiB. Fewer records fit in a leaf, so the tree gets taller, but the amplification ratio falls.
+
+An in-place B+ tree with a write-ahead log writes a log record of about the size of the change, and then the page later. Many updates to a hot page share one page write. So in-place trees usually write less than COW trees for small random updates. COW trees win on simplicity: no log, instant recovery and readers without latches. Batching more updates into each transaction is the main tool to reduce their write cost.
+
+```rust
+// Path copying: returns the page number of the new copy of `page`.
+fn put(txn: &mut Txn, page: PageId, key: u64, val: u64) -> PageId {
+    let mut node = txn.writable(page); // same page if this txn already copied it, else a copy
+    match &mut node {
+        Node::Leaf(l) => l.upsert(key, val),
+        Node::Inner(n) => {
+            let i = n.child_index(key);
+            n.kids[i] = put(txn, n.kids[i], key, val); // the child moved, so this node changes too
+        }
+    }
+    txn.split_if_full(node)                            // splits allocate more fresh pages
+}
+```
+
+## Append-only trees and compaction
+
+An **append-only** tree is the extreme case: it never reuses a page. CouchDB writes every new page and every commit header at the end of its file. Writes are always sequential, which suited spinning disks. Recovery is also simple: the last valid header wins.
+
+The file grows without limit, so append-only stores need **compaction**. CouchDB copies the live documents into a new file, then switches to the new file and deletes the old one. During compaction, the disk must hold both files. Compaction also costs I/O, and the database must keep up with new writes while it runs. LSM trees face the same problem, and they solve it with a more structured compaction.
+
+| System | Free pages | Commit | Readers |
+|---|---|---|---|
+| LMDB | reused after the oldest reader moves on | dirty pages, `fsync`, then one of two meta pages | snapshot of a root, reader table in the lock file |
+| btrfs | extents freed by reference counts | superblock points to the new tree of roots; commit every 30 s by default | snapshots are extra roots |
+| CouchDB | never reused; compaction makes a new file | header appended at the end of the file | the header they started from |
+
+## Connect
+
+- The in-place tree: [B+ trees](/databases/btrees/b-trees). The alternative to latches: [latch crabbing and B-link trees](/databases/btrees/latch-crabbing-and-b-link-trees).
+- Crash safety with a log instead: [write-ahead logging](/databases/recovery/write-ahead-logging) and [durability, fsync, torn writes and checksums](/databases/storage/durability-fsync-torn-writes-and-checksums).
+- Versions for transactions: [MVCC](/databases/transactions/mvcc) and its cleanup, [MVCC garbage collection](/databases/transactions/mvcc-garbage-collection).
+- Append-only storage with compaction: [compaction: leveled vs tiered](/databases/lsm/compaction-leveled-vs-tiered).
+- The same rule of "free only when no reader can see it" in lock-free code: [epoch-based reclamation](/concurrency/lock-free/epoch-based-reclamation).
+- A full comparison of engines: [SQLite, LMDB and RocksDB compared](/databases/engine/sqlite-lmdb-and-rocksdb-compared).
+
+<Recall cards={[
+  { q: "Which pages does a copy-on-write B+ tree write to change one record?", a: "A copy of the leaf and of every node on the path up to the root, each at a new page number. Then the commit writes a meta page or header that names the new root." },
+  { q: "How does LMDB commit atomically, and what does it do at startup?", a: "It writes the new pages and syncs, then writes the new root and transaction id into the older of its two meta pages and syncs. At startup it uses the valid meta page with the higher transaction id." },
+  { q: "Why do readers of a COW tree need no latches?", a: "A reader starts from the root of a committed version, and committed pages never change. So it sees a consistent snapshot while writers make new versions." },
+  { q: "When can LMDB reuse a page that a transaction freed?", a: "When no open reader started before the transaction that freed it, and the page is not part of the two newest versions." },
+  { q: "What happens when an LMDB read transaction stays open for a long time?", a: "No page freed after it started can be reused, so every update takes new pages and the file grows. It can reach the map size and fail with MDB_MAP_FULL." },
+  { q: "How do you reduce the write amplification of path copying?", a: "Batch many updates into one transaction, so they share the copies of the upper levels. Pages that the transaction already copied are changed in place." },
+]} />

@@ -1,0 +1,167 @@
+---
+summary: Why databases index with wide, flat trees of pages, and how a B+ tree searches, splits, merges and scans.
+---
+import { BTreeLabDemo, HeightCalcDemo, CacheLinesDemo, TreeShapeDemo } from "@/demos/db/BtreeDemos";
+
+A database reads storage in **pages**: fixed blocks of 4 to 16 KiB. One page read from storage takes much longer than thousands of key comparisons in memory. So an index must find a key with as few page reads as possible. A binary search tree is a bad fit, because each node holds one key and each step down the tree can be a new page.
+
+A **B-tree** puts hundreds of keys in each node and makes each node one page. The number of children of a node is its **fanout**. With a fanout of 500, each level divides the search space by 500, not by 2. Rudolf Bayer and Edward McCreight described B-trees in 1970, and almost every relational database still uses them for indexes.
+
+## B-tree and B+ tree
+
+The original B-tree stores keys and their values in all nodes. The **B+ tree** is the variant that engines actually use:
+
+- **Internal nodes** hold only **separator keys** and child pointers. A separator tells the search which child to follow. It is a copy of a key, not the data.
+- **Leaves** hold all the keys and their values (a row, or a pointer to a row).
+- Each leaf has a pointer to the next leaf. So a **range scan** finds the first key once and then reads leaves in order.
+
+Internal nodes without values are small, so their fanout is higher, and the tree is shorter. InnoDB stores each table as a B+ tree on the primary key, with the rows in the leaves. SQLite stores tables as B+ trees on the rowid, but its index B-trees keep keys in internal nodes too. PostgreSQL keeps rows in a heap file and uses B+ trees for indexes.
+
+## Play with a tree
+
+<Predict
+  id="grow"
+  question="The demo tree has order 4: a node holds at most 3 keys. The leaf for key 40 is full, its parent is full, and the root is full. Where does the new level appear when you insert 40?"
+  options={[
+    "Under the full leaf: the leaf gets two child leaves",
+    "At the top: the root splits and a new root is made above it",
+    "Nowhere: the tree moves keys to a sibling with free space",
+  ]}
+  answer={1}
+  explain="The leaf splits and sends a separator up. The parent is full, so it splits too, and so does the root. A new root with one separator is made above the old root. A B+ tree grows only at the top, so all leaves stay at the same depth."
+>
+<BTreeLabDemo />
+</Predict>
+
+Things to try:
+
+1. Set the key to 65 and press **Find**. The search reads 3 nodes, one per level. In each internal node, it follows the pointer between the two separators that surround 65.
+2. Set the key to 40 and press **Insert**. Step through the log: the leaf splits, then its parent, then the root. The height goes from 3 to 4.
+3. Press **Reset**, then **Delete** 50. The leaf drops below its minimum, and its left sibling lends one key. Now delete 60. No sibling can lend, so two leaves **merge**.
+4. Press **Reset**, then delete 33. The leaves merge, and the merge leaves their parent too empty. The parent borrows a child from its left sibling.
+5. Press **Scan 40–60**. The search descends once. Then it follows the green links from leaf to leaf.
+6. Move **Order** from 3 to 8. The same 23 keys need 4 levels at order 3, but only 2 levels at order 8.
+
+## The rules
+
+A B+ tree of **order** m has at most m children in each internal node, so a node holds at most m − 1 keys. (Some books count order in keys, not children. Check the definition.) Every node except the root must stay at least half full. Every leaf is at the same depth. These rules make the height a function of the number of keys only, not of the insert order.
+
+**Search.** Start at the root. In each internal node, find the first separator that is greater than the key, and follow the pointer to its left. At the leaf, do a binary search. Separators obey one rule: child i holds every key k with keys[i−1] ≤ k < keys[i].
+
+**Insert.** Search for the leaf and put the key in sorted position. If the leaf now has m keys, **split** it. The left half stays, and the right half goes to a new leaf. The first key of the new leaf is copied up into the parent.
+
+If the parent overflows, it splits too. In an internal split, the middle key moves up and does not stay in either half. When the root splits, a new root grows above it.
+
+**Delete.** Remove the key from its leaf. If the leaf is now below half full, look at a sibling with the same parent. If the sibling has a spare key, **borrow** it and update the separator. If not, **merge** the two nodes and remove their separator from the parent.
+
+A merge can make the parent too empty, so the repair can go up to the root. When the root has one child left, that child becomes the new root.
+
+```rust
+// Search in one internal node: the number of separators <= key is the child index.
+fn child_index(seps: &[u64], key: u64) -> usize {
+    seps.partition_point(|&s| s <= key)
+}
+
+fn lookup(tree: &Tree, key: u64) -> Option<u64> {
+    let mut page = tree.root;
+    loop {
+        match tree.read(page) {                      // one page read per level
+            Node::Inner { seps, kids } => page = kids[child_index(seps, key)],
+            Node::Leaf { keys, vals, .. } => {
+                return keys.binary_search(&key).ok().map(|i| vals[i]);
+            }
+        }
+    }
+}
+```
+
+Each split and merge changes a few pages and takes O(m) time. A search reads one page per level, so the cost of every operation is O(log N) page reads. Real engines do not always follow the delete rules. PostgreSQL never merges half-empty index pages: it removes a page only when the page is completely empty. InnoDB merges a page with a neighbor when the page drops below 50% full. The next lesson shows how this threshold is set.
+
+## How flat is it?
+
+<Predict
+  id="height"
+  question="An index has 16 KiB pages and 8-byte keys. It holds one billion keys. How many levels does the B+ tree have?"
+  options={["About 30, like a balanced binary tree", "About 10", "4"]}
+  answer={2}
+  explain="A 16 KiB page holds about 900 separators and child pointers. Three levels of internal nodes give 900 × 900 × 900 leaves, which is far more than needed. One billion keys need 1,107,420 leaves, and 4 levels hold them."
+>
+<HeightCalcDemo />
+</Predict>
+
+1. Keep the defaults: 8-byte keys, 1 G keys and 16 KiB pages. The fanout is 903, and the tree has 4 levels with 1, 2, 1,227 and 1,107,420 nodes.
+2. Read the size of all levels above the leaves: 19.2 MiB. With a 64 MiB buffer pool, those levels stay in memory, and a lookup needs only 1 storage read.
+3. Set **Average page fill** to 69%. The fanout drops to 623, but the tree still has 4 levels.
+4. Select **4 KiB** pages and move **Key size** to 64 B. The fanout falls to 53, and the tree needs 6 levels. Long keys cost levels.
+5. Move **Buffer pool** down to 1 MiB. Now the cache holds fewer levels, and each lookup needs more storage reads.
+
+The height of a B+ tree is about $\log_F N$ for fanout $F$. Because $\log_{903} 10^9 \approx 3$, the tree needs three internal levels plus the leaves. Each step of fanout counts only through a logarithm, so the height changes slowly. But the levels near the root are tiny. Almost all pages are leaves, so the buffer pool can keep every internal page in memory. A real lookup then costs one leaf read.
+
+| Engine | Default page size | Notes |
+|---|---|---|
+| InnoDB (MySQL) | 16 KiB | `innodb_page_size`; table rows live in the leaves of the primary-key tree |
+| PostgreSQL | 8 KiB | fixed when the server is compiled; indexes point to rows in a heap file |
+| SQLite | 4 KiB | `PRAGMA page_size`; tables are B+ trees on the rowid |
+| LMDB | 4 KiB | the operating system page size; copy-on-write B+ tree |
+
+## Shape in 3D
+
+<TreeShapeDemo />
+
+1. Keep 10 M keys and fanout 256. The binary search tree is a tall tower of 24 levels. The B+ tree has 3 levels, and the leaf slab holds 99.6% of its bytes.
+2. Turn the view. The top levels of the B+ tree are so small that they are only specks. This is the memory that the buffer pool must keep.
+3. Select fanout 16. The B+ tree gets taller, but it is still much shorter than the binary tree.
+
+## In memory: cache lines, not pages
+
+When the whole index is in RAM, the unit of cost is the 64-byte **cache line**, not the page. A binary search tree with a billion keys has 30 levels. Each node is a separate allocation, so each level can be a cache miss.
+
+<CacheLinesDemo />
+
+1. Read the 64 B row. A node of one cache line has fanout 4, so the tree has 15 levels and one lookup touches 15 lines. That is half of the 30 lines of the binary tree.
+2. Read the 4 KiB row. The tree has only 4 levels, but the binary search inside each node touches about 6 lines. The total is 24 lines.
+3. Change the key size to 32 B. Only one key fits in a 64-byte node, and every node size now touches 30 lines or more. Long keys remove the advantage.
+
+So in-memory B-trees use small nodes of a few cache lines. Lines inside one node are close together, so the hardware prefetcher and the TLB help too. Disk-based engines keep large pages, because there the cost of a page read is much larger than the cost of a cache miss.
+
+## Shorter keys: prefix and suffix truncation
+
+Fanout depends on key size, so engines shrink the keys in internal nodes.
+
+- **Suffix truncation**: a separator must be greater than the last key on its left, and not greater than the first key on its right. Between "database" and "datum", the separator "datu" is enough. PostgreSQL 12 and later truncate separators this way.
+- **Prefix compression**: keys on one page often share a prefix, such as "user:1001", "user:1002" and "user:1093". The page stores the prefix "user:10" once. WiredTiger can store keys like this, and MongoDB turns it on for indexes.
+
+```go
+// Shortest separator s with left < s <= right (suffix truncation).
+func shortestSeparator(left, right string) string {
+	for n := 1; n <= len(right); n++ {
+		if right[:n] > left {
+			return right[:n]
+		}
+	}
+	return right
+}
+```
+
+## When it breaks
+
+- **Random keys** such as UUIDv4 send each insert to a random leaf. The working set is the whole leaf level, so the buffer pool misses often. Keys that grow with time, such as UUIDv7 or a sequence, keep inserts in a few hot leaves.
+- **Long keys** cut the fanout and add levels. An index on a 200-byte text column is taller than one on a 64-bit integer.
+- **Concurrent writers** must protect the pages that a split changes. The lesson on [latch crabbing and B-link trees](/databases/btrees/latch-crabbing-and-b-link-trees) covers this.
+
+## Connect
+
+- Pages and their layout: [pages and slotted records](/databases/storage/pages-and-slotted-records). The cache for pages: [buffer pools](/databases/storage/buffer-pools).
+- Building a tree fast and choosing how full pages are: [bulk loading and fill factor](/databases/btrees/bulk-loading-and-fill-factor).
+- Why small nodes help in memory: [locality](/architecture/caches/locality) and [cache organization and access patterns](/architecture/caches/cache-organization-and-access-patterns).
+- The main alternative for write-heavy data: [memtables and SSTables](/databases/lsm/memtables-and-sstables) in LSM trees.
+- Indexes on more than one column: [secondary and covering indexes](/databases/indexes/secondary-and-covering-indexes).
+
+<Recall cards={[
+  { q: "Name two differences between a B-tree and a B+ tree.", a: "A B+ tree keeps all values in the leaves, and its internal nodes hold only separators and child pointers. Its leaves are linked, so a range scan walks the leaf chain." },
+  { q: "Where does a B+ tree grow a new level, and why does that matter?", a: "At the top: when the root splits, a new root is made above it. So every leaf stays at the same depth, and the tree stays balanced." },
+  { q: "In a leaf split, what goes to the parent? In an internal split?", a: "A leaf split copies the first key of the new right leaf into the parent. An internal split moves its middle key up, and that key stays in neither half." },
+  { q: "What does delete do when a node drops below half full?", a: "It borrows a key from a sibling with a spare key and updates the separator. If no sibling can lend, it merges the two nodes and removes their separator from the parent." },
+  { q: "Why can a billion-key index with 16 KiB pages need only one storage read per lookup?", a: "The fanout is about 900, so the tree has 4 levels. The three upper levels are only about 19 MiB, so they stay in the buffer pool. Only the leaf is read from storage." },
+  { q: "Why do in-memory B-trees use nodes of a few cache lines, not 16 KiB pages?", a: "In memory, the cost is cache lines. A binary search in a large node touches many lines. With 8-byte keys, 4 KiB nodes touch about 24 lines per lookup, but 64-byte nodes touch about 15." },
+]} />

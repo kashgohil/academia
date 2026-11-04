@@ -1,0 +1,194 @@
+---
+summary: How many threads search and split one B+ tree at the same time, from latch crabbing to B-link trees and optimistic lock coupling.
+---
+import { LatchStepperDemo, RootContentionDemo } from "@/demos/db/BtreeLatchDemos";
+
+A B+ tree in a buffer pool is a shared data structure, and many threads use it at the same time. A split changes three pages: the old page, the new page and the parent. The change cannot be atomic. So between the steps of a split, another thread can see a tree that is only half changed.
+
+## Latches are not locks
+
+Databases use two separate words. A **latch** protects a data structure in memory, such as one page in the buffer pool. A **lock** protects logical data, such as a row or a key range, for a transaction.
+
+| | Latch | Lock |
+|---|---|---|
+| Protects | a page or other in-memory structure | rows, keys, tables |
+| Held by | a thread | a transaction |
+| Held for | the time of one operation on the page (microseconds) | until commit or abort |
+| Deadlocks | prevented by a fixed order of acquisition | detected by the lock manager |
+| Example | a reader-writer latch on each buffer frame | `SELECT ... FOR UPDATE` |
+
+This lesson is about latches. A latch has two modes: **shared (S)** for readers and **exclusive (X)** for writers. Many threads can hold S together, but X excludes every other holder. Transaction locks are a separate topic: [two-phase locking and deadlocks](/databases/transactions/two-phase-locking-and-deadlocks).
+
+## The race
+
+<Predict
+  id="race"
+  question="No thread takes latches. The reader searches for 30. It reads the root R and learns that 30 is in leaf B. Then the writer inserts 22 into the full leaf B: it moves 25 and 30 to a new leaf B2 and finishes. Now the reader reads B. What does it report?"
+  options={[
+    "It finds 30, because 30 is still in the tree",
+    "It says that 30 is not in the tree",
+    "It waits until the writer is done",
+  ]}
+  answer={1}
+  explain="The reader holds a pointer to B, which it read before the split. B now holds only 20 and 22. The reader has no way to know that 30 moved right, so it reports a wrong result. Nothing made it wait."
+>
+<LatchStepperDemo />
+</Predict>
+
+1. With **no latches**, press **Play the race**. The reader reads R, the writer does all its steps, and then the reader reads B = [20, 22]. The result is wrong.
+2. Press **Reset** and click the steps yourself: reader, writer, writer, reader. The reader now sees B = [20] in the middle of the split. Of the 15 possible orders of the steps, 11 give the wrong answer.
+3. Select **latch crabbing** and play the race. The reader holds S on R, so the writer must wait for its X latch on R. The reader finishes first, with the correct answer.
+4. Select **B-link** and play the race. Now the writer is not blocked. The reader reads B after the split, sees that 30 is not below the **high key** 25, and moves right to B2.
+5. Select **optimistic (versions)**. Step the reader twice, then the writer to the end, then the reader. The reader sees that the version of B changed, so it throws away what it read and restarts.
+
+## Latch crabbing
+
+**Latch crabbing**, or latch coupling, moves down the tree like a crab. It holds the parent, takes the child, and only then lets go of the parent. So no writer can change the pointer between the read of the parent and the latch on the child.
+
+- **Search**: S-latch the root. For each level, S-latch the child, then release the parent.
+- **Insert or delete**: X-latch the root. For each level, X-latch the child. If the child is **safe**, release all latches above it. A node is safe for an insert when it is not full. For a delete, it is safe when it is more than half full.
+
+A safe node cannot split or merge, so no change can go above it. So the writer keeps latched exactly the part of the path that a split or merge could change. Latches are always taken from parent to child, so two descents cannot wait for each other in a circle. A scan that moves left along the leaf chain breaks this order, so it must use a try-latch and restart when the latch is busy.
+
+```cpp
+// Pessimistic insert with latch crabbing (C++20).
+Page* p = pool.fix(root);  p->latch.lock();            // X on the root
+std::vector<Page*> held{p};
+while (!p->is_leaf()) {
+    Page* c = pool.fix(p->child_for(key));
+    c->latch.lock();                                    // X on the child
+    if (!c->full()) {                                   // safe: no split can reach above c
+        for (Page* a : held) a->latch.unlock();
+        held.clear();
+    }
+    held.push_back(c);
+    p = c;
+}
+insert_and_split(held, key, val);                       // changes only latched pages
+for (Page* a : held) a->latch.unlock();
+```
+
+The problem is the root. Every writer takes an X latch on it, even when the insert changes only a leaf. So writers run one at a time through the top of the tree.
+
+## Optimistic descent
+
+Most inserts do not split. In the sim below, with order 64, only 119 of 4,984 inserts find a full leaf. Rudolf Bayer and Mario Schkolnick proposed an **optimistic** writer in 1977. It descends like a reader, with S latches, and it takes X only on the leaf. If the leaf is not safe, the writer releases everything and starts again with the pessimistic crabbing above.
+
+<Predict
+  id="root"
+  question="10,000 operations, half of them inserts, run on a tree with order 64. Under pessimistic latch crabbing, how many operations take an exclusive latch on the root?"
+  options={[
+    "Only the few that split a leaf",
+    "Every insert: about 5,000",
+    "None: the root only needs shared latches",
+  ]}
+  answer={1}
+  explain="Pessimistic crabbing X-latches the root on every insert, because it does not know yet whether a split will reach the root. In the sim, that is 4,984 exclusive latches. Optimistic descent needs only 119, and B-link and OLC need 7."
+>
+<RootContentionDemo />
+</Predict>
+
+1. Read the **X** counts at 50% writes. Crabbing takes 4,984. Optimistic descent takes 119, one for each restart after a full leaf. B-link and OLC take 7: only the inserts that really changed the root.
+2. Read the bars. Crabbing writes the root latch word 20,000 times, because every acquire and every release writes it. Shared latches are not free: each one moves the cache line of the latch to the core that takes it.
+3. Look at **optimistic lock coupling**. Its readers write nothing, so the root latch word gets only 14 writes.
+4. Move **Writes** to 0%. Crabbing and B-link still write the root latch word on every read.
+5. Select order 16. Leaves are smaller, so more inserts split them, and optimistic descent restarts more often.
+
+## B-link trees: move right
+
+Philip Lehman and S. Bing Yao described the **B-link tree** in 1981. Each node gets two more fields:
+
+- a **right link**: a pointer to the next node on the same level, also for internal nodes;
+- a **high key**: an upper bound for all keys in the node and its subtree.
+
+A split now happens in two separate steps. First comes the **half split**. Make the new right node, and copy the high key and right link of the old node into it. Then give the old node the new high key and a link to the new node. After this step, the new node is already reachable through the link. Second, insert the separator into the parent, as a separate change with its own short latch.
+
+A reader that arrives at a node after a half split checks the high key. If its key is not below the high key, the key moved right, so the reader follows the right link. So a reader needs only one latch at a time, and a writer holds the leaf latch only for the half split. PostgreSQL B-tree indexes use this design. Each page has a high key and a right link, and a search "moves right" when it finds that the page split under it.
+
+```go
+// B-link search: one short latch at a time; move right past concurrent splits.
+func (t *Tree) Search(key uint64) (uint64, bool) {
+	n := t.root.Load()
+	for {
+		n.mu.RLock()
+		for key >= n.high && n.right != nil { // the node split after we chose it
+			next := n.right
+			n.mu.RUnlock()
+			n = next
+			n.mu.RLock()
+		}
+		if n.leaf {
+			v, ok := n.find(key)
+			n.mu.RUnlock()
+			return v, ok
+		}
+		child := n.childFor(key)
+		n.mu.RUnlock()
+		n = child
+	}
+}
+```
+
+Deletes are harder. A merge removes a node that a reader may still be about to visit. Engines often skip merges or mark pages dead and remove them later, when no reader can hold a pointer to them. PostgreSQL deletes only empty pages, and it keeps a deleted page until no running transaction can still reach it.
+
+## Optimistic lock coupling
+
+On a many-core machine, even S latches hurt. A shared latch is a counter, and every reader must write it. So the cache line of the root latch moves from core to core on every operation. **Optimistic lock coupling (OLC)** removes these writes. It comes from the research engines HyPer and LeanStore, and Umbra uses it too.
+
+Each node has a 64-bit **version**. The lowest bit means locked, and the other bits count changes.
+
+- A **reader** reads the version, reads the node, and reads the version again. If the version changed, or was odd, it restarts. The reader writes nothing to shared memory.
+- A **writer** locks with a compare-and-swap from an even version to the next odd one, changes the node, and unlocks by adding one more.
+- **Coupling**: after the reader reads the version of a child, it checks the version of the parent again. If the parent changed, the child pointer may be stale, so the reader restarts.
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering::*};
+
+struct Version(AtomicU64);
+impl Version {
+    fn read_lock(&self) -> Result<u64, Restart> {
+        let v = self.0.load(Acquire);
+        if v & 1 == 1 { Err(Restart) } else { Ok(v) }     // locked by a writer
+    }
+    fn validate(&self, v: u64) -> Result<(), Restart> {
+        std::sync::atomic::fence(Acquire);
+        if self.0.load(Relaxed) == v { Ok(()) } else { Err(Restart) }
+    }
+    fn write_lock(&self, v: u64) -> Result<(), Restart> {
+        self.0.compare_exchange(v, v + 1, Acquire, Relaxed).map(|_| ()).map_err(|_| Restart)
+    }
+    fn write_unlock(&self) { self.0.fetch_add(1, Release); }
+}
+```
+
+OLC has costs. A reader can read a node while a writer changes it. So it can see garbage, such as an offset out of range or a wrong key count. The code must check bounds before it uses such values, and it must validate before it acts on them.
+
+A writer can also free a node that a reader still reads. So OLC needs safe memory reclamation, such as [epoch-based reclamation](/concurrency/lock-free/epoch-based-reclamation). Under heavy write contention, readers can restart many times.
+
+## Which one?
+
+| Protocol | Readers write shared memory | Root X latches | Latches held by a writer |
+|---|---|---|---|
+| Latch crabbing | yes, S latches | every write | up to the full path |
+| Optimistic descent | yes, S latches | only after a full leaf | up to the full path, after a restart |
+| B-link (Lehman–Yao) | yes, one short S latch per node | only when the root changes | about 2 |
+| Optimistic lock coupling | no | only when the root changes | the nodes it changes |
+
+Disk-based engines spend most time on I/O, so B-link trees with short latches are enough. In-memory engines spend most time on cache misses, so OLC wins there.
+
+## Connect
+
+- The tree and its split and merge rules: [B+ trees](/databases/btrees/b-trees).
+- The atomic tools: [compare-and-swap](/concurrency/atomics/compare-and-swap) and [happens-before](/concurrency/atomics/happens-before).
+- Freeing nodes that readers may still use: [epoch-based reclamation](/concurrency/lock-free/epoch-based-reclamation) and [hazard pointers](/concurrency/lock-free/hazard-pointers).
+- Locks for transactions, not latches: [two-phase locking and deadlocks](/databases/transactions/two-phase-locking-and-deadlocks).
+- A tree with no latches for readers at all: [copy-on-write B-trees](/databases/btrees/copy-on-write-b-trees).
+
+<Recall cards={[
+  { q: "Give three differences between a latch and a lock.", a: "A latch protects an in-memory structure such as a page, and a thread holds it for one operation. A lock protects logical data for a transaction until commit. Latches avoid deadlock by order, and the lock manager detects deadlocks between locks." },
+  { q: "In write crabbing, when can a thread release the latches above a node?", a: "When the node is safe: not full for an insert, more than half full for a delete. Then no split or merge can reach above it." },
+  { q: "Why does pessimistic crabbing limit write throughput?", a: "Every writer X-latches the root, even when it changes only a leaf. So all writers pass one at a time through the root." },
+  { q: "What does an optimistic descent do, and when does it restart?", a: "It descends with S latches and takes X only on the leaf. If the leaf is full, so that a split could change the parent, it releases all and restarts with pessimistic crabbing." },
+  { q: "What two fields does a B-link node add, and how does a reader use them?", a: "A right link to the next node on its level and a high key. If the search key is not below the high key, the node split, and the reader follows the right link." },
+  { q: "How does a reader in optimistic lock coupling detect a concurrent change, and what must the engine add to make it safe?", a: "It compares the node version before and after the read, and it checks the parent version after it reads the child version. The engine must check bounds on data it reads and use safe memory reclamation for freed nodes." },
+]} />

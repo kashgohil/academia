@@ -9,7 +9,6 @@ import remarkMdxFrontmatter from "remark-mdx-frontmatter";
 import { fileURLToPath } from "node:url";
 
 export default defineConfig({
-  base: process.env.BASE_PATH ?? "/",
   plugins: [
     {
       enforce: "pre",

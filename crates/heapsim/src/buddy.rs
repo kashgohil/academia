@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const MIN: u32 = 16;
 
 pub struct Buddy {
-    cap: u32,
     max_order: u32,
     free: Vec<BTreeSet<u32>>,
     used: BTreeMap<u32, (u32, u32)>, // addr -> (order, requested)
@@ -20,7 +19,7 @@ impl Buddy {
     pub fn new(cap: u32) -> Self {
         let cap = if cap.is_power_of_two() { cap } else { cap.next_power_of_two() / 2 }.max(MIN);
         let max_order = (cap / MIN).trailing_zeros();
-        let mut b = Buddy { cap, max_order, free: Vec::new(), used: BTreeMap::new() };
+        let mut b = Buddy { max_order, free: Vec::new(), used: BTreeMap::new() };
         b.reset();
         b
     }

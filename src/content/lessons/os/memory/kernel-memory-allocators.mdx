@@ -93,7 +93,7 @@ kmalloc(256, GFP_KERNEL)
   new_slab → alloc_pages   → pcp list, then zone->lock    (page allocator)
 ```
 
-Recent kernels add a per-CPU layer called sheaves for some caches, so the details are moving. The layers above show the classic path, as the demo does.
+Linux 6.18 added a per-CPU layer called sheaves for some caches, and Linux 7.0 made it the main path. The layers above show the classic path, as the demo does.
 
 **A free** is fast only if the object belongs to this CPU's current slab. Otherwise, `__slab_free` pushes it on the slab's own freelist with a `cmpxchg`. If the slab was full, this CPU adopts it on `c->partial`. A slab that becomes empty goes back to the page allocator if the node already has enough partial slabs (`min_partial`, between 5 and 10).
 
@@ -160,7 +160,7 @@ Things to try:
 | `GFP_NOWAIT` | kswapd | cannot sleep; fail fast |
 | `GFP_HIGHUSER_MOVABLE` | reclaim, I/O, FS, movable | user pages |
 
-In recent kernels, a caller that cannot sleep may use 25% of the min watermark, and `__GFP_HIGH` raises this to 62.5%. New code should prefer the scoped API, `memalloc_nofs_save()` and `memalloc_noio_save()`, over passing flags through many layers. The block layer also uses a `mempool_t`, a small private reserve, so that I/O can always make progress and free memory.
+In recent kernels, a `__GFP_HIGH` caller may use 50% of the min watermark, and a `GFP_ATOMIC` caller may use 62.5%. A `GFP_NOWAIT` caller may use none. New code should prefer the scoped API, `memalloc_nofs_save()` and `memalloc_noio_save()`, over passing flags through many layers. The block layer also uses a `mempool_t`, a small private reserve, so that I/O can always make progress and free memory.
 
 <Callout title="On your Mac">
 XNU has a similar design with different names: `kalloc` with zones (`zalloc`) on top of the page allocator. `zprint` lists the zones, like `/proc/slabinfo`. Linux tools such as `slabtop` do not work on macOS. A Linux VM is the simplest way to try the commands in this lesson.

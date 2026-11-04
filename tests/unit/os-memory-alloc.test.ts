@@ -190,11 +190,12 @@ describe("GFP", () => {
     expect(has("GFP_ATOMIC", "HIGH")).toBe(true);
     expect(has("GFP_NOWAIT", "HIGH")).toBe(false);
   });
-  test("reserve shares: none, 25%, 62.5%", () => {
+  test("reserve shares: none, none, 62.5% (__zone_watermark_ok: no __GFP_HIGH, no min reserve)", () => {
     expect(reserveShare(GFP_BITS.GFP_KERNEL)).toBe(0);
-    expect(reserveShare(GFP_BITS.GFP_NOWAIT)).toBe(0.25);
+    expect(reserveShare(GFP_BITS.GFP_NOWAIT)).toBe(0);
+    expect(reserveShare(["HIGH", "DIRECT_RECLAIM"])).toBe(0.5);
     expect(reserveShare(GFP_BITS.GFP_ATOMIC)).toBe(0.625);
-    for (const n of ["25%", "62.5%"]) expect(lesson).toContain(n);
+    for (const n of ["50%", "62.5%"]) expect(lesson).toContain(n);
   });
   test("a sleeping flag in an atomic context is always a bug; a non-sleeping flag never is", () => {
     for (const c of Object.keys(CONTEXT_LABEL) as GfpContext[]) for (const b of Object.keys(GFP_BITS) as GfpBase[]) {

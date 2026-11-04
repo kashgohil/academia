@@ -9,7 +9,7 @@
  * alloc() tries each layer in order and reports which one served the request. free() is fast only if the
  * object belongs to this CPU's current slab. Otherwise it pushes onto the slab's own freelist.
  *
- * Recent kernels add a per-CPU layer called "sheaves" for some caches. This model shows the classic path.
+ * Linux 6.18 added a per-CPU layer called "sheaves" for some caches, and Linux 7.0 made it the main path. This model shows the classic path.
  *
  * Path costs are model inputs, for scale only.
  */

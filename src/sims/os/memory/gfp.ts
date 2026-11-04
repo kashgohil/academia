@@ -58,12 +58,13 @@ export interface GfpOutcome {
 }
 
 /**
- * Non-blocking callers may use 25% of the min watermark; with __GFP_HIGH, 62.5% (min/2, then a quarter of what
- * is left). See __zone_watermark_ok and the ALLOC_NON_BLOCK and ALLOC_MIN_RESERVE flags in recent kernels.
+ * __GFP_HIGH callers may use 50% of the min watermark. Those that also cannot sleep, such as GFP_ATOMIC, may use
+ * 62.5% (min/2, then a quarter of what is left). Without __GFP_HIGH, as in GFP_NOWAIT, the share is 0.
+ * See __zone_watermark_ok and the ALLOC_MIN_RESERVE and ALLOC_NON_BLOCK flags in recent kernels.
  */
 export function reserveShare(bits: readonly GfpBit[]): number {
-  let floor = 1;
-  if (bits.includes("HIGH")) floor -= floor / 2;
+  if (!bits.includes("HIGH")) return 0;
+  let floor = 1 / 2;
   if (!bits.includes("DIRECT_RECLAIM")) floor -= floor / 4;
   return 1 - floor;
 }
@@ -97,7 +98,7 @@ export function gfpOutcome(context: GfpContext, base: GfpBase, mods: readonly Gf
     why = "Reclaim may call back into the file system to write inodes or pages. The file system may wait for the transaction that you hold. Use GFP_NOFS.";
   } else if (nofail && order > 1) {
     verdict = "warn";
-    why = "The kernel warns about __GFP_NOFAIL above order 1: it can loop for a long time and fragmentation can block it.";
+    why = "Through Linux 6.18, the kernel warns about __GFP_NOFAIL above order 1. Such a call can loop for a long time, and fragmentation can block it.";
   } else if (!direct) {
     why = "It cannot sleep, so it only takes what is free now and wakes kswapd" + (bits.includes("KSWAPD_RECLAIM") ? "." : " if it may.") + " The caller must handle NULL.";
   } else if (mayFail) {

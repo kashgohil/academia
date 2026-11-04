@@ -1,67 +1,104 @@
 ---
-summary: How malloc-class allocators (mimalloc, jemalloc, tcmalloc) combine size classes, pages and per-thread caches.
+summary: How malloc-class allocators (mimalloc, jemalloc, tcmalloc) combine size classes, pages and caches per thread.
 ---
 import { SizeClassDemo } from "@/demos/AllocatorDemos";
+import { ClassSpacingDemo, MallocPathDemo } from "@/demos/AllocExtrasB";
 
-Modern general-purpose allocators (mimalloc, jemalloc, tcmalloc, and glibc's small-object paths) all combine the ideas from this module:
+A **general-purpose allocator** serves any size, at any time, from any thread. Modern ones, such as mimalloc, jemalloc, tcmalloc and the small-object paths of glibc, all combine the ideas of this module:
 
-1. Round small requests up to a **size class**.
-2. Serve each class from **pages dedicated to that class**, like slabs but without per-type caches.
-3. Send **large** requests to runs of whole pages, which come from something buddy-like or from the OS directly.
-4. Keep metadata **out of band**: the page number of an address (`addr >> page_shift`) indexes a page table that knows the class. `free` needs no header and no search.
-5. Give every thread its own heap or cache, so the fast path takes no lock.
+1. Round each small request up to a **size class**: one of a fixed list of block sizes.
+2. Serve each class from **pages for that class only**. These are like slabs, but there is no cache per type.
+3. Send **large** requests to runs of whole pages. These come from a buddy-like page allocator or from the operating system (OS).
+4. Keep the metadata **out of band**, in a table outside the blocks. The page number of an address (`addr >> page_shift`) selects a table entry that knows the class. So `free` needs no header and no search.
+5. Give each thread its own heap or cache, so the fast path takes no lock.
 
-The demo implements steps 1–4 in a 16 KiB heap with 1 KiB pages.
+The first demo does steps 1 to 4 in a 16 KiB heap with 1 KiB pages.
 
 <Predict
   id="classes"
-  question="Switching from power-of-two size classes (16, 32, 64, …) to finer ones (16, 32, 48, 64, 80, …) cuts the worst-case rounding waste per object from about 50% to about 25%. On a random mix of 8–512 B requests, how does the total memory needed change?"
-  options={["It drops by roughly a quarter", "It stays about the same", "It goes up"]}
+  question="A size-class allocator changes from power-of-two classes (16, 32, 64, …) to finer classes (16, 32, 48, 64, 80, …). The rounding waste per object goes down. On a random mix of requests from 8 to 512 B, what happens to the total memory that it needs?"
+  options={["It drops by about a quarter", "It stays about the same", "It goes up"]}
   answer={2}
-  explain="More classes means more partially filled pages: each class in use holds at least one page, and live objects are spread across 16 classes instead of 6. In the Fragmentation lesson's replay, fine classes need about 1.67× peak live data vs 1.48× for powers of two. Per-object waste is only half the story; page-level waste is the other half."
+  explain="More classes means more pages that are only partly full. Each class in use holds at least one page, and the live objects spread over 16 classes instead of 6. In the replay of the Fragmentation lesson, fine classes need 1.67 times the peak live data. Powers of two need 1.48 times. Waste per object is only half of the story, and waste per page is the other half."
 >
 <SizeClassDemo />
 </Predict>
 
 Things to try:
 
-1. Run **alloc(33)** under both class settings: 64 B vs 48 B.
-2. **Churn** under each setting and compare the *slack / live* readout with how many pages are touched. Fine classes cut slack but open more pages.
-3. Run **alloc(3000)**: it takes three whole pages, the large-object path.
-4. Free everything in a page and watch it return to the free pool, ready to serve any class.
+1. Click **alloc(33)** with each class setting. The block is 64 B or 48 B.
+2. Click **Churn** with each setting. Compare the *slack / live* value with the number of pages in use. Fine classes cut the slack, but they use more pages.
+3. Click **alloc(3000)**. It takes three whole pages. This is the path for large objects.
+4. Free all the objects in one page. The page goes back to the free pool. It can then serve any class.
 
-## Choosing size classes
+## Choose the size classes
 
-The usual design is roughly **geometric spacing with a few steps per doubling**. jemalloc, for example, uses 4 classes per doubling, so worst-case rounding waste is about 20%. Spacing is a three-way trade-off:
+Most allocators space their classes geometrically, with a few classes in each doubling of size. jemalloc, for example, uses 4 classes in each doubling. The spacing controls the worst-case and the average rounding waste.
+
+<ClassSpacingDemo />
+
+Things to try:
+
+1. Select **1 (powers of two)**. The worst case is just under 50% (49.95%, at 1025 B). The average waste is 25%.
+2. Select **4 (jemalloc)**. The worst case drops to 19.92%, and the average drops to 7.9%. There are now 16 classes between 129 B and 2 KiB, instead of 4.
+3. Select **8**. The worst case is 11.02%, but there are 32 classes. Each class needs its own pages and caches.
+4. Move the request size. The waste is largest just above a class boundary. It drops to zero at the next class.
+
+The spacing is a three-way trade-off:
 
 | Finer classes | Coarser classes |
 |---|---|
 | less rounding waste per object | more rounding waste |
-| more partially filled pages | fewer, fuller pages |
-| more metadata and per-class caches | less |
+| more pages that are partly full | fewer pages, and fuller ones |
+| more metadata and more caches per class | less |
 
 ## Threads
 
-A single global lock would serialize every `malloc`. The fixes, in roughly historical order:
+One global lock would make each `malloc` wait for the others. These are the fixes, in rough historical order:
 
-- **Arenas per thread or per CPU** (glibc, jemalloc): a thread allocates from "its" arena, which reduces contention.
-- **Thread caches** (tcmalloc, jemalloc's tcache, glibc's tcache): small per-thread stacks of free objects per class, so the common path needs no synchronization.
-- **Free-list sharding** (mimalloc): each *page* has its own free list, plus a separate atomic list for objects freed by *other* threads. The owner collects those later in bulk. This keeps locality and avoids most atomics.
+- **Arenas per thread or per CPU** (glibc, jemalloc). A thread allocates from "its" arena. This reduces contention for the lock.
+- **Thread caches** (tcmalloc, the tcache of jemalloc, the tcache of glibc). Each thread keeps a small stack of free objects for each class. The common path needs no synchronization.
+- **Free-list sharding** (mimalloc). Each page has its own free list, plus a separate atomic list for objects that *other* threads free. The owner thread collects these objects later, in one batch. This keeps locality and prevents most atomic operations.
 
-Cross-thread frees (allocate on one thread, free on another) are the hard case, as in producer/consumer queues. They are also where allocator choice shows up in benchmarks.
+The next demo models a tcmalloc-style allocator with four levels. A **thread cache** holds free objects for one thread. A **central free list** holds free objects for all threads, behind a lock. The **page heap** holds free pages. When it is empty, it asks the OS for 1 MiB more.
+
+The model gives each level a cost: 1, 10, 100 and 1000 units. Each level is roughly ten times slower than the level above it. Real costs depend on the machine and on the allocator. In the model, requests above 32 KiB are large, and they go to the page heap directly.
+
+<Predict
+  id="prodcons"
+  question="Thread 1 allocates messages, and thread 2 frees them. Compare this with one thread that allocates and frees. How often does the allocator take the central lock?"
+  options={["About as often", "Several times more often", "Never, because each thread has its own cache"]}
+  answer={1}
+  explain="The frees go into the cache of thread 2. That cache overflows and sends objects back to the central list. The cache of thread 1 empties and must refill from the central list. With a 32-object cache, the model takes the lock 160 times in 3000 operations. One thread with steady churn takes it 17 times in 3200 operations."
+>
+<MallocPathDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Play** on **Steady churn**. Almost all operations stay in the thread cache. Over the whole trace, 99.1% of the operations take no lock.
+2. Move **Thread cache size** to 0. Now each operation goes to the central list and takes the lock. The average cost goes up from 1.70 to 10.62.
+3. Set the cache size to 4. The cache must refill and drain often. Only 84.8% of the operations stay in it.
+4. Select **Producer and consumer**. The fast path drops to 94.2%, and the lock trips go up from 17 to 160.
+5. Select **Large objects**. Each operation goes to the page heap or to the OS. The thread cache has no effect.
+
+Frees from another thread are the difficult case. Producer and consumer queues do this all the time. Benchmarks of this pattern often show the largest differences between allocators.
 
 ## In your languages
 
-- **C / C++**: `malloc` is glibc's ptmalloc by default on Linux. Swap it with `LD_PRELOAD=libmimalloc.so` or by linking jemalloc.
-- **Rust**: uses the system allocator. Replace it with `#[global_allocator] static A: mimalloc::MiMalloc = mimalloc::MiMalloc;`.
-- **Zig**: no hidden allocations. You pass an allocator explicitly. The standard library includes a page allocator, `DebugAllocator` (formerly `GeneralPurposeAllocator`, which detects leaks and double frees) and `smp_allocator` for release builds. You can also use `std.heap.c_allocator`.
-- **Odin**: `context.allocator` defaults to a heap allocator over the platform's `malloc`. Override it per scope by assigning to `context.allocator`.
-- **Go**: a tcmalloc-derived allocator with per-P caches (`mcache`), size classes and spans, integrated with the garbage collector.
+- **C and C++**: on Linux, `malloc` is the ptmalloc allocator of glibc by default. To change it, use `LD_PRELOAD=libmimalloc.so` or link with jemalloc.
+- **Rust**: Rust uses the system allocator. Replace it with `#[global_allocator] static A: mimalloc::MiMalloc = mimalloc::MiMalloc;`.
+- **Zig**: Zig has no hidden allocations. You pass an allocator explicitly. The standard library has a page allocator and `DebugAllocator`, which finds leaks and double frees. It also has `smp_allocator` for release builds, and `std.heap.c_allocator`.
+- **Odin**: `context.allocator` is a heap allocator over the `malloc` of the platform by default. To change it for one scope, assign a new value to `context.allocator`.
+- **Go**: Go has an allocator derived from tcmalloc, with a cache per P (`mcache`), size classes and spans. It works together with the garbage collector.
+
+`DebugAllocator` was earlier called `GeneralPurposeAllocator`.
 
 <Recall cards={[
-  { q: "How does a size-class allocator find an object's size class on free without a header?", a: "Page metadata stored out of band: addr >> page_shift indexes a page table entry that records the class." },
-  { q: "Why can finer size classes increase total memory use?", a: "More classes means more partially filled pages: each class in use pins at least a page, and objects spread thinner." },
-  { q: "Typical size-class spacing, and its worst-case rounding waste?", a: "About 4 classes per doubling (geometric), for roughly 20% worst-case waste." },
-  { q: "What is mimalloc's free-list sharding?", a: "A free list per page, plus a separate list for frees from other threads. The owner batches those in later, so locality is good and few atomics are needed." },
-  { q: "How do you replace the global allocator in Rust?", a: "#[global_allocator] static on a type implementing GlobalAlloc, e.g. mimalloc::MiMalloc." },
+  { q: "How does a size-class allocator find the class of an object on free, without a header?", a: "It keeps page metadata out of band. The value addr >> page_shift selects a table entry that records the class." },
+  { q: "Why can finer size classes increase the total memory use?", a: "More classes means more pages that are partly full. Each class in use holds at least one page, and the objects spread thinner." },
+  { q: "What is a typical size-class spacing, and what is its worst-case rounding waste?", a: "About 4 classes per doubling, spaced geometrically. The worst-case waste is just under 20%." },
+  { q: "What does a thread cache save, and when does it stop helping?", a: "It serves most mallocs and frees with no lock. It helps less when one thread frees what another thread allocates, and not at all for large objects." },
+  { q: "What is the free-list sharding of mimalloc?", a: "Each page has a free list, plus a separate list for frees from other threads. The owner collects those in batches, so locality is good and few atomic operations are necessary." },
+  { q: "How do you replace the global allocator in Rust?", a: "Put #[global_allocator] on a static of a type that implements GlobalAlloc, for example mimalloc::MiMalloc." },
 ]} />

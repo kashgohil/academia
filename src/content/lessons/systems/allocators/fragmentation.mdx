@@ -1,59 +1,91 @@
 ---
-summary: Measuring how much memory an allocator wastes on the same workload, and what actually controls it.
+summary: The two kinds of memory waste in an allocator, how to measure them on a workload, and what controls them.
 ---
 import { FragmentationDemo } from "@/demos/FragmentationDemo";
+import { FragExplorerDemo } from "@/demos/AllocExtrasB";
 
-Fragmentation means memory that is reserved but cannot be used for the program's data. It has two forms you have now seen in every allocator:
+**Fragmentation** is memory that the allocator holds but that the program cannot use for its data. There are two kinds, and each allocator in this module has one or both:
 
-- **Internal**: waste *inside* allocated blocks, from headers, alignment padding and rounding up to a class or power of two.
-- **External**: free memory split into pieces too small for the requests that arrive.
+- **Internal fragmentation** is waste inside allocated blocks. It comes from headers, alignment padding and rounding up to a size class or a power of two.
+- **External fragmentation** is free memory that is split into pieces. Each piece is too small for the requests that arrive.
 
-A single number captures both. Replay the same allocation trace through each allocator, and record the highest address it ever needed, its **footprint**. Divide by the peak amount of live data at any moment. A ratio of 1.0 is perfect packing. This is the measure Wilson, Johnstone and colleagues used in their 1990s studies of real allocators.
+## See both kinds
+
+The demo measures external fragmentation as the part of free memory that is outside the largest free block:
+
+$$\text{external} = 1 - \frac{\text{largest free block}}{\text{total free memory}}$$
+
+When this value is high, a large request can fail although much memory is free.
+
+<Predict
+  id="checker"
+  question="A 1 KiB heap holds 16 blocks of 64 B. The program frees every second block, so 512 B is free. Can alloc(128) succeed?"
+  options={["Yes, because 512 B is free", "Only after the allocator moves the live blocks", "No, because the largest free block is 64 B"]}
+  answer={2}
+  explain="Each free block is 64 B, with a live block on each side. No single free block holds 128 B. External fragmentation is 1 − 64/512 = 87.5%. A C allocator cannot move the live blocks, because the program holds their addresses."
+>
+<FragExplorerDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Checkerboard**. Free memory is 512 B, but the largest free block is 64 B. External fragmentation is 87.5%. Set the request size to 128 B: the request does not fit.
+2. Click a live block between two free blocks. The three blocks merge into one free block of 192 B. External fragmentation goes down.
+3. Click **Reset**. Set the request size to **65 B** and click **Fill with 65 B**. The exact-size allocator holds 14 objects, with 9.7% internal fragmentation.
+4. Select **Power-of-two blocks** and fill with 65 B again. Only 8 objects fit, because each one takes a 128 B block. Internal fragmentation is now 49.2%.
+5. Click **Checkerboard** with power-of-two blocks. The result is the same 87.5%. The buddy of each free block is in use, so no free block can merge.
+
+## One number for a whole workload
+
+A **trace** is a recorded list of the allocations and frees of a program. Replay the same trace through each allocator. Record the highest address that the allocator ever used. This is its **footprint**. Divide the footprint by the peak amount of live data. A ratio of 1.0 is perfect packing.
+
+This ratio includes both kinds of fragmentation. Wilson, Johnstone and others used this measure in their studies of real allocators in the 1990s.
 
 <Predict
   id="policy"
-  question="Four free-list placement policies, all with coalescing, run the same trace of random sizes and lifetimes. Which needs the least memory?"
+  question="Four free-list placement policies, all with coalescing, run the same trace of random sizes and lifetimes. Which policy needs the least memory?"
   options={["First fit", "Next fit", "Best fit", "Worst fit"]}
   answer={2}
-  explain="Best fit needs about 1.09× peak live on this trace, with first fit close behind at 1.16×. Next fit and worst fit spread allocations across the whole heap and need several times more. Their bars carry a + because they hit the 64 KiB limit of the simulation."
+  explain="Best fit needs about 1.09 times the peak live data on this trace. First fit is close, at 1.16 times. Next fit and worst fit spread allocations over the whole heap and need more than 3 times. A + after their values shows that they touched almost all of the 64 KiB heap."
 >
 <FragmentationDemo />
 </Predict>
 
 Things to try:
 
-1. On **Random sizes and lifetimes**, tick *next fit*. Its footprint climbs almost immediately: next fit keeps advancing through fresh memory instead of reusing holes behind it.
-2. Compare **first fit** with and without **coalescing**: about 1.16× vs 2.23×. Coalescing is not optional.
-3. Switch to **Request-scoped (server)**. Every request frees everything it allocated. A per-request arena would match this lifetime pattern exactly, with a footprint close to live data and no per-object frees.
-4. On **Growing buffers**, the policies converge. The big doubling buffers dominate, and they fit power-of-two blocks exactly, so the buddy allocator does as well as best fit.
+1. On **Random sizes and lifetimes**, select *next fit*. Its footprint climbs almost at once. Next fit keeps moving forward into new memory, and it does not reuse the holes behind it.
+2. Compare **first fit** with and without **coalescing**: about 1.16 and 2.23. Coalescing (merging free neighbors) is necessary.
+3. Select **Request-scoped (server)**. Each request frees all the objects that it allocated. An arena per request matches this pattern exactly. Its footprint is close to the live data, and it needs no free per object.
+4. On **Growing buffers**, the policies come close together. Buffers that double in size use most of the memory. They fit power-of-two blocks exactly, so the buddy allocator does as well as best fit.
 
-## What actually controls fragmentation
+## What controls fragmentation
 
 <Steps>
-<div><b>Placement policy.</b> Policies that reuse memory close to recent allocations and keep large blocks intact (best fit, address-ordered first fit) fragment least. On real program traces, Johnstone and Wilson (1998) measured both at only a few percent.</div>
-<div><b>Coalescing.</b> Merging neighbors immediately (or before memory is needed) turns many small holes back into large ones.</div>
-<div><b>Rounding.</b> Size classes and buddy blocks buy speed with internal waste; the class layout controls the trade-off.</div>
-<div><b>Lifetimes, most of all.</b> Fragmentation comes from <i>interleaving</i> objects that die at different times. Long-lived small objects scattered among short-lived large ones pin holes open (the <b>Small pins between big frees</b> workload).</div>
+<div><b>Placement policy.</b> Some policies reuse memory near recent allocations and keep large blocks whole. Best fit and address-ordered first fit do this, and they fragment least. On real program traces, Johnstone and Wilson (1998) measured only a few percent for both.</div>
+<div><b>Coalescing.</b> When the allocator merges free neighbors at once (or before it needs the memory), many small holes become large holes again.</div>
+<div><b>Rounding.</b> Size classes and buddy blocks make allocation faster, but they add internal waste. The layout of the classes controls this trade-off.</div>
+<div><b>Lifetimes, most of all.</b> Fragmentation comes from objects that are next to each other but die at different times. Small long-lived objects between large short-lived ones keep the holes apart. The <b>Small pins between big frees</b> workload shows this.</div>
 </Steps>
 
-<Callout title="Synthetic traces exaggerate">
-Uniformly random sizes and lifetimes are the worst kind of test workload. Real programs allocate in phases, reuse a few sizes and free objects in clusters, and allocators exploit exactly that. Wilson et al. argued that random-trace studies made fragmentation look far worse than it is in practice. Use these demos to understand mechanisms, and measure your real program before choosing an allocator.
+<Callout title="Synthetic traces make fragmentation look worse">
+Random sizes and random lifetimes are the worst kind of test workload. Real programs allocate in phases, use a few sizes again and again, and free objects in groups. Allocators use these patterns. Wilson and his colleagues showed that studies with random traces made fragmentation look much worse than it is in practice. Use these demos to learn the mechanisms. Measure your real program before you choose an allocator.
 </Callout>
 
-## Tools that don't depend on the allocator
+## Fixes that do not depend on the allocator
 
-In C, C++, Rust, Zig and Odin, pointers are raw addresses, so an allocator can never **move** a live object to close a gap. (Compacting garbage collectors can, which is one of their real advantages.) That leaves you with structural fixes:
+In C, C++, Rust, Zig and Odin, pointers are raw addresses. So an allocator can never **move** a live object to close a gap. A compacting garbage collector can move objects, and this is one of its real advantages. Without one, you must change the structure of the program:
 
-- **Group by lifetime**: arenas per frame, request or phase. This removes fragmentation instead of managing it.
-- **Group by size or type**: pools and slabs for hot, uniform objects.
-- **Avoid pinning**: allocate long-lived objects up front or in their own region, away from churn.
-- **Reserve capacity**: grow containers geometrically, or reserve once, to avoid the free-old/allocate-new churn of growing buffers.
-- **Return memory to the OS**: allocators keep freed pages for reuse. jemalloc's decay settings, mimalloc's purge delays and glibc's `malloc_trim` control when memory goes back.
+- **Group by lifetime.** Use arenas per frame, per request or per phase. This removes fragmentation, instead of managing it.
+- **Group by size or type.** Use pools and slabs for hot objects of one size.
+- **Prevent pinning.** Allocate long-lived objects at the start or in their own region, away from short-lived ones.
+- **Reserve capacity.** Grow containers geometrically, or reserve their size once. This prevents the cycle of free-old, allocate-new that growing buffers cause.
+- **Give memory back to the OS.** Allocators keep freed pages for reuse. The decay settings of jemalloc, the purge delays of mimalloc and `malloc_trim` in glibc control when memory goes back.
 
 <Recall cards={[
-  { q: "Internal vs external fragmentation?", a: "Internal: unused bytes inside allocated blocks (headers, padding, rounding). External: free memory split into pieces too small to satisfy requests." },
-  { q: "A single metric for allocator fragmentation on a trace?", a: "Footprint (memory needed, the highest address used) divided by peak live data. 1.0 is perfect." },
-  { q: "Which placement policies fragment least, and which most?", a: "Best fit and address-ordered first fit least; next fit and worst fit most." },
-  { q: "Why can't malloc-style allocators compact the heap?", a: "Programs hold raw addresses, so live objects can't be moved without updating every pointer to them. Only moving GCs (or handle-based designs) can compact." },
-  { q: "The most effective structural fix for fragmentation?", a: "Group allocations by lifetime (arenas per frame, request or phase), so objects that die together are allocated together." },
+  { q: "What is the difference between internal and external fragmentation?", a: "Internal: unused bytes inside allocated blocks, from headers, padding and rounding. External: free memory split into pieces that are too small for the requests." },
+  { q: "How do you measure external fragmentation at one moment?", a: "1 minus the largest free block divided by the total free memory. A high value means that large requests can fail although memory is free." },
+  { q: "What single number measures the fragmentation of an allocator on a trace?", a: "The footprint (the highest address used) divided by the peak live data. A value of 1.0 is perfect." },
+  { q: "Which placement policies fragment least, and which fragment most?", a: "Best fit and address-ordered first fit fragment least. Next fit and worst fit fragment most." },
+  { q: "Why can a malloc-style allocator not compact the heap?", a: "The program holds raw addresses. The allocator cannot move a live object without a change to each pointer to it." },
+  { q: "What is the most effective structural fix for fragmentation?", a: "Group allocations by lifetime, for example with arenas per frame, request or phase. Objects that die together are then allocated together." },
 ]} />

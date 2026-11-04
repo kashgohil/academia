@@ -1,57 +1,81 @@
 ---
-summary: Power-of-two blocks, finding your buddy with one XOR, and the allocator behind the Linux page allocator.
+summary: Power-of-two blocks, how one XOR finds the buddy of a block, and the allocator that Linux uses for physical pages.
 ---
 import { BuddyDemo } from "@/demos/AllocatorDemos";
+import { BuddyTreeDemo } from "@/demos/AllocExtrasB";
 
-The buddy system restricts every block to a power-of-two size, aligned to its own size. That restriction pays off. Splitting a block yields two halves, called **buddies**. A block's buddy can be computed rather than searched for, so merging on free is a handful of operations per level. Linux manages physical pages this way: orders 0 to 10, from 4 KiB to 4 MiB, visible in `/proc/buddyinfo`.
+A **buddy allocator** gives out blocks whose sizes are powers of two. Each block starts at a multiple of its own size. When the allocator splits a block, it gets two equal halves. These two halves are **buddies**. The allocator can calculate the address of a buddy, so it does not search for it. Thus a free can merge blocks again with a few operations per level.
+
+The **order** of a block tells its size. A block of order $k$ is $2^k$ times the minimum block. Linux uses a buddy allocator for physical memory pages. It has orders 0 to 10, from 4 KiB (one page) to 4 MiB. The file `/proc/buddyinfo` shows the number of free blocks in each order.
+
+## See the tree
 
 <Predict
   id="split"
-  question="A fresh 1 KiB buddy heap (16-byte minimum block) gets alloc(33). Afterwards, what does the heap contain?"
+  question="A new 1 KiB buddy heap has a 16-byte minimum block. The program calls alloc(33). After the call, what does the heap contain?"
   options={[
     "A 33-byte block and one 991-byte free block",
     "A 64-byte block, and free blocks of 512, 256, 128 and 64 bytes",
     "The whole 1 KiB block, allocated",
   ]}
   answer={1}
-  explain="33 rounds up to 64. The allocator splits 1024 into two 512s, one 512 into two 256s, and so on down to 64. One half of each split stays free. The allocation wastes 31 bytes inside its block."
+  explain="The allocator rounds 33 up to 64. It splits 1024 into two 512-byte buddies, then one 512 into two 256s, and so on down to 64. One half of each split stays free. The allocation wastes 31 bytes inside its block."
 >
-<BuddyDemo />
+<BuddyTreeDemo />
 </Predict>
+
+Each row of the tree is one order. The top row is the whole heap. Each row below it has blocks of half the size, down to 16 B. A grey block is split into two buddies in the row below it.
 
 Things to try:
 
-1. **Four 100 B, free in order**. Each 100 B request takes a 128 B block. Watch the free-block list as they are freed: buddies merge only when *both* halves are free, so the full 1 KiB block reappears only at the last free.
-2. Allocate 129 B: you get a 256 B block, and almost half of it is slack. Power-of-two rounding has a worst case just under 50% internal waste.
-3. Allocate one 16 B block, then try 513 B. It fails: the 1 KiB block is split, and the small allocation **pins** its 512 B half.
-4. Choose **align 64** with a small request: the block size becomes 64, because blocks are naturally aligned to their size.
+1. Click **Allocate 33 B**. The allocator splits 4 times, from 1024 B down to 64 B. Red outlines show the blocks that the operation touched.
+2. Click **Allocate 33 B** again. The request takes the free 64 B buddy at `0x040`, with no split.
+3. Click **Free newest**. The buddy of `0x040` is `0x040 XOR 64 = 0x000`. That block is in use, so the merge stops at once. The binary view shows the one bit that XOR changes.
+4. Click **Free newest** again. Now each buddy is free, so the block merges 4 times, back to one 1 KiB block.
+5. Set the request size to **129 B** and allocate. The block is 256 B, so almost half of it is waste. The free-block counts at the bottom use the format of `/proc/buddyinfo`.
 
 ## Why XOR finds the buddy
 
 <Steps>
-<div>A block of size $2^k$ always starts at a multiple of $2^k$, so bit $k$ of its offset says whether it is the lower or upper half of its parent.</div>
-<div>The buddy differs from it in exactly that bit: $\text{buddy}(o, 2^k) = o \oplus 2^k$.</div>
-<div>The parent starts at $\min(o, \text{buddy})$, i.e. $o$ with bit $k$ cleared.</div>
-<div>Free: while the buddy at this order is free, remove it from its free list and move up one order. That's at most $\log_2(\text{heap}/\text{min})$ steps.</div>
+<div>A block of size $2^k$ always starts at a multiple of $2^k$. So bit $k$ of its offset tells if the block is the lower half or the upper half of its parent.</div>
+<div>The buddy is different from the block only in that bit: $\text{buddy}(o, 2^k) = o \oplus 2^k$.</div>
+<div>The parent starts at the lower of the two offsets. That is $o$ with bit $k$ set to 0.</div>
+<div>To free a block, the allocator does this: while the buddy is free and has the same order, remove the buddy from its free list and go up one order.</div>
+<div>For a heap of $N$ bytes and a minimum block of $m$ bytes, a free takes at most $\log_2(N/m)$ steps. In the demo, that is 6 steps.</div>
 </Steps>
 
-Allocation is the mirror image: take the smallest free order that fits, then split down, pushing each upper half onto its order's free list. Each order's free list can be a simple list or a bitmap; Linux uses lists per order plus migrate types.
+Allocation is the opposite process. The allocator finds the smallest free order that fits. Then it splits down, and it puts each upper half on the free list of its order. Each order can keep its free blocks in a list or in a bitmap. Linux keeps one list per order and per migration type. A **migration type** groups pages by whether the kernel can move them.
+
+## The same heap as bytes
+
+This view shows the same allocator as a map of bytes. Click a live block to free it.
+
+<BuddyDemo />
+
+Things to try:
+
+1. Click **Four 100 B, free in order**. Each 100 B request takes a 128 B block. Buddies merge only when both halves are free. So the full 1 KiB block comes back only at the last free.
+2. Allocate **129 B**. You get a 256 B block. Almost half of it is **slack**: unused bytes inside the block.
+3. Allocate one 16 B block, then try 513 B. The request fails. The 1 KiB block is split, and the small block **pins** its 512 B half: it stops the merge.
+4. Select **align 64** with a small request. The block size becomes 64 B, because each block is aligned to its size.
 
 ## Trade-offs
 
+Waste inside a block is **internal fragmentation**. A request of $2^k + 1$ bytes gets a block of $2^{k+1}$ bytes. So the worst case is just under 50% (49.95% for a request of 1025 B). For request sizes from 129 B to 2 KiB, chosen uniformly, the average waste is 25% of the block.
+
 | | Buddy |
 |---|---|
-| Internal fragmentation | up to ~50% (about 25% on average for uniform sizes) |
-| External fragmentation | limited: free blocks merge eagerly, but one live block pins every ancestor |
-| Metadata | an order per block, kept out of band (or a bit per block pair) |
-| Speed | O(log n) worst case, usually O(1) |
+| Internal fragmentation | just under 50% in the worst case, 25% on average for uniform sizes |
+| External fragmentation | limited: free buddies merge at once, but one live block keeps all its ancestors split |
+| Metadata | the order of each block, kept outside the block (or one bit for each pair of buddies) |
+| Speed | at most O(log n) steps, usually O(1) |
 
-That is why the buddy allocator usually sits at the **bottom** of a stack. It hands out pages or large runs cheaply, and a slab or size-class allocator on top carves those into small objects without power-of-two waste.
+For this reason, a buddy allocator usually sits at the bottom of a stack of allocators. It gives out pages and large runs at low cost. A slab allocator or a size-class allocator on top cuts these pages into small objects without power-of-two waste.
 
 <Recall cards={[
-  { q: "Address of the buddy of a block at offset o with size 2^k?", a: "o XOR 2^k." },
-  { q: "Worst-case internal fragmentation for a binary buddy allocator?", a: "Just under 50%: a request of 2^k + 1 bytes gets a 2^(k+1) block." },
-  { q: "When can two buddies merge?", a: "Only when both are free and at the same order. One live block keeps its whole ancestor chain split." },
-  { q: "Where does Linux use a buddy allocator?", a: "For physical page frames, orders 0–10 (4 KiB to 4 MiB). See /proc/buddyinfo." },
-  { q: "Why are buddy blocks naturally aligned?", a: "Splitting always halves an aligned block, so a block of size 2^k starts at a multiple of 2^k." },
+  { q: "What is the address of the buddy of a block at offset o with size 2^k?", a: "o XOR 2^k. The two buddies are different only in bit k." },
+  { q: "What is the worst-case internal fragmentation of a binary buddy allocator?", a: "Just under 50%. A request of 2^k + 1 bytes gets a block of 2^(k+1) bytes." },
+  { q: "When can two buddies merge?", a: "Only when both are free and have the same order. One live block keeps all the blocks above it split." },
+  { q: "Where does Linux use a buddy allocator?", a: "For physical page frames, in orders 0 to 10 (4 KiB to 4 MiB). The file /proc/buddyinfo shows the free blocks per order." },
+  { q: "Why is each buddy block aligned to its size?", a: "Each split cuts an aligned block in half. So a block of size 2^k always starts at a multiple of 2^k." },
 ]} />

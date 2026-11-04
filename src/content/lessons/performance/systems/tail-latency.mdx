@@ -1,0 +1,60 @@
+---
+summary: Why the slowest 1% of responses matters, how fan-out makes rare delays common, and how hedged requests fix it.
+---
+import { FanoutDemo, HedgingDemo } from "@/demos/SystemsDemos";
+
+The **tail latency** is the latency of the slowest responses. People measure it with high percentiles. The 99th percentile (p99) is the time that 99% of the requests are faster than.
+
+The mean hides the tail. Users do not. And in a distributed system, the tail of one component becomes the typical latency of the whole system.
+
+<Predict
+  id="fanout"
+  question="A request calls 100 backends in parallel and waits for all of them. Each backend is slow 1% of the time. What fraction of requests is slow?"
+  options={["About 1%", "About 10%", "About 63%"]}
+  answer={2}
+  explain="The request is fast only if all 100 backends are fast. The chance of that is 0.99 to the power 100, which is about 37%. So about 63% of requests wait for at least one slow backend."
+>
+<FanoutDemo />
+</Predict>
+
+Do these steps:
+
+1. Set the backends to **1**. About 1% of requests are slow. The median is 10 ms.
+2. Set the backends to **10**. The p99 increases from about 23 ms to about 250 ms.
+3. Set the backends to **100**. Now the median request is slow. The rare delay is now normal.
+
+## Where the tail comes from
+
+Slow responses have many causes. Examples are garbage collection pauses, full queues, cache misses to disk and network retransmissions. Noisy neighbors on the same machine and background jobs also cause them. You cannot remove all of them. Jeff Dean and Luiz André Barroso called this "the tail at scale" (2013). Large systems must tolerate the tail.
+
+## Hedged requests
+
+A **hedged request** is a second copy of a request. You send it to a different replica when the first copy is slow. You use the first reply that arrives.
+
+<HedgingDemo />
+
+1. Turn off **Use hedged requests**. The p99.9 is about 270 ms.
+2. Turn it on, and send the copy after **30 ms**. The p99.9 drops to about 45 ms. Only about 1% of requests need a copy.
+3. Send the copy after **12 ms**. The latency drops a little more, but the extra load increases a lot.
+
+Send the copy at about the 95th percentile of normal latency. Then only about 5% of requests need a copy, or fewer.
+
+## Other methods
+
+| Method | How it helps |
+|---|---|
+| Tied requests | Send to two replicas at once. When one starts the work, it cancels the other. |
+| Timeouts with retries | Retry a request after a timeout. Use a budget, so retries cannot overload the system. |
+| Partial results | Return results from the backends that replied in time (search, recommendations). |
+| Fewer dependencies per request | Fan out to fewer backends, or cache their results. |
+| Remove the causes | Use concurrent GC, keep queues short, and isolate noisy work. |
+
+Always measure tail latency as a distribution: p50, p99, p99.9 and the maximum. Do not average percentiles from different machines. Combine the raw data or histograms (for example HdrHistogram), then compute the percentile.
+
+<Recall cards={[
+  { q: "What does p99 latency mean?", a: "99% of requests are faster than this value." },
+  { q: "100-way fan-out, each backend slow 1% of the time: share of slow requests?", a: "1 − 0.99¹⁰⁰ ≈ 63%." },
+  { q: "What is a hedged request?", a: "A second copy of a slow request, sent to another replica. You use whichever reply arrives first." },
+  { q: "When should you send the hedge?", a: "At about the 95th percentile of normal latency, so only a few percent of requests need a copy." },
+  { q: "Why must you not average percentiles from different servers?", a: "The average of percentiles is not the percentile of the combined data. Merge histograms instead." },
+]} />

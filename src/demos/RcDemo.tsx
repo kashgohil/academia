@@ -108,7 +108,6 @@ function Schematic({ charge, fill, current }: { charge: boolean; fill: number; c
       <line x1={101} y1={55} x2={101} y2={100} />
       <circle cx={140} cy={20} r={2.5} />
       <line x1={138} y1={21} x2={104} y2={charge ? 20 : 50} />
-      <text x={108} y={74} {...muted}>{charge ? "to Vs" : "to ground"}</text>
       {/* resistor */}
       <polyline points="143,20 152,20 160,10 172,30 184,10 196,30 208,10 216,20 230,20" />
       <text x={180} y={48} {...muted}>R</text>

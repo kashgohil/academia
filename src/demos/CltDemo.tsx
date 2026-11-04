@@ -89,36 +89,32 @@ export function CltDemo() {
           { label: "σ/√n (theory)", value: Number.isFinite(seTheory) ? seTheory.toFixed(3) : d.sigma2 === Infinity ? "∞" : "undefined" },
         ]}
       />
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 16, marginTop: 14 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16, marginTop: 14 }}>
         <div>
-          <div className="muted" style={{ fontSize: 12.5 }}>Population: one draw</div>
-          <Plot x={d.view} y={[0, Math.max(...population.map((b) => b.y)) * 1.1 || 1]} height={180} yFormat={(v) => v.toFixed(1)}>
+          <div className="muted" style={{ fontSize: 12.5 }}>Population (one draw)</div>
+          <Plot x={d.view} y={[0, Math.max(...population.map((b) => b.y)) * 1.1 || 1]} height={190} ticks={4} yFormat={(v) => v.toFixed(1)}>
             <Bars bins={population} color="var(--faint)" />
             {Number.isFinite(d.mu) && d.mu >= d.view[0] && d.mu <= d.view[1] && <RuleX at={d.mu} label="μ" />}
           </Plot>
         </div>
         <div>
           <div className="muted" style={{ fontSize: 12.5 }}>
-            {z ? <>Standardized mean (x̄ − μ)/(σ/√n), n = {n}</> : <>Mean, robustly scaled (σ undefined), n = {n}</>}
+            {z ? <>Standardized mean, n = {n}</> : <>Mean, robust scale (σ undefined), n = {n}</>}
           </div>
-          <Plot x={[-4, 4]} y={[0, 0.6]} height={180} yFormat={(v) => v.toFixed(1)}>
+          <Plot x={[-4, 4]} y={[0, 0.6]} height={190} ticks={4} yFormat={(v) => v.toFixed(1)}>
             <Bars bins={bins} />
             <Line points={curve} color="var(--c2)" />
           </Plot>
         </div>
-      </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 16, marginTop: 8, alignItems: "end" }}>
         <div>
-          <div className="muted" style={{ fontSize: 12.5 }}>Q-Q plot against N(0, 1): on the diagonal means normal</div>
-          <Plot x={[-3.5, 3.5]} y={[-5, 5]} height={180} xLabel="normal quantile" yLabel="sample">
+          <div className="muted" style={{ fontSize: 12.5 }}>Q-Q vs N(0, 1)</div>
+          <Plot x={[-3.5, 3.5]} y={[-5, 5]} height={190} xTicks={[-2, 0, 2]} yTicks={[-4, -2, 0, 2, 4]}>
             <Line points={[[-5, -5], [5, 5]]} color="var(--faint)" width={1} dash="4 3" />
             <Dots points={qq} r={2} />
           </Plot>
         </div>
-        <div style={{ paddingBottom: 30 }}>
-          <Legend items={[{ label: "histogram of sample means", color: "var(--c1)" }, { label: "N(0, 1) density", color: "var(--c2)" }]} />
-        </div>
       </div>
+      <Legend items={[{ label: "sample means", color: "var(--c1)" }, { label: "N(0, 1) density", color: "var(--c2)" }, { label: "on the diagonal = normal", color: "var(--faint)" }]} />
     </Demo>
   );
 }

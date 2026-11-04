@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { contours } from "d3-contour";
-import { Demo, Stats, Controls, Plot, Line, Dots, Legend, usePlot, useParams, useSim, range, select, toggle } from "../kit";
+import { Demo, Stats, Controls, Param, Plot, Line, Dots, Legend, usePlot, useParams, useSim, range, select, toggle } from "../kit";
 import { SURFACES, getSurface, run, type OptimizerId, type Surface, type Vec2 } from "../sims/optim";
 import { mulberry32, normal } from "../sims/rng";
 
@@ -63,7 +63,19 @@ export function GradientDescentDemo() {
           <button className="btn ghost" onClick={() => setStart(surf.start)}>Reset start</button>
         </>
       }
-      controls={<Controls params={params} />}
+      controls={
+        <>
+          <Controls params={params} only={["surface", "lr", "adamLr", "beta", "noise"]} />
+          <div className="param">
+            <span className="param-label">Show</span>
+            <div className="row" style={{ gap: 14 }}>
+              {OPTS.map((o) => (
+                <Param key={o.id} spec={{ ...schema[o.id], label: o.label }} value={v[o.id]} onChange={(x) => params.set(o.id, x as boolean)} />
+              ))}
+            </div>
+          </div>
+        </>
+      }
     >
       <Stats
         items={[
@@ -96,7 +108,7 @@ export function GradientDescentDemo() {
       </Plot>
       <Legend items={OPTS.filter((o) => paths[o.id]).map((o) => ({ label: o.label, color: o.color }))} />
       <div style={{ height: 12 }} />
-      <Plot x={[0, STEPS]} y={[1e-8, 1e4]} logY height={170} xLabel="step" yLabel="f(θ) − f*" yFormat={(t) => (Math.log10(t) % 2 === 0 ? `1e${Math.log10(t)}` : "")}>
+      <Plot x={[0, STEPS]} y={[1e-8, 1e4]} logY height={170} xLabel="step" yLabel="f(θ) − f*" yTicks={[1e-8, 1e-4, 1, 1e4]} yFormat={(t) => (t === 1 ? "1" : `1e${Math.round(Math.log10(t))}`)}>
         {OPTS.map((o) => {
           const path = paths[o.id];
           if (!path) return null;
@@ -133,7 +145,7 @@ function Contours({ surface }: { surface: Surface }) {
   return (
     <g>
       {bands.gens.map((c, i) => (
-        <path key={i} d={toPath(c.coordinates as number[][][][])} fill="var(--c1)" fillOpacity={0.045} stroke="var(--faint)" strokeOpacity={0.5} strokeWidth={0.75} />
+        <path key={i} d={toPath(c.coordinates as number[][][][])} fill="none" stroke="var(--faint)" strokeOpacity={0.7} strokeWidth={0.75} />
       ))}
     </g>
   );

@@ -9,7 +9,7 @@ const schema = {
   pattern: select({ label: "Access pattern", options: PATTERNS.map((p) => ({ value: p.id, label: p.label })), default: "row-major" }),
   size: select({ label: "Cache size", options: SIZES.map((s) => ({ value: String(s), label: bytes(s) })), default: "4096" }),
   line: select({ label: "Line size", options: [16, 32, 64, 128].map((s) => ({ value: String(s), label: `${s} B` })), default: "64", segmented: true }),
-  ways: select({ label: "Associativity", options: [["1", "Direct"], ["2", "2-way"], ["4", "4-way"], ["8", "8-way"], ["0", "Full"]].map(([value, label]) => ({ value: value!, label: label! })), default: "1", segmented: true }),
+  ways: select({ label: "Associativity (ways)", options: [["1", "1"], ["2", "2"], ["4", "4"], ["8", "8"], ["0", "Full"]].map(([value, label]) => ({ value: value!, label: label! })), default: "1", segmented: true }),
   policy: select<Policy>({ label: "Replacement", options: [{ value: "lru", label: "LRU" }, { value: "fifo", label: "FIFO" }, { value: "random", label: "Random" }], default: "lru", segmented: true }),
   n: range({ label: "Accesses", min: 256, max: 16384, default: 4096, log: true, format: (v) => String(Math.round(v)) }),
 };
@@ -91,7 +91,7 @@ export function CacheDemo() {
       {sweep && (
         <>
           <div className="muted" style={{ fontSize: 12.5, margin: "20px 0 4px" }}>Hit rate vs cache size for this pattern</div>
-          <Plot x={[SIZES[0]!, SIZES[SIZES.length - 1]!]} y={[0, 1]} logX height={200} xFormat={(t) => (SIZES.includes(t) ? bytes(t) : "")} yFormat={(t) => pct(t, 0)}>
+          <Plot x={[SIZES[0]!, SIZES[SIZES.length - 1]!]} y={[0, 1]} logX height={200} xTicks={SIZES} xFormat={bytes} yFormat={(t) => pct(t, 0)}>
             {sweep.map((s, i) => (
               <g key={s.ways}>
                 <Line points={s.pts} color={`var(--c${i + 1})`} width={1.5} />

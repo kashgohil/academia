@@ -54,3 +54,39 @@ describe("stalled thread", () => {
     expect(Math.max(...hp.map((p) => p[1]))).toBeLessThanOrEqual(8);
   });
 });
+
+describe("lesson scripts", () => {
+  test("scripts behave as the lessons describe", async () => {
+    const { replay } = await import("@/sims/lockfree/scenario");
+    const C = await import("@/demos/lockfreeConfigs");
+    const run = (sc: Scenario, s: Scheme, steps: [number, number | "done" | { before: string }][], tags = false) => {
+      const w = makeWorld(sc, opts(s, tags));
+      for (const [t, n] of steps) {
+        const th = w.threads[t]!;
+        if (n === "done") while (th.next !== null) w.step(t);
+        else if (typeof n === "number") for (let i = 0; i < n; i++) w.step(t);
+        else while (th.next !== null && !th.next.startsWith(n.before)) w.step(t);
+      }
+      w.finalize();
+      return w;
+    };
+    void replay;
+    // Stack race: T0's first CAS fails, it retries, everything consistent.
+    const race = run(C.STACK_RACE, "leak", C.STACK_RACE_SCRIPTS[0]!.steps);
+    expect(race.violations).toEqual([]);
+    expect(race.log.filter((l) => l.t === 0 && l.label.startsWith("CAS")).length).toBe(2);
+    // Hazard pointers: immediate free → use-after-free; hazard → none.
+    expect(run(C.HP, "immediate", C.HP_SCRIPTS[0]!.steps).violations.map((v) => v.kind)).toContain("use-after-free");
+    expect(run(C.HP, "hazard", C.HP_SCRIPTS[0]!.steps).violations).toEqual([]);
+    // EBR: while T0 is pinned, T1's retired nodes stay unfreed.
+    const e = makeWorld(C.EBR, opts("epoch"));
+    while (!e.threads[0]!.next!.startsWith("read A.next")) e.step(0);
+    while (e.threads[1]!.next) e.step(1);
+    expect(e.unreclaimed()).toBe(3);
+    // MS queue: T1 helps swing the lagging tail.
+    const q = run(C.MSQ, "leak", C.MSQ_SCRIPTS[0]!.steps);
+    expect(q.violations).toEqual([]);
+    expect(q.log.some((l) => l.t === 1 && l.label.startsWith("help"))).toBe(true);
+    expect(q.threads[2]!.results).toEqual([1, 10]);
+  });
+});

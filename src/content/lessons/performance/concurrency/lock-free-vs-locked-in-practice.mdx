@@ -1,0 +1,59 @@
+---
+summary: Lock-free code is not always faster. Its real advantage is that a paused thread cannot stop the other threads.
+---
+import { PreemptTimelineDemo, PreemptionDemo } from "@/demos/ConcurrencyPerfDemos";
+import { LockScalingDemo } from "@/demos/ConcurrencyPerfDemos";
+
+Many people think that lock-free code is always faster than code with locks. This is not true. A good mutex costs about the same as a CAS when there is no contention. Under contention, both wait for the same cache line.
+
+Lock-free code has a different advantage. A thread that holds a lock can stop all the other threads. A thread in lock-free code cannot.
+
+<Predict
+  id="paused"
+  question="Four threads use a mutex. The operating system pauses the thread that holds the mutex for 8 µs. What do the other three threads do?"
+  options={["They continue with their work", "They wait until the paused thread runs again and releases the mutex", "The operating system gives the mutex to a different thread"]}
+  answer={1}
+  explain="The mutex stays locked while its holder is paused. All the other threads that need the mutex wait. In lock-free code, no thread holds anything, so the other threads continue."
+>
+<PreemptTimelineDemo />
+</Predict>
+
+Look at the two timelines:
+
+1. **With a mutex**: T0 is paused (orange) while it holds the lock. All the other threads stop (red) until T0 runs again.
+2. **Lock-free**: T0 is paused, but the other threads continue. Only T0's own work waits.
+3. Turn off the pause. The two timelines now look almost the same.
+
+## How often pauses matter
+
+The operating system pauses threads for many reasons: the time slice ends, an interrupt occurs, or a page fault occurs. A pause is usually several microseconds or more.
+
+<PreemptionDemo />
+
+1. Set the chance to **0%**. The mutex and the lock-free queue have almost the same throughput.
+2. Set the chance to **1%**. The mutex drops from about 10 to about 1.2 updates per µs. The lock-free queue does not change.
+
+## Without pauses, the difference is small
+
+<LockScalingDemo />
+
+Under contention, every method waits for the same cache line. The lock-free queue and the mutex have the same limit. Sharding the data is a bigger improvement than going lock-free.
+
+## How to choose
+
+<Steps>
+<div>Start with a mutex. It is simple, and it is fast when there is little contention.</div>
+<div>If you see contention, first shard the data or make the critical section shorter.</div>
+<div>Use lock-free code when a paused thread must not stop the others. Examples are real-time audio, kernels, signal handlers and latency-critical servers.</div>
+<div>Use a tested library for lock-free structures. Examples are crossbeam (Rust), folly and libcds (C++), and Java's java.util.concurrent. Safe memory reclamation is difficult to get correct.</div>
+</Steps>
+
+Also remember: a spinlock is the worst choice when there are more threads than cores. The waiting threads use the CPU time that the paused holder needs. A mutex puts waiting threads to sleep, so the holder can run sooner.
+
+<Recall cards={[
+  { q: "Is lock-free code always faster than a mutex?", a: "No. Without contention they cost about the same. Under contention, both wait for the same cache line." },
+  { q: "What is the real advantage of lock-free code?", a: "A paused or slow thread cannot stop the other threads, because no thread holds a lock." },
+  { q: "What happens when the OS pauses a thread that holds a mutex?", a: "Every thread that needs the mutex waits until the paused thread runs again and releases it." },
+  { q: "Why are spinlocks bad when there are more threads than cores?", a: "Waiting threads use the CPU time that the paused holder needs to finish." },
+  { q: "What should you try before you write lock-free code?", a: "Shard the data, or make the critical section shorter." },
+]} />

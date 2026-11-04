@@ -23,6 +23,14 @@ impl Regions {
             self.0.push(Region { off, len, kind });
         }
     }
+
+    /// Free memory that is interchangeable with its free neighbour (whole pages): extend the previous run.
+    pub fn push_free_run(&mut self, off: u32, len: u32) {
+        match self.0.last_mut() {
+            Some(r) if r.kind == FREE && r.off + r.len == off && r.len % len == 0 => r.len += len,
+            _ => self.push(off, len, FREE),
+        }
+    }
 }
 
 pub fn align_up(x: u32, a: u32) -> u32 {

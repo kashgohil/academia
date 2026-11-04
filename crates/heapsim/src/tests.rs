@@ -196,3 +196,12 @@ fn slab_fills_partial_before_empty() {
     let next = s.alloc(64, 8).unwrap();
     assert!(next >= 512, "should fill the partial slab at 512, got {next}");
 }
+
+#[test]
+fn empty_page_heaps_report_one_free_run() {
+    for (kind, cap, a) in [(KIND_SLAB, 4096, 512), (KIND_SIZECLASS, 16384, 1024)] {
+        let h = Heap::new(make(kind, cap, a, 0).unwrap());
+        let s = stats(&h.alloc.regions());
+        assert_eq!(s.largest_free, cap);
+    }
+}

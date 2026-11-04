@@ -93,7 +93,7 @@ impl Allocator for Slab {
         for (i, p) in self.pages.iter().enumerate() {
             let base = i as u32 * self.page;
             match p {
-                None => r.push(base, self.page, FREE),
+                None => r.push_free_run(base, self.page),
                 Some(p) => {
                     r.push(base, SLAB_HEADER, META);
                     let obj = CLASSES[p.class];

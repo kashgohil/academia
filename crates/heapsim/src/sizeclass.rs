@@ -98,7 +98,7 @@ impl Allocator for SizeClass {
         for (i, p) in self.pages.iter().enumerate() {
             let base = i as u32 * self.page;
             match p {
-                PageState::Free => r.push(base, self.page, FREE),
+                PageState::Free => r.push_free_run(base, self.page),
                 PageState::Small { class, used } => {
                     let obj = self.classes[*class];
                     for (k, &u) in used.iter().enumerate() {

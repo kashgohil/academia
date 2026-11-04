@@ -1,0 +1,166 @@
+---
+summary: Test-and-set, ticket locks and MCS on real coherence traffic, Linux qspinlock, when to spin and when to block, the kernel rules for spinlocks, and what lock holder preemption does.
+---
+import { SyncSpinRaceDemo, SyncSpinBlockDemo } from "@/demos/os/SyncLockDemos";
+
+A **spinlock** is a lock where a waiting thread stays on the CPU and checks the lock again and again. A spinlock is correct as soon as it uses an atomic [compare-and-swap](/concurrency/atomics/compare-and-swap) or swap. The hard part is cost. Each waiting core reads or writes the lock's cache line, so the waiters slow down the holder.
+
+This lesson counts that traffic. The race below runs the real memory accesses of each algorithm on a MESI simulator, the same one as in [cache coherence](/architecture/multicore/cache-coherence-mesi). A **bus transaction** is one request that a core sends to the other caches.
+
+<Predict
+  id="traffic"
+  question="16 cores race for one lock. Which algorithm has a bus traffic per acquisition that does not grow with the number of cores?"
+  options={[
+    "Test-and-test-and-set, because waiters only read",
+    "Ticket lock, because each waiter has a number",
+    "MCS, because each waiter spins on its own cache line",
+  ]}
+  answer={2}
+  explain="In test-and-test-and-set and in the ticket lock, all waiters share one line. Each release invalidates all their copies, and each waiter must read the line again. In MCS, each waiter spins on its own line, and a release touches only the next waiter."
+>
+<SyncSpinRaceDemo />
+</Predict>
+
+1. Look at the plot. MCS stays at 6.0 bus transactions per acquisition. At 16 cores, test-and-set needs 24.5, and the ticket lock needs 19.1.
+2. Read **cycles** in the table at 16 cores. MCS needs 444 cycles for each acquisition. The ticket lock needs 1716. The critical section and the work are the same.
+3. Select 32 cores, and look at **fairness** and **bypass**. Ticket and MCS have a fairness of 1.00. The test-and-set family has a lower value, and one waiter can watch many handoffs.
+4. Change **Handoff order** to Ticket and then to MCS. The dots form a repeating pattern, because the waiters take turns. Test-and-set looks random.
+5. Set **Critical section** to the maximum and select 4 cores. Test-and-set now makes 79.7 transactions per acquisition, and test-and-test-and-set makes 7.2. Test-and-set never stops writing while it waits.
+
+These numbers come from the simulator. Its model inputs are 40 cycles for a transfer between caches and 4 cycles for a hit. The critical section and the work are each 300 cycles.
+
+## The algorithms
+
+**Test-and-set (TAS)** swaps 1 into the lock until the old value is 0. Each attempt takes the line in exclusive state, even if the lock is held. Bus traffic never stops.
+
+```c
+void lock(atomic_int *l)   { while (atomic_exchange(l, 1)) ; }
+void unlock(atomic_int *l) { atomic_store(l, 0); }
+```
+
+**Test-and-test-and-set (TTAS)** reads until the lock looks free, and only then swaps. While the lock is held, all waiters hit their shared copy, so the bus is quiet. A release causes a burst: all waiters miss, all waiters see 0, and all waiters try the swap. The [contention lesson](/performance/concurrency/contention) shows the effect on throughput.
+
+**Backoff** makes a waiter sleep for a random, growing time after a failed swap. It spreads the burst. It does not give an order, and it adds a delay when the lock is free.
+
+**Ticket lock** has two counters, like a queue at a counter in a shop. A thread takes a number with `fetch_add`, and it waits until `serving` equals that number. This order is first in, first out, so bounded waiting is simple. Linux used ticket locks on x86 from 2.6.25 until it moved to qspinlock.
+
+```rust
+pub struct Ticket { next: AtomicU32, serving: AtomicU32 }
+
+impl Ticket {
+    pub fn lock(&self) {
+        let me = self.next.fetch_add(1, Ordering::Relaxed);
+        while self.serving.load(Ordering::Acquire) != me {
+            std::hint::spin_loop();
+        }
+    }
+    pub fn unlock(&self) {
+        self.serving.fetch_add(1, Ordering::Release);
+    }
+}
+```
+
+The ticket lock has a cost that TTAS does not have. Only one waiter can take the lock next, but a release invalidates every waiter's copy. The next owner must wait for its own read to complete in that storm. So at high core counts, the ticket lock is slower than TTAS in this model: 3380 against 2904 cycles at 32 cores.
+
+**MCS** (Mellor-Crummey and Scott, 1991) builds a linked queue of waiters. Each waiter has a queue node on its own cache line, and it spins only on that line. To release, the holder writes one flag in the next node.
+
+```c
+struct mcs { _Atomic(struct mcs *) next; atomic_int wait; };
+
+void lock(_Atomic(struct mcs *) *tail, struct mcs *me) {
+    me->next = NULL; me->wait = 1;
+    struct mcs *prev = atomic_exchange(tail, me);
+    if (prev) {
+        prev->next = me;
+        while (me->wait) cpu_relax();
+    }
+}
+void unlock(_Atomic(struct mcs *) *tail, struct mcs *me) {
+    struct mcs *succ = me->next;
+    if (!succ) {
+        struct mcs *expected = me;
+        if (atomic_compare_exchange_strong(tail, &expected, NULL)) return;
+        while (!(succ = me->next)) cpu_relax();  // the next waiter is linking itself
+    }
+    succ->wait = 0;
+}
+```
+
+| Lock | Lock word | Traffic per handoff | Order | Cost of the design |
+|---|---|---|---|---|
+| TAS | 1 word | Grows with waiters and with hold time | None | Bus never quiet |
+| TTAS | 1 word | Grows with waiters | None | Burst at each release |
+| Ticket | 2 counters | Grows with waiters | FIFO | Storm at each release |
+| MCS | 1 pointer, 1 node per waiter | Constant | FIFO | The caller must supply a node |
+
+## Linux qspinlock
+
+The Linux `spinlock_t` must stay small, because the kernel puts it in many structures. An MCS lock needs a node, and that does not fit the `spin_lock(&lock)` interface. Since Linux 4.2 on x86, **qspinlock** fits MCS behavior into one 32-bit word (`kernel/locking/qspinlock.c`).
+
+- The word holds a **locked** byte, a **pending** bit and a **tail**. The tail encodes a CPU number and a small index.
+- With no contention, one compare-and-swap sets the locked byte.
+- The first waiter sets the pending bit, and it spins on the word. It needs no queue node.
+- Later waiters use the slow path, `queued_spin_lock_slowpath`. They take a per-CPU MCS node and join the queue through the tail.
+- Each CPU has 4 nodes, one for each context that can nest: task, soft interrupt, hard interrupt and non-maskable interrupt.
+
+## Spin or block
+
+<Predict
+  id="spinblock"
+  question="Sleeping and waking cost 4 microseconds in total. Eight threads contend for a lock. Each thread waits behind half of the others. The critical section is 100 ns. Which choice wastes less CPU time per acquisition?"
+  options={[
+    "Block, because spinning burns the CPU",
+    "Spin, because the wait is much shorter than a sleep and a wake",
+    "They cost the same",
+  ]}
+  answer={1}
+  explain="The average wait is 3.5 critical sections, which is 350 ns. That is much less than 4 microseconds. Spinning wastes 350 ns, and blocking wastes 4000 ns."
+>
+<SyncSpinBlockDemo />
+</Predict>
+
+1. With the defaults, find the point where **Spin** crosses **Block**. It is at about 1143 ns of critical section.
+2. Move **Threads** to 64 and **CPU cores** to 64. The crossover moves left to about 127 ns, because the queue is longer.
+3. Set **Threads** to 32 and **CPU cores** to 16. The spin line jumps above 1 ms. A waiter can spin while the holder has no CPU at all.
+4. Look at the green dashed line. It is never more than twice the better of the other two lines.
+
+The model uses two inputs: a 2 µs cost for a sleep or a wake, and a 4 ms time slice. It counts wasted CPU time. It does not count the extra latency of a wake.
+
+An **adaptive mutex** does not guess. It spins for about as long as a block costs, and then it blocks. This is the ski rental argument. If the wait is short, the spin was the best choice. If the wait is long, the mutex wasted at most one block cost, so its total is at most twice the best.
+
+The Linux kernel `struct mutex` also checks whether the owner is running on a CPU (`mutex_optimistic_spin`). If the owner is not running, a spin cannot help, so the waiter sleeps at once. Waiters queue on an MCS-style lock while they spin, so the mutex word does not bounce. glibc offers `PTHREAD_MUTEX_ADAPTIVE_NP`. On macOS, `os_unfair_lock` is the normal low-level lock. It blocks in the kernel, and the waiter donates its priority to the owner.
+
+## Kernel spinlock rules
+
+A kernel spinlock has rules that user locks do not have.
+
+| Rule | Why |
+|---|---|
+| Do not sleep while you hold it | Another CPU spins with no limit, and the holder may not return for milliseconds |
+| `spin_lock` disables preemption | If the holder lost the CPU, every waiter would spin for a full time slice |
+| Use `spin_lock_irqsave` if a hard interrupt handler takes the lock | Otherwise a handler on this CPU spins on a lock that the interrupted code holds |
+| Use `spin_lock_bh` if only a soft interrupt takes the lock | The same problem, with bottom halves |
+| Keep the section short | All waiters burn their CPUs |
+
+With `CONFIG_DEBUG_ATOMIC_SLEEP`, a call to a sleeping function under a spinlock prints "BUG: sleeping function called from invalid context". On a `PREEMPT_RT` kernel, `spinlock_t` becomes a sleeping lock based on `rt_mutex`, and `raw_spinlock_t` is the type that still spins.
+
+## Lock holder preemption
+
+User-space code has no way to disable preemption. So a thread can lose the CPU while it holds a spinlock. All waiters then spin until the scheduler runs the holder again. The [contention lesson](/performance/concurrency/contention) has a demo that shows this stall. This is why user code should not use a pure spinlock unless each thread has its own core.
+
+Virtual machines have the same problem in the kernel. The hypervisor can stop a virtual CPU that holds a kernel spinlock. x86 hardware can detect long `PAUSE` loops and return to the hypervisor. This feature is pause-loop exiting. Linux also has a paravirtual qspinlock, where a waiter asks the hypervisor to stop its virtual CPU. See [virtual machines](/os/isolation/virtual-machines-and-hypervisors).
+
+## Connect
+
+- [False sharing](/performance/concurrency/false-sharing) is the same traffic with no lock at all.
+- [Lock-free versus locked in practice](/performance/concurrency/lock-free-vs-locked-in-practice) compares these locks with queues.
+- [Futexes](/os/sync/futexes) give a user-space lock a way to block.
+
+<Recall cards={[
+  { q: "Why does test-and-set generate bus traffic while the lock is held?", a: "Each attempt is a swap, and a swap needs the line in exclusive state. So waiters take the line from each other all the time." },
+  { q: "What does a ticket lock fix, and what does it not fix?", a: "It gives FIFO order, so bounded waiting is simple. All waiters still read one line, so each release invalidates all of them." },
+  { q: "How does MCS keep traffic constant?", a: "Each waiter spins on its own queue node, on its own cache line. A release writes only the node of the next waiter." },
+  { q: "What are the three fields of the Linux qspinlock word?", a: "A locked byte, a pending bit and a tail that encodes a CPU and a node index. It fits in 32 bits." },
+  { q: "State the adaptive spin rule and its guarantee.", a: "Spin for about as long as a block costs, and then block. The total cost is at most twice the cost of the best choice." },
+  { q: "When must a kernel path use spin_lock_irqsave?", a: "When a hard interrupt handler can take the same lock on this CPU. Without it, the handler spins forever on a lock that the code it interrupted holds." },
+]} />

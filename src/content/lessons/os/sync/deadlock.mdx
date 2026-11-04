@@ -1,0 +1,142 @@
+---
+summary: The four Coffman conditions, resource allocation graphs, lock ordering, try-lock with backoff, the banker's algorithm and why kernels do not use it, detection, Linux lockdep, and the relatives of deadlock.
+---
+import { SyncRagDemo, SyncLockdepDemo, SyncBankerDemo } from "@/demos/os/SyncDeadlockDemos";
+
+A **deadlock** is a state where a set of threads wait for each other, so none of them can ever run. The program does not crash. It stops, often in production, and often only after months. This lesson shows how to see a deadlock, how to prevent one, and how Linux finds them before they occur.
+
+Coffman, Elphick and Shoshani listed four conditions in 1971. A deadlock needs all four at once.
+
+| Condition | Meaning | How to break it |
+|---|---|---|
+| **Mutual exclusion** | A resource has a limited number of users | Use lock-free or read-only data, or [RCU](/os/sync/read-copy-update) readers |
+| **Hold and wait** | A thread holds one resource while it waits for another | Take all locks at once, or release before you wait |
+| **No preemption** | Only the holder can release a resource | Try-lock, and give locks up on failure |
+| **Circular wait** | A cycle of threads, each waiting for the next | Use one global lock order |
+
+Real systems nearly always break the last condition.
+
+## The resource allocation graph
+
+A **resource allocation graph** has a node for each thread and each resource. An edge from a resource to a thread means "held by". An edge from a thread to a resource means "waits for". If each resource has one unit, a cycle means a deadlock.
+
+<Predict
+  id="cycle"
+  question="T1 holds R1 and waits for R2. T2 holds one unit of R2 and waits for R1. R2 has 2 units, and T3 holds the other one. The graph has a cycle through T1, R2, T2 and R1. Is this a deadlock?"
+  options={[
+    "Yes, because a cycle always means a deadlock",
+    "No, because T3 can finish and release its unit of R2, and then T1 can run",
+    "Only if T3 also waits",
+  ]}
+  answer={1}
+  explain="With many units, a cycle is necessary but not sufficient. T3 waits for nothing. When it releases its unit, T1 gets R2 and finishes. Then T2 gets R1. The detection algorithm reduces the graph in exactly this way."
+>
+<SyncRagDemo />
+</Predict>
+
+1. Click **Req R1** for T1 and **Req R2** for T2. Each thread holds one resource. Solid edges point from a resource to its holder.
+2. Click **Req R2** for T1 and **Req R1** for T2. The cycle lights up, and the banner says deadlock.
+3. Click **Back** until there is no cycle, and try a ring through all three threads.
+4. Select **R2 has 2 units**. Reset. Make T1 hold R1, and make T2 and T3 each hold R2. Then T1 requests R2 and T2 requests R1. A cycle exists, but T3 can still free the waiters.
+5. Click **Rel** on T3's R2. T1 gets the unit at once, and the cycle goes away.
+
+## Lock ordering
+
+The method that real code uses is a **lock order**: a rule that says which lock comes first. If all threads take locks in the same order, no cycle can form. A cycle needs one thread that goes against the order.
+
+The Linux kernel documents its orders in comments. For example, the top of `mm/rmap.c` lists the order of the memory management locks. When two locks of the same type must be held, one common rule is to take the lower address first.
+
+```rust
+fn transfer(a: &Account, b: &Account, n: u64) {
+    // A global order by address. Two transfers in opposite directions cannot deadlock.
+    let (first, second) = if std::ptr::from_ref(a) < std::ptr::from_ref(b) { (a, b) } else { (b, a) };
+    let mut x = first.balance.lock().unwrap();
+    let mut y = second.balance.lock().unwrap();
+    // ... move n between *x and *y, in the correct direction ...
+}
+```
+
+Sometimes an order is not possible, because you do not know the second lock until you hold the first. Then use **try-lock with backoff**. Take the first lock, and try the second lock with no wait. If the try fails, release the first lock, wait for a short random time, and start again. This breaks "no preemption", because the thread gives up what it holds. C++ `std::scoped_lock` uses a method of this type to take several locks at once.
+
+The risk is **livelock**: all threads keep running, but they make no progress, because they keep backing off together. Random delays make that unlikely.
+
+## Avoidance: the banker's algorithm
+
+Dijkstra's **banker's algorithm** avoids deadlock by choosing when to grant. Each process declares its maximum need in advance. A state is **safe** if some order exists in which every process can get its maximum and finish. The system grants a request only if the new state is still safe.
+
+An **unsafe** state is not yet a deadlock. It is a state where the system can no longer guarantee that all processes finish.
+
+<SyncBankerDemo />
+
+1. Click **Step** until the end. The check looks for a process whose need fits in `work`. That process can finish, so its allocation goes back to `work`. The safe order is P1, P3, P4, P0, P2, after 17 comparisons.
+2. Click **P4 asks (3 3 0)**. The units are free, but the new state is unsafe, so P4 must wait. Step through the check, and see where it stops.
+3. Click **P1 asks (1 0 2)**. The new state is safe, so the request is granted.
+4. Click **P0 asks (8 0 0)**. That is more than its declared maximum, so it is an error.
+
+The algorithm is correct and clean, and kernels do not use it, for these reasons.
+
+- **No declared maximum.** A process does not know in advance which locks or how much memory it will need.
+- **The set changes.** Threads and resources appear and go away all the time.
+- **The cost.** One check makes at most `m × n(n + 1)/2` comparisons. With 1000 processes and 10 resource types, that is 5,005,000 comparisons for each request.
+- **It rejects safe work.** It delays requests that would have been fine.
+
+## Detection and recovery
+
+Another option is to let deadlocks occur, find them, and break them.
+
+A database does this, because it can abort a [transaction](/databases/transactions/two-phase-locking-and-deadlocks) and run it again. It builds a wait-for graph and looks for a cycle. A kernel has no general way to roll back, so it does not break a lock deadlock. It only reports the symptoms. The hung task detector (`khungtaskd`) warns about tasks that stay in uninterruptible sleep, with a default of 120 seconds in `/proc/sys/kernel/hung_task_timeout_secs`. The lockup detectors warn about CPUs that do not schedule.
+
+Go's runtime detects one simple case. If all goroutines are asleep, it stops with "fatal error: all goroutines are asleep - deadlock!". This check misses a deadlock if any other goroutine is still running.
+
+## Lockdep
+
+A deadlock needs bad timing, so a test can run for years and miss it. **Lockdep**, by Ingo Molnar, added in 2.6.18, does not wait for bad timing. It checks the *order*, and the order is visible in any run.
+
+<Predict
+  id="lockdep"
+  question="At boot, T1 takes A and then B, and releases both. An hour later, T2 takes B and then A. The two never overlap. No deadlock occurred. What does a lockdep-style checker report?"
+  options={[
+    "Nothing, because nothing went wrong",
+    "A possible deadlock, because the order A then B and the order B then A form a cycle",
+    "It reports only if the two threads overlap in time",
+  ]}
+  answer={1}
+  explain="The checker records the order A then B. When it later sees B then A, the new edge closes a cycle. Some other timing would deadlock, so the checker reports it now."
+>
+<SyncLockdepDemo />
+</Predict>
+
+1. Click **Run all** on the first trace. The run completed with no deadlock. The checker reports on `T2: lock(A)`, and the stats say that a 2-step schedule can deadlock.
+2. Select **Three locks in a ring**. No two threads disagree directly. The cycle is A → B → C → A.
+3. Select **One global order**. There is no report.
+4. Select **A gate lock G**. Both threads take G first, so the exhaustive search proves that no deadlock exists. Lockdep still reports it. It is conservative, and this is a known false positive.
+5. Select **Lock used in an interrupt handler**. This has no second lock. Its danger is an interrupt on the holder's CPU.
+
+Lockdep works on **lock classes**, not on single locks. All locks that one initialization site creates, such as the lock in every `inode`, share one class. So one run teaches it about all instances. A correct nesting of two locks of one class needs an annotation, such as `spin_lock_nested`.
+
+Each time a task takes a lock, lockdep adds an edge from the lock it holds last. If the new edge closes a cycle, it prints "WARNING: possible circular locking dependency detected", with both call chains. It also tracks IRQ state: a lock used in a hard interrupt must never be taken with interrupts on. It keeps the checks fast by hashing each chain of held locks, so it checks a chain only once.
+
+You enable it with `CONFIG_PROVE_LOCKING`. It costs a lot, so it runs in debug kernels, and developers run it. `/proc/lockdep` lists the classes and their order. In user space on Linux, ThreadSanitizer reports lock order inversions with a similar method. Lockdep is a Linux kernel feature, so it does not exist on macOS.
+
+## Relatives
+
+**Livelock**: threads are active, but no thread makes progress. Two threads that each back off and retry in step are the classic case.
+
+**Starvation**: a thread can wait with no limit, while others make progress. The [semaphores lesson](/os/sync/semaphores) showed writers that starve under reader preference.
+
+**Priority inversion**: a high-priority thread waits for a lock that a low-priority thread holds, and a medium-priority thread keeps the low one off the CPU. The Mars Pathfinder lander hit this in 1997, and its computer reset again and again. The fix was to enable priority inheritance on one mutex. With **priority inheritance**, the holder runs at the priority of its highest waiter. Linux offers it through `rt_mutex`, `PTHREAD_PRIO_INHERIT` and [PI futexes](/os/sync/futexes). See [real-time scheduling](/os/scheduling/real-time-scheduling).
+
+## Connect
+
+- [Two-phase locking](/databases/transactions/two-phase-locking-and-deadlocks) has deadlock detection in a database.
+- [Critical sections](/os/sync/critical-sections) define the safety and liveness terms.
+- [Interrupt handling](/os/kernel/interrupt-handling) explains why a lock in a handler needs care.
+
+<Recall cards={[
+  { q: "Name the four Coffman conditions.", a: "Mutual exclusion, hold and wait, no preemption and circular wait. A deadlock needs all four." },
+  { q: "When is a cycle in a resource allocation graph not a deadlock?", a: "When a resource has several units. A holder that waits for nothing can finish, and it releases a unit that frees the cycle." },
+  { q: "Why does a global lock order prevent deadlock?", a: "A cycle needs one thread that takes a lower lock while it holds a higher lock. With one order, no such thread exists." },
+  { q: "What does the banker's algorithm check, and why do kernels not use it?", a: "It grants a request only if some order still lets every process reach its maximum. Kernels do not know the maximum needs, the set of tasks changes, and the check is expensive." },
+  { q: "How can lockdep report a deadlock that did not occur?", a: "It records the order in which locks are taken. A new edge that closes a cycle in that order graph means that some other timing can deadlock." },
+  { q: "What is one kind of false positive from lockdep?", a: "A gate lock: if both threads first take G, then A and B in opposite orders cannot overlap. Lockdep still sees the cycle between A and B." },
+]} />

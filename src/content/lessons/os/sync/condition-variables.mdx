@@ -1,0 +1,138 @@
+---
+summary: The wait-with-mutex protocol, why the check must be a loop, signal against broadcast and the thundering herd, how a condition variable is built on a futex, and Go channels as an alternative.
+---
+import { SyncCondvarDemo, SyncFutexCondvarDemo, SyncHerdDemo } from "@/demos/os/SyncCondDemos";
+
+A semaphore counts. Many conditions are not counts: "the queue has an item and the shutdown flag is clear", or "this balance is above the amount". A **condition variable** lets a thread sleep until some other thread says that a condition may have changed. It holds no value. The condition lives in your own data, under your own mutex.
+
+```c
+// Waiter                               // Notifier
+pthread_mutex_lock(&m);                 pthread_mutex_lock(&m);
+while (count == 0)                      count++;
+    pthread_cond_wait(&cv, &m);         pthread_cond_signal(&cv);
+count--;                                pthread_mutex_unlock(&m);
+pthread_mutex_unlock(&m);
+```
+
+`pthread_cond_wait` does three things. It releases the mutex and joins the queue in one atomic step. It sleeps. When a notifier wakes it, it takes the mutex again before it returns.
+
+**Signal** wakes one waiter. **Broadcast** wakes all waiters. If no thread waits, both do nothing. The notification is not stored. That is why the state must live in your data.
+
+<Predict
+  id="ifwhile"
+  question="A consumer wrote: if (count == 0) wait(&cv, &m); count--; A producer adds one item and signals. The consumer wakes and takes the mutex. Is count always above 0 at that moment?"
+  options={[
+    "Yes, because the signal means that an item exists",
+    "No, because another consumer can take the mutex first and remove the item",
+    "Yes, because the mutex stops all other threads",
+  ]}
+  answer={1}
+  explain="Signal only moves the waiter toward the mutex. Another consumer can get the mutex first and take the item. When the first consumer finally runs, the condition is false. A while loop checks again. An if does not."
+>
+<SyncCondvarDemo />
+</Predict>
+
+1. With **if** and **signal**, try to make `count` go below 0. If you need help, click **Show the shortest bug schedule**. It takes 14 steps.
+2. Read the table under the demo. An exhaustive search covers all schedules of this program. The `if` row fails, and the `while` row is correct.
+3. Select **while**, and then **Capacity 1, one condvar**. `while` with `signal` now fails in a different way: all threads get stuck in 26 steps. A consumer woke another consumer, not the producer. Broadcast is correct here.
+4. Select **Spurious wakeups** and **if**. It breaks with no second consumer in the schedule. Select **while**. It holds.
+5. Select **Hoare handoff**, **if** and **signal**. The `if` is correct now. Select **Unlock, then join queue**. It gets stuck in 16 steps even with `while`.
+
+## Why a loop
+
+**Hoare semantics** (Hoare, 1974) hand the mutex straight to the woken thread. No thread can run between the signal and the waiter, so the condition is still true, and an `if` is enough. In the demo, the search confirms it.
+
+**Mesa semantics** (Lampson and Redell, 1980) only move the waiter to the ready state. The signal is a hint: "look again". Other threads can run first. Almost every real system uses Mesa semantics, because a handoff forces two extra context switches and makes the scheduler less free.
+
+A second reason is **spurious wakeups**. POSIX allows `pthread_cond_wait` to return with no signal at all. This lets implementations stay simple, and it also covers signal delivery. C++ and Rust document the same rule. So always write a loop. `std::condition_variable::wait` has a form that takes a predicate and contains the loop.
+
+```rust
+let mut q = m.lock().unwrap();
+while q.is_empty() {
+    q = cv.wait(q).unwrap();      // releases q; takes it again before it returns
+}
+let item = q.pop();
+```
+
+The Linux kernel has the same pattern. `wait_event(wq, condition)` is a macro with the loop inside. It sets the task state before it checks the condition, so a wake between the check and `schedule()` is not lost.
+
+## Signal or broadcast
+
+Use signal when any one waiter can use the event, and all waiters wait for the same condition. Use broadcast when the event can help many waiters, or when waiters wait for different conditions on one condition variable.
+
+The third step above shows the danger. One condition variable served two conditions: "not full" and "not empty". A signal can wake a thread of the wrong kind, and that thread goes back to sleep, and the signal is gone. The better fix is two condition variables, one for each condition. Then signal is correct again.
+
+Broadcast is always correct, if the check is a loop. It has a cost.
+
+<SyncHerdDemo />
+
+1. With 64 waiters and one item at a time, `signal` causes 64 wakeups and no sleep again.
+2. `broadcast` causes 2080 wakeups and 2016 sleeps again. Each item wakes all remaining waiters, and only one of them gets the item.
+3. The formula for wakeups is `W(W + 1)/2`. Move the slider, and compare.
+4. Read the CPU column. At a model input of 2 µs for each sleep or wake, broadcast costs 8.19 ms, and signal costs 128 µs.
+
+This is the **thundering herd**: many threads wake for one event. The same thing occurs with sockets: many processes sleep in `accept()` or `epoll_wait()`, and one connection arrives. Linux has `WQ_FLAG_EXCLUSIVE` wait queue entries, and `EPOLLEXCLUSIVE` since 4.5, to wake only one.
+
+## The lost wakeup
+
+The check and the sleep must look atomic to the notifier. Suppose that a waiter unlocks, and only then joins the queue. A notifier can run in that gap. It changes the state and signals, and nobody is in the queue. Then the waiter joins and sleeps forever.
+
+Here the mutex protects the check, and `wait` joins the queue before it releases the mutex. So a notifier that holds the mutex cannot run in the gap. This is why a notifier must change the state under the mutex. It may call `signal` after it unlocks, which can avoid a wake that blocks at once on the mutex. It must not change the state with no lock.
+
+## A condition variable on a futex
+
+Rust's standard library builds its Linux condition variable on one futex word. The word is a sequence number. It is short enough to read in full.
+
+```rust
+pub fn notify_one(&self) {
+    self.futex.fetch_add(1, Relaxed);
+    futex_wake(&self.futex);
+}
+pub unsafe fn wait(&self, mutex: &Mutex) {
+    let seen = self.futex.load(Relaxed);  // read before the unlock
+    mutex.unlock();
+    futex_wait(&self.futex, seen, None);  // sleeps only if no notify has run
+    mutex.lock();
+}
+```
+
+The gap between the unlock and the sleep is real here. The [value check](/os/sync/futexes) closes it: a notify in the gap changes the word, so `futex_wait` returns at once.
+
+<SyncFutexCondvarDemo />
+
+1. Click **Notify in the window**. The notifier runs between the unlock and the wait. The word changed, so the wait returns `EAGAIN`.
+2. Turn on **Remove the kernel's value check**. Click **Show the shortest lost wakeup**. The waiter sleeps forever, after a schedule of 10 steps.
+3. A return with no change in the condition is a spurious wakeup. This design produces them, and the loop handles them.
+
+glibc needs more. POSIX requires that a signal wakes only threads that started to wait before it. Since glibc 2.25, `pthread_cond_t` uses two groups of waiters to give this guarantee, and it is a much larger piece of code.
+
+## Monitors
+
+A **monitor** is a language construct: data, a mutex that the compiler adds to each method, and condition variables. Java has `synchronized`, with `wait` and `notifyAll`. Rust gets a similar safety from its types. `Mutex<T>` holds the data, so you cannot touch the data with no lock.
+
+## Channels in Go
+
+Go offers another style. A channel combines the buffer, the lock and the wait queues into one object. The runtime type `hchan` has a ring buffer, a mutex, and two queues of parked goroutines (`recvq` and `sendq`).
+
+```go
+items := make(chan Item, 16)
+go func() { items <- produce() }()   // blocks if the buffer is full
+x := <-items                         // blocks if the buffer is empty
+```
+
+A send hands the value straight to a waiting receiver if one exists. That is a Hoare-style handoff, so the receiver needs no loop. `select` waits on several channels at once, which is hard with condition variables. Go also has `sync.Cond`, but channels are usually clearer. A channel transfers ownership of a value, and a condition variable says only that some shared state changed.
+
+## Connect
+
+- [Semaphores](/os/sync/semaphores) solve the bounded buffer with counts.
+- [Futexes](/os/sync/futexes) give the wait and wake.
+- [Scheduling](/os/scheduling/fifo-sjf-round-robin) decides who runs after a wake, and this is why Mesa semantics need a loop.
+
+<Recall cards={[
+  { q: "What three things does a wait on a condition variable do?", a: "It releases the mutex and joins the queue atomically, it sleeps, and it takes the mutex again before it returns." },
+  { q: "Give two reasons why the check must be a while loop.", a: "Under Mesa semantics, another thread can run first and make the condition false. Also, implementations may have spurious wakeups." },
+  { q: "When does an if work?", a: "Under Hoare semantics, where the signal hands the mutex straight to the waiter, and there are no spurious wakeups. Real systems rarely give this." },
+  { q: "One condition variable serves not full and not empty, with while and signal. What can go wrong?", a: "A signal can wake a thread of the wrong kind. It sleeps again, and the signal is lost. All threads can get stuck. Use two condition variables, or broadcast." },
+  { q: "With W waiters and items that arrive one at a time, how many wakeups does broadcast cause?", a: "W(W + 1)/2, because each item wakes all remaining waiters. With 64 waiters, that is 2080. Signal causes 64." },
+  { q: "How does a futex condition variable avoid a lost wakeup between the unlock and the sleep?", a: "The waiter reads a sequence word before it unlocks, and it passes that value to FUTEX_WAIT. A notify changes the word, so the wait returns at once." },
+]} />

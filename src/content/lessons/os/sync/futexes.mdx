@@ -1,0 +1,155 @@
+---
+summary: How a mutex avoids the kernel when there is no contention, what FUTEX_WAIT and FUTEX_WAKE do, the race that the value check stops, Drepper's 3-state mutex, and how glibc, Rust and Go use it.
+---
+import { SyncFutexStepperDemo, SyncFutexLoadDemo, SyncFutexHashDemo } from "@/demos/os/SyncFutexDemos";
+
+A user-space spinlock wastes the CPU when the wait is long. A kernel lock needs a [system call](/os/processes/system-calls) for each lock and unlock, even with no contention. Most locks have no contention most of the time. So we want a lock that stays in user space when it is free, and that asks the kernel for help only to sleep.
+
+A **futex** (fast user-space mutex) does this. Linux added it in the 2.6 series. The lock state is one 32-bit word in the memory of the program, and the kernel keeps only a queue of sleeping threads. The kernel does not know what the word means. It offers two main operations.
+
+- `FUTEX_WAIT(addr, expected)`: if the word at `addr` still equals `expected`, sleep. If not, return `EAGAIN` at once.
+- `FUTEX_WAKE(addr, n)`: wake up to `n` threads that sleep on `addr`.
+
+glibc has no wrapper function, so C code calls `syscall(SYS_futex, ...)`.
+
+<Predict
+  id="check"
+  question="A thread sees that the mutex is held, and it decides to sleep. Before it enters the kernel, the owner unlocks and calls FUTEX_WAKE. What stops the thread from sleeping forever?"
+  options={[
+    "The kernel saves the wake for later, like a pending signal",
+    "FUTEX_WAIT compares the word under a kernel lock, sees that it changed, and returns EAGAIN",
+    "The owner keeps calling FUTEX_WAKE until a thread wakes",
+  ]}
+  answer={1}
+  explain="A wake with no sleeper does nothing, so the kernel saves nothing. The expected value is the protection. The word changed before the wait, so the wait refuses to sleep."
+>
+<SyncFutexStepperDemo />
+</Predict>
+
+1. Click **Fast path**. Both threads lock and unlock with no syscall. Only the word changes.
+2. Click **Slow path**. T1 fails the compare-and-swap, marks the word as 2, and enters the kernel. Lines with a purple bar run in the kernel. T0 unlocks and wakes T1. That run makes 3 syscalls.
+3. Turn on **Remove the kernel's value check**. Click **Show the lost wakeup**. T1 decides to sleep, T0 unlocks and wakes nobody, and then T1 joins the queue. Nothing will ever wake it.
+4. Look at the search result. With the check, no stuck state exists among 72 states. Without the check, an 8-step schedule reaches a stuck state.
+5. Select **2-state**, and repeat step 3. It breaks in 6 steps.
+
+## The lost wakeup
+
+The window is between two events: the check in user space, and the sleep in the kernel. A **lost wakeup** occurs if the wake falls in that window.
+
+The kernel closes it in `futex_wait`. It takes the lock of the hash bucket, reads the user word, and compares it. If the value matches, it joins the wait queue before it drops the bucket lock. `FUTEX_WAKE` takes the same bucket lock.
+
+So there are two cases. If the wake runs before the comparison, the waker's change to the word is visible. If the wake runs after it, the wake finds the thread in the queue.
+
+The waker must change the word before it calls `FUTEX_WAKE`. That rule is on the user-space code. The tests for this lesson search every schedule: with 2 threads and 2 rounds (1050 states), and with 3 threads and 1 round (2138 states). The correct mutex never gets stuck.
+
+## The kernel side
+
+The kernel does not create an object for each futex. A word with no waiters costs the kernel nothing. So there is one table of **hash buckets** (`futex_queues` in `kernel/futex/`). Each bucket has a spinlock and a priority-sorted list of waiters. The table has `256 × CPUs` buckets, rounded up to a power of two. Recent kernels can also give a process its own private table.
+
+The key of a private futex is the address space and the virtual address. A shared futex, in [shared memory](/os/ipc/shared-memory), uses the inode and the page offset, because two processes can map the same word at different addresses. The `FUTEX_PRIVATE_FLAG` tells the kernel to skip that lookup. glibc passes it for normal mutexes.
+
+<SyncFutexHashDemo />
+
+1. Put two threads to sleep on `0x1000`. Then select `0x1040`, which falls in the same bucket, and put one thread to sleep. All three share a list.
+2. Wake `0x1040`. The kernel walks the list and skips entries with another key. **Entries walked** goes up by 3, although only one thread wakes.
+3. Add waiters on one address and click **Requeue**. They move to the other address with no wakeup. The next section explains why.
+
+## The 3-state mutex
+
+Now look at the obvious mutex, with 0 for free and 1 for held. Unlock has a problem: it cannot know if anyone sleeps. So it must call `FUTEX_WAKE` every time. That is one syscall for each unlock, even for a lone thread.
+
+Ulrich Drepper's paper "Futexes Are Tricky" gives a word with three states. 0 is free. 1 is held with no waiters. 2 is held with possible waiters.
+
+```c
+void lock(atomic_int *val) {
+    int c = cmpxchg(val, 0, 1);           // returns the old value
+    if (c != 0) {
+        do {
+            if (c == 2 || cmpxchg(val, 1, 2) != 0)
+                futex_wait(val, 2);       // sleep only if val is still 2
+        } while ((c = cmpxchg(val, 0, 2)) != 0);
+    }
+}
+void unlock(atomic_int *val) {
+    if (atomic_fetch_sub(val, 1) != 1) {  // old value was 2
+        atomic_store(val, 0);
+        futex_wake(val, 1);
+    }
+}
+```
+
+A woken thread sets the word to 2, not to 1, because other waiters may still sleep. So the last waiter causes one wake that finds nobody. That is why the slow path in the first demo makes 3 syscalls, not 2. This is the price of a word that has no waiter count.
+
+<Predict
+  id="load"
+  question="Threads lock, do some work and unlock in a loop. Which statement is true about 3-state and 2-state mutexes as contention grows?"
+  options={[
+    "3-state always makes far fewer syscalls",
+    "3-state saves the most at low contention, and both approach about 2 syscalls per pair at high contention",
+    "3-state makes more syscalls at every load",
+  ]}
+  answer={1}
+  explain="With 1 thread, 2-state makes 1 syscall per pair, and 3-state makes 0. Under heavy contention, nearly every lock must sleep and nearly every unlock must wake, so both need about 2."
+>
+<SyncFutexLoadDemo />
+</Predict>
+
+1. Read the left side. With 1 thread, 2-state makes 1.00 syscalls per lock and unlock pair, and 3-state makes 0.00.
+2. At 4 threads, 2-state makes 1.36 and 3-state makes 0.83.
+3. At 16 threads, 88% of locks find the mutex held. The two lines meet: 2.17 and 2.20.
+4. Make **Critical section** longer. Contention rises sooner, and the lines meet at fewer threads.
+
+Ticks are steps of the interleaving machine. Syscall entry (3 ticks), wake latency (30 ticks) and the mean work (120 ticks) are model inputs. So read the shape, not the time.
+
+To reduce syscalls under contention, real mutexes spin for a short time before they sleep. A wait that ends in a spin costs no syscall.
+
+## More operations
+
+- **`FUTEX_CMP_REQUEUE`** wakes some waiters and moves the rest to another futex with no wakeup. Consider a condition variable broadcast with 100 waiters. If all wake, 99 of them block at once on the mutex. Requeue moves them straight to the mutex queue.
+- **Priority inheritance futexes** (`FUTEX_LOCK_PI`, `FUTEX_UNLOCK_PI`) use a defined word format: the owner's thread ID, plus a waiters bit. Because the kernel can read the owner, it can raise the owner's priority. It uses an `rt_mutex` inside. See [real-time scheduling](/os/scheduling/real-time-scheduling).
+- **Robust futexes** let the kernel mark a lock when its owner dies.
+- **futex2** adds new calls. `futex_waitv` (Linux 5.16) waits on several words at once, and the Proton compatibility layer uses it. Linux 6.7 added separate `futex_wake`, `futex_wait` and `futex_requeue` calls.
+
+## Who builds on it
+
+| Runtime | Lock | Details |
+|---|---|---|
+| glibc | `pthread_mutex_t` | The low-level lock has states 0, 1 and 2. The slow path, `__lll_lock_wait`, swaps 2 into the word and sleeps |
+| Rust std on Linux | `std::sync::Mutex` | States 0, 1 and 2. It spins for a bounded number of checks, and then it calls `futex_wait` |
+| Go | `sync.Mutex` | It parks the goroutine on a runtime semaphore, with no kernel sleep. Threads with no work sleep on a futex inside the runtime |
+| Zig | `std.Thread.Futex` | One portable API with a backend for each operating system |
+
+```rust
+// The fast paths of a Rust-style futex mutex.
+const UNLOCKED: u32 = 0; const LOCKED: u32 = 1; const CONTENDED: u32 = 2;
+
+pub fn lock(&self) {
+    if self.futex.compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed).is_err() {
+        self.lock_contended();   // spin, then swap in CONTENDED, then futex_wait
+    }
+}
+pub fn unlock(&self) {
+    if self.futex.swap(UNLOCKED, Release) == CONTENDED {
+        futex_wake(&self.futex); // only if someone may sleep
+    }
+}
+```
+
+<Callout title="macOS">
+XNU has no futex syscall. The closest equivalents are `__ulock_wait` and `__ulock_wake`, which are private calls. libc++ uses them for `std::atomic::wait`. Since macOS 14.4, `os_sync_wait_on_address` is the public API. The idea is the same: compare a word, then sleep on its address. To count futex calls on Linux, run `strace -f -c -e futex ./prog`. That command does not exist on macOS.
+</Callout>
+
+## Connect
+
+- [Locks and spinlocks](/os/sync/locks-and-spinlocks) explains the choice between a spin and a sleep.
+- [Condition variables](/os/sync/condition-variables) build on the same wait and wake.
+- [Blocking and non-blocking I/O](/os/io/blocking-non-blocking-and-async-i-o) uses wait queues in the same way.
+
+<Recall cards={[
+  { q: "What does FUTEX_WAIT check, and why?", a: "It checks under the bucket lock that the word still equals the expected value. This closes the window between the user-space check and the sleep, which would otherwise lose a wakeup." },
+  { q: "Why does an unlock in a 2-state futex mutex always need a syscall?", a: "The word says only free or held. Unlock cannot know if a thread sleeps, so it must call FUTEX_WAKE." },
+  { q: "What do the three states in Drepper's mutex mean?", a: "0 is free. 1 is held with no waiters. 2 is held with possible waiters. Unlock makes a syscall only if the old value was 2." },
+  { q: "Why does a woken thread set the word to 2, not 1?", a: "Other waiters may still sleep. If it set 1, its unlock would not wake them. The cost is one needless wake after the last waiter." },
+  { q: "How does the kernel find waiters for a futex word with no per-futex object?", a: "It hashes a key to a bucket in a global table: address space and address for private futexes, or inode and offset for shared ones. Then it walks the list of that bucket." },
+  { q: "What does FUTEX_CMP_REQUEUE save?", a: "It moves waiters to another futex with no wakeup. So a broadcast does not wake many threads that would block on the mutex at once." },
+]} />

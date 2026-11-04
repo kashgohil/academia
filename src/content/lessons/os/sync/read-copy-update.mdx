@@ -1,0 +1,128 @@
+---
+summary: Why read locks stop scaling, how RCU lets readers run with no shared writes, publish and subscribe, grace periods and quiescent states, deferred free, and where Linux uses it.
+---
+import { SyncRcuDemo, SyncReadScaleDemo } from "@/demos/os/SyncRcuDemos";
+
+A routing table or a directory cache is read millions of times per second, and it changes rarely. A reader-writer lock looks like the right tool, because readers can overlap. But each reader must write a shared count to enter and to leave. That write moves a cache line between cores. So the read path itself has a limit, even with no writers at all.
+
+**Read-copy-update (RCU)** removes the shared write from the read path. A writer does not change data that a reader can see. It makes a copy, changes the copy, and publishes it with one pointer store. Old readers keep the old version. The writer frees the old version only after all those readers have finished.
+
+<Predict
+  id="scale"
+  question="Readers run on 64 cores, with a read section of 100 cycles and no writers at all. A reader-writer lock lets all of them overlap. Compared with RCU, what do you expect from the reader-writer lock?"
+  options={[
+    "About the same, because readers do not block each other",
+    "It stops at a fixed limit, because the shared count serializes all readers",
+    "It is faster, because RCU has extra bookkeeping",
+  ]}
+  answer={1}
+  explain="Readers overlap in the section, but each one needs the count's cache line twice. The line moves one core at a time. So the total rate cannot pass one read per two transfers, however many cores you add."
+>
+<SyncReadScaleDemo />
+</Predict>
+
+1. At 64 cores, RCU reaches 1548 million reads per second, and the reader-writer lock reaches 37.7 million. RCU is 41 times faster.
+2. Read the bus counts. Each reader-writer read makes 1.99 bus transactions, and each RCU read makes 0.00.
+3. The reader-writer limit is simple. A transfer is 40 cycles, and at 3 GHz, 2 transfers per read gives 37.5 million reads per second.
+4. Set **Read section** to 2000 cycles. Now the reader-writer lock reaches 22.7 million at 16 cores, near RCU's 24.0. A long read section hides the cost until about 32 cores.
+5. Look at the mutex. It is lower than the reader-writer lock, because reads cannot overlap.
+
+The transfer time, read section, gap between reads (20 cycles) and clock are model inputs. The bus counts come from the MESI simulator. See [contention](/performance/concurrency/contention) and [false sharing](/performance/concurrency/false-sharing) for the same effect in other code.
+
+## Publish and subscribe
+
+RCU has two sides that must agree on order.
+
+```c
+struct config { int a; int b; };
+struct config __rcu *cur;
+
+// Reader. It does not block, and it writes no shared memory.
+rcu_read_lock();
+struct config *c = rcu_dereference(cur);
+use(c->a, c->b);
+rcu_read_unlock();
+
+// Writer. Writers exclude each other with a normal lock.
+struct config *new = kmalloc(sizeof *new, GFP_KERNEL);
+spin_lock(&cfg_lock);
+struct config *old = rcu_dereference_protected(cur, lockdep_is_held(&cfg_lock));
+*new = *old;
+new->a = 42;
+rcu_assign_pointer(cur, new);        // publish
+spin_unlock(&cfg_lock);
+synchronize_rcu();                   // wait for all old readers
+kfree(old);                          // now no reader can hold it
+```
+
+`rcu_assign_pointer` has release ordering. It makes the fields of the new object visible before the pointer. `rcu_dereference` is the matching subscribe. On most CPUs, the address dependency gives the order, so it is a plain load that the compiler must not change. Alpha is the exception, and it needs a barrier.
+
+A reader sees either the old version or the new version, never a mix. It can hold that version for its whole read section, even after the writer publishes a new one. So readers can disagree for a short time. RCU is good for data where a slightly old value is acceptable.
+
+## Grace periods
+
+The hard part is the free. When is it safe? A **grace period** is a period that ends after every reader that existed at its start has finished.
+
+A **quiescent state** is a point where a CPU cannot be in a read section. On a non-preemptible kernel, `rcu_read_lock` only marks a section where the thread must not block, and it generates almost no code. So a context switch on a CPU proves that any earlier read section on that CPU has ended. Idle and user mode are also quiescent. Once every CPU has passed a quiescent state, the grace period is over.
+
+Readers pay nothing, and the writer waits. On a preemptible kernel, `CONFIG_PREEMPT_RCU` makes `rcu_read_lock` increment a counter in the task, and a preempted reader blocks the grace period until it runs again.
+
+<SyncRcuDemo />
+
+1. Click **rcu_read_lock** on CPU 0. It now reads version 1. Click **Publish a copy**. The pointer moves to version 2, but CPU 0 still reads version 1.
+2. Click **rcu_read_lock** on CPU 1. New readers get version 2.
+3. Click **Start grace period**. The thin lines show which CPUs still owe a quiescent state. Click **Context switch** on CPU 2. CPUs 0 and 1 cannot report while they are in a read section.
+4. Unlock each CPU, and click **Context switch** on it. When the last one reports, **kfree** appears on version 1.
+5. Reset and turn on **Free at once**. Lock on CPU 0, publish, and click **kfree**. It is a use after free in 3 steps.
+
+The tests search every order of these actions: 14314 states with 3 CPUs. In the correct version, no version is ever freed while a reader holds it.
+
+## Waiting or deferring
+
+| Call | What it does | Use it when |
+|---|---|---|
+| `synchronize_rcu()` | Blocks until a grace period ends | The writer can sleep and writes are rare |
+| `call_rcu(head, fn)` | Queues a callback and returns at once | The writer cannot sleep, or writes are frequent |
+| `kfree_rcu(ptr, field)` | Queues the free, with no function to write | The callback would only call `kfree` |
+| `rcu_barrier()` | Waits for queued callbacks to finish | Before a module unload |
+
+A grace period takes milliseconds, because every CPU must reach a quiescent state. So a writer that calls `synchronize_rcu` in a loop is very slow. `call_rcu` batches frees, so one grace period serves many of them. The memory stays in use until then, so a burst of updates can use a lot of memory. RCU is a poor fit for write-heavy data.
+
+**SRCU** (sleepable RCU) lets readers sleep. Each `struct srcu_struct` is its own domain with its own grace periods, so a slow reader delays only that domain. `srcu_read_lock` returns an index and does a little more work than plain RCU.
+
+## RCU, hazard pointers and epochs
+
+RCU solves the same problem as [hazard pointers](/concurrency/lock-free/hazard-pointers) and [epoch-based reclamation](/concurrency/lock-free/epoch-based-reclamation): when can I free this node?
+
+| | RCU | Hazard pointers | Epochs |
+|---|---|---|---|
+| Reader cost | Almost none in the kernel | Store and fence for each pointer | Store and fence for each section |
+| Stalled reader | Blocks all frees | Blocks one node for each hazard slot | Blocks all frees |
+| Memory bound | None | Yes | None |
+| Needs kernel help | Uses the scheduler | No | No |
+
+The kernel has a large advantage: the scheduler already sees each context switch, so quiescent states need no extra work. User-space RCU, such as `liburcu`, has to do this work itself, for example with `membarrier` or with per-thread counters. XNU has a similar facility, called safe memory reclamation (SMR).
+
+## Where Linux uses it
+
+- **The directory cache.** [Path lookup](/os/fs/path-lookup-and-the-vfs) walks `dentry` objects in RCU mode, with no lock and no shared write. If a sequence check fails, it falls back to a slower walk with references.
+- **Routing.** IPv4 and IPv6 lookups read the tables under `rcu_read_lock`. A route update is rare and a lookup occurs for each packet.
+- **File descriptors.** The `fdtable` of a process can be replaced under RCU, so `fget` does not take a lock in the common case.
+- **Process lists.** Walking tasks and looking up PIDs use RCU.
+
+Lists have their own helpers: `list_add_rcu`, `list_del_rcu` and `list_for_each_entry_rcu`. A deleted entry keeps its `next` pointer, so a reader on that entry can still continue through the list.
+
+## Connect
+
+- [Kernel memory allocators](/os/memory/kernel-memory-allocators) include `SLAB_TYPESAFE_BY_RCU`, where a slab page is freed only after a grace period.
+- [The TLB](/os/vm/the-tlb) has a related problem: page tables are freed only after other CPUs stop using them.
+- [Deadlock](/os/sync/deadlock): an RCU reader cannot deadlock with a writer, because it never waits for one.
+
+<Recall cards={[
+  { q: "Why does a reader-writer lock stop scaling with no writers at all?", a: "Each reader writes a shared count on entry and on exit. The cache line moves between cores, so readers serialize on that line." },
+  { q: "What do rcu_assign_pointer and rcu_dereference guarantee?", a: "The publish has release ordering, so a reader that sees the new pointer also sees the initialized fields. The dereference is the matching load." },
+  { q: "Define a grace period.", a: "A period that ends after every reader that existed at its start has finished." },
+  { q: "What is a quiescent state on a non-preemptible kernel, and why does it prove anything?", a: "A context switch, idle or user mode. A read section cannot block, so a switch proves that any earlier read section on that CPU has ended." },
+  { q: "When do you use call_rcu instead of synchronize_rcu?", a: "When the writer cannot sleep, or when writes are frequent. It queues the free and returns, and one grace period can serve many callbacks." },
+  { q: "Why is RCU a poor fit for write-heavy data?", a: "Each update copies data, and old versions stay in memory until a grace period ends. A grace period takes a long time compared with a write." },
+]} />

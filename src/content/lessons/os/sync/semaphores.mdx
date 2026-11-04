@@ -1,0 +1,128 @@
+---
+summary: Dijkstra's P and V, counting and binary semaphores, the bounded buffer, readers and writers with their starvation variants, the dining philosophers, and how a semaphore differs from a mutex.
+---
+import { SyncBoundedBufferDemo, SyncReadersWritersDemo, SyncDiningDemo } from "@/demos/os/SyncSemDemos";
+
+A mutex answers one question: is the section free? Some problems must count: how many slots are free, how many items are ready. A **semaphore** is an integer with two atomic operations. Dijkstra defined it in the 1960s, for the THE operating system.
+
+- **P** (wait, or `down`): if the value is above 0, subtract 1 and continue. If not, sleep until it is above 0.
+- **V** (signal, or `up`): add 1. If a thread sleeps, wake one.
+
+The letters come from Dutch words. The value is never negative in this definition. It is the number of units that are free right now. A **counting semaphore** can hold any non-negative value. A **binary semaphore** holds only 0 or 1.
+
+```c
+#include <semaphore.h>   // POSIX, on Linux
+sem_t free_slots;
+sem_init(&free_slots, 0, 16);
+sem_wait(&free_slots);   // P
+sem_post(&free_slots);   // V
+```
+
+On Linux, glibc builds `sem_t` on a futex. The kernel has its own `struct semaphore`, with `down`, `down_interruptible` and `up`. On macOS, `sem_init` is not supported for unnamed semaphores, so use `dispatch_semaphore_t`, or a named semaphore with `sem_open`.
+
+## The bounded buffer
+
+A **bounded buffer** is a fixed array between producers and consumers. Producers must wait if it is full, and consumers must wait if it is empty. Three semaphores solve it: `empty` counts free slots, `full` counts items, and `mutex` protects the indexes.
+
+```c
+void produce(item x) {                   void consume(item *x) {
+    P(&empty);                               P(&full);
+    P(&mutex);                               P(&mutex);
+    buf[in] = x; in = (in + 1) % N;          *x = buf[out]; out = (out + 1) % N;
+    V(&mutex);                               V(&mutex);
+    V(&full);                                V(&empty);
+}                                        }
+```
+
+<Predict
+  id="order"
+  question="A producer calls P(mutex) first, and then P(empty). The buffer is full. What happens?"
+  options={[
+    "Nothing changes, because both calls run before the write",
+    "The producer sleeps while it holds the mutex, the consumer cannot get the mutex to free a slot, and all threads stop",
+    "The producer overwrites an item",
+  ]}
+  answer={1}
+  explain="The producer waits for a free slot and holds the mutex. Only a consumer can free a slot, and it needs that mutex. Each waits for the other, and this is a deadlock."
+>
+<SyncBoundedBufferDemo />
+</Predict>
+
+1. Run the threads in any order. `empty + full` plus the operations in progress always equals 2. No schedule breaks this code: the search finds no error among 4334 states.
+2. Select **P(mutex), then P(empty)**. Click **Show the deadlock**. A 17-step schedule stops all threads.
+3. Select **No mutex**. Click **Show the overwrite**. Two producers read the same `in`, and the second producer overwrites the first item in 6 steps. `empty` and `full` count correctly, but they do not protect the index.
+
+The order rule is general. Wait for a condition first, and take the lock for a short time after. If you hold a lock while you sleep for something that needs that lock, you have a [deadlock](/os/sync/deadlock).
+
+## Semaphores and mutexes
+
+A binary semaphore looks like a mutex. It is different in one way: a mutex has an **owner**, and a semaphore does not.
+
+| | Mutex | Semaphore |
+|---|---|---|
+| Who releases | Only the thread that locked it | Any thread |
+| Priority inheritance | Possible, because the owner is known | Not possible |
+| Debug checks | Double lock and wrong owner can be detected | No checks are possible |
+| Use | Protect data | Count resources, and signal events |
+
+Linux kernel code uses `struct mutex` for mutual exclusion for these reasons. A semaphore is correct for a signal between contexts. For example, `up` can run in an interrupt handler, and a thread can sleep in `down` until the device finishes. Rust's `std::sync` has no semaphore. Tokio has one, for limits on concurrent tasks.
+
+## Readers and writers
+
+Many structures are read much more than they are written. Readers can overlap with each other, but a writer needs exclusive access. A **reader-writer lock** allows this. The question is who goes next when both wait. Courtois, Heymans and Parnas described this problem in 1971.
+
+<Predict
+  id="rw"
+  question="Readers arrive at 6 per millisecond, and each one holds the lock for about 1 ms. Writers arrive at 0.3 per millisecond. New readers may always join active readers. What happens to the writers?"
+  options={[
+    "They wait about one read time, which is 1 ms",
+    "They almost never run, because at nearly every moment some reader holds the lock",
+    "They run in turn with the readers",
+  ]}
+  answer={1}
+  explain="With about 6 readers active at once, the count almost never reaches 0. A writer needs a moment with no readers. In the simulation, only 3 of 58 writers ran in 200 ms."
+>
+<SyncReadersWritersDemo />
+</Predict>
+
+1. With **Reader preference**, look at the table. Readers wait 0.01 ms on average. Only 3 of 58 writers run, and the worst wait is 199 ms. That is the whole run.
+2. Select **Writer preference**. A waiting writer blocks new readers. Now all 58 writers run with a mean wait of 1.31 ms, and readers wait 0.85 ms.
+3. Select **Fair (FIFO)**. Readers wait 1.72 ms and writers wait 2.89 ms. Each writer also blocks the readers behind it, so groups of readers are smaller.
+4. Set readers to 2 and writers to 0.8. Now **Writer preference** starves readers: only 325 of 414 readers run, with a worst wait of 41 ms.
+
+| Policy | Good for | Bad for | Example |
+|---|---|---|---|
+| Reader preference | Read throughput | Writers starve | glibc `pthread_rwlock_t` default |
+| Writer preference | Fresh data, rare writers | Readers starve under many writes | Go `sync.RWMutex`: a pending writer blocks new readers |
+| Fair | Bounded waits | Lower read concurrency | Queue-based locks |
+
+The Linux kernel has `struct rw_semaphore`, with `down_read`, `up_read`, `down_write` and `up_write`. The memory map lock (`mmap_lock`) of a process is the best-known user. Its waiters queue in order, and a writer can spin while the owner runs. It also has a handoff bit that stops starvation. Rust's `std::sync::RwLock` documents that its priority policy depends on the operating system.
+
+A reader-writer lock is not free for readers. Each reader writes a shared count, so the cache line bounces. The [RCU lesson](/os/sync/read-copy-update) measures this and removes it.
+
+## The dining philosophers
+
+Five philosophers sit at a round table with one fork between each pair. Each needs two forks to eat. Dijkstra used this problem to show a circular wait. It is small, but it has the same shape as real lock order bugs.
+
+<SyncDiningDemo />
+
+1. Click **Jump to the deadlock**. It takes only 5 steps: each philosopher takes the left fork.
+2. Select **Lowest fork first**. Philosopher 4 now takes fork 0 before fork 4, and this breaks the ring. The search finds no deadlock.
+3. Select **Room semaphore**. A counting semaphore with value 4 lets only 4 philosophers sit. One of them can always get two forks.
+
+The two fixes are general methods. The first is a **lock order**: all threads take locks in one global order. The second **limits concurrency** with a counting semaphore. The [deadlock lesson](/os/sync/deadlock) continues from here.
+
+## Connect
+
+- [Futexes](/os/sync/futexes) give the sleep and the wake under `sem_t`.
+- [Pipes](/os/ipc/pipes) are a bounded buffer in the kernel.
+- [Condition variables](/os/sync/condition-variables) solve the same problems for conditions that a count cannot express.
+
+<Recall cards={[
+  { q: "Define P and V.", a: "P waits until the value is above 0, and then subtracts 1. V adds 1 and wakes one waiter if any exists. Both are atomic." },
+  { q: "Which three semaphores solve the bounded buffer, and what does each mean?", a: "empty counts free slots, full counts items, and mutex protects the indexes." },
+  { q: "What goes wrong if a producer takes the mutex before it waits for a free slot?", a: "It sleeps while it holds the mutex. A consumer needs that mutex to free a slot, so all threads stop." },
+  { q: "What is the main difference between a mutex and a binary semaphore?", a: "A mutex has an owner. So it allows priority inheritance and error checks. Any thread can release a semaphore." },
+  { q: "Why do writers starve under reader preference?", a: "New readers can always join active readers. If reads overlap all the time, the reader count never reaches 0, so a writer never gets in." },
+  { q: "Name two ways to stop the deadlock in the dining philosophers.", a: "Take forks in one global order, or use a counting semaphore that lets only N minus 1 philosophers try at once." },
+]} />

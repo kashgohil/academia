@@ -1,0 +1,124 @@
+---
+summary: Why one counter increment can lose data, what a correct lock must guarantee, why Peterson's algorithm works on paper but fails on real CPUs, and why disabling interrupts helps only on one CPU.
+---
+import { SyncInterleaveDemo, SyncPetersonLitmusDemo } from "@/demos/os/SyncCriticalDemos";
+
+A thread runs one instruction at a time. The scheduler and the other CPUs decide what happens between two of those instructions. An **interleaving** is one possible order of the instructions of all threads. A **race condition** is a bug that appears only in some interleavings.
+
+The concurrency track covers [atomic operations](/concurrency/atomics/atomic-operations) and [memory orderings](/concurrency/atomics/memory-orderings-relaxed-acquire-release-seq-cst) from the view of the language. This module takes the view of the operating system: what the kernel provides, and how it is built.
+
+<Predict
+  id="counter"
+  question="Two threads each run count = count + 1 once. The statement compiles to a load, an add and a store. A switch can occur between any two instructions. How many of the possible schedules give count = 2?"
+  options={[
+    "All of them, because each thread runs the statement once",
+    "About half of them",
+    "Only 2 of the 20 schedules",
+  ]}
+  answer={2}
+  explain="There are 20 ways to merge two lists of 3 instructions. Only the 2 schedules where one thread finishes before the other thread loads give count = 2. The other 18 lose an update."
+>
+<SyncInterleaveDemo />
+</Predict>
+
+1. Click **Run T0** and **Run T1** yourself. You are the scheduler. Try to get `count = 1`.
+2. Click **Show a lost update**. Both threads load 0, both compute 1, and the second store overwrites the first store.
+3. Read the numbers under the demo. Of 20 schedules, 2 are correct and 18 lose an update.
+4. Select **Counter, atomic add**. The increment is now one step, so no switch can occur inside it. Both of the 2 schedules are correct.
+5. Select **Counter, cli on one CPU**. Run T0 once. Now T1 cannot run, because a disabled timer interrupt means no switch. Every schedule is correct.
+6. Select **Counter, cli on two CPUs**. Now T1 runs on another CPU, and `cli` does not stop it. Of 252 schedules, 200 lose an update.
+
+## What a lock must guarantee
+
+A **critical section** is code that accesses shared state and must not overlap with itself in another thread. An entry protocol runs before it, and an exit protocol runs after it. A correct protocol must give three properties.
+
+| Property | Meaning | What failure looks like |
+|---|---|---|
+| **Mutual exclusion** | At most one thread is inside at a time | Lost updates and corrupt structures |
+| **Progress** | If the section is free and threads want it, one of them gets in | All threads wait, and nothing holds the lock |
+| **Bounded waiting** | After a thread asks, other threads can pass it only a limited number of times | One thread starves |
+
+Mutual exclusion is a **safety** property: a bad thing never occurs. Progress and bounded waiting are **liveness** properties: a good thing eventually occurs. A lock that never lets anyone in is safe and useless.
+
+## Peterson's algorithm
+
+Peterson published this algorithm in 1981. It gives mutual exclusion to two threads with only loads and stores. It has no atomic read-modify-write.
+
+```c
+int flag[2];  // flag[i] = 1: thread i wants to enter
+int turn;     // which thread must wait if both want to enter
+
+void lock(int me) {
+    int other = 1 - me;
+    flag[me] = 1;       // I want to enter.
+    turn = other;       // But you can go first.
+    while (flag[other] && turn == other)
+        ;               // Wait.
+}
+void unlock(int me) { flag[me] = 0; }
+```
+
+The argument is short. Suppose that both threads are inside. Each thread wrote its own flag before it read the other flag. So each thread must have passed because `turn` pointed to itself. But `turn` holds one value, and the thread that wrote `turn` last gave the turn away. So that thread must still wait.
+
+The same writes also give bounded waiting. When T1 comes back, it sets `turn` to T0 and then waits. The explorer in this lesson confirms it: T1 enters at most 1 time after T0 finishes its entry writes.
+
+In the first demo, select **Peterson's algorithm**. Sequential memory has 48 reachable states, and none of them has two threads inside.
+
+## Why it fails on real CPUs
+
+<Predict
+  id="tso"
+  question="Peterson's algorithm is correct under sequential consistency. You run it on an x86-64 CPU with plain MOV instructions. Can both threads enter the critical section?"
+  options={[
+    "No, because x86 has a strong memory model",
+    "Yes, because each store can wait in a store buffer while the thread loads the other flag",
+    "Only if the compiler reorders the code",
+  ]}
+  answer={1}
+  explain="x86 keeps stores in order and loads in order, but a load can pass an earlier store. Each thread reads the other flag as 0 while its own flag waits in its store buffer. So both threads enter, even if the compiler changes nothing."
+>
+<SyncPetersonLitmusDemo />
+</Predict>
+
+1. Look at **Plain stores**. The highlighted rows let both threads enter. They have a mark in the TSO column and no mark in the SC column.
+2. Select **Add mfence**. The fence empties the store buffer before the loads, so TSO has no failing row. The C++ column still has one. On a weak CPU, the two relaxed stores can become visible out of order.
+3. Select **seq_cst**. The stores compile to `XCHG`, and no model allows a failure.
+4. Go back to the first demo. Select **Peterson's algorithm** and **x86-TSO**. Click **Show the failing schedule**. Both threads pass with empty memory, because neither store has drained.
+5. In that stepper, turn on **mfence after turn**. Now a thread cannot read until its buffer is empty.
+
+A **store buffer** holds a store until the cache can accept it. The CPU does not wait for the store, so a later load can run first. The [fences lesson](/concurrency/atomics/fences) shows this pattern as store buffering. Peterson's entry protocol is exactly that pattern: write my flag, then read your flag.
+
+The exhaustive search agrees. Under TSO, the search reaches 353 states and finds a failing schedule of 6 steps. With the fence, it reaches 139 states and finds no failure.
+
+Apple Silicon uses arm64, which is weaker than TSO. It can also reorder two stores, or two loads, unless the code says otherwise. So write Peterson in Rust with `Ordering::Relaxed` on your Mac, and expect it to fail. These CPUs also have a TSO mode that Rosetta 2 uses, but normal arm64 programs do not get it.
+
+Real locks do not use Peterson's algorithm. It still needs a fence, which costs about as much as an atomic instruction, and this form works for only two threads. An atomic [compare-and-swap](/concurrency/atomics/compare-and-swap) is simpler, and it works for any number of threads.
+
+## Disabling interrupts
+
+On one CPU, a thread loses the CPU only for two reasons: it blocks, or an interrupt runs the scheduler. So if a thread disables interrupts, it cannot be preempted, and no other code can run.
+
+On x86, `cli` clears the interrupt flag in `RFLAGS`, and `sti` sets it. On arm64, the kernel masks interrupts through the `DAIF` bits. In Linux, use `local_irq_save(flags)` and `local_irq_restore(flags)`. Both instructions are privileged in normal user programs, so this is a tool for the kernel.
+
+This method fails in three ways.
+
+- **It is per CPU.** The flag is one bit in one core. The other CPUs continue to run the same code, as the demo shows.
+- **It delays interrupts.** While the flag is clear, the CPU does not take device or timer interrupts. Long sections increase [interrupt](/os/io/interrupts) latency.
+- **It cannot be given to users.** A bad program could keep the CPU forever.
+
+The kernel still uses it, together with a lock. A spinlock stops other CPUs. Disabled interrupts stop a handler on this CPU from taking the same lock and spinning forever. The [next lesson](/os/sync/locks-and-spinlocks) gives the rules.
+
+## Connect
+
+- [Threads](/os/processes/threads) and [context switching](/os/processes/context-switching) explain when a switch can occur.
+- [Cache coherence](/architecture/multicore/cache-coherence-mesi) explains why stores need a buffer.
+- [Happens-before](/concurrency/atomics/happens-before) gives the language-level rule for data races.
+
+<Recall cards={[
+  { q: "Two threads each increment a counter with a load, an add and a store. How many schedules exist, and how many lose an update?", a: "There are 20 schedules, and 18 of them lose an update. Only the 2 schedules where one thread finishes before the other loads are correct." },
+  { q: "Name the three properties of a correct critical section protocol.", a: "Mutual exclusion, progress and bounded waiting." },
+  { q: "Why does Peterson's algorithm fail on x86 with plain MOV?", a: "A load can pass an earlier store. Each store waits in a store buffer, so each thread reads the other flag as 0, and both threads enter." },
+  { q: "What is the minimum fix for Peterson's algorithm on x86?", a: "A full fence, such as MFENCE, after the stores and before the loads. A locked instruction such as XCHG also empties the store buffer." },
+  { q: "Why does disabling interrupts give mutual exclusion on one CPU but not on two?", a: "On one CPU, no interrupt means no switch, so no other code runs. On two CPUs, the other CPU continues to run, because the flag is per CPU." },
+  { q: "Why does the kernel disable interrupts and also take a spinlock?", a: "The lock stops other CPUs. Disabled interrupts stop a handler on the same CPU from spinning on a lock that the interrupted code holds." },
+]} />

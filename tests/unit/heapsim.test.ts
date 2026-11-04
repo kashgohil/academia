@@ -28,7 +28,7 @@ describe("allocator lesson claims", () => {
 
   test("arena: three 100 B allocations in 256 B chunks open a second chunk", () => {
     withHeap({ kind: "arena", cap: 2048, a: 256 }, (h) => {
-      for (let i = 0; i < 3; i++) h.alloc(100, 8);
+      for (let i = 0; i < 3; i++) h.alloc(100, 1);
       const s = h.stats();
       expect(s.meta).toBe(32);
       expect(s.slack).toBe(40);

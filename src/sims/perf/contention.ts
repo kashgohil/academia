@@ -122,9 +122,15 @@ export function simulateLock(cfg: LockConfig, seed = 1, trace?: Span[]): number 
         // Everyone waiting is asleep. Waking one takes WAKE ns; a running thread that arrives
         // before then grabs the lock instead (the woken thread finds it taken and sleeps again).
         const wakeAt = lockFree + WAKE;
+        const sleeper = waiting.reduce((a, b) => (ready[b]! < ready[a]! ? b : a));
         const runners = live.filter((i) => ready[i]! >= lockFree && ready[i]! < wakeAt);
-        if (runners.length) { t = runners.reduce((a, b) => (ready[b]! < ready[a]! ? b : a)); start = ready[t]! + TRANSFER; }
-        else { t = waiting.reduce((a, b) => (ready[b]! < ready[a]! ? b : a)); start = wakeAt + TRANSFER; }
+        if (runners.length) {
+          t = runners.reduce((a, b) => (ready[b]! < ready[a]! ? b : a));
+          start = ready[t]! + TRANSFER;
+          // The release still woke one sleeper; from wakeAt it competes as a running thread.
+          if (trace) trace.push({ thread: sleeper, from: ready[sleeper]!, to: wakeAt, kind: "wait" });
+          ready[sleeper] = wakeAt;
+        } else { t = sleeper; start = wakeAt + TRANSFER; }
       }
     } else {
       t = waiting.reduce((a, b) => (ready[b]! < ready[a]! ? b : a));

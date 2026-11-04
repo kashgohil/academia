@@ -54,7 +54,7 @@ export function k8sOomScoreAdj(qos: K8sQos, requestBytes = 0, capacityBytes = 1)
   switch (qos) {
     case "guaranteed": return -997;
     case "besteffort": return 1000;
-    case "burstable": return Math.min(Math.max(2, 1000 - Math.floor((1000 * requestBytes) / capacityBytes)), 999);
+    case "burstable": return Math.min(Math.max(3, 1000 - Math.floor((1000 * requestBytes) / capacityBytes)), 999);
   }
 }
 

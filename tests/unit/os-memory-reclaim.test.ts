@@ -142,7 +142,7 @@ describe("OOM arithmetic", () => {
     expect(k8sOomScoreAdj("guaranteed")).toBe(-997);
     expect(k8sOomScoreAdj("besteffort")).toBe(1000);
     expect(k8sOomScoreAdj("burstable", 2 ** 30, 16 * 2 ** 30)).toBe(938);
-    expect(k8sOomScoreAdj("burstable", 16 * 2 ** 30, 16 * 2 ** 30)).toBe(2);
+    expect(k8sOomScoreAdj("burstable", 16 * 2 ** 30, 16 * 2 ** 30)).toBe(3);
     expect(k8sOomScoreAdj("burstable", 1, 16 * 2 ** 30)).toBe(999);
   });
 });

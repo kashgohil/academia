@@ -118,7 +118,7 @@ Things to try:
 
 A container's memory limit is `memory.max` in its [cgroup](/os/isolation/cgroups). The cgroup counts anonymous memory, page cache, and some kernel memory. When a charge would pass the limit, the kernel reclaims inside the cgroup. If that fails, it runs a **cgroup OOM**. It chooses only inside that cgroup, even if the node has free memory. The kubelet then reports `OOMKilled`, with exit code 137 (128 + 9, for `SIGKILL`).
 
-Recent kubelets on cgroup v2 set `memory.oom.group`, so one kill ends the whole container. The kubelet sets `oom_score_adj` by **QoS class**: Guaranteed gets -997, and BestEffort gets 1000. Burstable gets $1000 - 1000 \cdot \text{request} / \text{capacity}$, clamped to 2 to 999. So a 1 GiB request on a 16 GiB node gives 938. A node can also run short of memory. The kubelet then evicts pods in a controlled way, and the kernel OOM killer is the last resort.
+Recent kubelets on cgroup v2 set `memory.oom.group`, so one kill ends the whole container. The kubelet sets `oom_score_adj` by **QoS class**: Guaranteed gets -997, and BestEffort gets 1000. Burstable gets $1000 - 1000 \cdot \text{request} / \text{capacity}$, clamped to 3 to 999. So a 1 GiB request on a 16 GiB node gives 938. A node can also run short of memory. The kubelet then evicts pods in a controlled way, and the kernel OOM killer is the last resort.
 
 Page cache rarely causes an OOM on its own, because clean cache is cheap to drop. A pod with a large page cache can still stall in direct reclaim. `memory.high` makes a softer limit: it throttles the cgroup and does not kill.
 

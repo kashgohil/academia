@@ -99,7 +99,7 @@ A walk of each path is exponential, so the verifier saves states at jump targets
 
 A state on the current path is different, because its proof is not finished. If the walk reaches a jump target with the same state as an earlier one on the same path, it has made no progress. So a real run may not either, and the verifier rejects the program.
 
-Linux limits a load to 1 million processed instructions. This also limits the length of any run. A run follows one path through a finite graph of states, so it cannot take more steps than the walk took. The tests in this project check that bound at random.
+Linux limits a load to 1 million processed instructions. In the subset here, the same walk also limits the length of any run. A run follows one path through a finite graph of states, so it cannot take more steps than the walk took. The tests in this project check that bound at random. Real Linux programs can run longer, through tail calls and the `bpf_loop` helper.
 
 A bounded loop is valid since Linux 5.3, because the walk simply runs it, one pass at a time. So a long loop is too costly even if it is correct. The `bpf_loop` helper takes a callback that the verifier checks once.
 

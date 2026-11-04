@@ -136,7 +136,7 @@ The large gains appear where system calls and per-operation overhead are the mai
 
 io_uring is a second system call interface, and a very large one. It also gained features quickly, in code that runs with kernel rights and shares state across threads. The result was many serious bugs.
 
-- Google reported in 2023 that 60% of the kernel exploits submitted to its kCTF program in 2022 used io_uring. It disabled io_uring for ChromeOS, for Android apps and on its production servers.
+- Google reported in June 2023 that 60% of the submissions to its kCTF program in the past year exploited io_uring. It disabled io_uring for ChromeOS, for Android apps and on its production servers.
 - A seccomp filter can see `io_uring_enter`, but it cannot see the operations inside the ring. It reads only registers. So a filter that blocks `openat` does not stop `IORING_OP_OPENAT`. See [seccomp and sandboxing](/os/isolation/seccomp-and-sandboxing).
 - For these reasons, many sandboxes block the three io_uring calls. Docker's default seccomp profile blocks them.
 - Linux 6.6 added the sysctl `kernel.io_uring_disabled`. A value of 0 allows io_uring, 1 limits it to privileged users or a chosen group, and 2 turns it off.

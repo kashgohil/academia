@@ -18,7 +18,7 @@ Coherence (previous lesson) guarantees that all cores agree on the order of writ
 </Predict>
 
 1. **Store buffering** on TSO: execute all four instructions *before* draining anything, then drain. The outcome is marked impossible under SC.
-2. Same program, **No buffer (SC)**: the outcome can't be reached.
+2. Same program, store buffer **None (SC)**: the outcome can't be reached.
 3. **Message passing, relaxed** on TSO: no order of drains shows stale data, because the FIFO buffer keeps stores in order. Switch to **PSO** and drain `flag` before `data`: the reader sees the flag with old data.
 4. **Message passing, release fence only** on PSO: the fence keeps `flag` behind `data` in the buffer.
 5. **Store buffering with seq_cst fences**: the fence blocks until the buffer is empty. That's x86's `MFENCE`, and why it costs tens of cycles.

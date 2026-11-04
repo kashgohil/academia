@@ -36,7 +36,7 @@ export function StoreBufferDemo() {
       controls={
         <>
           <Param spec={select({ label: "Program", options: SB_PRESETS.map((k) => ({ value: k, label: PRESETS[k]!.label })), default: SB_PRESETS[0]! })} value={preset} onChange={(v) => { setPreset(v as string); const np = parse(PRESETS[v as string]!.src); setHistory([initial(np)]); }} />
-          <Param spec={select({ label: "Hardware", options: [{ value: "sc", label: "No buffer (SC)" }, { value: "tso", label: "FIFO buffer (TSO)" }, { value: "pso", label: "Unordered (PSO)" }], default: "tso", segmented: true })} value={mode} onChange={(v) => { setMode(v as Mode); reset(); }} />
+          <Param spec={select({ label: "Store buffer", options: [{ value: "sc", label: "None (SC)" }, { value: "tso", label: "FIFO (TSO)" }, { value: "pso", label: "PSO" }], default: "tso", segmented: true })} value={mode} onChange={(v) => { setMode(v as Mode); reset(); }} />
         </>
       }
     >
@@ -174,7 +174,7 @@ export function NumaDemo() {
         ))}
       </div>
       <p className="muted" style={{ fontSize: 12, marginBottom: 0 }}>
-        Model: each core streams up to {NUMA_DEFAULTS.coreBW} GB/s; each socket's memory gives {NUMA_DEFAULTS.memBW} GB/s; each socket-to-socket link carries {NUMA_DEFAULTS.linkBW} GB/s; local {NUMA_DEFAULTS.latLocal} ns, remote {NUMA_DEFAULTS.latRemote} ns.
+        Model: each core streams up to {NUMA_DEFAULTS.coreBW} GB/s; each socket's memory gives {NUMA_DEFAULTS.memBW} GB/s; each socket-to-socket link carries {NUMA_DEFAULTS.linkBW} GB/s; local {NUMA_DEFAULTS.latLocal} ns, remote {NUMA_DEFAULTS.latRemote} ns. The dips at odd thread counts are real: one socket gets an extra thread and saturates its memory first.
       </p>
     </Demo>
   );

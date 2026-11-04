@@ -1,0 +1,84 @@
+---
+summary: The fastest allocator there is, what alignment costs, and why "free" is mostly a no-op.
+---
+import { BumpDemo } from "@/demos/AllocatorDemos";
+
+A bump allocator owns a buffer and one integer, `top`. To allocate, round `top` up to the requested alignment, check the end, and advance it. That's the whole fast path: a few instructions, no metadata and no searching. Compilers use it for AST nodes, games for per-frame data, and it sits underneath Zig's `FixedBufferAllocator`, Odin's temp allocator and Rust's `bumpalo`.
+
+<Predict
+  id="struct"
+  question="On a bump allocator starting at address 0, you allocate the fields of struct { char a; double b; char c; double d; } in order, each at its natural alignment (1, 8, 1, 8). How many bytes does that consume?"
+  options={["18", "24", "32", "40"]}
+  answer={2}
+  explain="a at 0; b must start at a multiple of 8, so 7 bytes of padding, b at 8–15; c at 16; 7 more padding bytes; d at 24–31. That is 32 bytes for 18 bytes of data, and it is exactly how a C compiler lays out that struct."
+>
+<BumpDemo />
+</Predict>
+
+Things to try:
+
+1. Click **char, double, char, double** and then **double, double, char, char**. That's the same data with 14 bytes of padding vs 0.
+2. Allocate a few blocks and free the **last** one by clicking it. `top` rolls back. Now free one in the **middle**: it turns grey (freed, but not reclaimed).
+3. Free the top block again. The rollback continues through the grey block underneath, because it is dead too.
+4. **Begin scope**, allocate several blocks, then **End scope**. Everything allocated in the scope disappears in O(1).
+
+## Alignment arithmetic
+
+Hardware requires (or strongly prefers) that a value of size 8 sits at an address divisible by 8. Alignments are powers of two, which makes rounding up a bit trick:
+
+<Steps>
+<div>We want the smallest multiple of $a$ that is $\ge x$. Adding $a-1$ pushes $x$ past the next multiple, unless it's already on one.</div>
+<div>For $a = 2^k$, "round down to a multiple of $a$" means "clear the low $k$ bits": AND with $\lnot(a-1)$.</div>
+<div>Together: $\text{align\_up}(x, a) = (x + a - 1)\ \&\ \lnot(a - 1)$. For $x = 17, a = 8$: $(24)\ \&\ \lnot 7 = 24$.</div>
+<div>The padding wasted is $\text{align\_up}(x, a) - x$, between $0$ and $a - 1$ bytes.</div>
+</Steps>
+
+```zig
+const Bump = struct {
+    buf: []u8,
+    top: usize = 0,
+
+    fn alloc(self: *Bump, n: usize, alignment: usize) ?[*]u8 {
+        const start = std.mem.alignForward(usize, self.top, alignment);
+        if (start + n > self.buf.len) return null;
+        self.top = start + n;
+        return self.buf.ptr + start;
+    }
+};
+```
+
+## Struct layout is the same problem
+
+A compiler laying out a struct is a bump allocator running over its fields. Different languages handle this differently:
+
+- **C, C++, Zig `extern struct`** keep declaration order, so field order decides padding. Sorting fields by decreasing alignment minimizes it.
+- **Rust** (default `repr(Rust)`) and **Zig** (plain `struct`) may reorder fields to reduce padding. Use `#[repr(C)]` / `extern struct` when the layout must be fixed (FFI, file formats).
+- **Odin** keeps declaration order by default; `#packed` removes padding, at the cost of unaligned access.
+
+The total size is also rounded up to the struct's alignment, so that arrays of it stay aligned. `{double; char}` is 16 bytes, not 9.
+
+## What "free" means here
+
+A bump allocator can only reclaim memory at the top. In practice it supports:
+
+- **LIFO frees**: freeing the most recent allocation rolls `top` back (a stack allocator).
+- **Reset**: drop everything at once.
+- **Mark / restore**: save `top`, do temporary work, restore it. This is a scoped stack, which is what *Begin scope / End scope* do.
+
+Any other free just leaks until the next reset. That's not a defect: it is the design. **Bump allocation works when lifetimes are grouped**, so that many objects die at the same moment. When they aren't, use a pool or a general-purpose allocator.
+
+| Property | Bump |
+|---|---|
+| alloc | O(1), ~3 instructions |
+| free | O(1) at the top; otherwise a no-op |
+| metadata per allocation | none |
+| locality | perfect: allocations are contiguous in program order |
+| fragmentation | none until you need individual frees |
+
+<Recall cards={[
+  { q: "Formula to round x up to a multiple of a power-of-two alignment a?", a: "(x + a − 1) & ~(a − 1)" },
+  { q: "struct { char; double; char; double } in C: size and padding?", a: "32 bytes, 14 of them padding. Reordered as { double; double; char; char } it needs 18 bytes of data plus 6 bytes of tail padding (size 24), so arrays stay 8-aligned." },
+  { q: "Which frees can a bump allocator actually reclaim?", a: "Only frees at the top (LIFO), a reset of everything, or a restore to a saved mark." },
+  { q: "Which languages may reorder struct fields by default?", a: "Rust (repr(Rust)) and Zig (plain struct). C, C++, Zig extern struct and Odin keep declaration order." },
+  { q: "When is a bump allocator the right choice?", a: "When many allocations share one lifetime and die together: per frame, per request, per compiler pass." },
+]} />

@@ -1,0 +1,132 @@
+---
+summary: "Why translation must be cached: TLB structure and reach, ASIDs and PCIDs, shootdowns by IPI and what they cost on many cores, and the effect on pointer chasing. Includes a TLB simulator with real page walks."
+---
+import { VmTlbSimDemo, VmNestedWalkDemo, VmTlbReachDemo, VmShootdownDemo } from "@/demos/os/VmTlbDemos";
+import { VmTable } from "@/demos/os/VmUi";
+
+A page walk costs up to 4 memory reads. If each load needed a walk, each load would cost 5 reads. The **translation lookaside buffer (TLB)** avoids this. It is a small cache in the CPU core that maps a virtual page number to a frame number and its rights. A hit costs almost nothing. A miss starts the walker, which fills the entry.
+
+<Predict
+  id="seventeen"
+  question="A fully associative TLB has 16 entries and uses LRU. A loop reads 17 pages in order, again and again. What is the hit rate?"
+  options={["About 94%: 16 of the 17 pages fit", "About 50%", "0%: every access misses"]}
+  answer={2}
+  explain="LRU always evicts the page that the loop needs next. So each access misses, forever. One page more than the capacity removes all hits. The 4-way TLB with the same 16 entries does better here: 69.6%."
+>
+<VmTlbSimDemo />
+</Predict>
+
+Things to try:
+
+1. Press **Step** a few times, then **+100**. Each miss shows the 4 reads of the walk. Read the hit rate: 0%. Set the pages to 16, and it rises to 98.7%.
+2. Set the pages to 17 and the ways to 4. The hit rate is 69.6%. Lower associativity broke the cycle, because some sets do not overflow.
+3. Select the pattern **Pages that share one set**, with 4 ways. Five pages fight for one set, and the hit rate is 0%, while 12 entries stay empty. Select **Full** ways: the same five pages fit, and the hit rate is 99.6%.
+4. Select **Array scan, 64-byte steps**. One page holds 64 of these steps, so only 1 access in 64 misses: 98.4%. Spatial locality does the work.
+5. With a hot pattern, press **Context switch** with PCID on and off. Without PCID, each switch empties the TLB.
+
+## Why translation must be cached
+
+The cost of one miss grows with the depth of the tree, and virtual machines make it worse. A guest has its own page tables, and each guest table address is itself a guest physical address. The hardware must translate each one through the host tables. This is **nested paging** (EPT on Intel, NPT on AMD).
+
+<VmNestedWalkDemo />
+
+1. Keep 4 guest levels and 4 host levels. A miss can cost 24 reads: $(4+1)(4+1)-1$.
+2. Set the host levels to 0. The cost falls to 4, which is the native walk.
+3. Set both to 5. A miss can now cost 35 reads.
+
+CPUs reduce this in two ways. **Paging-structure caches** keep upper-level entries, so a walk often needs only the last level. PTEs also live in the normal data caches. A typical walk is therefore much cheaper than the worst case. It is still far more than a hit.
+
+## Structure
+
+A modern core has two levels, as CPU caches do. The **L1 TLBs** are small and fast, with separate parts for instructions and data. The **L2 TLB** (STLB on Intel) is larger, and it serves both. Each TLB is **set associative**: the low bits of the page number select a set, and the entry can use any way in that set.
+
+This table lists the model input for this lesson, the data side of an Intel Skylake core. Other CPUs differ:
+
+<VmTable head={["Page size", "L1 entries", "L2 entries", "L1 reach", "L2 reach"]} rows={[
+  ["4 KiB", "64, 4 ways", "1,536, 12 ways", "256 KiB", "6 MiB"],
+  ["2 MiB", "32, 4 ways", "1,536, 12 ways", "64 MiB", "3 GiB"],
+  ["1 GiB", "4", "16", "4 GiB", "16 GiB"],
+]} />
+
+**TLB reach** is entries times page size. It is the memory that the TLB can map without a miss. It is the most useful single number about a TLB. Compare 6 MiB with the size of your last-level cache: on a large server, data can sit in the cache while its translation misses.
+
+## Reach and pointer chasing
+
+<Predict
+  id="chase"
+  question="A pointer chase jumps to a random address in 1 GiB, with 4 KiB pages. The L2 TLB reach is 6 MiB. About what fraction of accesses need a page walk?"
+  options={["About 0.6%: most translations stay cached", "About 50%", "About 99%: the reach covers less than 1% of the data"]}
+  answer={2}
+  explain="Random access gives no locality. The chance that a page is in the TLB is about the reach divided by the working set, 6 MiB in 1 GiB. So 99.4% of accesses walk in this model."
+>
+<VmTlbReachDemo />
+</Predict>
+
+1. Read the blue line from left to right. It is near zero, until the working set passes the L1 reach. Then L2 hits add a few cycles. After the L2 reach, the walks begin.
+2. Look at the far right of the blue line. It rises again, because the page table itself no longer fits in the data caches.
+3. Compare the green line. 2 MiB pages push the L2 step 512 times further to the right.
+4. Turn on the data read. Translation is a large part of the total only for large working sets.
+
+In this model, translation costs 5.2 cycles per access at 1 MiB, 15.0 at 16 MiB, 46.6 at 1 GiB, and 214.7 at 64 GiB. With 2 MiB pages, it costs 6.6 cycles at 1 GiB and 26.8 at 64 GiB. The model inputs are in `TRANSLATION_MODEL`. An L2 hit costs 7 cycles, and a walk costs 15 cycles plus one read of the PTE. The model does not include misses in the paging-structure caches, so it is low for very large sets.
+
+This is why pointer-heavy code suffers twice. Each hop can miss the data cache and also the TLB, and the walk itself can miss the cache. A sorted array and a linked list can differ by more than the cache model predicts. To measure it on Linux:
+
+```sh
+perf stat -e dTLB-loads,dTLB-load-misses,cycles ./chase
+```
+
+`perf` does not exist on macOS. The Instruments app has a CPU Counters tool for this purpose.
+
+## Address space tags
+
+A TLB entry is only valid for one page table. The simple solution is to flush the TLB on every context switch, and early x86 CPUs did this. A write to CR3 still flushes everything except global entries, if the tag feature is off. The cost is not the flush, but the misses after it.
+
+A **PCID** (process-context identifier) tags each entry with an address space. The tag has 12 bits, in the low bits of CR3, so 4,096 values exist. Entries of other address spaces stay in the TLB but do not match. If bit 63 of the new CR3 value is set, the write flushes nothing.
+
+arm64 has the same idea under the name **ASID**, with 8 or 16 bits.
+
+Linux does not give each process a permanent PCID. Each CPU keeps a small table of the 6 most recent address spaces (`TLB_NR_DYN_ASIDS`). A switch to one of them can skip the flush. KPTI also uses PCIDs. The user tables and the kernel tables of one process have different tags, so a system call does not lose the TLB.
+
+The **global bit** handles the other case. The kernel half is the same in all address spaces, so its entries match any tag, and they survive a CR3 write.
+
+## Shootdowns
+
+The TLB is a cache that the hardware does not keep coherent on x86. If the kernel changes a PTE, other cores can keep the old translation. This is dangerous. Suppose that a core keeps a stale entry after `munmap`, and the kernel gives the frame to another process. A thread with the stale entry can then read and write the memory of that process.
+
+The kernel must therefore invalidate the entry on each core that may hold it. On x86, one core cannot do this for another, so it sends an **inter-processor interrupt (IPI)**. This is a **TLB shootdown**. The sender also waits, because the kernel must not free the frame until every core has acknowledged.
+
+<VmShootdownDemo />
+
+1. Press **Replay**. The sender spins while the IPIs go out. Each target stops your code, runs a handler, and acknowledges.
+2. Move the core count from 2 to 128. The sender's wait grows slowly, but the time on all cores together grows with N.
+3. Set the pages above 33. Linux now flushes the whole TLB on each target, and the model adds the cost of the later misses.
+4. Select **Hardware broadcast**. arm64 has `TLBI` instructions that reach all cores, and no IPI is needed.
+
+With the model inputs in `SHOOTDOWN_MODEL`, one page on 32 cores makes the caller wait 3.25 µs and costs 40.45 µs across all cores. On 128 cores, these become 8.05 µs and 160.45 µs. One thread that calls `munmap` often can therefore slow down every other thread of its process. The mechanism is the reason why allocators delay returning memory.
+
+Linux reduces the work in several ways:
+
+- `mm_cpumask` records which CPUs ran this address space, and only those CPUs get an IPI.
+- A CPU that runs a kernel thread can be in **lazy TLB** mode. It skips the IPI and flushes when it next returns to a user address space.
+- `munmap` gathers its pages in a `struct mmu_gather`, and it frees frames only after the flush.
+- `flush_tlb_mm_range` flushes one page at a time up to `tlb_single_page_flush_ceiling`, which is 33 by default. Beyond this, it flushes the whole TLB.
+
+The count of shootdowns is in `/proc/interrupts`, on the line named TLB. Recent AMD CPUs add `INVLPGB`, a broadcast invalidate, which can remove the IPI.
+
+## Connect
+
+- [Paging and page tables](/os/vm/paging-and-page-tables) shows what the walker reads.
+- [Huge pages](/os/vm/huge-pages) increase reach by a factor of 512.
+- [Cache organization](/architecture/caches/cache-organization-and-access-patterns) explains sets and ways, which work the same here.
+- [Cache-friendly code](/performance/memory/cache-friendly-code) shows the cost of pointer chasing from the cache side.
+- [Virtual machines and hypervisors](/os/isolation/virtual-machines-and-hypervisors) explains the two page tables behind nested paging.
+- [Buffer pools](/databases/storage/buffer-pools) explains why shootdowns limit mmap as a database cache.
+
+<Recall cards={[
+  { q: "What is TLB reach, and what is it for 1,536 entries of 4 KiB?", a: "Entries times page size: the memory that the TLB can map without a miss. Here it is 6 MiB." },
+  { q: "Why can a TLB miss cost 24 memory reads in a virtual machine?", a: "Each of the 4 guest table reads and the final guest address need a 4-level host walk: 5 times 5, minus the data read." },
+  { q: "What problem do PCIDs solve?", a: "They tag TLB entries with an address space, so a context switch does not need to flush the TLB." },
+  { q: "Why must munmap wait for other cores before it frees a frame?", a: "Another core may hold a stale translation. If the frame is reused, that core can read or write another process's memory." },
+  { q: "Why is a shootdown more expensive than its sender's wait suggests?", a: "Each target core stops its work for an interrupt, and a full flush adds TLB misses later. The total grows with the core count." },
+  { q: "A loop reads one more page than a fully associative LRU TLB holds. What is the hit rate, and why?", a: "0%. LRU always evicts the page that the loop needs next." },
+]} />

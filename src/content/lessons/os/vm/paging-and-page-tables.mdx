@@ -1,0 +1,153 @@
+---
+summary: "Pages, frames and the radix page table: why a flat table is too large, the x86-64 4-level walk, 5-level paging, PTE bits, CR3, and what tables cost for sparse and dense mappings. With arm64 granules and the 16 KiB pages of Apple Silicon."
+---
+import { VmPageWalkDemo, VmPageTable3DDemo, VmTableCostDemo } from "@/demos/os/VmPagingDemos";
+import { VmTable } from "@/demos/os/VmUi";
+
+Paging divides virtual memory into fixed-size **pages** and physical memory into **frames** of the same size. On x86-64 the base size is 4 KiB. An address has two parts. The low 12 bits are the **offset** in the page, and the CPU does not translate them. The rest is the **virtual page number**. A **page table** maps each virtual page number to a frame.
+
+The hardware reads this table itself, with a unit called the **page walker**. The kernel only writes the table. The table lives in ordinary memory, so each translation can cost several memory reads.
+
+<Predict
+  id="walk-reads"
+  question="A program reads one byte, and the TLB does not hold the translation. How many memory reads does the CPU do on x86-64 with 4-level paging?"
+  options={["1: the page table is one array", "4 reads for the walk, and then 1 read for the byte", "48: one for each address bit"]}
+  answer={1}
+  explain="The table is a tree with 4 levels. Each level needs one read of one 8-byte entry. Only then does the CPU know the frame, and it can read the byte. The next lesson shows why this rarely happens."
+>
+<VmPageWalkDemo />
+</Predict>
+
+Things to try:
+
+1. Press **Next read** four times. Each read adds an index times 8 to the base of a table. The bit strip shows where each index comes from.
+2. Drag the **PT index** slider. The first three levels do not change: neighbouring pages share them. Press **All**: most values have no leaf.
+3. Press **2 MiB page**, then **All**. The walk stops after 3 reads, because the PD entry has the PS bit.
+4. Press **code** and select **Write**. The walk finishes, but the leaf has no RW bit. Read the error code. Click the **RW** bit and try again.
+5. Press **0x8000_0000_0000**. It is not canonical, so no read happens. Select **5 levels** and press it again. The address is now canonical, and the walk ends at an empty entry.
+
+## Why a flat table fails
+
+The simplest table is one array with one entry per virtual page.
+
+<Steps>
+<div>A 48-bit address space with 4 KiB pages has $2^{48-12} = 2^{36}$ virtual pages.</div>
+<div>Each entry takes 8 bytes, so the array takes $2^{36} \times 8 = 2^{39}$ bytes. This is 512 GiB, for each process.</div>
+<div>The array must exist in full, because the hardware finds an entry by indexing. Even a process with one page would need all of it.</div>
+<div>A 32-bit system with 4-byte entries needs only $2^{20} \times 4$ bytes, which is 4 MiB. Flat tables were a real choice then. They are not now.</div>
+</Steps>
+
+Programs use a very small part of this range, with large gaps. A sparse structure fits this better.
+
+## The radix tree
+
+The fix is a **radix tree**. A table is one page, and it holds $4096 / 8 = 512$ entries, so one level consumes 9 bits. Four levels give $9 + 9 + 9 + 9 + 12 = 48$ bits. A table exists only if something below it is mapped. One empty entry at the top removes 512 GiB of address range, and it needs no tables below it.
+
+<VmTable head={["Level", "Intel name", "Linux name", "One entry maps", "Bits of the address"]} rows={[
+  ["1", "PML4", "`pgd`", "512 GiB", "47 to 39"],
+  ["2", "PDPT", "`pud`", "1 GiB", "38 to 30"],
+  ["3", "PD", "`pmd`", "2 MiB", "29 to 21"],
+  ["4", "PT", "`pte`", "4 KiB", "20 to 12"],
+]} />
+
+Linux has a generic fifth level, `p4d`, which folds away on a 4-level system. **CR3** is the register that holds the physical address of the top table. A context switch to another process writes CR3, and this switches the whole address space. Each entry holds a physical frame number, not a virtual address. The walker has no translation for its own reads, so physical addresses are the only choice.
+
+This is the walk, in Rust. The real one is hardware:
+
+```rust
+fn walk(cr3: u64, va: u64, phys: &[u64]) -> Result<u64, Fault> {
+    let mut table = cr3 & ADDR_MASK;
+    for level in (0..4).rev() {
+        let shift = 12 + 9 * level;
+        let index = (va >> shift) & 0x1ff;
+        let entry = phys[((table + index * 8) / 8) as usize];   // one memory read
+        if entry & P == 0 { return Err(Fault::NotPresent { level }); }
+        if level == 0 || entry & PS != 0 {                      // a leaf: 4 KiB, 2 MiB or 1 GiB
+            let mask = (1u64 << shift) - 1;
+            return Ok((entry & ADDR_MASK & !mask) | (va & mask));
+        }
+        table = entry & ADDR_MASK;
+    }
+    unreachable!()
+}
+```
+
+## Entry bits
+
+A leaf entry holds a frame number and these bits:
+
+<VmTable head={["Bit", "Name", "Meaning"]} rows={[
+  ["0", "P (present)", "The entry is valid. If it is clear, the CPU raises a page fault, and the other bits belong to the kernel."],
+  ["1", "RW (writable)", "Writes are allowed."],
+  ["2", "US (user)", "User mode can use the page."],
+  ["5", "A (accessed)", "The CPU sets it on use. Page replacement reads and clears it."],
+  ["6", "D (dirty)", "The CPU sets it on a write. The kernel must save the page before it reuses the frame."],
+  ["7", "PS (page size)", "In a PD or PDPT entry: this entry is a leaf, not a link to a table."],
+  ["8", "G (global)", "The translation stays in the TLB across a CR3 write. The kernel uses it for its own pages."],
+  ["63", "NX (no execute)", "An instruction fetch from this page raises a page fault."],
+]} />
+
+Rights combine along the path. The walker takes the AND of RW and US across all levels, and the OR of NX. Linux therefore keeps the upper levels permissive and sets the real rights in the leaf.
+
+## Most of the tree does not exist
+
+Now look at the tree itself. This view uses a real table from the simulator. A plate is one table, and a small block is one used entry.
+
+<VmPageTable3DDemo />
+
+1. Keep **A small process**. A few plates exist at each level, and each plate has only a few used entries. Read the table below the view: far fewer tables exist than could.
+2. Move the slider and watch the red path. It takes one entry from each layer. It is the same walk as the stepper above.
+3. Select **One page**. One plate exists at each level: 4 tables, which is 16 KiB, to map 4 KiB.
+4. Select **32 MiB, dense**. The PT plates are full, and each PT is shared by 512 pages. The cost per page is small.
+5. Select **64 pages, 1 GiB apart**. Each page has its own PD and its own PT. This is the worst pattern: the pages share nothing below the PDPT.
+
+## What tables cost
+
+<Predict
+  id="sparse-cost"
+  question="A process maps 1 GiB with 4 KiB pages, but only 1 page in each 2 MiB. How much table memory does it need?"
+  options={["About 2 MiB, the same as for 1 GiB of dense pages", "About 1 GiB: as much as the data", "512 GiB, the same as a flat table"]}
+  answer={1}
+  explain="Each page sits alone in its own PT, and a PT costs 4 KiB. So the tables take as much memory as the data: 1 GiB, or 100.2% of it. The address range is 512 GiB here, and the tables are still far smaller than a flat table for 48 bits."
+>
+<VmTableCostDemo />
+</Predict>
+
+1. Keep 1 GiB. Dense pages cost 2.01 MiB of tables, which is 0.20% of the data. Sparse pages cost 1 GiB.
+2. Select **2 MiB pages**. The dense line falls: 1 GiB now needs 3 tables, which is 12 KiB. The leaf level has gone.
+3. Drag the slider to the smallest values. All lines meet at 16 KiB. Tables have a minimum cost, whatever the pattern.
+
+A very sparse pattern, with 1 page per 1 GiB, costs 2 GiB of tables for 1 GiB of data, or 200%. A completely full tree costs a little more than a flat table: 513 GiB against 512 GiB. The tree wins because real programs do not fill it. It loses only in the worst case, and only by about 0.2%.
+
+Linux reports this memory. `VmPTE` in `/proc/<pid>/status` is the cost for one process, and `PageTables` in `/proc/meminfo` is the system total. The kernel frees tables on `munmap`, in `free_pgtables`. `MADV_DONTNEED` clears the PTEs and usually keeps the tables.
+
+A large shared memory region, mapped by many processes, has one set of tables per process. This is a real cost for databases with many connections. Huge pages reduce it, as [the last lesson](/os/vm/huge-pages) shows.
+
+## Five levels
+
+48 bits limit a machine to 256 TiB of virtual range. **5-level paging (LA57)** adds one more level of 9 bits, for 57 bits and 128 PiB. The CR4.LA57 bit turns it on. Each walk then has 5 reads. Linux keeps ordinary programs in the lower 47 bits, because some programs hide tags in the top bits of pointers. A program gets a higher address only if it passes a high hint to `mmap`.
+
+## arm64 and Apple Silicon
+
+<Callout title="Granules">
+arm64 can use a page size of 4 KiB, 16 KiB or 64 KiB. This is the **granule**. A table is still one page of 8-byte entries, so a larger page gives more bits per level. A 16 KiB granule has 2,048 entries per table, which is 11 bits. Three levels then cover 47 bits, and the first block size is 32 MiB. A 64 KiB granule has 8,192 entries, and its first block is 512 MiB. arm64 also has two table roots, TTBR0 and TTBR1, for the low and high halves.
+</Callout>
+
+macOS on Apple Silicon uses 16 KiB pages. Run `getconf PAGESIZE` on your Mac: a native process sees 16384. Code that assumes 4096 can break there. Ask the system instead, with `sysconf(_SC_PAGESIZE)` in C or `std.heap.pageSize()` in Zig. An `mmap` length or a guard page that is computed from a fixed 4096 is a common bug.
+
+## Connect
+
+- [The TLB](/os/vm/the-tlb) explains why walks are rare.
+- [Page faults](/os/vm/page-faults-and-demand-paging) start where the walk fails.
+- [Huge pages](/os/vm/huge-pages) use the PS bit to end the walk early.
+- [Protected mode and long mode](/os/kernel/protected-mode-and-long-mode) shows the first tables that a kernel builds.
+- [B-trees](/databases/btrees/b-trees) use the same idea: a wide tree, with one node per page.
+
+<Recall cards={[
+  { q: "Why does each level of an x86-64 page table use 9 bits?", a: "A table is one 4 KiB page of 8-byte entries, so it holds 512 entries, which 9 bits can index." },
+  { q: "How large is a flat table for 48-bit addresses with 4 KiB pages? Derive it.", a: "2^36 entries times 8 bytes is 2^39 bytes, which is 512 GiB for each process." },
+  { q: "What does CR3 hold, and why are the table links physical addresses?", a: "The physical address of the top table. The walker cannot use virtual addresses, because it is what translates them." },
+  { q: "How do access rights combine across the levels of a walk?", a: "RW and US are ANDed along the path, and NX is ORed. So every level must allow a write or a user access." },
+  { q: "Which mapping pattern makes page tables as large as the data, and why?", a: "One page per 2 MiB. Each page needs its own 4 KiB PT, so the table memory equals the data." },
+  { q: "What does a 16 KiB granule change on arm64?", a: "A table has 2,048 entries, so each level has 11 bits instead of 9. Three levels cover 47 bits." },
+]} />

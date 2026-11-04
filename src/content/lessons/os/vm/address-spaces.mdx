@@ -1,0 +1,139 @@
+---
+summary: "Why every process gets its own address space: the layout of a Linux x86-64 process, canonical addresses and the 47-bit limit, /proc/pid/maps, VMAs and ASLR, and the older designs that it replaced."
+---
+import { VmAddressMapDemo, VmProcMapsDemo, VmTwoProcessesDemo } from "@/demos/os/VmAddressDemos";
+import { VmTable } from "@/demos/os/VmUi";
+
+A program uses addresses, but those addresses do not name memory cells. They are **virtual addresses**. The CPU translates each one to a **physical address** on every load, store and instruction fetch. The operating system controls the translation. The set of virtual addresses that a process can use is its **address space**.
+
+Virtual memory gives three things:
+
+- **Isolation.** A process can only name memory that the kernel mapped for it. No address exists that reaches another process, unless the kernel mapped one.
+- **Relocation.** The linker and the program do not need to know where physical memory is free. Physical memory can also be scattered, while the program sees one contiguous range.
+- **Overcommit.** The kernel can promise more memory than it has. It allocates a physical frame only when the program first uses the page.
+
+<Predict
+  id="how-big"
+  question="Pointers on x86-64 are 64 bits wide. How much of that range can one process use with 4-level paging?"
+  options={["All of it: 16 EiB", "The lower half: 8 EiB", "128 TiB for user code, because only 48 bits are implemented"]}
+  answer={2}
+  explain="The CPU implements 48 bits. Bits 63 down to 47 must all be equal. This leaves 128 TiB at the bottom for user code and 128 TiB at the top for the kernel. Almost all of the 64-bit range cannot be named."
+>
+<VmAddressMapDemo />
+</Predict>
+
+Things to try:
+
+1. Hover over each band and read its size. Find the largest empty band in user space. It is much larger than everything that the program uses.
+2. Select **Linear, 48 bits**. The program image and the stack have a height far below one pixel. This is why the first view uses a log scale.
+3. Select **Linear, 64 bits**. The hole fills the whole bar, and the two usable halves disappear.
+4. Press **Run the program again** a few times. The program, the heap, the mmap area and the stack all move. The kernel half does not change in this view.
+
+## The layout of a process
+
+An x86-64 address has 64 bits, but with 4-level paging only the low 48 bits select a page. A **canonical** address has bits 63 to 47 all equal. This rule gives two usable ranges, each of 128 TiB. The range between them is about 16 EiB, and no address in it is valid. An access there raises a general protection fault, not a page fault. AMD chose this rule so that old programs could not hide data in the unused top bits and break when later CPUs implemented more bits.
+
+Linux uses the two ranges as follows:
+
+<VmTable head={["Range", "Size", "Use"]} rows={[
+  ["`0x0000_0000_0000_0000` to `0x0000_7fff_ffff_f000`", "128 TiB", "User space"],
+  ["`0xffff_8880_0000_0000`", "64 TiB", "Direct map of all physical memory"],
+  ["`0xffff_c900_0000_0000`", "32 TiB", "vmalloc and ioremap"],
+  ["`0xffff_ea00_0000_0000`", "1 TiB", "`struct page` array (vmemmap)"],
+  ["`0xffff_ffff_8000_0000`", "512 MiB", "Kernel text"],
+  ["`0xffff_ffff_a000_0000`", "1,520 MiB", "Kernel modules"],
+]} />
+
+The **direct map** is a simple idea. Every physical frame also has a kernel virtual address, at a fixed offset. The kernel can reach any frame by adding a constant. Page tables, as you will see, store physical addresses, so the kernel needs this.
+
+The kernel half is mapped in every process, but user mode cannot read it, because its pages have the user bit clear. After the Meltdown attack, Linux added **kernel page-table isolation (KPTI)** on affected CPUs. Each process then has a second set of tables for user mode, with only a small part of the kernel in it.
+
+User space grows from known points. A position-independent program loads near `0x5555_5555_4000`, which is two thirds of the way up the user range. The heap follows it and grows up. The **mmap area** starts below the stack and grows down: shared libraries, mapped files, thread stacks and large `malloc` blocks all go there. The stack starts near the top and grows down, by default up to 8 MiB.
+
+On a Mac, the idea is the same but the layout differs. A 64-bit Mach-O program has a `__PAGEZERO` segment of 4 GiB with no access, so that any truncated 32-bit pointer faults. System libraries come from one **dyld shared cache**, which is mapped once and shared by all processes.
+
+## Reading the map
+
+<VmProcMapsDemo />
+
+1. Click each line and read what it is. Count the lines for `libc.so.6`. One file has several mappings, because each part needs different rights.
+2. Press **Run it again**. Compare the first digits of the addresses. Then turn ASLR off, and the addresses stay the same on each run.
+3. Find `[heap]` and `[stack]`. Their inode is 0, because no file backs them.
+
+The real file is `/proc/<pid>/maps`, and `cat /proc/self/maps` shows the map of `cat` itself. It does not exist on macOS. Use `vmmap <pid>` there. Each line is one **VMA** (virtual memory area, `struct vm_area_struct` in the kernel): a range of pages with one set of rights and one backing store. The `struct mm_struct` of a process holds its VMAs. Linux stores them in a **maple tree** since version 6.1, and in a red-black tree before that.
+
+A VMA is only a promise. When a program calls `mmap`, the kernel creates a VMA and no more. It fills in translations later, when a [page fault](/os/vm/page-faults-and-demand-paging) arrives. This is why `mmap` of 1 GiB returns at once.
+
+You can look at your own layout with a few lines of Rust:
+
+```rust
+// Linux only: /proc does not exist on macOS.
+fn main() {
+    let on_stack = 0u8;
+    let on_heap = Box::new(0u8);
+    println!("code  {:p}", main as *const ());
+    println!("heap  {:p}", on_heap);
+    println!("stack {:p}", &on_stack);
+    print!("{}", std::fs::read_to_string("/proc/self/maps").unwrap());
+}
+```
+
+A Go program shows a different heap. On linux/amd64, the Go runtime asks for its heap near `0xc000000000`, so Go pointers often start with those digits. A `malloc` from C does not.
+
+## ASLR
+
+**Address space layout randomization (ASLR)** adds a random offset to each base when the program starts. An attacker who finds a memory bug then does not know where the useful code is. `/proc/sys/kernel/randomize_va_space` controls it: 0 is off, 1 randomizes the stack, mmap area and vDSO, and 2 also randomizes the heap.
+
+<VmTable head={["Base", "Random page bits", "Range"]} rows={[
+  ["mmap area and PIE base", "28 (kernel default, `mmap_rnd_bits`)", "1 TiB"],
+  ["Stack", "22", "16 GiB"],
+  ["Heap start", "13", "32 MiB"],
+]} />
+
+Some distributions raise `mmap_rnd_bits`.
+
+ASLR has limits. One leaked pointer reveals a whole library, because a library moves as one unit. A forked child also has the layout of its parent. A server that forks its workers therefore gives an attacker many tries against one layout. Debuggers turn ASLR off by default, so that addresses stay the same between runs. This is why you often see `0x5555_5555_4000` in `gdb`.
+
+## Same address, different memory
+
+<Predict
+  id="same-address"
+  question="Two processes run the same program with ASLR off, so their stacks use the same virtual address. Process A writes to its stack. What does process B read at that address?"
+  options={["The value that A wrote, because the address is the same", "Its own value, because each process has its own page table", "A fault, because two processes cannot use one address"]}
+  answer={1}
+  explain="An address means nothing without a page table. A and B have different page tables, so the same virtual address leads to different frames. The kernel can also do the opposite: map different virtual addresses to one frame, as it does for library code."
+>
+<VmTwoProcessesDemo />
+</Predict>
+
+1. Click **stack** in process A. The virtual address in B is the same, but the frame is different.
+2. Click **libc code**. Both lines reach one frame, marked ×2. All processes share one copy of the code.
+3. Turn on ASLR. The virtual addresses now differ, but the shared frames stay shared.
+4. Read the readouts. This model has 16 virtual pages but only 11 frames, so sharing saves 5 frames.
+
+Sharing is safe because these pages are read-only. A writable private page starts shared after `fork`, and [copy-on-write](/os/memory/copy-on-write) gives each process its own copy on the first write.
+
+## What came before
+
+**Base and bound** was the first design. The CPU holds two registers for the running process. It adds the base to each address, and it checks the address against the bound. This gives isolation and relocation with almost no hardware. However, each process needs one contiguous block of physical memory, and growth is hard. Free memory breaks into holes, which is **external fragmentation**.
+
+**Segmentation** gives each logical part its own base and bound: code, data and stack. Parts can now be placed apart, and code can be shared. The holes remain, because segments have different sizes. Long mode on x86-64 removed almost all of it. The CPU treats the CS, DS, ES and SS bases as 0 and does not check limits. Only the FS and GS bases still work, and thread-local storage uses them.
+
+**Paging** removes the holes, because all pieces have one size. Any free frame fits any page. The price is a table with one entry for each page. The next lesson shows how to keep that table small.
+
+## Connect
+
+- [Paging and page tables](/os/vm/paging-and-page-tables) shows how the translation works.
+- [Page faults and demand paging](/os/vm/page-faults-and-demand-paging) shows how a VMA becomes real memory.
+- [mmap](/os/memory/mmap) and [copy-on-write](/os/memory/copy-on-write) use these structures.
+- [Loading a program](/os/processes/loading-a-program-elf-and-the-dynamic-linker) explains who creates the first mappings.
+- [Fragmentation](/systems/allocators/fragmentation) explains the holes that base and bound suffers from.
+
+<Recall cards={[
+  { q: "What makes an x86-64 address canonical, with 4-level paging?", a: "Bits 63 to 47 are all equal. A non-canonical access raises a general protection fault, not a page fault." },
+  { q: "How much address space does a Linux x86-64 process have for user code, with 4-level paging, and why?", a: "128 TiB: half of the 256 TiB that 48 implemented bits can name. The kernel uses the other half." },
+  { q: "What is a VMA, and what does the kernel do when a program calls mmap?", a: "A range of pages with one set of rights and one backing store. mmap creates the VMA and fills in no translations." },
+  { q: "Why does the same virtual address in two processes usually reach different memory?", a: "Each process has its own page table. Translation depends on the address and on the table." },
+  { q: "Why does one leaked library pointer defeat ASLR for that library?", a: "ASLR moves the library as one unit. One known address gives the offset of every other address in it." },
+  { q: "Which problem of base and bound and of segmentation does paging remove?", a: "External fragmentation. All pieces have one size, so any free frame fits any page." },
+]} />

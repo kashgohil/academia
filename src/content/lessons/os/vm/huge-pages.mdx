@@ -1,0 +1,130 @@
+---
+summary: "2 MiB and 1 GiB pages and the TLB reach arithmetic behind them; hugetlbfs against Transparent Huge Pages; khugepaged, compaction, latency spikes and bloat; why databases often turn THP off; folios, mTHP and 16 KiB base pages."
+---
+import { VmReachCalcDemo, VmThpSimDemo } from "@/demos/os/VmHugeDemos";
+import { VmTable } from "@/demos/os/VmUi";
+
+A **huge page** is a page that one upper-level entry maps. On x86-64, a PD entry with the PS bit maps 2 MiB, and a PDPT entry with the PS bit maps 1 GiB. The walk ends early, with 3 reads or 2 reads instead of 4. The main gain, however, is in the TLB: one 2 MiB entry maps 512 times more memory.
+
+<Predict
+  id="reach-32g"
+  question="A database reads randomly through 32 GiB. The L2 TLB has 1,536 entries for 4 KiB and 2 MiB pages. With 2 MiB pages, what part of the working set can the TLB cover?"
+  options={["All of it: huge pages solve the problem", "About 9%", "About 0.02%"]}
+  answer={1}
+  explain="1,536 entries of 2 MiB give 3 GiB of reach, which is 9.4% of 32 GiB. The 4 KiB pages reach only 6 MiB, or 0.02%. This is 512 times better, but large memory still misses often. 1 GiB pages reach 16 GiB here, even with 16 entries."
+>
+<VmReachCalcDemo />
+</Predict>
+
+Things to try:
+
+1. Keep 32 GiB and read the coverage bars. Read the walk cost for each page size: 164.4, 62.7, 24.2 and 10.0 cycles per access in this model.
+2. Drag the working set down to about 16 GiB. The 1 GiB row reaches 100%. Its 16 entries just cover the set.
+3. Read **entries needed**. 32 GiB needs 8,388,608 PTEs at 4 KiB, or 64 MiB of leaf tables. At 2 MiB it needs 16,384 entries, or 128 KiB of tables.
+4. Compare 4 KiB with 16 KiB. The reach is 4 times larger, with no special handling. This is why 16 KiB base pages are attractive.
+
+These figures use the model inputs from [the TLB lesson](/os/vm/the-tlb), with the sizes of an Intel Skylake core.
+
+x86-64 has no 16 KiB page, so that row is a what-if.
+
+## Two ways to get them
+
+**hugetlbfs** is the explicit way. An administrator reserves a pool of huge pages, and programs map from it. The pool is set by `/proc/sys/vm/nr_hugepages`. Reserve the 1 GiB pool at boot, with `hugepagesz=1G hugepages=N` on the kernel command line. Later, 1 GiB of contiguous free memory is rare. These pages are not swapped, and a fault never needs compaction.
+
+```c
+void *p = mmap(NULL, 1UL << 30, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB, -1, 0);
+// MAP_FAILED if the pool does not have enough pages
+```
+
+The cost is planning. Reserved memory is unavailable for other uses, even if nobody maps it. PostgreSQL uses this way, with `huge_pages = try` by default for its shared memory, and it falls back to small pages if the pool is empty.
+
+**Transparent Huge Pages (THP)** is the automatic way. The kernel gives a program huge pages without any change to the program. Its controls are in `/sys/kernel/mm/transparent_hugepage/`:
+
+<VmTable head={["File", "Values", "Meaning"]} rows={[
+  ["`enabled`", "`always`, `madvise`, `never`", "For all anonymous memory, only for regions marked with `madvise(MADV_HUGEPAGE)`, or never."],
+  ["`defrag`", "`always`, `defer`, `defer+madvise`, `madvise`, `never`", "What a fault does when no free block exists."],
+  ["`khugepaged/pages_to_scan`", "4096 by default", "PTEs scanned per pass, which is 8 regions."],
+  ["`khugepaged/scan_sleep_millisecs`", "10000 by default", "The sleep between passes."],
+  ["`khugepaged/max_ptes_none`", "511 by default", "Empty PTEs allowed in a region that it collapses."],
+]} />
+
+A region must be aligned to 2 MiB and large enough. A program that opts in usually aligns its own block:
+
+```c
+size_t huge = 2UL << 20;
+char *raw = mmap(NULL, len + huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+char *p = (char *)(((uintptr_t)raw + huge - 1) & ~(huge - 1));
+madvise(p, len, MADV_HUGEPAGE);
+```
+
+Check the result in `AnonHugePages` in `/proc/meminfo`, or per mapping in `/proc/<pid>/smaps`. `thp_fault_alloc`, `thp_fault_fallback` and `compact_stall` in `/proc/vmstat` show how it went. These files do not exist on macOS.
+
+## Physical memory is the hard part
+
+A 2 MiB page needs 512 contiguous frames, aligned to 2 MiB. After a machine has run for a while, free memory is plentiful, but it is scattered in small holes. This is [fragmentation](/systems/allocators/fragmentation) at the page level.
+
+<Predict
+  id="direct-compaction"
+  question="Physical memory has no free 2 MiB block. A fault wants a huge page. Which policy gives the program its worst single fault?"
+  options={["Fall back to small pages: 512 faults instead of 1", "Direct compaction: the fault moves pages while the program waits", "Both are the same: the work must happen"]}
+  answer={1}
+  explain="Falling back spreads the cost, and each small fault stays short. Direct compaction does the work inside one fault. In this model the worst fault is 1,545 µs, against 100 µs when a block is free."
+>
+<VmThpSimDemo />
+</Predict>
+
+1. Press **Touch 8** three times, with **Fall back** selected. Free blocks serve the first 14 regions, as green squares. The last 10 regions fall back to scattered orange pages.
+2. Read **TLB entries needed**: 5,134. With THP off it would be 12,288, and with all huge pages it would be 24.
+3. Press **Run khugepaged** a few times. It finds free blocks, using compaction if it must, and it collapses orange pages into green squares. Read the two work counters: 2,890 pages moved, and 5,120 pages copied.
+4. Press **Reset** and select **Direct compaction**. Touch 24 regions. All are huge, but the latency plot shows the red spikes.
+5. Set the pinned blocks to 100% and touch 24 regions. After the free blocks run out, compaction fails. One pinned page ruins all 512 frames around it.
+6. Set **Pages touched per 2 MiB region** to 8, and touch 14 regions. RSS is 28 MiB for 448 KiB of use. This is the bloat.
+
+**Compaction** moves movable pages out of a block, so that the block becomes free. Each move must unmap the page, flush the TLB, copy the page, and map it again. `kcompactd` does this in the background. **Direct compaction** does it inside the fault, and the program waits. **Pinned** pages cannot move: kernel slab pages, DMA buffers and pages held by `mlock` or `get_user_pages` can all block a region.
+
+**khugepaged** is a kernel thread that fixes the fallback later. It scans a process, finds a 2 MiB range of small pages, allocates a huge page, copies the data, and replaces the PMD. This needs a write lock on the whole address space for part of the work, and a TLB flush. `MADV_COLLAPSE` asks for the same work directly.
+
+<VmTable head={["Case, 24 regions, model", "Worst fault", "All faults", "TLB entries"]} rows={[
+  ["THP off", "1 µs", "12.3 ms", "12,288"],
+  ["THP on, fall back", "100 µs", "6.5 ms", "5,134"],
+  ["THP on, direct compaction", "1,545 µs", "16.9 ms", "24"],
+]} />
+
+The model inputs are in `THP_COST`. A small fault costs 1 µs, and a huge fault costs 100 µs because the kernel must clear 2 MiB. Migrating one page costs 5 µs. Note the middle row. A huge fault is slower than a small fault, but it replaces 512 of them.
+
+## Why databases often turn THP off
+
+THP helps long-running compute with large dense heaps. Databases often have the opposite pattern:
+
+- **Latency spikes.** Direct compaction, and khugepaged holding locks, stop a thread at unpredictable times. A database cares about its slowest requests more than its mean.
+- **Memory bloat.** One touched byte makes 2 MiB resident. With 8 touched pages per region, the model uses 64 times more memory. The default `max_ptes_none` of 511 lets khugepaged do the same to a region with only one page in it. A sparse allocator can run out of memory this way.
+- **Write amplification after fork.** A copy-on-write fault on a huge page can copy 2 MiB instead of 4 KiB. Redis forks for its snapshots, and its documentation asks operators to turn THP off for this reason.
+- **Freed memory stays resident.** If an allocator frees part of a huge page, the kernel must first split the page before it can reclaim the rest.
+
+Advice differs by product and version, so read the current documentation for yours. MongoDB and Oracle have long advised turning THP off. MongoDB 8.0 changed this advice, because its new allocator handles huge pages well. A good middle setting is `enabled=madvise` with `defrag=madvise`: only programs that ask get huge pages, and only they pay for compaction.
+
+## Between 4 KiB and 2 MiB
+
+The jump from 4 KiB to 2 MiB is large. Recent systems fill the gap.
+
+**Folios** (Linux 5.16 and later) let the kernel treat a contiguous group of pages as one object. Much of its memory code then stops assuming one size. **Multi-size THP (mTHP)**, from Linux 6.8, uses them for anonymous memory. The THP folder gains controls such as `hugepages-64kB/enabled`. A 64 KiB block is far easier to find than a 2 MiB block, and it causes less bloat. On arm64, 16 PTEs that map 64 KiB of contiguous memory can set the **contiguous bit** and share one TLB entry.
+
+A **larger base page** is the other route. Apple Silicon uses 16 KiB pages under macOS, and Android 15 added support for them. Each entry reaches 4 times further, and all programs gain without compaction, because every page has this size. The costs are internal waste for small mappings, and software that assumes 4 KiB. The Linux controls above do not exist on macOS, so the base page is the main lever that you have there.
+
+## Connect
+
+- [The TLB](/os/vm/the-tlb) gives the reach arithmetic.
+- [Paging and page tables](/os/vm/paging-and-page-tables) shows the PS bit and how huge pages shrink the tables.
+- [The buddy allocator](/systems/allocators/buddy-allocator) is what supplies 2 MiB blocks in the kernel.
+- [Copy-on-write](/os/memory/copy-on-write) explains the cost of a fork with huge pages.
+- [Tail latency](/performance/systems/tail-latency) explains why rare spikes matter so much.
+
+<Recall cards={[
+  { q: "How much reach do 1,536 TLB entries give with 4 KiB pages and with 2 MiB pages?", a: "6 MiB and 3 GiB. The ratio is 512, the number of small pages in a huge page." },
+  { q: "What is the main practical difference between hugetlbfs and THP?", a: "hugetlbfs uses a reserved pool and the program asks for it. THP needs no reservation or program change, but it depends on free blocks and compaction." },
+  { q: "What does khugepaged do?", a: "It scans for 2 MiB ranges of small pages, allocates a huge page, copies the data into it, and replaces the mapping." },
+  { q: "Why can one pinned page ruin a 2 MiB block?", a: "Compaction cannot move a pinned page, so the block can never become fully free." },
+  { q: "Name two reasons why databases often turn THP off.", a: "Compaction and khugepaged cause latency spikes, and copy-on-write after fork can copy 2 MiB. Sparse use also causes memory bloat." },
+  { q: "Why do 16 KiB base pages help without compaction?", a: "Every page has this size, so no contiguous search is needed, and each TLB entry reaches 4 times further." },
+]} />

@@ -1,0 +1,165 @@
+---
+summary: "What happens when a walk fails: the error code, CR2, the VMA lookup, then a minor fault, a major fault or SIGSEGV. Demand zero, the zero page, file-backed faults, first touch, overcommit modes, fault cost, and how to count faults."
+---
+import { VmFaultPathDemo, VmDemandPagingDemo, VmFaultCostDemo, VmOvercommitDemo } from "@/demos/os/VmFaultDemos";
+import { VmTable } from "@/demos/os/VmUi";
+
+A **page fault** is an exception that the CPU raises when a walk cannot finish or the entry forbids the access. The word "fault" misleads. Most page faults are not errors. They are how the kernel builds an address space: it does nothing until a page is needed, and the fault tells it when.
+
+The hardware gives the kernel two facts. **CR2** holds the address that failed. The **error code** says why:
+
+<VmTable head={["Bit", "Name", "If set"]} rows={[
+  ["0", "P", "The page was present, so this is a rights violation. If clear, the page was not present."],
+  ["1", "W", "The access was a write."],
+  ["2", "U", "The access came from user mode."],
+  ["3", "RSVD", "An entry had a reserved bit set. This is a kernel bug or a corrupted table."],
+  ["4", "I", "The access was an instruction fetch."],
+]} />
+
+<Predict
+  id="readonly-write"
+  question="A program writes to a page. The VMA allows writes, but the PTE is read-only. What happens?"
+  options={["SIGSEGV: the PTE forbids the write", "The kernel handles the fault, and the program never knows", "The CPU ignores the PTE, because the VMA allows the write"]}
+  answer={1}
+  explain="The VMA says what the program may do. The PTE says what the hardware will allow now. If the VMA allows it, a read-only PTE is on purpose: copy-on-write or the zero page. The kernel fixes the PTE, and the instruction runs again."
+>
+<VmFaultPathDemo />
+</Predict>
+
+Things to try:
+
+1. Select the first page of **malloc block** and press **Read**. Press **Next decision** to follow each branch. The PTE now points at the zero page, and the resident count stays at 0.
+2. Press **Write** on the same page. This second fault goes through `do_wp_page`, and the page gets its own frame.
+3. Read a page of **libc code**. It is a minor fault, because another process already loaded it. Read a page of **program code**: it is a major fault, because it must come from disk.
+4. Write to **program code** and read the **guard page**. Both are `SEGV_ACCERR`, because a VMA exists but forbids the access. Press **NULL**, then **Read**: no VMA, so `SEGV_MAPERR`.
+5. Write to a heap page and press **Swap this page out**. The PTE is now not present, but it holds a swap slot. Read it again: a major fault.
+6. Press **Just below the stack**, then **Write**. The stack grows. Press **Far below the stack**, then **Write**: it is past the 8 MiB limit, and the process gets a signal.
+
+## The fault path
+
+On x86-64, the entry point is `exc_page_fault`. It calls `do_user_addr_fault` for a user address. Older kernels and many books call this `do_page_fault`. The path then has three decisions:
+
+1. **Is there a VMA?** The kernel looks up the address in the VMA tree. Since Linux 6.4, a common fault can do this under RCU with a per-VMA lock, without the `mmap_lock` of the whole process. If there is no VMA, the kernel checks for stack growth, and otherwise it sends `SIGSEGV` with `SEGV_MAPERR`.
+2. **Do the VMA rights allow this access?** If not, the kernel sends `SIGSEGV` with `SEGV_ACCERR`.
+3. **What does the PTE hold?** `handle_mm_fault` allocates missing tables, and `handle_pte_fault` chooses the handler.
+
+<VmTable head={["State of the PTE and VMA", "Handler", "Result"]} rows={[
+  ["Empty PTE, anonymous VMA, read", "`do_anonymous_page`", "Map the zero page. Minor."],
+  ["Empty PTE, anonymous VMA, write", "`do_anonymous_page`", "New zeroed frame. Minor."],
+  ["Empty PTE, file VMA, page in cache", "`do_fault`", "Map the cached page. Minor."],
+  ["Empty PTE, file VMA, page not in cache", "`do_fault`, `filemap_fault`", "Read from disk. Major."],
+  ["Swap entry in the PTE", "`do_swap_page`", "Read from swap. Major."],
+  ["Read-only PTE, writable VMA, a write", "`do_wp_page`", "Copy, or reuse if sole owner. Minor."],
+]} />
+
+A **minor fault** needs no I/O. A **major fault** blocks the thread on a disk read. After the handler returns, the CPU runs the same instruction again. The program sees only lost time.
+
+On macOS, the Mach `vm_fault` function plays this role. The ideas are the same: a map of regions, then a decision by the state of the page.
+
+## Demand paging
+
+<Predict
+  id="read-only-touch"
+  question="A program calls malloc for 16 MiB and then reads every page, without writing. How much does its resident memory grow?"
+  options={["16 MiB: each page was touched", "Almost nothing: every page maps one shared zero page", "8 MiB: the kernel maps half of them"]}
+  answer={1}
+  explain="Each read takes a minor fault, but the kernel maps the same read-only page of zeros every time. RSS does not count that page. Only the page tables grow: 44 KiB in this model."
+>
+<VmDemandPagingDemo />
+</Predict>
+
+1. Press **Play** with **Writes each page**. Resident memory follows the touches in a straight line: 16 MiB takes 4,096 faults.
+2. Select **Only reads each page** and press **Play**. The fault count is the same, but resident size stays at 0. The grey cells all share one frame.
+3. Select **Reads, then writes**. Each page now faults twice. Reading first made the total work larger, not smaller: 8,192 faults.
+4. Read **page tables**. Memory that nobody wrote still needs a table, 44 KiB here.
+
+**Demand zero** is the rule for anonymous memory: a new page reads as zero. The kernel must clear the frame, because it may hold data from another process. Clearing costs time, so the kernel delays it until the first write. Until then, reads use one global frame of zeros, the **zero page**.
+
+This explains a useful trick. `vec![0u8; n]` in Rust calls `alloc_zeroed`, which can take fresh pages from `mmap`. No loop runs, and no page is touched:
+
+```rust
+let a = vec![0u8; 1 << 30];  // returns quickly: fresh pages already read as zero
+let b = vec![1u8; 1 << 30];  // touches every page: about 262,144 faults
+```
+
+The same is true of `calloc` for a large block in C. The glibc allocator serves a large request with its own `mmap`. The threshold is 128 KiB by default.
+
+**File-backed faults** read from the **page cache**. If the page is there, the fault is minor. For a read, Linux also maps nearby cached pages, up to 64 KiB by default (`fault_around_bytes`). This avoids up to 15 more faults. A private mapping that takes a write gets a copy, so the file does not change. A shared mapping maps the cached page itself, and the page becomes dirty.
+
+**First touch** decides more than time. On a NUMA machine, the default policy allocates the frame on the node of the CPU that first touches it. A program that initializes all of its memory on one thread therefore puts it all on one node. Later reads from other sockets pay the [remote cost](/architecture/multicore/numa).
+
+A program that cannot accept fault latency can take the faults early. `MAP_POPULATE`, `MADV_POPULATE_WRITE` and `mlock` all fault pages in before the critical part starts.
+
+## What a fault costs
+
+<VmFaultCostDemo />
+
+1. Keep NVMe and move the slider. The average stays near DRAM until the rate nears 1 in 10,000.
+2. Select **Hard disk**. Now 1 fault in 800,000 accesses adds 10%.
+3. Compare the two model costs in the readouts. One major fault costs as much as 100 minor faults on NVMe.
+
+These are the model inputs, in `FAULT_COST_NS` and `DEVICE_NS`:
+
+<VmTable head={["Event", "Model input"]} rows={[
+  ["DRAM access", "100 ns"],
+  ["Minor fault, zero page", "0.5 µs"],
+  ["Minor fault, new frame", "1 µs"],
+  ["Minor fault, copy on write", "1.5 µs"],
+  ["Major fault, NVMe SSD", "100 µs"],
+  ["Major fault, SATA SSD", "200 µs"],
+  ["Major fault, hard disk", "8 ms"],
+]} />
+
+Real values depend on the CPU and the mitigations. With these inputs, a new 16 MiB block takes about 4.1 ms of faults. The first request after a deploy pays this time. The average access time is $(1-p) \cdot t_{\text{DRAM}} + p \cdot (t_{\text{device}} + t_{\text{DRAM}})$.
+
+To count faults:
+
+```c
+struct rusage r;
+getrusage(RUSAGE_SELF, &r);
+printf("minor %ld major %ld\n", r.ru_minflt, r.ru_majflt);
+```
+
+```sh
+perf stat -e minor-faults,major-faults ./app   # Linux
+/usr/bin/time -v ./app                         # Linux: GNU time
+/usr/bin/time -l ./app                         # macOS: prints page reclaims and page faults
+```
+
+Fields 10 and 12 of `/proc/<pid>/stat` hold the same two counters on Linux.
+
+## Overcommit
+
+Because allocation is lazy, the kernel can promise more than it has. `vm.overcommit_memory` sets the policy:
+
+<VmOvercommitDemo />
+
+1. Keep mode 0 and lower the request to 20 GiB. It passes, although 12 GiB is already committed. Mode 0 looks at one request only.
+2. Select mode 2. The limit is now swap plus half of RAM: 12 GiB here. Requests that mode 0 allowed now fail.
+3. Select mode 1. Everything passes, even 128 GiB.
+
+<VmTable head={["Mode", "Name", "Rule"]} rows={[
+  ["0", "Heuristic (default)", "Refuse only an obvious overcommit: one request larger than RAM plus swap."],
+  ["1", "Always", "Never refuse."],
+  ["2", "Never", "Refuse if the total commitment passes `CommitLimit`."],
+]} />
+
+`CommitLimit` is swap plus RAM times `vm.overcommit_ratio` percent, and the ratio is 50 by default. `/proc/meminfo` shows `CommitLimit` and `Committed_AS`. In modes 0 and 1, `malloc` almost never fails. The failure comes later, at a page fault, when no frame is left. The kernel cannot return an error from a load instruction, so it starts [the OOM killer](/os/memory/swapping-and-the-oom-killer). Check the return value of `malloc` anyway, but do not expect it to save you.
+
+## Connect
+
+- [Paging and page tables](/os/vm/paging-and-page-tables) shows where the walk fails.
+- [Copy-on-write](/os/memory/copy-on-write) is the main user of write-protect faults.
+- [mmap](/os/memory/mmap) and [the page cache](/os/fs/the-page-cache-and-writeback) explain file-backed faults.
+- [Page replacement](/os/memory/page-replacement) decides which pages go out, so that a major fault can bring others in.
+- [Signals](/os/ipc/signals) explains what SIGSEGV does to a process.
+- [Interrupt handling](/os/kernel/interrupt-handling) shows how the CPU enters the kernel.
+
+<Recall cards={[
+  { q: "What two facts does the CPU give the kernel on a page fault on x86-64?", a: "CR2 holds the address, and the error code says present or not, read or write, user or kernel, and instruction fetch or not." },
+  { q: "What is the difference between SEGV_MAPERR and SEGV_ACCERR?", a: "MAPERR means no VMA covers the address. ACCERR means a VMA covers it but forbids this access." },
+  { q: "What separates a minor fault from a major fault?", a: "A major fault needs disk I/O, so the thread blocks. A minor fault is served from memory." },
+  { q: "Why does reading untouched anonymous memory not increase RSS?", a: "The kernel maps one shared read-only zero page. RSS does not count it." },
+  { q: "What does vm.overcommit_memory = 2 enforce?", a: "Total commitment must stay under CommitLimit, which is swap plus RAM times overcommit_ratio percent." },
+  { q: "Why does first touch matter on a NUMA machine?", a: "By default the frame comes from the node of the CPU that first touches the page. One initializing thread can put all data on one node." },
+]} />

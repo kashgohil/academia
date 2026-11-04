@@ -1,31 +1,47 @@
 ---
-summary: Free memory in bulk once every thread has moved past the epoch in which it was retired. Cheap reads, but one stalled thread blocks everything.
+summary: Free memory in batches after every thread has moved past the epoch of the removal. Reads are cheap, but one stalled thread stops all reclamation.
 ---
 import { LockFreeStepper } from "@/demos/LockFreeStepper";
 import { StressDemo, StallDemo } from "@/demos/LockFreeStress";
+import { EpochRingDemo } from "@/demos/LockFreeExtrasDemos";
 import { EBR, EBR_SCRIPTS, STRESS_EBR } from "@/demos/lockfreeConfigs";
 
-Hazard pointers protect individual nodes. **Epoch-based reclamation** (EBR, Keir Fraser, 2004) protects *time periods* instead. A global counter, the **epoch**, advances slowly. A thread entering an operation **pins** itself: it announces "I'm active in epoch e". Nodes retired in epoch e go into a bag labelled e. The epoch can only advance when every active thread has announced the current one. Once the global epoch is e + 2, nobody can still hold a pointer obtained in epoch e, so that bag is freed in one go.
+Hazard pointers protect single nodes. **Epoch-based reclamation** (EBR, Keir Fraser, 2004) protects *periods of time* instead. A global counter, the **epoch**, advances slowly. When a thread starts an operation, it **pins** itself: it announces "I am active in epoch e". When the operation ends, the thread unpins.
+
+A thread that removes a node puts it on the **limbo list** of the current global epoch. A limbo list holds removed nodes that wait to be freed. The global epoch can move from e to e + 1 only when every pinned thread announced e. When the global epoch reaches e + 2, every pinned thread pinned after the removal. So no thread can hold a node from the list of epoch e, and the whole list is freed in one batch.
+
+Three limbo lists are enough. Only the lists of the current and the previous epoch hold nodes. The third list was freed when the epoch last moved, and it becomes the list of the next epoch.
 
 <Predict
   id="stall"
-  question="One thread pins itself, starts a pop, and is then descheduled indefinitely. Other threads keep pushing and popping. What happens to unreclaimed memory under EBR?"
-  options={["It stays bounded, as with hazard pointers", "It grows without bound until the stalled thread unpins", "It is freed anyway after a timeout"]}
+  question="One thread pins itself and starts a pop. Then the operating system stops it for a long time. The other threads continue to push and pop. What happens to the memory that waits to be freed under EBR?"
+  options={["It stays bounded, as with hazard pointers", "It grows without limit until the stalled thread unpins", "A timeout frees it anyway"]}
   answer={1}
-  explain="The stalled thread is still active in an old epoch, so the global epoch can never advance two steps past it. Every node retired from then on waits, and memory grows like a leak. Hazard pointers only hold the few nodes the stalled thread actually announced."
+  explain="The stalled thread is still pinned in an old epoch. So the global epoch can never move two steps past it. Every node that is retired after that waits, and memory grows like a leak. Hazard pointers hold only the few nodes that the stalled thread announced."
 >
 <StallDemo />
 </Predict>
 
-The plot replays the same workload under three schemes, with T0 stalled after pinning or protecting. **Never free** grows linearly. **Epoch-based** tracks it exactly, because no bag can be freed. **Hazard pointers** stay under a handful of nodes.
+The plot replays the same workload under three schemes. T0 stalls after it pins or protects. **Never free** grows in a straight line. **Epoch-based** follows it exactly, because no list can be freed. **Hazard pointers** stay at 8 nodes or fewer.
+
+## Watch the epochs
+
+<EpochRingDemo />
+
+1. Watch the arrow in the center: it points to the global epoch. The epoch moves only when every pinned thread announced the current epoch. One thread in the previous sector holds it back.
+2. Watch a sector when the epoch moves two steps past it. Its nodes are freed in one batch. With 4 threads, at most 9 nodes wait during this run.
+3. Turn on **T0 stalls while pinned**. The global epoch reaches 1 and stops there. No node is ever freed, and after 300 steps, 99 nodes wait.
+4. Change the number of threads. More threads must catch up before each move, so more nodes wait. With 2 threads, at most 5 nodes wait. With 6 threads, at most 16 nodes wait.
 
 ## Step through it
 
+In this stepper, each thread keeps its own three bags. A bag is a limbo list that belongs to one thread.
+
 <LockFreeStepper title="Treiber stack with epoch-based reclamation" scenario={EBR} scripts={EBR_SCRIPTS} scheme="epoch" />
 
-1. Run **T0 pinned while T1 retires three nodes**. T1's attempts to advance the epoch fail at `check T0's epoch`, and its bags fill up.
-2. Reset, run T0's whole pop first, then T1's three pops. With nobody pinned in an old epoch, T1's advance attempts succeed and the global epoch reaches 2. The bags still aren't freed by the end: a bag is emptied only when its owner next pins two epochs later. EBR frees lazily, in batches.
-3. Count the steps per operation and compare with hazard pointers: pin, unpin and occasional advance attempts, but **no fence per node visited**.
+1. Run **T0 pinned while T1 retires three nodes**. The first advance succeeds, because T0 announced the current epoch 0. The next attempt stops at `check T0's epoch`, because T0 is still in epoch 0. The global epoch stays at 1, and the three nodes of T1 stay in its bags.
+2. Reset. Run the whole pop of T0 first, then the three pops of T1. No thread is pinned in an old epoch, so the advance attempts of T1 succeed, and the global epoch reaches 2. The bags are still not freed at the end. A thread frees its old bags only when it pins again in a later epoch.
+3. Count the steps for each operation, and compare them with hazard pointers. There is a pin, an unpin and sometimes an attempt to advance. There is **no fence for each node** that the thread visits.
 
 ## Correctness and cost
 
@@ -33,17 +49,20 @@ The plot replays the same workload under three schemes, with T0 stalled after pi
 
 | | Hazard pointers | Epoch-based |
 |---|---|---|
-| Read-side cost | store + fence per protected pointer | one announcement per *operation* |
-| Long traversals | expensive | cheap: any number of nodes inside one pin |
-| Unreclaimed memory | bounded | unbounded if a thread stalls while pinned |
-| Freeing | per-node scans | in bulk, by epoch |
+| Cost for readers | a store and a fence for each protected pointer | one announcement for each *operation* |
+| Long traversals | expensive | cheap: one pin covers any number of nodes |
+| Memory that waits | bounded | unbounded if a thread stalls while pinned |
+| Freeing | scans for each thread | in batches, by epoch |
 
-That trade-off decides most real choices. EBR suits data structures where operations are short and threads don't block inside them: crossbeam-epoch underlies Rust's crossbeam channels and maps. Linux's RCU is the same idea, with "quiescent states" (a context switch means a CPU holds no RCU-protected pointers) instead of explicit epochs. Hazard pointers suit long-lived readers and systems that must bound memory. Hybrids exist (hazard eras, interval-based reclamation) to get EBR's speed with bounded memory.
+This trade-off decides most real choices. EBR suits data structures with short operations, where threads do not block inside an operation. In Rust, the crossbeam-epoch crate is the base of crossbeam-deque, which Rayon uses, and of crossbeam-skiplist. Linux RCU uses the same idea with **quiescent states** instead of explicit epochs. A context switch is a quiescent state: after it, a CPU holds no pointers that RCU protects.
+
+Hazard pointers suit long-lived readers and systems that must limit memory. Hybrid schemes, such as hazard eras and interval-based reclamation, try to get the speed of EBR with bounded memory.
 
 <Recall cards={[
-  { q: "When can EBR free nodes retired in epoch e?", a: "Once the global epoch reaches e + 2: every active thread has since pinned in a later epoch, so none can hold those nodes." },
-  { q: "What blocks the epoch from advancing?", a: "Any thread still active (pinned) in an older epoch." },
-  { q: "EBR's main weakness?", a: "A thread stalled while pinned prevents all reclamation, so memory grows without bound." },
-  { q: "Why is EBR cheaper than hazard pointers for traversals?", a: "One pin covers any number of node accesses; there is no per-pointer publish and fence." },
-  { q: "How does Linux RCU relate to EBR?", a: "Same grace-period idea, but it detects quiescent states (e.g. context switches) instead of explicit epoch announcements." },
+  { q: "When can EBR free the nodes on the limbo list of epoch e?", a: "When the global epoch reaches e + 2. Then every pinned thread pinned after the removal, so no thread can hold those nodes." },
+  { q: "What stops the global epoch from advancing?", a: "A thread that is still pinned in an older epoch." },
+  { q: "Why are three limbo lists enough?", a: "Only the lists of the current and the previous epoch hold nodes. The third list was freed at the last advance and becomes the list of the next epoch." },
+  { q: "What is the main weakness of EBR?", a: "A thread that stalls while pinned stops all reclamation, so memory grows without limit." },
+  { q: "Why is EBR cheaper than hazard pointers for traversals?", a: "One pin covers any number of node accesses. There is no write and fence for each pointer." },
+  { q: "How does Linux RCU relate to EBR?", a: "It uses the same grace-period idea, but it detects quiescent states, such as context switches, instead of explicit epoch announcements." },
 ]} />

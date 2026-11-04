@@ -1,60 +1,79 @@
 ---
-summary: A lock-free FIFO with a dummy node and a tail pointer that's allowed to lag, kept consistent by threads helping each other.
+summary: A lock-free FIFO queue with a dummy node and a tail pointer that can lag, kept consistent by threads that help each other.
 ---
 import { LockFreeStepper } from "@/demos/LockFreeStepper";
 import { StressDemo } from "@/demos/LockFreeStress";
+import { MsqTailDemo, MsqLagDemo } from "@/demos/LockFreeExtrasDemos";
 import { MSQ, MSQ_SCRIPTS, STRESS_MSQ } from "@/demos/lockfreeConfigs";
 
-A queue needs two ends, so a lock-free queue must coordinate two pointers with single-word CAS. Maged Michael and Michael Scott's design (1996), used in Java's `ConcurrentLinkedQueue` and many others, does it with two ideas:
+A queue has two ends, so a lock-free queue must keep two pointers consistent. But a CAS changes only one word at a time. Maged Michael and Michael Scott published a solution in 1996. Java's `ConcurrentLinkedQueue` and many other queues use it. The design has two ideas:
 
-- **A dummy node.** `head` always points to a node whose value has already been consumed. The first real element is `head.next`. Enqueue and dequeue never touch the same pointer, even when the queue has one element.
-- **A lagging tail, plus helping.** Enqueue takes *two* CASes: link the new node after the last node, then swing `tail` to it. Another thread can run between them and find `tail` pointing at a node whose `next` isn't null. Instead of waiting, it **helps**: it swings `tail` forward itself, then carries on.
+- **A dummy node.** `head` always points to a node whose value was already taken. The first real element is `head.next`. So enqueue and dequeue never change the same pointer, even when the queue holds one element.
+- **A lagging tail, plus helping.** An enqueue needs *two* CAS operations. The first CAS links the new node after the last node. The second CAS moves `tail` to the new node. Another thread can run between them and find that `tail.next` is not null. That thread does not wait: it **helps**, which means that it moves `tail` forward itself and then continues.
 
 <Predict
   id="help"
-  question="T0 has linked its node after the last node, but stalls before swinging tail. T1 now enqueues: it reads tail, then tail.next, which isn't null. What does T1 do?"
+  question="T0 linked its node after the last node, but it stalls before it moves tail. Now T1 starts an enqueue. It reads tail, then tail.next, which is not null. What does T1 do?"
   options={[
-    "Waits for T0 to swing tail",
-    "Swings tail forward itself (helping), then retries its own enqueue",
-    "Links its node after the stale tail, overwriting T0's node",
+    "It waits until T0 moves tail",
+    "It moves tail forward itself (helping), then tries its own enqueue again",
+    "It links its node after the old tail and overwrites the node of T0",
   ]}
   answer={1}
-  explain="A non-null tail.next means some enqueue is halfway done. Waiting would make the queue blocking, so T1 completes T0's second step with a CAS on tail and retries. When T0 resumes, its own tail CAS simply fails, which is fine."
+  explain="If tail.next is not null, an enqueue is half done. If T1 waited, the queue would be blocking. So T1 does the second step of T0 with a CAS on tail, and then it tries again. When T0 continues, its own CAS on tail fails, and that is correct."
 >
 <LockFreeStepper title="Michael–Scott queue" scenario={MSQ} scripts={MSQ_SCRIPTS} schemes={["leak", "hazard", "epoch"]} />
 </Predict>
 
-1. Run **T0 links its node, then stalls before swinging tail**. In the log T1 performs `help: swing lagging tail`, then its own enqueue. T2 dequeues 1, then 10.
-2. Reset and step a dequeue by hand. The value is read from `head.next`, and the old dummy is retired: the node whose value was just taken becomes the new dummy.
-3. Step a dequeue on a queue whose `head == tail` while an enqueue is half done. The dequeuer helps swing `tail` before it can proceed, so `head` never overtakes `tail`.
+1. Run **T0 links its node, then stalls before swinging tail**. In the log, T1 does `help: swing lagging tail`, and then its own enqueue. T2 dequeues 1, then 10.
+2. Reset and step a dequeue yourself. The value comes from `head.next`, and the old dummy is retired. The node whose value was just taken becomes the new dummy.
+3. Step a dequeue while `head == tail` and an enqueue is half done. The dequeuer first helps to move `tail`, and only then can it continue. So `head` never passes `tail`.
+
+## Watch the tail lag
+
+<MsqTailDemo />
+
+1. Keep **Enqueuer stalls**. T0 links C, but tail stays on B. The tail label turns red: tail is 1 node behind. T1 moves tail to C and then does its own enqueue. Later, the tail CAS of T0 fails, and the queue is still correct.
+2. Select **Dequeuer helps**. The queue is empty, and T0 stalls after its link. T1 wants to dequeue, but head and tail both point to the dummy. T1 first moves tail and then takes 10, so head never passes tail.
+3. Select **No stall**. Each enqueue does its two CAS operations one after the other. Tail is behind only between them, and no thread helps.
+4. Watch the old dummy nodes. After each dequeue, the node that held the value becomes the new dummy. The old dummy leaves the queue and is retired.
 
 ## The invariants
 
 <Steps>
-<div>The list from <code>head</code> is never broken. Nodes are only ever appended (a CAS on the last <code>next</code>, from null) or dropped from the front (a CAS on <code>head</code>).</div>
-<div><code>tail</code> points to the last node or the one before it: it lags by at most one, and any thread that sees the lag fixes it.</div>
-<div><code>head</code> never passes <code>tail</code>: a dequeuer seeing <code>head == tail</code> with a non-null next first helps advance <code>tail</code>.</div>
-<div>Linearization points: a successful enqueue at its CAS on <code>last.next</code>; a successful dequeue at its CAS on <code>head</code>.</div>
+<div>The list from <code>head</code> is never broken. Nodes are only added at the end, with a CAS on the last <code>next</code> from null. Nodes are only removed at the front, with a CAS on <code>head</code>.</div>
+<div><code>tail</code> points to the last node or to the node before it. So it lags by at most one node, and any thread that sees the lag fixes it.</div>
+<div><code>head</code> never passes <code>tail</code>. A dequeuer that sees <code>head == tail</code> and a <code>next</code> that is not null first helps to move <code>tail</code>.</div>
+<div>Linearization points: a successful enqueue takes effect at its CAS on <code>last.next</code>. A successful dequeue takes effect at its CAS on <code>head</code>.</div>
 </Steps>
 
-The stepper checks the first three after every step, and the final value accounting checks FIFO completeness.
+The stepper checks the first three invariants after every step. At the end, it also checks that each value came out exactly once, in FIFO order.
+
+## How often do threads help?
+
+<MsqLagDemo />
+
+1. With 1 thread, no thread ever helps. No other thread runs between the two CAS operations.
+2. With 4 threads, 69% of the 300 runs need at least one help.
+3. Move the slider through all thread counts. In every run, tail is never more than 1 node behind the last node.
 
 ## Memory reclamation, again
 
 <StressDemo configs={STRESS_MSQ} />
 
-The queue reads `head.next` and `tail.next` through pointers that other threads may retire, so it needs a scheme. Hazard pointers need *two* slots in dequeue, `head` and `head.next`, and the second must be validated by re-checking `head`. Switch the stepper to hazard pointers and look for `hazard[1]`.
+The queue reads `head.next` and `tail.next` through pointers that other threads can retire. So it needs a reclamation scheme. With hazard pointers, a dequeue needs *two* slots: one for `head` and one for `head.next`. The second slot is valid only after a new check of `head`. Select hazard pointers in the stepper and look for `hazard[1]`.
 
 ## In practice
 
-- **Contention on two hot pointers** limits scalability. Production queues often use arrays and ring buffers (bounded MPMC queues such as Vyukov's, LMAX Disruptor), or segment linked arrays (crossbeam's `SegQueue`, `ConcurrentLinkedQueue` with batching), to touch fewer cache lines per operation.
-- **Single-producer or single-consumer variants** drop most atomics and are much faster. Choose the weakest variant your design allows.
-- **Helping** is a general technique: whenever an operation is visible in an intermediate state, design it so that any thread can finish it. That's how lock-free structures avoid waiting on stalled threads.
+- **Contention on two hot pointers** limits how far the queue scales. Production queues often use arrays and ring buffers, such as the bounded MPMC queue of Vyukov or the LMAX Disruptor. Others link segments of arrays, such as the `SegQueue` of crossbeam. Both touch fewer cache lines for each operation.
+- **Variants with a single producer or a single consumer** remove most atomic operations and are much faster. Use the most restricted variant that your design allows.
+- **Helping** is a general technique. If an operation is visible in an intermediate state, design it so that any thread can finish it. This is how lock-free structures avoid waiting for stalled threads.
 
 <Recall cards={[
-  { q: "Why does the Michael–Scott queue use a dummy node?", a: "So head and tail never need to change together. Enqueue and dequeue update different pointers, even for a single-element queue." },
-  { q: "Why can tail lag behind the last node?", a: "Enqueue links the node (CAS on last.next) and swings tail (second CAS) in separate steps; another thread can run in between." },
-  { q: "What is helping?", a: "A thread that finds another operation half-done (e.g. a lagging tail) completes that step itself instead of waiting." },
-  { q: "Linearization point of a successful MS-queue enqueue?", a: "The successful CAS that links the new node onto last.next." },
-  { q: "How many hazard pointers does an MS-queue dequeue need, and why?", a: "Two: one for head and one for head.next, whose value is read. The second is validated by re-checking head." },
+  { q: "Why does the Michael–Scott queue use a dummy node?", a: "So head and tail never need to change together. Enqueue and dequeue update different pointers, even when the queue holds one element." },
+  { q: "Why can tail lag behind the last node?", a: "An enqueue links the node (CAS on last.next) and moves tail (a second CAS) in separate steps. Another thread can run between them." },
+  { q: "What is helping?", a: "A thread finds another operation half done, for example a lagging tail. It finishes that step itself instead of waiting." },
+  { q: "How far behind the last node can tail be?", a: "At most one node. Any thread that sees the lag moves tail forward before it links its own node." },
+  { q: "What is the linearization point of a successful enqueue?", a: "The successful CAS that links the new node to last.next." },
+  { q: "How many hazard pointers does a dequeue need, and why?", a: "Two: one for head and one for head.next, whose value the dequeue reads. The second becomes valid only after a new check of head." },
 ]} />

@@ -1,17 +1,20 @@
 ---
-summary: Treiber's stack, one CAS at a time, what makes it lock-free, and why freeing memory is the real problem.
+summary: Treiber's stack, one CAS at a time. What makes it lock-free, and why freeing memory is the real problem.
 ---
 import { LockFreeStepper } from "@/demos/LockFreeStepper";
+import { CasRaceDemo } from "@/demos/LockFreeExtrasDemos";
 import { STACK_RACE, STACK_RACE_SCRIPTS } from "@/demos/lockfreeConfigs";
 
-A lock-free stack is a linked list whose `head` is an atomic pointer. Every change is prepared privately and then published with a single compare-and-swap on `head`. If the CAS fails, someone else changed the stack first, so you re-read and try again. R. Kent Treiber described it at IBM in 1986. It is still the simplest real lock-free structure, and it contains every problem the rest of this module solves.
+A **lock-free stack** is a linked list with an atomic `head` pointer. An atomic variable is a variable that threads read and write in one indivisible step. Each change uses **compare-and-swap** (CAS). `CAS(head, old, new)` writes `new` only if `head` still holds `old`, and it reports success or failure. A thread prepares its change privately and then publishes it with one CAS on `head`. If the CAS fails, another thread changed the stack first, so the thread reads `head` again and tries again.
+
+R. Kent Treiber described this stack at IBM in 1986. It is still the simplest real lock-free data structure. It also contains every problem that the rest of this module solves.
 
 ```rust
 fn push(&self, v: T) {
     let n = Box::into_raw(Box::new(Node { v, next: null_mut() }));
     loop {
         let h = self.head.load(Acquire);
-        unsafe { (*n).next = h };                       // private: n isn't visible yet
+        unsafe { (*n).next = h };                       // private: no other thread can see n yet
         if self.head.compare_exchange_weak(h, n, Release, Relaxed).is_ok() { return; }
     }
 }
@@ -19,9 +22,9 @@ fn pop(&self) -> Option<T> {
     loop {
         let h = self.head.load(Acquire);
         if h.is_null() { return None; }
-        let next = unsafe { (*h).next };                // ← reads a node another thread may free
+        let next = unsafe { (*h).next };                // reads a node that another thread can free
         if self.head.compare_exchange_weak(h, next, Acquire, Relaxed).is_ok() {
-            return Some(unsafe { take_value(h) });      // and when can h be freed? (see below)
+            return Some(unsafe { take_value(h) });      // and when is it safe to free h? (see below)
         }
     }
 }
@@ -29,49 +32,69 @@ fn pop(&self) -> Option<T> {
 
 <Predict
   id="race"
-  question="T0 is pushing: it has loaded head = A and set its new node's next to A. Before T0's CAS, T1 pops A. What happens next?"
+  question="T0 is pushing. It loaded head = A and set the next field of its new node to A. Before the CAS of T0, T1 pops A. What happens next?"
   options={[
-    "T0's CAS succeeds and links its node to the popped A",
-    "T0's CAS fails because head is now B; T0 reloads head and retries",
-    "T0 blocks until T1 finishes",
+    "The CAS of T0 succeeds and links its node to the popped A",
+    "The CAS of T0 fails because head is now B. T0 loads head again and tries again",
+    "T0 waits until T1 finishes",
   ]}
   answer={1}
-  explain="CAS(head, A → N) only succeeds if head is still A. T1 changed it to B, so T0 fails, re-reads head = B, sets N.next = B and succeeds. No thread ever waits for another; a failed CAS means someone else made progress."
+  explain="CAS(head, A → N) succeeds only if head is still A. T1 changed head to B, so the CAS fails. T0 loads head = B, sets N.next = B and then succeeds. No thread waits for another thread. A failed CAS means that another thread made progress."
 >
 <LockFreeStepper title="Treiber stack: step each thread yourself" scenario={STACK_RACE} scripts={STACK_RACE_SCRIPTS} />
 </Predict>
 
-How to read the stepper: the top row is the stack as reachable from `head`. The row below holds nodes that are off the list: being built (dashed, *private*), popped but not freed (*retired*), or freed while a thread still points at them (red). Each thread card shows the **next** atomic step it will take; **Step** performs it.
+How to read the stepper: the top row is the stack, as you reach it from `head`. The row below holds nodes that are not on the list. A dashed node is **private**: one thread builds it, and no other thread can see it yet. A **retired** node was popped but is not freed. A red node was freed while a thread still points to it. Each thread card shows the **next** atomic step of that thread, and **Step** does it.
 
-1. Run **T1 pops between T0's load and CAS**, then read the log: T0's first CAS fails and the second succeeds.
-2. Reset and interleave by hand. Any order you choose ends consistent: every value is either returned or still on the stack. The checks panel verifies this.
-3. Note that popped nodes stay **retired**, never freed. This demo leaks on purpose. The next three lessons are about when it is safe to free them.
+1. Run **T1 pops between T0's load and CAS**. Then read the log: the first CAS of T0 fails, and the second CAS succeeds.
+2. Reset and choose the order of steps yourself. Every order ends in a correct state: each value is returned or is still on the stack. The checks panel verifies this.
+3. Popped nodes stay **retired** and are never freed. This demo leaks memory on purpose. The next three lessons show when it is safe to free them.
 
-## Why it's correct
+## Many threads, one head
 
-- **Linearizability.** Each operation appears to take effect at one instant: its successful CAS (or, for a pop on an empty stack, the load that saw null). Any concurrent history is equivalent to some sequential order of those instants (Herlihy and Wing, 1990).
-- **Private until published.** A pushed node is only written while nobody else can see it, and the release CAS publishes its contents.
-- **Retry on interference.** Because the CAS checks the exact head we based our change on, a stale view can't overwrite someone else's update.
+<Predict
+  id="lockstep"
+  question="Four threads push at the same time, in lock step. All four load head, then all four try their CAS, and so on. How many CAS attempts do the four pushes need in total?"
+  options={["4", "10", "16"]}
+  answer={1}
+  explain="In each round, only the first CAS succeeds, because it changes head. The other CAS operations compare with an old head, so they fail. The rounds need 4, 3, 2 and 1 attempts: 10 in total. In each round, one thread finishes."
+>
+<CasRaceDemo />
+</Predict>
+
+1. Keep 4 threads in **Lock step**. Each arrow goes from a private node to the node that its thread saw as head. A red arrow is a stale view: head moved, so that CAS will fail.
+2. Count the attempts: 4 pushes need 10 CAS operations. The last thread fails 3 times before it succeeds.
+3. Set 6 threads. Lock step now needs 21 attempts. In general, $n$ threads need $n(n+1)/2$ attempts, so the work grows with the square of the thread count.
+4. Select **Random**. This order is less hostile: 4 threads need about 6 attempts on average. Click **New order** to see other orders.
+
+## Why it is correct
+
+- **Linearizability.** An operation is linearizable if it seems to take effect at one instant between its start and its end. For a Treiber push or pop, that instant is the successful CAS. For a pop on an empty stack, it is the load that saw null. So each concurrent history is equal to some sequential order of these instants (Herlihy and Wing, 1990).
+- **Private until published.** A thread writes a new node only while no other thread can see it. The release CAS then publishes the contents of the node. Release means that the earlier writes become visible to a thread that reads `head` with acquire.
+- **Retry on interference.** The CAS checks the exact head on which the change is based. So a thread with an old view cannot overwrite the update of another thread.
 
 ## Progress guarantees
 
 | Guarantee | Meaning | Treiber stack |
 |---|---|---|
-| Blocking (locks) | a stalled thread can stop everyone | no |
-| Obstruction-free | a thread running alone finishes | yes |
-| **Lock-free** | some thread always finishes in a bounded number of system-wide steps | **yes**: a failed CAS means another one succeeded |
-| Wait-free | *every* thread finishes in a bounded number of its own steps | no: one unlucky thread can retry forever |
+| Blocking (locks) | one stalled thread can stop all threads | no |
+| Obstruction-free | a thread that runs alone finishes | yes |
+| **Lock-free** | some thread always finishes within a bounded number of steps of the whole system | **yes**: a failed CAS means that another CAS succeeded |
+| Wait-free | *every* thread finishes within a bounded number of its own steps | no: one thread can fail again and again |
 
-Lock-free doesn't mean fast: under heavy contention the CAS retries (Compare-and-swap lesson) can make a good lock faster. It means **no thread can block the others**, even when it's descheduled, killed, or running in a signal handler.
+Lock-free does not mean fast. Under heavy contention, CAS retries can make a good lock faster (see the Compare-and-swap lesson). Lock-free means that **no thread can block the other threads**. This is true even if a thread is descheduled, killed, or runs in a signal handler.
 
 ## The real difficulty
 
-Look at `pop` again. Between `h = head.load()` and reading `(*h).next`, another thread can pop `h`, and if it **frees** `h` we read freed memory. If that memory is **reused** for a new node, the CAS can even succeed when it shouldn't. That's the ABA problem, the next lesson. Garbage-collected languages (Java, Go, C#) avoid both, because nothing is freed while a reference exists. In C, C++, Rust and Zig the solution is a **memory reclamation scheme**.
+Look at `pop` again. Between `h = head.load()` and the read of `(*h).next`, another thread can pop `h`. If that thread **frees** `h`, the read uses freed memory. If the allocator **reuses** that memory for a new node, the CAS can succeed when it must fail. This is the ABA problem, the subject of the next lesson.
+
+Garbage-collected languages, such as Java, Go and C#, avoid both problems. They free nothing while a reference to it exists. C, C++, Rust and Zig need a **memory reclamation scheme**: a rule that decides when no thread can still use a removed node.
 
 <Recall cards={[
-  { q: "Where is the linearization point of a successful Treiber pop?", a: "Its successful CAS on head." },
-  { q: "What does a failed CAS in a lock-free loop tell you?", a: "Another thread's CAS succeeded in between, so the system as a whole made progress." },
-  { q: "Lock-free vs wait-free?", a: "Lock-free: some thread always completes. Wait-free: every thread completes within a bounded number of its own steps." },
-  { q: "Why can push write node.next without atomics?", a: "The node is private until the CAS publishes it, and the release CAS makes those writes visible." },
-  { q: "What makes freeing popped nodes hard in a lock-free stack?", a: "Another thread may have loaded the same head and still be about to read its next field, or CAS on its address after reuse." },
+  { q: "Where is the linearization point of a successful Treiber pop?", a: "At its successful CAS on head." },
+  { q: "What does a failed CAS in a lock-free loop tell you?", a: "The CAS of another thread succeeded between your load and your CAS. So the system as a whole made progress." },
+  { q: "What is the difference between lock-free and wait-free?", a: "Lock-free: some thread always finishes. Wait-free: every thread finishes within a bounded number of its own steps." },
+  { q: "Four threads push in lock step. How many CAS attempts do they need?", a: "10, because 4 + 3 + 2 + 1 = 10. Only one CAS succeeds in each round. In general, n threads need n(n+1)/2 attempts." },
+  { q: "Why can push write node.next without atomic operations?", a: "The node is private until the CAS publishes it. The release CAS makes those writes visible." },
+  { q: "Why is it hard to free popped nodes in a lock-free stack?", a: "Another thread may have loaded the same head. That thread can still read the next field, or do a CAS with that address after the allocator reuses it." },
 ]} />

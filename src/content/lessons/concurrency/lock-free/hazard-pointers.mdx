@@ -1,54 +1,73 @@
 ---
-summary: Announce what you're about to touch, check it's still there, and free only what nobody announced. Bounded memory, at a per-access cost.
+summary: Announce the node you will use, check that it is still there, and free only the nodes that nobody announced. Bounded memory, at a cost for each access.
 ---
 import { LockFreeStepper } from "@/demos/LockFreeStepper";
 import { StressDemo } from "@/demos/LockFreeStress";
+import { HazardScanDemo } from "@/demos/LockFreeExtrasDemos";
 import { HP, HP_SCRIPTS, STRESS_HP } from "@/demos/lockfreeConfigs";
 
-The problem from the last two lessons: a thread holds the address of a node that another thread may free at any moment. **Hazard pointers** (Maged Michael, 2004) make that holding visible. Each thread owns a few shared slots. Before dereferencing a node, it writes the node's address into a slot. A thread that wants to free nodes first scans every slot and keeps anything announced there.
+The last two lessons showed the problem. A thread holds the address of a node, and another thread can free that node at any moment. **Hazard pointers** (Maged Michael, 2004) make this holding visible. Each thread owns a few shared slots, called **hazard slots**. Before a thread uses a node, it writes the address of the node into one of its slots. A thread that wants to free nodes first reads every slot, and it keeps each node that a slot names.
 
 <Predict
   id="recheck"
-  question="T0 loads head = A, then publishes hazard = A. Why must it load head again and check it is still A before reading A.next?"
+  question="T0 loads head = A, then writes A into its hazard slot. Why must T0 load head again and check that it is still A before it reads A.next?"
   options={[
     "To refresh its cache",
-    "Between the first load and the publish, A may have been popped and freed; the re-check proves A was still in the stack after the hazard became visible",
-    "It doesn't need to; publishing is enough",
+    "A can be popped and freed between the first load and the write to the slot. The check proves that A was still on the stack after the slot became visible",
+    "It is not necessary, because the write to the slot is enough",
   ]}
   answer={1}
-  explain="A reclaimer that scanned the hazard slots before T0's publish became visible could already have freed A. If head is still A after the publish, A can't have been removed and freed in between: any later scan will see the hazard. If head changed, start over."
+  explain="A reclaimer can read the slots before the write of T0 becomes visible, and then free A. If head is still A after the write, nobody removed A in between. Every later scan then sees the slot. If head changed, T0 starts again."
 >
 <LockFreeStepper title="Free immediately vs hazard pointers" scenario={HP} scripts={HP_SCRIPTS} scheme="immediate" schemes={["immediate", "hazard"]} />
 </Predict>
 
-1. With **Free immediately**, run **T1 pops and frees while T0 holds A**. T0's next step, `read A.next`, is a use-after-free: A is drawn red, with T0 still pointing at it.
-2. Switch to **Hazard pointers** and run the same script. T0's steps now include `hazard[0] = A` and the re-check. When T1 has retired two nodes it scans, finds A in T0's slot, and frees only B. A stays on T1's retired list until a later scan finds it unprotected.
-3. Watch each thread's **retired** list: nodes wait there until a scan proves them unprotected.
+1. With **Free immediately**, run **T1 pops and frees while T0 holds A**. The next step of T0, `read A.next`, is a use-after-free. The demo draws A in red, and T0 still points to it.
+2. Select **Hazard pointers** and run the same script. The steps of T0 now include `hazard[0] = A` and the check. When T1 has retired two nodes, it scans. It finds A in the slot of T0, so it frees only B.
+3. Watch the **retired** list of each thread. A retired node was removed from the stack but is not freed yet. It waits on the list until a scan proves that no slot names it.
+
+## The scan
+
+<Predict
+  id="scanmin"
+  question="There are 4 threads with 2 hazard slots each. T0 scans when its retired list holds R = 12 nodes. What is the smallest number of nodes that one scan can free?"
+  options={["0", "4", "8"]}
+  answer={1}
+  explain="The 4 threads have 8 slots, so a scan finds at most 8 protected nodes. A scan of 12 nodes keeps at most 8 nodes, so it frees at least 4. With R = 16, each scan frees at least 8."
+>
+<HazardScanDemo />
+</Predict>
+
+1. Watch one scan. T0 reads the slots of each thread in turn. A node that a slot names turns orange and stays on the list. T0 frees all the other nodes.
+2. Select **Stall forever**. Each reader protects two nodes and then stops. Those nodes stay on the list for ever, but T0 frees every other node. With R = 12, the list never holds more than 12 nodes.
+3. Move R down to 8. In the worst case, a scan now frees nothing, because 8 slots can protect all 8 nodes. The slot reads per freed node go up.
+4. Move R up to 16. A scan still reads 8 slots, but it frees at least 8 nodes. That is at most 1 slot read for each freed node.
 
 ## The protocol
 
 <Steps>
-<div><b>Protect</b>: <code>p = head.load(); hazard[i].store(p, SeqCst); if head.load() != p, retry</code>. The seq_cst store-then-load is the store-buffering pattern from the memory-ordering lesson: without it, the reclaimer's scan and the reader's re-check could both miss each other.</div>
-<div><b>Use</b>: dereference <code>p</code> freely while it stays in the slot.</div>
-<div><b>Retire</b>: after unlinking a node, put it on a thread-local retired list instead of freeing it.</div>
-<div><b>Scan</b>: when the list reaches a threshold R, read every thread's hazard slots and free every retired node not found there.</div>
+<div><b>Protect</b>: <code>p = head.load(); hazard[i].store(p, SeqCst); if head.load() != p, retry</code>. This store and the load after it form the store-buffering pattern from the memory-ordering lesson. Without seq_cst, the scan of the reclaimer and the check of the reader can both miss each other.</div>
+<div><b>Use</b>: read <code>p</code> freely while it stays in the slot.</div>
+<div><b>Retire</b>: after a thread removes a node, it puts the node on its own retired list. It does not free the node yet.</div>
+<div><b>Scan</b>: when the list reaches a threshold R, read the hazard slots of every thread. Free each retired node that no slot names.</div>
 </Steps>
 
 ## Costs and guarantees
 
 <StressDemo configs={STRESS_HP} />
 
-- **Correct**: no violations in any random schedule, for the stack or the queue. Hazard pointers solve ABA too, since a protected node can't be freed and reused.
-- **Bounded memory**: at most H × T nodes (hazards per thread × threads) can be protected, so each thread's retired list stays under about R + H·T, *even if another thread stalls forever*. That robustness is their main advantage (Epoch-based reclamation lesson).
-- **Per-access cost**: every protected pointer needs a store and a full fence, plus a re-load. That's acceptable for occasional accesses, but expensive for traversing a long list node by node.
-- **Scan cost**: amortized O(1) per retire if R is proportional to H·T. Scans sort or hash the hazard set.
+- **Correct**: the stress test finds no violations for the stack or the queue. Hazard pointers also solve ABA, because nobody can free and reuse a protected node.
+- **Bounded memory**: at most H × T nodes are protected, with H slots for each of T threads. So the retired list of each thread stays below about R + H·T, *even if another thread stalls forever*. This is the main advantage over epoch-based reclamation (next lesson).
+- **Cost for each access**: each protected pointer needs a store, a full fence and a second load. This is acceptable for occasional accesses. It is expensive when a thread walks a long list node by node.
+- **Scan cost**: if R is proportional to H·T, a scan costs O(1) per retired node on average. For example, R = 2·H·T gives at most 1 slot read for each freed node. Real scans sort or hash the set of hazard pointers to look up nodes fast.
 
-C++26 adds `std::hazard_pointer`, based on Facebook's Folly implementation. Rust has the `haphazard` crate.
+C++26 adds `std::hazard_pointer`, based on the Folly library of Meta. Rust has the `haphazard` crate.
 
 <Recall cards={[
-  { q: "The hazard-pointer protect sequence?", a: "Load the pointer, publish it to a hazard slot (seq_cst), re-load and confirm it is unchanged; retry if not." },
-  { q: "Why is the re-check after publishing necessary?", a: "The node may have been removed and freed between the first load and the publish. Seeing it still in place proves later scans will find the hazard." },
-  { q: "When does a thread actually free retired nodes under hazard pointers?", a: "When its retired list reaches a threshold, it scans all hazard slots and frees retired nodes that nobody has announced." },
-  { q: "Main advantage of hazard pointers over epoch-based reclamation?", a: "Memory stays bounded even if a thread stalls, because only individually announced nodes are held." },
-  { q: "Main cost of hazard pointers?", a: "A store plus a full fence (and a re-check) for every pointer protected, which is expensive for long traversals." },
+  { q: "What is the protect sequence of hazard pointers?", a: "Load the pointer, write it to a hazard slot (seq_cst), load it again and check that it did not change. If it changed, try again." },
+  { q: "Why is the check after the write to the slot necessary?", a: "The node can be removed and freed between the first load and the write. If the node is still in place after the write, every later scan finds the slot." },
+  { q: "When does a thread free its retired nodes under hazard pointers?", a: "When its retired list reaches a threshold R, it reads all hazard slots and frees each retired node that no slot names." },
+  { q: "4 threads have 2 slots each, and R = 12. How many nodes does a scan free at least?", a: "4. The 8 slots can protect at most 8 of the 12 nodes." },
+  { q: "What is the main advantage of hazard pointers over epoch-based reclamation?", a: "Memory stays bounded even if a thread stalls, because only the nodes that a slot names are held." },
+  { q: "What is the main cost of hazard pointers?", a: "A store, a full fence and a second load for every protected pointer. This is expensive for long traversals." },
 ]} />

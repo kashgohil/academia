@@ -1,52 +1,83 @@
 ---
-summary: How a pointer that changed from A to B and back to A fools compare-and-swap, and what tagged pointers do and don't fix.
+summary: How a pointer that changes from A to B and back to A fools compare-and-swap, and what tagged pointers fix and do not fix.
 ---
 import { LockFreeStepper } from "@/demos/LockFreeStepper";
 import { StressDemo } from "@/demos/LockFreeStress";
+import { AbaOrderDemo, TagBitsDemo } from "@/demos/LockFreeExtrasDemos";
 import { ABA, ABA_SCRIPTS, STRESS_ABA } from "@/demos/lockfreeConfigs";
 
-CAS asks "is the value still what I saw?", but the question you care about is "has *anything* changed since I looked?" Those differ when a value goes **A → B → A**. With pointers this happens easily: a node is popped and freed, and the allocator hands the same address back for a new node that gets pushed. To CAS, the head is "still A".
+A CAS asks one question: is the value still the value that I saw? The real question is different: did *anything* change since I looked? The two questions have different answers when a value goes **A → B → A**. With pointers, this happens easily. A thread pops a node and frees it, and the allocator gives the same address to a new node. For the CAS, head is "still A".
 
 <Predict
   id="aba"
-  question="T0 starts a pop: it reads head = A, A.next = B and A's value 1, then pauses before its CAS. T1 pops A, pops B, pushes 7 and pushes 8, and the allocator reuses the freed nodes, so 8 lands in A's old memory and head = A again. Now T0 runs CAS(head, A → B). What happens?"
+  question="T0 starts a pop. It reads head = A, A.next = B and the value 1 of A, and then pauses before its CAS. T1 pops A, pops B, pushes 7 and pushes 8. The allocator reuses the freed nodes, so 8 goes into the old memory of A, and head = A again. Now T0 runs CAS(head, A → B). What happens?"
   options={[
     "It fails, because the stack changed",
-    "It succeeds: head becomes B, 8 is lost, and T0 returns 1, which T1 already popped",
-    "It succeeds harmlessly",
+    "It succeeds: head becomes B, 8 is lost, and T0 returns 1, which T1 popped already",
+    "It succeeds, and no harm occurs",
   ]}
   answer={1}
-  explain="head holds the same address A, so the CAS succeeds and installs T0's stale B. The node holding 8 is cut out of the stack, and T0 returns the value 1 it read before the pause, a value that was already popped. Run the script to watch it happen."
+  explain="Head holds the same address A, so the CAS succeeds and installs the old next pointer B. The node that holds 8 is cut out of the stack. T0 returns the value 1 that it read before the pause, but T1 popped 1 already. Run the script to see it happen."
 >
 <LockFreeStepper title="Treiber stack with immediate free and LIFO reuse" scenario={ABA} scripts={ABA_SCRIPTS} scheme="immediate" showTags />
 </Predict>
 
-1. Run **Play the ABA schedule** without tags. Watch the free list: the most recently freed node is the next one allocated, as in real allocators. The checks panel reports values 1 and 8 lost or returned twice.
-2. Turn on **tagged pointers** and run it again. `head` now carries a version number that every successful CAS increments. T0 saw `A·v0`, but by then head is `A·v4`, so the CAS fails, T0 retries and correctly pops 8.
-3. Even with tags, step through T0 slowly: it still **reads A.next after A was freed** (a use-after-free) before its CAS fails.
+1. Run **Play the ABA schedule** without tags. Watch the free list: the node that was freed last is the next node that the allocator gives out. Real allocators do the same. The checks panel reports that values 1 and 8 are lost or returned twice.
+2. Turn on **tagged pointers** and run the script again. Now `head` also holds a version number, and every successful CAS increments it. T0 saw `A·v0`, but head is `A·v4` at the CAS. So the CAS fails, T0 tries again, and it pops 8 correctly.
+3. With tags, step through T0 slowly. T0 still **reads A.next after A was freed** before its CAS fails. This is a use-after-free: a read of memory that was already freed.
+
+## Move the CAS
+
+<Predict
+  id="where"
+  question="T1 does four operations: pop, pop, push 7 and push 8. T0 read head = A and A.next = B, and it waits to do its CAS. After which operation of T1 can the CAS of T0 break the stack?"
+  options={["After any of them, because the stack changed", "Only after push 8, when head is A again", "After none of them, because CAS always sees the change"]}
+  answer={1}
+  explain="After the first three operations, head is B, then C, then B again. These values differ from A, so the CAS fails and T0 tries again. After push 8, head is A again, because the allocator gave A to the value 8. Only then does the stale CAS succeed."
+>
+<AbaOrderDemo />
+</Predict>
+
+1. Move the slider from 0 to 4. Only position 4 breaks the stack. T0 returns 1, which T1 also returned, and 8 is lost.
+2. At position 4, click the steps one by one. Watch the freed nodes and the next allocations. The allocator gives out the newest freed node first, so A comes back.
+3. Select **Reuse the oldest free node**. Now 8 goes into a new node E, the CAS fails, and the stack stays correct. ABA needs the same address to come back.
+4. Turn on **tagged pointers**. Now no position breaks the stack, with either allocator.
 
 ## How common is it?
 
 <StressDemo configs={STRESS_ABA} />
 
-Under random schedules, freeing immediately breaks the stack in most runs: lost and duplicated values, a corrupted list, double frees. Tags eliminate every *logical* failure, but the use-after-free reads remain. In this simulation the freed node is still mapped memory, so the stale read is harmless. In a real program the allocator may have returned that page to the OS (segfault) or reused it as a different type (you read garbage and act on it).
+Under random schedules, immediate free causes a violation in most runs. Most violations are use-after-free reads. Some runs also lose or duplicate values, corrupt the list or free a node twice. Tags remove every *logical* failure, but the use-after-free reads stay. In this simulation, a freed node is still mapped memory, so the stale read does no harm.
+
+A real program is different. The allocator can return the page to the operating system, and the read then causes a segmentation fault. Or the allocator can reuse the memory for a different type, and the thread reads garbage and acts on it.
+
+## Where can the tag live?
+
+A **tagged pointer** puts a version counter next to the pointer, and the CAS compares both. The counter needs bits, and there are three usual places for them.
+
+<TagBitsDemo />
+
+1. With **4 low bits**, click **Set to 2^4**. After 16 changes, the tag is 0 again. If the address is also A again, the CAS cannot see the change.
+2. Select **16 high bits**. The tag repeats only after 65,536 changes. A thread that sleeps for a long time can still miss exactly that number of changes, but it is much less likely.
+3. Select **Second word**. A 64-bit counter does not wrap in practice.
 
 ## Fixes and their limits
 
 | Fix | How | Limit |
 |---|---|---|
-| **Tagged pointers** | CAS a (pointer, counter) pair: `cmpxchg16b` on x86-64, or pack the counter into unused pointer bits (16 spare high bits with 48-bit addresses, or low bits from alignment) | Doesn't stop reads of freed memory; the counter can wrap |
-| **LL/SC** | ARM `ldxr`/`stxr`: the store fails if the line was written at all, so no ABA on the location itself | Not exposed portably; C++ and Rust offer CAS |
-| **Type-stable memory** | Never return nodes to the general allocator; recycle them only as nodes (e.g. a pool) | Needs tags anyway; memory is never given back |
-| **Safe memory reclamation** | Don't reuse a node while anyone might still hold its address: hazard pointers, epochs, RCU | Extra bookkeeping per operation (next two lessons) |
-| **Garbage collection** | The address can't be reused while a reference exists | Not available in C, C++, Rust or Zig without a library |
+| **Tagged pointers** | CAS a (pointer, counter) pair: `cmpxchg16b` on x86-64, or put the counter in unused pointer bits (16 high bits with 48-bit addresses, or low bits from alignment) | does not stop reads of freed memory; a small counter can wrap |
+| **LL/SC** | ARM `ldxr`/`stxr`: the store fails if any thread wrote the cache line, so the location itself has no ABA | not available in portable code; C++ and Rust give you CAS |
+| **Type-stable memory** | never return nodes to the general allocator; reuse them only as nodes (for example, a pool) | still needs tags; the memory never goes back to the system |
+| **Safe memory reclamation** | do not reuse a node while a thread can still hold its address: hazard pointers, epochs, RCU | extra work in each operation (next two lessons) |
+| **Garbage collection** | the address cannot be reused while a reference exists | not available in C, C++, Rust or Zig without a library |
 
-The robust answer is the last row but one: if no node is freed while a thread might hold its address, it can't come back as "A" either. Reclamation fixes ABA and use-after-free together.
+The robust answer is safe memory reclamation. If no thread frees a node while another thread can hold its address, the address cannot come back as "A". So reclamation fixes ABA and use-after-free together.
 
 <Recall cards={[
-  { q: "What is the ABA problem?", a: "A location changes from A to B and back to A between a thread's read and its CAS, so the CAS succeeds even though the structure changed." },
-  { q: "Why does ABA happen naturally with pointers?", a: "A freed node's address is reused by the allocator for a new node, so the same pointer value reappears." },
-  { q: "How do tagged pointers prevent ABA?", a: "Each CAS compares and increments a version counter alongside the pointer, so A·v0 ≠ A·v4." },
-  { q: "What problem do tagged pointers NOT solve?", a: "Use-after-free: a thread can still dereference a node that was freed before its CAS fails." },
-  { q: "Where can a version tag live without a double-width CAS?", a: "In unused pointer bits: high bits above the virtual address width, or low bits freed by alignment." },
+  { q: "What is the ABA problem?", a: "A location changes from A to B and back to A between the read and the CAS of a thread. So the CAS succeeds, but the structure changed." },
+  { q: "Why does ABA happen naturally with pointers?", a: "The allocator gives the address of a freed node to a new node. So the same pointer value comes back." },
+  { q: "T1 pops A, pops B, pushes 7, pushes 8. After which step does the stale CAS of T0 succeed?", a: "Only after push 8, because only then does head hold address A again. After the other steps, head is B or C, and the CAS fails." },
+  { q: "How do tagged pointers prevent ABA?", a: "Each successful CAS increments a version counter next to the pointer, and the CAS compares both. So A·v0 is not equal to A·v4." },
+  { q: "What problem do tagged pointers NOT solve?", a: "Use-after-free: a thread can still read a node that was freed before its CAS fails." },
+  { q: "Where can a version tag live without a double-width CAS, and what is the risk?", a: "In unused pointer bits: the high bits above the address width, or the low bits that alignment leaves free. A small tag wraps: 4 bits repeat after 16 changes." },
 ]} />

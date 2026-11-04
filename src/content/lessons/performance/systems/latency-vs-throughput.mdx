@@ -1,0 +1,54 @@
+---
+summary: Latency is how long one request takes. Throughput is how many requests finish per second. Batching and load testing show how they trade off.
+---
+import { BatchingDemo, ClosedLoopDemo } from "@/demos/SystemsDemos";
+import { LittleCalcDemo } from "@/demos/SystemsDemos";
+
+**Latency** is the time for one operation. **Throughput** is the number of operations per second. They are related, but they are not the same. Many optimizations increase one and decrease the other.
+
+Batching is the clearest example. Many operations have a fixed cost, such as a system call, a network round trip or a disk write. With a batch, many items share one fixed cost. Throughput increases. But each item waits for its batch, so latency also increases.
+
+<Predict
+  id="batch"
+  question="Each batch costs 1 ms, plus 0.05 ms per item. Items arrive at 2 per ms. Is a batch size of 1 a good choice?"
+  options={["Yes: no item waits for a batch", "No: the system cannot keep up, so the queue grows without limit", "It makes no difference"]}
+  answer={1}
+  explain="With batches of 1, each item costs 1.05 ms. The capacity is about 0.95 items per ms. Items arrive at 2 per ms, so the queue grows forever. With batches of 4, the capacity is 3.3 items per ms and the system is stable."
+>
+<BatchingDemo />
+</Predict>
+
+Do these steps:
+
+1. Start at batch size **1**. The capacity line is below the arrivals line. The system cannot keep up.
+2. Increase the batch size to **4**. The capacity is now enough. The latency is about 2 ms.
+3. Increase the batch size to **64**. The capacity is very high, but the latency is about 20 ms. Most of that time is waiting for the batch to fill.
+4. Set the fixed cost to **0.1 ms**. Now small batches are good enough.
+
+Good batching systems use the smallest batch that keeps up. Many also send a partial batch after a short timeout. Examples are Nagle's algorithm in TCP, group commit in databases, and dynamic batching in ML inference servers.
+
+## Load tests: find the knee
+
+In a load test, a number of users each send a request, wait for the response, and then wait a "think time". When you add users, throughput increases until the server is fully used. After that point, more users only add waiting.
+
+<ClosedLoopDemo />
+
+1. Increase the users from 1 to 11. Throughput increases in a straight line. The response time stays at 10 ms.
+2. Increase the users past 11. Throughput stays at 100 requests per second. The response time increases.
+3. The knee is at (D + Z) / D users. D is the server time per request (10 ms) and Z is the think time (100 ms).
+
+Report a load test as a curve: throughput and latency at each load level. A single "maximum throughput" number hides the latency at that throughput.
+
+## Connect the two with Little's law
+
+Little's law connects the two: concurrency = throughput × latency. To get more throughput at the same latency, you need more requests in progress at the same time.
+
+<LittleCalcDemo />
+
+<Recall cards={[
+  { q: "Latency vs throughput?", a: "Latency is the time for one operation. Throughput is the number of operations per second." },
+  { q: "How does batching trade latency for throughput?", a: "One fixed cost serves many items, so throughput increases. But items wait for their batch, so latency increases." },
+  { q: "What is the knee in a closed-loop load test?", a: "The number of users at which the server becomes fully used: (D + Z) / D. After it, more users only add waiting." },
+  { q: "Name three systems that use batching with a timeout.", a: "Nagle's algorithm (TCP), group commit (databases), dynamic batching (ML inference servers)." },
+  { q: "How do you get more throughput at the same latency?", a: "Have more requests in progress at the same time (Little's law: L = λ × W)." },
+]} />

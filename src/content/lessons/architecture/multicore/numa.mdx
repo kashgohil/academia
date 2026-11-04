@@ -1,0 +1,49 @@
+---
+summary: Memory attached to sockets, local vs remote latency, the first-touch rule, and the placement mistakes that halve bandwidth.
+---
+import { NumaDemo } from "@/demos/MulticoreDemos";
+
+On a multi-socket server, each socket (and on large chips, each part of a socket) has its own memory controllers. Every core can access all memory, but **local** memory is faster and has more bandwidth than **remote** memory, which goes over the socket-to-socket interconnect. That's **NUMA**: non-uniform memory access. Remote latency is typically 1.5–2× local, and a socket's memory bandwidth is a fixed budget that remote readers share.
+
+The OS decides which node backs each page, and Linux's default is **first touch**: a page is placed on the node of the core that first *writes* it, not the core that called `malloc`.
+
+<Predict
+  id="first-touch"
+  question="A 2-socket machine. The main thread allocates and zero-fills a large array, then 16 threads (8 per socket) stream through it in parallel. Compared with zero-filling it in parallel by the same threads, the bandwidth is…"
+  options={["About the same", "About half", "About double"]}
+  answer={1}
+  explain="First touch put every page on socket 0. All 16 threads now read through socket 0's memory controllers (60 GB/s in the model), and socket 1's memory sits idle. Initializing in parallel places each thread's part locally: 120 GB/s, all accesses local."
+>
+<NumaDemo />
+</Predict>
+
+1. **2 sockets, 16 threads**: one-thread initialization stops at 60 GB/s, while parallel initialization and interleaving reach 120.
+2. Compare the latency cards: parallel first touch is 100% local (90 ns). Interleaving is 50% remote (120 ns), so it gets the bandwidth but every access is slower on average.
+3. **4 sockets**: one-thread initialization is still capped at 60 GB/s, with a quarter of the machine's memory bandwidth unused. Parallel first touch reaches 240.
+4. Lower the thread count: below about 6 threads the cores themselves are the bottleneck, and placement doesn't matter for bandwidth. It still matters for latency.
+
+## Rules that follow
+
+<Steps>
+<div><b>Initialize data with the same threads, and the same partitioning, that will use it.</b> A parallel loop that zero-fills or loads each thread's share places pages correctly for free.</div>
+<div><b>Pin threads</b>, or the scheduler may move a thread away from its data: <code>taskset</code>, <code>pthread_setaffinity_np</code>, <code>OMP_PROC_BIND=close</code> / <code>OMP_PLACES=cores</code>.</div>
+<div><b>Interleave data that every thread reads</b> (shared tables, hash maps): <code>numactl --interleave=all</code> spreads pages round-robin, trading latency for balanced bandwidth.</div>
+<div><b>Keep hot shared writes on one socket.</b> Cross-socket coherence traffic is far more expensive than within a socket, so false sharing across sockets is the worst case.</div>
+</Steps>
+
+## Tools
+
+- `numactl --hardware`: nodes, their memory, and the **distance** matrix (10 = local; 20–32 is typical for remote).
+- `numactl --cpunodebind=0 --membind=0 ./app`: run on node 0 with node-0 memory. Also `--interleave=all` and `--preferred=N`.
+- `numastat -p <pid>`: where a process's pages actually live.
+- `mbind`, `set_mempolicy`, `move_pages` (libnuma) for per-region control from code.
+- **Automatic NUMA balancing** (`/proc/sys/kernel/numa_balancing`): the kernel samples accesses and migrates pages toward the threads using them. It helps long-running processes, but it has overhead, and pinning plus correct first touch is more predictable.
+- A single socket can be NUMA too: Intel **Sub-NUMA Clustering** and AMD **NPS** settings split one socket into several nodes, trading convenience for lower local latency.
+
+<Recall cards={[
+  { q: "What is Linux's default NUMA page placement?", a: "First touch: a page goes on the node of the CPU that first writes to it." },
+  { q: "Why does initializing an array from one thread hurt a later parallel loop?", a: "All pages land on that thread's node, so every thread competes for one node's memory bandwidth and most accesses are remote." },
+  { q: "Interleaving vs local placement?", a: "Interleaving balances bandwidth across nodes but makes a share (s−1)/s of accesses remote. Local placement gives the best latency when each thread uses its own data." },
+  { q: "What does numactl --hardware's distance matrix show?", a: "Relative access cost between nodes: 10 is local, larger numbers are remote." },
+  { q: "What does automatic NUMA balancing do?", a: "The kernel samples page accesses and migrates pages (or tasks) toward the node that uses them most." },
+]} />

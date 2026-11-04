@@ -1,5 +1,4 @@
 use super::*;
-use crate::region::*;
 
 const ALL: &[(u32, u32, u32, u32)] = &[
     // kind, cap, a, b

@@ -98,7 +98,7 @@ function Gantt({ ops, start, k }: { ops: Op[]; start: number[]; k: number }) {
 // ---------------- SIMD ----------------
 
 const simdSchema = {
-  lanes: select({ label: "Lanes (32-bit floats)", options: [{ value: "1", label: "scalar" }, { value: "4", label: "4 (SSE / NEON)" }, { value: "8", label: "8 (AVX2)" }, { value: "16", label: "16 (AVX-512)" }], default: "8", segmented: true }),
+  lanes: select({ label: "Lanes: 4 = SSE/NEON, 8 = AVX2, 16 = AVX-512", options: [{ value: "1", label: "1" }, { value: "4", label: "4" }, { value: "8", label: "8" }, { value: "16", label: "16" }], default: "8", segmented: true }),
   k: select({ label: "Vector accumulators", options: ["1", "4", "8"].map((v) => ({ value: v, label: v })), default: "1", segmented: true }),
 };
 

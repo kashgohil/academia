@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas } from "@react-three/fiber";
-import { OrbitControls, Text } from "@react-three/drei";
+import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
 import { Demo, Stats, Param, select, range, useSim, cssVar } from "../kit";
 
@@ -115,14 +115,12 @@ export function IterationSpaceDemo() {
       }
     >
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.4fr) minmax(200px, 1fr)", gap: 16, alignItems: "center" }}>
-        <div style={{ height: 300, borderRadius: 6, border: "1px solid var(--border)", background: "var(--subtle)" }}>
+        <div style={{ position: "relative", height: 300, borderRadius: 6, border: "1px solid var(--border)", background: "var(--subtle)" }}>
+          <div className="muted" style={{ position: "absolute", left: 10, top: 8, fontSize: 11.5, zIndex: 1, pointerEvents: "none" }}>across: j · down: i · depth: k</div>
           <Canvas camera={{ position: [9, 7, 11], fov: 45 }} dpr={[1, 2]} fallback={<div className="empty">WebGL is not available in this browser.</div>}>
             <ambientLight intensity={0.7} />
             <directionalLight position={[10, 12, 8]} intensity={1.2} />
             <Cubes order={order} step={s} />
-            <Text position={[0, N / 2 + 0.6, 0]} fontSize={0.6} color={cssVar("--muted") || "#888"}>j →</Text>
-            <Text position={[-N / 2 - 0.9, 0, 0]} fontSize={0.6} color={cssVar("--muted") || "#888"}>i ↓</Text>
-            <Text position={[N / 2 + 0.6, -N / 2, N / 2]} fontSize={0.6} color={cssVar("--muted") || "#888"}>k ↗</Text>
             <OrbitControls enablePan={false} enableZoom={false} autoRotate={!sim.running} autoRotateSpeed={0.6} />
           </Canvas>
         </div>

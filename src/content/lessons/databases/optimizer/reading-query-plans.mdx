@@ -1,0 +1,131 @@
+---
+summary: "Reading PostgreSQL EXPLAIN (ANALYZE, BUFFERS): node types, cost=startup..total, rows and width, actual time and loops, shared hit and read buffers; finding the bad estimate, the missing index, the spill and the runaway nested loop; and MySQL's EXPLAIN FORMAT=TREE."
+---
+import { ExplainReaderDemo, FindProblemDemo } from "@/demos/db/OptimizerPlanDemos";
+
+`EXPLAIN` prints the plan that the optimizer chose, with its estimates. `EXPLAIN ANALYZE` also runs the query and prints what really happened. The difference between the two is where most performance problems show. The `BUFFERS` option adds the pages that each node touched.
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT c.country, sum(o.total) FROM orders o JOIN customers c ON c.id = o.customer_id
+WHERE o.created_at >= DATE '2026-10-01' GROUP BY c.country ORDER BY 2 DESC LIMIT 10;
+```
+
+`EXPLAIN ANALYZE` executes the statement. For an `UPDATE` or a `DELETE`, put it inside `BEGIN; ... ROLLBACK;`. In PostgreSQL 18, `ANALYZE` includes `BUFFERS` by default, and the actual row counts have two decimals.
+
+## The anatomy of a plan line
+
+A plan is a tree. Each node pulls rows from its children, so data flows from the most indented lines up to the top line. Read a plan from the inside out. Each node line has two groups of numbers:
+
+```text
+->  Hash Join  (cost=3606.97..6543.63 rows=42466 width=13) (actual time=9.524..25.182 rows=44164 loops=1)
+                ^ startup ^ total     ^ estimate  ^ bytes                ^ first  ^ last   ^ real     ^ runs
+```
+
+- `cost=startup..total` is the estimate in planner units, as in [cost models](/databases/optimizer/cost-models). A node's cost includes its children.
+- `rows` is the estimated number of rows that the node returns, and `width` the average row size in bytes.
+- `actual time=first..last` is in milliseconds: the time to the first row and to the last row. It includes the children.
+- `rows` in the actual part and `loops` say how many rows the node returned and how many times it ran.
+
+The trap is `loops`. Some nodes run more than once, such as the inner side of a nested loop. For them, the time and the rows are **averages per loop**. The real total is the per-loop value times `loops`. A line with `actual time=0.064..0.763 rows=10 loops=8000` spent about 6.1 seconds in total, not 0.76 ms.
+
+`Buffers: shared hit=5682 read=5682` counts 8 KiB pages. A **hit** page was in `shared_buffers`. A **read** page came from the operating system, which is either its page cache or the disk. `temp read` and `temp written` count pages of temporary files from sorts and hashes that did not fit in `work_mem`. Buffers, like time, include the children.
+
+<Predict
+  id="loops-total"
+  question="An inner Index Scan shows actual time=0.050..0.600 rows=10 loops=8000. About how much time did this node take in total?"
+  options={["0.6 ms", "About 4.8 seconds", "0.05 ms per row"]}
+  answer={1}
+  explain="PostgreSQL prints averages per loop. The node ran 8,000 times at about 0.6 ms each: 8,000 × 0.6 ms = 4.8 s. It also returned 80,000 rows in total, not 10."
+>
+<ExplainReaderDemo />
+</Predict>
+
+Things to try:
+
+1. Click the **Hash** node. Its startup cost equals its total cost: it must read all of its input before the join can start. The Hash Join's startup cost includes the whole build.
+2. Click the **Index Scan** on orders. Compare `rows` with the actual rows: the estimate is close, so the plan above it is sound.
+3. Switch to the **tree** view. The bars show the self time of each node: its time minus its children's time.
+4. Move the date slider to more days. At 74 days the planner stops hashing the filtered orders and hashes the customers. At 397 days it replaces the index scan with a seq scan.
+5. Turn **ANALYZE** off. Only the estimates remain: this is what plain `EXPLAIN` shows, without running the query.
+6. Select **MySQL FORMAT=TREE** to see the same plan in MySQL's shape.
+
+## The common node types
+
+| Node | Reads | Look for |
+|---|---|---|
+| Seq Scan | every page of the table | `Rows Removed by Filter` much larger than `rows` |
+| Index Scan | the index, then each matching heap row | many `loops`; random heap reads |
+| Index Only Scan | only the index, if pages are all-visible | `Heap Fetches` near the row count: run `VACUUM` |
+| Bitmap Index / Heap Scan | the index into a bitmap, then pages in order | `Heap Blocks: lossy` when `work_mem` is small |
+| Nested Loop | the inner side once per outer row | a large outer side; a large `Rows Removed by Join Filter` |
+| Hash Join + Hash | builds on the inner side, probes with the outer | `Batches` above 1: the hash spilled |
+| Merge Join | two inputs sorted on the join key | an extra Sort below it |
+| Sort | all of its input before the first row | `Sort Method: external merge  Disk: …` |
+| HashAggregate | all input into a hash table of groups | `Batches` above 1, `Disk Usage` |
+| Limit | stops early | a slow child with a high startup cost |
+
+## Finding the problem
+
+Work through a slow plan in this order:
+
+1. **Find where the time goes.** Look for the node with the largest self time. Remember to multiply by `loops`.
+2. **Compare estimated and actual rows**, from the bottom up. The lowest node where they differ by 10 times or more is usually the cause. Every node above it was planned for the wrong input.
+3. **Look at the work per row.** A scan that removes almost all of its rows needs an index. A join that removes almost all of its pairs uses the wrong algorithm.
+4. **Look for disk use.** `temp read` and `temp written`, `external merge`, and `Batches` above 1 mean that a sort or a hash did not fit in memory.
+
+The fixes follow from the cause:
+
+- **Bad estimates.** Run `ANALYZE` if the statistics are stale. Raise the statistics target of a skewed column. Add `CREATE STATISTICS` for related columns. Avoid predicates the planner cannot estimate, such as functions on a column, or give them an expression index.
+- **Missing index.** Add an index on the filter or join column. A partial index or a covering index (`INCLUDE`) can make it smaller or allow an index-only scan.
+- **Spills.** Raise `work_mem` for the session or the query, not for the whole server: every sort and hash node in every connection may use that much. Hash nodes may use `work_mem × hash_mem_multiplier` (2.0).
+- **Wrong join algorithm.** Rewrite conditions that a hash or merge join cannot use, such as an `OR` across columns or a range. Fix the estimate that made a nested loop look cheap.
+
+<Predict
+  id="first-look"
+  question="A query is slow. Its plan has a Nested Loop with an inner Index Scan that runs 8,000 times. The Seq Scan under it expects 80 rows but returns 8,000. What do you fix first?"
+  options={["Disable nested loops with SET enable_nestloop = off", "The estimate on the Seq Scan, for example with CREATE STATISTICS", "Add an index on the inner table"]}
+  answer={1}
+  explain="The nested loop is a symptom: with 80 rows it is the cheapest plan. The lowest node with a large error is the Seq Scan, at 100 times too few rows. With a correct estimate, the planner picks a hash join on its own."
+>
+<FindProblemDemo />
+</Predict>
+
+1. **Plan 1.** The estimate (10 rows) is good, but the Seq Scan reads all 9,346 pages and removes 999,988 rows. An index on `customer_id` lowers the cost from 21,846.00 to 44.60.
+2. **Plan 2.** The sort writes `Disk: 31250kB` to temporary files with the default 4 MB `work_mem`. With 256 MB it sorts in memory and the query is 2.1 times faster.
+3. **Plan 3.** The scan on users expects 80 rows and gets 8,000. The planner multiplied the selectivities of `country` and `city`. With dependency statistics it estimates 8,000 and picks a hash join: 6.3 s becomes 2.2 s.
+4. **Plan 4.** The estimates are right, but the `OR` condition allows only a nested loop over 100 million pairs. Two equi-joins with `UNION ALL` take 7.1 ms in place of 10.5 s.
+
+Do not leave `enable_nestloop = off` or similar switches in production. They do not forbid a node type; they add a very large cost to it. They hide the cause and can hurt other queries. Use them only to test what the planner would do without that node.
+
+## MySQL
+
+MySQL 8.0.16 and later print a similar tree with `EXPLAIN FORMAT=TREE`. MySQL 8.0.18 added `EXPLAIN ANALYZE`, which prints `(actual time=first..last rows=N loops=N)` like PostgreSQL. The tree reads the same way, with a few differences:
+
+- The names differ: `Table scan on t`, `Index lookup on t using idx`, `Index range scan`, `Inner hash join`, `Nested loop inner join`, `Filter: (...)` as a separate node.
+- Costs use MySQL's own units, so do not compare them with PostgreSQL costs.
+- The classic MySQL optimizer builds left-deep plans only, so the tree has a simple shape.
+
+The **MySQL FORMAT=TREE** view in the first demo shows our plan in this form.
+
+## Plans in production
+
+You cannot run `EXPLAIN ANALYZE` on every slow query by hand. The `auto_explain` module logs the plan of any statement slower than `auto_explain.log_min_duration`, and it can include `ANALYZE` numbers. `pg_stat_statements` shows which normalized queries use the most total time, so you know which plans to read first. Note that `ANALYZE` timing adds overhead for each row. `EXPLAIN (ANALYZE, TIMING OFF)` keeps the row counts and drops the per-node clock reads.
+
+## Connect
+
+- [Cost models](/databases/optimizer/cost-models) explain where each `cost=` number comes from.
+- [Cardinality estimation](/databases/optimizer/cardinality-estimation) explains why `rows` is wrong, and how to fix it.
+- [Join ordering](/databases/optimizer/join-ordering) explains the order of the joins in the tree.
+- [Volcano iterator model](/databases/query/volcano-iterator-model) explains why a node pulls rows from its children.
+- [External sorting and aggregation](/databases/query/external-sorting-and-aggregation) explains what `external merge` and hash `Batches` do on disk.
+- [Buffer pools](/databases/storage/buffer-pools) explain shared hit and read.
+
+<Recall cards={[
+  { q: "In actual time=0.064..0.763 rows=10 loops=8000, what are the total time and the total rows?", a: "The values are averages per loop: about 0.763 ms × 8,000 = 6.1 s, and 10 × 8,000 = 80,000 rows." },
+  { q: "What do shared hit and shared read mean in the Buffers line?", a: "They count 8 KiB pages of the node and its children. Hit pages were in shared_buffers; read pages came from the OS page cache or the disk." },
+  { q: "Why is the startup cost of a Hash node equal to its total cost?", a: "It must read all of its input and build the hash table before the join can probe it. No row leaves before the build is complete." },
+  { q: "Which node do you look at first when estimated and actual rows differ in many places?", a: "The lowest node, nearest the leaves, where they differ by 10 times or more. Every node above it was planned for the wrong input." },
+  { q: "Which plan details show that a sort or hash spilled to disk, and what is the usual fix?", a: "Sort Method: external merge with Disk, Batches above 1 on a Hash or HashAggregate, and temp read/written buffers. Raise work_mem for that session or query." },
+  { q: "Why can a nested loop with a large Rows Removed by Join Filter appear even when the estimates are right?", a: "Hash and merge joins need an equality condition. With an OR across columns or a range condition, only a nested loop can run the join, so it compares all pairs. Rewrite the query." },
+]} />

@@ -1,0 +1,142 @@
+---
+summary: "Choosing the order of joins: query graphs, the C_out cost model, how the search space grows (n! left-deep, Catalan × n! bushy), Selinger's dynamic programming over subsets, interesting orders, cross products, DPccp, and the greedy and genetic searches that take over for many tables."
+---
+import { JoinGraphDemo, DpTableDemo, SearchSpaceDemo } from "@/demos/db/OptimizerJoinDemos";
+
+A query that joins $n$ tables gives the same result in any join order. The cost does not stay the same. One order keeps every intermediate result small. Another order first joins two large tables that share no predicate, and builds a result of billions of rows that a later join throws away. Join ordering is the part of optimization where the difference between plans is largest.
+
+## The query graph and the cost model
+
+Draw each table as a node and each join predicate as an edge. This is the **query graph**. Its shape decides how hard the problem is:
+
+- **Chain**: A–B–C–D, as in a path through foreign keys.
+- **Star**: one fact table joined to many dimension tables, as in a data warehouse.
+- **Cycle** and **clique**: extra predicates that close loops. A clique has an edge between every pair.
+
+A join of two tables with no edge between them is a **cross product**. Its size is the product of the input sizes.
+
+To compare orders we need a cost. We use **C_out**: the sum of the sizes of all intermediate results. It ignores the join algorithm, but it follows the real work closely. Leis et al. found that simple cost models like it give good plans when the cardinalities are right. The size of a set of tables is the product of their row counts and of the selectivities of the edges inside the set. That is the independence assumption from [cardinality estimation](/databases/optimizer/cardinality-estimation).
+
+<Predict
+  id="worst-order"
+  question="Six tables in a chain, without cross products. How much more does the worst join order cost than the best one, in C_out?"
+  options={["At most about 2 times: all orders do the same joins", "About 10 times", "More than 100 times"]}
+  answer={2}
+  explain="In the demo's default graph the worst plan costs 142 times the best. All plans do the same five joins, but the worst one produces large intermediate results early. With other seeds and shapes the factor reaches millions."
+>
+<JoinGraphDemo />
+</Predict>
+
+Things to try:
+
+1. Read the table. The DP finds the optimum. Random search (the best of 10 random left-deep orders) costs 5.58 times as much here.
+2. Click each row to see its plan tree. The number next to each join is its result size, and C_out is the sum of these numbers.
+3. Set the seed to 15. Greedy now costs 2.35 times the optimum: an early cheap join forces expensive joins later.
+4. Select **star** and try several seeds. Left-deep DP always matches the optimum: without cross products, every star plan is left-deep, because each join must include the fact table.
+5. Select **bushy wins (fixed)**. Two small tables, A and D, each filter a large table, and B ⋈ C is many-to-many. The best bushy plan costs 21; the best left-deep plan costs 1,011, which is 48.1 times more.
+6. Turn on **Allow cross products** on a chain and compare the worst plan. Cross products make it far worse. They rarely help the best plan.
+
+## How large is the search space?
+
+A **left-deep** tree joins one new base table at each step: $((A \bowtie B) \bowtie C) \bowtie D$. There are $n!$ of them, one for each order of the tables. A **bushy** tree may join two intermediate results. The number of binary tree shapes with $n$ leaves is the Catalan number $C_{n-1}$, and each shape can hold the tables in $n!$ orders:
+
+$$\text{bushy}(n) = C_{n-1} \cdot n! = \frac{(2n-2)!}{(n-1)!}$$
+
+| Tables | Left-deep ($n!$) | Bushy ($C_{n-1} \cdot n!$) |
+|---|---|---|
+| 4 | 24 | 120 |
+| 6 | 720 | 30,240 |
+| 10 | 3,628,800 | 17,643,225,600 |
+| 12 | 479,001,600 | 2.8 × 10¹³ |
+
+<SearchSpaceDemo />
+
+1. Read the counts at 10 tables. No optimizer can cost 17.6 billion trees for one query.
+2. Compare with **subsets, 2ⁿ**: at 10 tables, only 1,024. Dynamic programming works on subsets, not trees.
+3. Compare the DP work for the three shapes: 165 pairs for a chain of 10, 2,304 for a star, 28,501 for a clique. The shape of the graph matters more than the number of tables.
+4. Move to 12 tables. PostgreSQL switches to its genetic optimizer at this point.
+
+## Selinger's dynamic programming
+
+Selinger et al. described the System R optimizer in 1979. The key idea is the **principle of optimality**. The best plan for a set of tables contains the best plans for the two parts it joins. So the optimizer solves each subset once, from the smallest to the largest, and stores the best plan in a table:
+
+```rust
+/// DPsub: the best C_out for every connected subset, by increasing subset value.
+/// A proper subset of s has a smaller value than s, so it is solved before s.
+fn dp_sub(n: usize, card: &[f64], connected: impl Fn(u32) -> bool, linked: impl Fn(u32, u32) -> bool) -> f64 {
+    let full = (1u32 << n) - 1;
+    let mut best = vec![f64::INFINITY; 1 << n];
+    for i in 0..n { best[1 << i] = 0.0; }                  // a base table costs nothing
+    for s in 1..=full {
+        if s.count_ones() < 2 || !connected(s) { continue; }
+        let mut l = (s - 1) & s;                           // every non-empty proper subset of s
+        while l > 0 {
+            let r = s ^ l;
+            if l > r && linked(l, r) && best[l as usize].is_finite() && best[r as usize].is_finite() {
+                let c = best[l as usize] + best[r as usize] + card[s as usize];
+                best[s as usize] = best[s as usize].min(c);
+            }
+            l = (l - 1) & s;
+        }
+    }
+    best[full as usize]
+}
+```
+
+<Predict
+  id="dp-order"
+  question="The DP solves subsets from the smallest to the largest. When it solves the subset ABCD, how many plans does it look at for the part ABC?"
+  options={["All plans of ABC, so it can combine them with D", "Only one: the best plan for ABC, found earlier", "None: it builds ABCD from base tables only"]}
+  answer={1}
+  explain="That is the principle of optimality. Any plan for ABCD that contains a worse plan for ABC can be improved by swapping in the best one. The table entry for ABC is all the DP needs."
+>
+<DpTableDemo />
+</Predict>
+
+1. Press **Step** a few times on the fixed graph. The highlighted nodes show the current subset. Each line below is one split into two connected parts.
+2. Watch the step for ABCD. The split AB + CD wins over ABC + D, because both AB and CD are small.
+3. Turn on **Left-deep only**. Now the right input is always one table, so AB + CD is not allowed, and the answer is 1,011.
+4. Select **clique** with 7 tables and press **Play**. Every subset is connected, so the table has 120 joined subsets.
+
+### Interesting orders and other dimensions
+
+System R kept more than one plan per subset. A plan whose output is sorted on a join column or an `ORDER BY` column can save a sort later. Such a sort order is an **interesting order**. The DP keeps the cheapest plan for each subset and each interesting order. PostgreSQL does the same with **pathkeys**. Its `add_path()` keeps a path if no other path is better in every dimension: total cost, startup cost, sort order and parameterization.
+
+### Avoiding cross products
+
+The DP above skips any split without an edge between its parts. That cuts the search space a lot: a chain of 10 tables has 165 splits to consider, a clique 28,501. System R and PostgreSQL both postpone cross products. PostgreSQL considers a clauseless join only when no join with a predicate is possible.
+
+DPsub, as written above, still enumerates every subset and every split, and then rejects most of them. **DPccp** (Moerkotte and Neumann, 2006) enumerates only the pairs of a connected subgraph and a connected complement. Its work is exactly the number of such pairs: $(n^3 - n)/6$ for a chain, $(n-1)\,2^{n-2}$ for a star and $(3^n - 2^{n+1} + 1)/2$ for a clique. **DPhyp** extends it to complex predicates that touch more than two tables. DuckDB and MySQL's newer hypergraph optimizer use DPhyp.
+
+## Left-deep or bushy?
+
+A left-deep plan has practical advantages. Each join reads one base table, so it can be an index nested loop on that table. With hash joins, the intermediate result streams through a pipeline of probes. MySQL's classic optimizer builds only left-deep plans. It uses a greedy search whose depth `optimizer_search_depth` limits.
+
+Bushy plans can be much cheaper, as the fixed example shows: 48.1 times in C_out. They also allow two independent subtrees to run in parallel. PostgreSQL's DP considers bushy plans, and so do most modern optimizers.
+
+## Many tables: greedy and genetic search
+
+Exhaustive DP grows like $3^n$ on a clique. For large queries, optimizers fall back to heuristics:
+
+- **Greedy Operator Ordering** (GOO, Fegaras 1998) starts with one tree per table. At each step it joins the two trees whose result is smallest. It is fast and often good, but one early choice can lock in a bad plan.
+- **Randomized search** (iterative improvement, simulated annealing) starts from random plans and changes them step by step.
+- **PostgreSQL GEQO** treats a join order as a permutation, as in the travelling salesman problem. It runs a genetic algorithm with edge recombination crossover over a pool of orders. GEQO starts when a query has `geqo_threshold` (12) or more FROM items.
+
+PostgreSQL has two more limits. `join_collapse_limit` (8) stops the planner from reordering explicit `JOIN` clauses past eight items, and `from_collapse_limit` (8) stops it from merging subqueries into the parent's search. Above these limits the written order constrains the plan. Raise them for a large query whose order you do not want to fix by hand.
+
+## Connect
+
+- [Cost models](/databases/optimizer/cost-models) give the cost of each join that a real optimizer uses in place of C_out.
+- [Cardinality estimation](/databases/optimizer/cardinality-estimation) gives the sizes that the DP adds up, and their errors.
+- [Join algorithms](/databases/query/join-algorithms) explain why the inner side of a nested loop should be small or indexed.
+- [Reading query plans](/databases/optimizer/reading-query-plans) shows a join order in `EXPLAIN` output.
+- [Relational algebra](/databases/query/relational-algebra) gives the rules that make join reordering correct.
+
+<Recall cards={[
+  { q: "How many left-deep and how many bushy join trees exist for n tables (with cross products)?", a: "Left-deep: n!. Bushy: Catalan(n − 1) × n! = (2n − 2)! / (n − 1)!. For 10 tables: 3,628,800 and 17,643,225,600." },
+  { q: "What is the principle of optimality, and why does C_out satisfy it?", a: "The best plan for a set of tables contains the best plans for its two parts. C_out of a plan is the C_out of its parts plus the size of the result, and that size depends only on the set." },
+  { q: "What is an interesting order?", a: "A sort order of a plan's output that a later operator can use, such as a merge join, ORDER BY or GROUP BY. The DP keeps the best plan for each subset and each interesting order." },
+  { q: "Why does a star query need no bushy plans when cross products are not allowed?", a: "Every join must include the fact table, because all edges touch it. So every plan adds one dimension table at a time: it is left-deep." },
+  { q: "When does PostgreSQL stop using exhaustive DP, and what does it use instead?", a: "When a query has geqo_threshold (12) or more FROM items. It then uses GEQO, a genetic algorithm over join permutations." },
+  { q: "What does DPccp enumerate, and how much work is that for a chain and a clique?", a: "Only pairs of a connected subgraph and a connected, linked complement. A chain of n has (n³ − n)/6 such pairs, a clique (3ⁿ − 2ⁿ⁺¹ + 1)/2." },
+]} />

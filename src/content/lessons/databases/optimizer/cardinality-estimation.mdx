@@ -1,0 +1,146 @@
+---
+summary: "How the planner guesses row counts: what ANALYZE samples, equi-width and equi-depth histograms, most-common values, n_distinct and HyperLogLog, the independence and uniformity assumptions, extended statistics for correlated columns, and why errors multiply through joins."
+---
+import { HistogramDemo, CorrelatedDemo, ErrorGrowthDemo } from "@/demos/db/OptimizerStatsDemos";
+
+The cost formulas of the [previous lesson](/databases/optimizer/cost-models) need one input for every operator: how many rows it returns. This number is the **cardinality**. The fraction of rows that a predicate keeps is its **selectivity**. If the planner thinks a filter keeps 10 rows and it keeps 100,000, every cost above that filter is wrong. The plan it picks can then be slower by orders of magnitude.
+
+The planner cannot count the rows before it runs the query. So it keeps a small summary of each column, and it assumes things about the parts that the summary does not describe.
+
+## What ANALYZE stores
+
+PostgreSQL's `ANALYZE` reads a random sample of each table. The sample has 300 × `default_statistics_target` rows, so 30,000 rows with the default target of 100. From the sample it computes, for each column, the rows you see in the `pg_stats` view:
+
+- `null_frac`: the fraction of NULL values.
+- `n_distinct`: the number of distinct values. A negative value means a fraction of the row count, for columns that grow with the table.
+- `most_common_vals` and `most_common_freqs`: the **MCV list**, up to 100 values that are clearly more common than average, with their frequencies.
+- `histogram_bounds`: an **equi-depth histogram** of the other values, with up to 100 buckets.
+- `correlation`: how well the physical row order follows the column order. The cost model uses it for index scans.
+
+`ALTER TABLE t ALTER COLUMN c SET STATISTICS 1000` gives one column a larger sample, MCV list and histogram. Autovacuum runs `ANALYZE` after about 10% of a table changes, but a bulk load can make the statistics stale at once.
+
+## Histograms
+
+A **histogram** splits the value range into **buckets** and stores how many rows fall in each. Inside a bucket, the planner assumes that the values are spread evenly. This is the **uniformity assumption**.
+
+- An **equi-width** histogram gives every bucket the same range of values. It is simple, but a dense region shares one bucket with a sparse one.
+- An **equi-depth** histogram gives every bucket the same number of rows. Dense regions get narrow buckets. The bucket bounds are the quantiles of the sample.
+
+An equi-depth histogram bounds the error of any range estimate: it is wrong by at most about two partial buckets. With 20 buckets on 100,000 rows, one bucket holds 5,000 rows. The weak point is a **spike**: one value with many rows. It fills several buckets alone, and its rows leak into its neighbours. That is why PostgreSQL removes the MCVs first and builds the histogram from the rest.
+
+<Predict
+  id="width-vs-depth"
+  question="A column of order amounts has most rows between 1 and 60, a tail up to 999 and spikes at 0, 99, 199 and 499. With 20 buckets and no MCV list, which histogram gives the better typical (median) estimate for ranges where the data is?"
+  options={["Equi-width: its buckets have a fixed size", "Equi-depth", "They are the same: both have 20 buckets"]}
+  answer={1}
+  explain="Equi-width puts most of the rows into its first bucket, 0 to 49, and assumes they are uniform there. The median q-error is 1.63 for equi-width and 1.07 for equi-depth. But equi-depth without MCVs has a bad worst case: 547, near the spikes."
+>
+<HistogramDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **equi-depth** and read the predicate `BETWEEN 10 AND 19`. Then select **equi-width**: the line inside the first bucket is flat, so the estimate misses the shape.
+2. Set the predicate to 0..0 and turn the MCV list off. Equi-width says 1,311 rows, equi-depth 6,667; the truth is 5,984. Turn the MCV list on: equi-depth now says 5,977.
+3. Set the predicate to 500..999 and view all values. The truth is 257 rows. Equi-width says 273; equi-depth says 3,601. Its last bucket spans the whole sparse tail.
+4. Move **Buckets** from 2 to 100 and watch the lower plot. More buckets help both kinds, with diminishing returns.
+5. Select the **3,000-row sample**. The median errors change little: a few thousand rows describe the shape well. Rare values are what a sample misses.
+
+The q-error in the demo is the standard measure of estimation error. For an estimate $e$ and a true count $t$ it is $q = \max(e/t,\ t/e)$. An estimate 10 times too high and one 10 times too low both give $q = 10$. With the MCV list on, the median errors fall to 1.14 (equi-width) and 1.02 (equi-depth).
+
+## Distinct counts
+
+`n_distinct` drives equality estimates (`col = const` for a value that is not an MCV) and the number of groups of a `GROUP BY`. ANALYZE estimates it from the sample with the **Duj1** estimator of Haas and Stokes:
+
+$$\hat D = \frac{n\,d}{n - f_1 + f_1\,n/N}$$
+
+Here $n$ is the sample size, $d$ the distinct values in the sample, $f_1$ the values seen exactly once, and $N$ the table rows. A sample sees few of the rare values in a skewed column, so the estimate is often far too low. For a Zipf-distributed column of 1,000,000 rows with 120,613 distinct values, a 30,000-row sample gives 15,658. If you know better, set it: `ALTER TABLE t ALTER COLUMN c SET (n_distinct = 120000)`.
+
+A **HyperLogLog** sketch counts distinct values in one pass with a few kilobytes of memory. It hashes each value and uses the first $p$ bits to choose one of $m = 2^p$ registers. Each register keeps the longest run of leading zero bits it has seen. Long runs are rare, so their length tells how many different hashes went by. The standard error is about $1.04/\sqrt m$:
+
+```go
+type HLL struct{ p uint8; reg []uint8 }
+
+func (h *HLL) Add(hash uint64) {
+	idx := hash >> (64 - h.p)                       // first p bits choose a register
+	rank := uint8(bits.LeadingZeros64(hash<<h.p|1<<(h.p-1))) + 1 // position of the first 1 after them
+	if rank > h.reg[idx] { h.reg[idx] = rank }
+}
+
+func (h *HLL) Estimate() float64 {
+	m := float64(len(h.reg)); sum, zeros := 0.0, 0
+	for _, r := range h.reg { sum += math.Ldexp(1, -int(r)); if r == 0 { zeros++ } }
+	e := 0.7213 / (1 + 1.079/m) * m * m / sum
+	if e <= 2.5*m && zeros > 0 { return m * math.Log(m/float64(zeros)) } // small-range correction
+	return e
+}
+```
+
+With 4,096 registers of 6 bits (3 KiB), our implementation estimates 120,945 for the same column: an error of 0.3%, inside the expected 1.6%. Trino's `approx_distinct`, ClickHouse's `uniqHLL12` and Redis's `PFCOUNT` use HyperLogLog. PostgreSQL's ANALYZE uses the sample estimator instead.
+
+## The independence assumption
+
+For `WHERE a = 1 AND b = 2`, the planner multiplies the two selectivities. This is the **independence assumption**: it is right only if the columns are not related. Real data is full of related columns: a zip code determines its city, a car model determines its make. Then the product counts the same restriction twice.
+
+<Predict
+  id="city-zip"
+  question="An address table has 20 cities with 5 zip codes each, 100,000 rows in total. Each zip code belongs to one city. How many rows does the planner expect for city = 'C3' AND zip = '10202', with only per-column statistics?"
+  options={["1,000: the true count", "50: twenty times too few", "5,000: the rows of the city"]}
+  answer={1}
+  explain="P(city) = 1/20 and P(zip) = 1/100, so the product is 1/2,000: 50 rows. The true count is 1,000, because the zip already implies the city. The error factor is the number of cities."
+>
+<CorrelatedDemo />
+</Predict>
+
+1. Read the first row. Per-column statistics give 50; **dependencies** and **mcv** both give 1,000.
+2. Read the second row: a zip code of another city, so no row can match. Dependencies still say 1,000. The formula assumes that the values you ask for are compatible. The MCV list knows the real pairs and says 0.
+3. Read the GROUP BY row. Independence multiplies the distinct counts: 20 × 100 = 2,000 groups. The `ndistinct` statistic stores the real number, 100.
+4. Move **Zip codes per city** to 50. There are now 1,000 pairs, and the 100-item MCV list covers only 10% of the rows. A pair outside the list falls back to the independence estimate: 5 rows for a true 100.
+5. Move **Rows with a wrong city** to 10%. The dependency degree falls to 0, because every zip now has at least one row with another city.
+
+PostgreSQL's **extended statistics** (`CREATE STATISTICS`, since version 10) describe groups of columns:
+
+| Kind | Stores | Fixes |
+|---|---|---|
+| `dependencies` | a degree $d$ for each functional dependency $a \Rightarrow b$ | equality on both columns: $P(a,b) = d \cdot \min(P(a), P(b)) + (1-d)\,P(a)P(b)$ |
+| `ndistinct` | distinct counts of column combinations | `GROUP BY a, b` and `DISTINCT` estimates |
+| `mcv` (version 12) | the most common value combinations and their frequencies | any predicate on listed combinations, including impossible ones |
+
+The degree $d$ is the fraction of sampled rows in groups where $a$ determines $b$ fully. This is why a few dirty rows destroy it. PostgreSQL 14 also accepts expressions, such as `CREATE STATISTICS s ON (date_trunc('day', ts)) FROM t`.
+
+## Errors multiply through joins
+
+A join's estimate is the product of its inputs' estimates and the join selectivity. A query with $j$ joins multiplies $2j + 1$ estimates: one per base table and one per join predicate. If each one is off by a random factor, the logarithms of the factors add. The spread grows with the square root of the count, and any common bias grows linearly.
+
+<ErrorGrowthDemo />
+
+1. Keep σ = 0.5 and bias −0.2. With no join, the median q-error is 1.4. At 5 joins it is 9.3, and at 10 joins it is 64.
+2. Read the 90th percentile at 10 joins: 1,273. One query in ten has an estimate off by more than three orders of magnitude.
+3. Look at the lower plot: 97% of the estimates at 10 joins are too low. A small bias towards under-estimation, as correlated predicates cause, becomes a strong one.
+4. Set the bias to 0. The median grows much more slowly, but the tails still grow.
+
+Leis, Gubichev, Mirchev, Boncz, Kemper and Neumann measured this in "How good are query optimizers, really?" (VLDB 2015). They built the **Join Order Benchmark** (JOB): 113 queries with 3 to 16 joins on the IMDB data set, which has real correlations. They found the following:
+
+- Every system they tested, PostgreSQL and four others, made large errors on multi-join queries. The errors grew quickly with the number of joins.
+- The errors were mostly under-estimates, because of the independence assumption.
+- Better cardinalities improved the plans much more than a better cost model did. Even a simple cost model gave good plans with true cardinalities.
+- Under-estimates led PostgreSQL to pick nested loop joins that were catastrophic on the real row counts.
+
+The practical rule follows: when a plan is bad, check the row estimates before you tune the cost constants.
+
+## Connect
+
+- [Cost models](/databases/optimizer/cost-models) turn these row counts into costs.
+- [Join ordering](/databases/optimizer/join-ordering) shows how the estimates choose a join order.
+- [Reading query plans](/databases/optimizer/reading-query-plans) shows how to find a bad estimate in `EXPLAIN ANALYZE`.
+- [Bloom filters](/databases/lsm/bloom-filters) are another small sketch that trades exactness for memory.
+- [Zone maps and data skipping](/databases/olap/zone-maps-and-data-skipping) keep per-block minimum and maximum values, a coarse kind of histogram.
+
+<Recall cards={[
+  { q: "How many rows does PostgreSQL's ANALYZE sample by default, and why that number?", a: "300 × default_statistics_target = 30,000 rows. The factor 300 comes from a bound on the sample size needed for a histogram of that many buckets." },
+  { q: "What is the advantage of an equi-depth histogram, and what is its weak point?", a: "Each bucket holds the same number of rows, so a range estimate is wrong by at most about two partial buckets of rows. A spike of one value spans several buckets and leaks into its neighbours, so the frequent values go into a separate MCV list." },
+  { q: "Define the q-error.", a: "q = max(estimate / true, true / estimate). It treats over- and under-estimates alike; 1 means exact." },
+  { q: "Why does the independence assumption under-estimate city = X AND zip = Y, and by how much?", a: "It multiplies P(city) × P(zip), but the zip already implies the city. The estimate is too low by a factor of 1 / P(city), the number of cities for uniform data." },
+  { q: "Name the three kinds of PostgreSQL extended statistics and what each fixes.", a: "Dependencies fix equality on related columns. Ndistinct fixes group counts for GROUP BY on several columns. MCV lists store common value combinations, so they also know impossible ones." },
+  { q: "How do estimation errors grow with the number of joins?", a: "A query with j joins multiplies 2j + 1 estimates, so the log errors add. The spread grows like the square root of the count, a common bias grows linearly, and the q-error grows exponentially." },
+]} />

@@ -1,0 +1,149 @@
+---
+summary: "What a query optimizer estimates and how PostgreSQL turns pages and tuples into one cost number: the five cost constants, the formulas for seq, index and bitmap scans, Mackert–Lohman caching, startup vs total cost, LIMIT, and join costs."
+---
+import { CostCalculatorDemo, PlanFlipDemo, JoinMethodDemo } from "@/demos/db/OptimizerCostDemos";
+
+A SQL query says what rows you want, not how to get them. The **optimizer** (also called the planner) chooses how. It lists the possible **plans**: trees of operators such as scans, joins and sorts. It gives each plan a **cost**, which is an estimate of the work it does. Then it runs the cheapest plan.
+
+The cost is not a time. It is a sum of three kinds of work:
+
+- **I/O**: pages read from disk or from the OS page cache, in order or at random positions.
+- **CPU**: tuples (rows) passed through an operator, and operators (comparisons, hashes) evaluated on them.
+- **Memory**: a sort or a hash table that does not fit in `work_mem` writes temporary files, which adds I/O.
+
+The optimizer cannot measure these before it runs the query. It estimates them from **statistics**: the number of rows and pages of each table, and the distribution of values in each column. The next lesson, [cardinality estimation](/databases/optimizer/cardinality-estimation), is about those statistics. This lesson takes the row counts as given and asks how they become a cost.
+
+## PostgreSQL's cost units
+
+PostgreSQL measures cost in units of one sequential page read. Five settings give the price of everything else:
+
+| Setting | Default | The price of |
+|---|---|---|
+| `seq_page_cost` | 1.0 | one 8 KiB page read as part of a sequential scan |
+| `random_page_cost` | 4.0 | one page read at a random position |
+| `cpu_tuple_cost` | 0.01 | passing one row through a plan node |
+| `cpu_index_tuple_cost` | 0.005 | processing one index entry |
+| `cpu_operator_cost` | 0.0025 | evaluating one operator or function call |
+
+The PostgreSQL documentation explains the 4.0: random access is about 40 times slower than sequential access, but about 90% of random reads hit a cache. So $40 \times 0.1 = 4$. The CPU constants are small because one page holds many rows.
+
+## Three ways to read one table
+
+The PostgreSQL documentation uses a table `tenk1` with 10,000 rows of 244 bytes in 345 pages: 29 rows per page. It has a B-tree index `tenk1_unique1` with 30 pages. Here are the three access paths for `WHERE unique1 < 100`.
+
+A **sequential scan** reads every page in order and checks every row:
+
+$$\text{cost} = \text{pages} \times \texttt{seq\_page\_cost} + \text{rows} \times (\texttt{cpu\_tuple\_cost} + n_\text{quals} \times \texttt{cpu\_operator\_cost})$$
+
+With no filter, that is $345 + 10{,}000 \times 0.01 = 445.00$. With one filter it is 470.00. These are the numbers that `EXPLAIN` prints in the documentation, and our model gives them exactly.
+
+An **index scan** descends the B-tree, reads the matching index entries in key order, and fetches each row from the heap. The heap fetches are random reads unless the table is stored in index order. A **bitmap scan** first reads all matching index entries into a bitmap of row positions. Then it reads the marked heap pages in physical order, so it reads each page only once.
+
+<Predict
+  id="which-scan"
+  question="WHERE unique1 < 100 matches 100 of the 10,000 rows (1%). The index is not correlated with the physical order. Which path does PostgreSQL choose?"
+  options={["Index Scan: it reads only 100 rows", "Bitmap Heap Scan", "Seq Scan: 1% still touches most pages"]}
+  answer={1}
+  explain="The index scan pays a random read for nearly every row: 358.04 in total. The bitmap scan reads the same 88 pages in page order, at a lower price per page: 224.98. The seq scan costs 470.00."
+>
+<CostCalculatorDemo />
+</Predict>
+
+Things to try:
+
+1. Read the three cards at 1%. The bitmap scan has a startup cost of 5.06: it reads the whole index part before it returns the first row. Its child, the Bitmap Index Scan, costs 5.04.
+2. Move the selectivity down to one row (0.01%). The index scan wins with cost 0.29..8.30, the documentation's result for `unique1 = 42`.
+3. Move the selectivity up. Past about 38% the seq scan becomes the cheapest path.
+4. Set **Index correlation** to 1. The heap fetches are now in order, so the index scan wins almost everywhere.
+5. Select **LIMIT 1** at a selectivity of 70%. The seq scan wins with 0.07, because it returns its first rows at once. The bitmap scan must pay its startup cost of 138.5 first.
+
+### The heap part of each formula
+
+For an index scan, PostgreSQL computes two extremes. If the index order is random, each fetched row costs one random page read. The number of distinct pages comes from the **Mackert–Lohman** formula, which models an LRU cache of the table's share of `effective_cache_size`. If the index order matches the heap order, the scan reads $\lceil s \cdot \text{pages} \rceil$ pages, mostly in sequence. The cost interpolates between the two with the square of the column's **correlation**, a statistic between −1 and 1.
+
+For a bitmap scan, the pages are read in order, but with gaps. The price per page falls from `random_page_cost` towards `seq_page_cost` as the fraction of pages read grows:
+
+```rust
+/// cost_bitmap_heap_scan(), the heap part (loop_count = 1).
+fn bitmap_heap_cost(t: &Table, sel: f64, p: &CostParams) -> f64 {
+    let tuples = (sel * t.rows).round().max(1.0);
+    let pages_total = t.pages;
+    let mut pages = 2.0 * pages_total * tuples / (2.0 * pages_total + tuples);
+    pages = if pages >= pages_total { pages_total } else { pages.ceil() };
+    let per_page = if pages >= 2.0 {
+        p.random_page_cost - (p.random_page_cost - p.seq_page_cost) * (pages / pages_total).sqrt()
+    } else {
+        p.random_page_cost
+    };
+    pages * per_page + tuples * (p.cpu_tuple_cost + p.cpu_operator_cost) // recheck the qual
+}
+```
+
+For `unique1 < 100` this gives 88 pages at 2.48 each. The index scan pays 4.0 for most of the same pages.
+
+## Startup cost and total cost
+
+`EXPLAIN` prints two costs for each node: `cost=startup..total`. The **startup cost** is the work before the node can return its first row. The **total cost** is the work to return all rows. A seq scan has startup 0. A sort, a hash table build and a bitmap must read all of their input first, so their startup cost is high.
+
+The two numbers matter when the query does not need all rows. For `LIMIT k`, PostgreSQL charges $\text{startup} + (\text{total} - \text{startup}) \times k / \text{rows}$. That is why a `LIMIT` often turns a hash join into a nested loop, or a sort into an index scan in key order.
+
+## When the plan flips
+
+The planner compares straight lines and curves. Where two cost curves cross, the plan changes at once. A small change in a statistic or a setting can move a query to the other side of a crossing.
+
+<Predict
+  id="ssd-flip"
+  question="On tenk1 the bitmap scan gives way to a seq scan at about 38% of the rows. What happens to this point if you lower random_page_cost from 4.0 to 1.1?"
+  options={["It moves to a higher selectivity: index-based paths look cheaper", "It does not move: a seq scan does no random reads", "It moves to a lower selectivity"]}
+  answer={0}
+  explain="The bitmap scan pays part of random_page_cost for each page. The seq scan pays only seq_page_cost. A lower random_page_cost makes the bitmap scan cheaper, and the flip moves from 37.9% to 52.9%."
+>
+<PlanFlipDemo />
+</Predict>
+
+1. Read the top plot. Each line is one access path. The dashed lines mark where the cheapest path changes.
+2. Move **random_page_cost** to 1.1. The horizontal line in the plan diagram moves, and the bitmap region grows to the right.
+3. Move **Index correlation** to 0.5, then to 1. The index scan region grows until it covers most of the diagram.
+4. Select **events** (100 million rows) and change **effective_cache_size**. The index scan line moves; the other lines do not.
+
+### Why SSD setups lower random_page_cost
+
+The default 4.0 dates from spinning disks. On an SSD, a random 8 KiB read costs only a little more than a sequential one, and a large cache absorbs many reads. Many guides suggest 1.1 to 1.5 for SSDs. Set it with `ALTER TABLESPACE ... SET (random_page_cost = 1.1)` or for the whole server. Measure first: a lower value makes the planner choose index scans more often, and an index scan on a cold, large table can be slow.
+
+### effective_cache_size
+
+`effective_cache_size` (default 4 GB) does not allocate memory. It tells the planner how much of the database the OS cache and `shared_buffers` can hold together. Only the Mackert–Lohman part uses it. If the table is larger than its share of the cache, repeated reads of the same page count as new reads. A 1% index scan of `events` costs 3.99 M at 128 MB, 3.06 M at 4 GB and 2.94 M at 64 GB. The bitmap scan costs 1.33 M at every setting, so it wins in all three.
+
+## Join costs
+
+The same constants price joins. A **nested loop** runs its inner side once for each outer row. Each candidate pair costs `cpu_tuple_cost` plus the join condition. If the inner side is an index scan, each run is a short B-tree lookup. A **hash join** reads the inner side once, builds a hash table, then probes it once for each outer row. Its startup cost includes the whole build.
+
+<JoinMethodDemo />
+
+1. Keep 100 customers. The nested loop with an index probe costs 6,653; the hash join costs 25,494, because it reads all 1,000,000 orders.
+2. Move the slider past 693 customers. The hash join becomes cheaper: one full scan beats hundreds of random probes.
+3. Set **random_page_cost** to 1.1. The flip moves to 16,674 customers.
+4. Turn on the nested loop without an index. At 100 customers it costs 3,186,987: it scans all of `orders` 100 times.
+
+Each probe gets cheaper as the outer side grows. With many probes, the same index and heap pages repeat, and the Mackert–Lohman formula counts fewer distinct page reads per probe.
+
+## What the model leaves out
+
+The formulas are cheap, which matters: the planner may cost thousands of paths for one query. But they make strong assumptions. Every page read of one kind costs the same. CPU costs do not depend on the data type. Concurrent queries, parallel workers and the real cache state do not exist. The largest error is usually not in the formulas but in the row counts that go into them.
+
+## Connect
+
+- [Buffer pools](/databases/storage/buffer-pools) explain the cache that `effective_cache_size` describes.
+- [Disks vs SSDs](/databases/storage/disks-vs-ssds) explains why random and sequential reads differ.
+- [B+ trees](/databases/btrees/b-trees) give the index height that the descent cost uses.
+- [Join algorithms](/databases/query/join-algorithms) show how nested loop, hash and merge joins run.
+- [Cardinality estimation](/databases/optimizer/cardinality-estimation) is where the row counts come from.
+
+<Recall cards={[
+  { q: "What are PostgreSQL's five cost constants and their defaults?", a: "seq_page_cost 1.0, random_page_cost 4.0, cpu_tuple_cost 0.01, cpu_index_tuple_cost 0.005, cpu_operator_cost 0.0025. Costs are in units of one sequential page read." },
+  { q: "Write the cost of a sequential scan with one filter.", a: "pages × seq_page_cost + rows × (cpu_tuple_cost + cpu_operator_cost). For tenk1: 345 + 10,000 × 0.0125 = 470." },
+  { q: "Why does a bitmap heap scan often beat an index scan at 1% selectivity?", a: "It sorts the row positions by page and reads each page once, in physical order. The price per page falls from random_page_cost towards seq_page_cost, while the index scan pays a random read for nearly every row." },
+  { q: "What is the difference between startup cost and total cost, and when does it matter?", a: "Startup cost is the work before the first row; total cost is the work for all rows. It matters with LIMIT or EXISTS, where the planner charges startup + (total − startup) × k / rows." },
+  { q: "What does effective_cache_size change?", a: "It allocates nothing. It is the cache size that the Mackert–Lohman formula assumes when it estimates how many distinct pages repeated index fetches read." },
+  { q: "Why do SSD setups often lower random_page_cost to about 1.1?", a: "On an SSD a random read costs little more than a sequential read. So index and bitmap scans are cheaper than the 4.0 default assumes." },
+]} />

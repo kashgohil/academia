@@ -76,7 +76,7 @@ try {
 
   // Phone width: no horizontal page scroll.
   const phone = await browser.newPage({ viewport: { width: 390, height: 844 } });
-  for (const path of ["", LIVE[1]]) {
+  for (const path of ["", LIVE[1], "systems/allocators/free-lists"]) {
     await phone.goto(`${BASE}/${path}`, { waitUntil: "networkidle" });
     const overflow = await phone.evaluate(() => document.documentElement.scrollWidth - innerWidth);
     if (overflow > 1) failures.push(`phone ${path || "home"}: horizontal overflow ${overflow}px`);

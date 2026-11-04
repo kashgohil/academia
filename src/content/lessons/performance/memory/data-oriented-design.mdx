@@ -1,0 +1,45 @@
+---
+summary: Organizing data by how it's processed rather than by what it represents, and why objects with pointers are the slowest layout.
+---
+import { DodDemo } from "@/demos/MemoryHierarchyDemos";
+
+Object-oriented design groups data by **what it is**: an `Entity` holds its position, velocity, health, name, inventory and AI state, often behind a pointer for polymorphism. **Data-oriented design** (Mike Acton, the Bitsquid and Molly Rocket engines, Andrew Kelley's talks on Zig's compiler) groups data by **how it's used**: the loop that updates positions reads positions and velocities, so those live together, densely, and nothing else comes along.
+
+<Predict
+  id="dod"
+  question="Updating position += velocity for 100,000 game entities of 128 bytes each. Option A: an array of pointers to individually allocated objects. Option B: separate arrays of positions and velocities. Roughly how much faster is B?"
+  options={["About 2×", "About 10×", "Nearly 100×"]}
+  answer={2}
+  explain="Scattered heap objects cost about 98 ns each: one unpredictable miss per entity. Separate hot arrays cost about 1.2 ns: they stream, and only 24 of every 128 bytes are needed, so they stay in cache. That's an 80× difference for the same arithmetic."
+>
+<DodDemo />
+</Predict>
+
+The three layouts tell a story in two steps:
+
+1. **Remove the pointers** (objects inline in an array): from about 98 ns to 4.75 ns. Accesses become predictable, so misses overlap.
+2. **Remove the cold bytes** (hot fields in their own arrays): from 4.75 ns to about 1.2 ns. Each line now carries only data the loop uses, so the working set is 5× smaller and fits in cache.
+
+Try **5,000** entities: everything fits in cache, and the gap shrinks to about 8×. Data-oriented layout pays most at scale.
+
+## The method
+
+<Steps>
+<div><b>Start from the transformations</b>, not the nouns: what does each hot loop read and write, and how often?</div>
+<div><b>Split hot from cold.</b> Fields touched every frame go in one place; rarely used ones (names, debug info, inventory) go elsewhere, linked by index.</div>
+<div><b>Prefer arrays and indices to pointers.</b> Indices are smaller, survive reallocation, serialize trivially, and keep data contiguous. Use generational indices for safety (the pool allocator lesson).</div>
+<div><b>Process in batches, by kind.</b> Instead of a virtual call per object (each a likely branch mispredict and i-cache miss), keep one array per kind and loop over each. Entity Component Systems (Bevy, EnTT, flecs) are this idea packaged.</div>
+<div><b>Encode state in where data lives, not in flags.</b> Dead entities removed or moved to another array means no `if (alive)` branch in the hot loop.</div>
+</Steps>
+
+## Costs
+
+Data-oriented code trades encapsulation for throughput. Invariants that a class would enforce are now spread across parallel arrays that must stay in sync, and adding a field means touching every system that copies entities. Apply it where profiles show memory-bound loops over many items: simulations, game engines, compilers (Zig's and Carbon's compilers use flat, index-based ASTs), databases, ML preprocessing. Keep ordinary design elsewhere.
+
+<Recall cards={[
+  { q: "Core idea of data-oriented design?", a: "Lay out data by how hot loops access it, not by conceptual objects, so each loop streams only the bytes it needs." },
+  { q: "Two steps that took the entity update from ~98 ns to ~1.2 ns?", a: "Remove pointer indirection (store objects contiguously), then split hot fields from cold ones into separate arrays." },
+  { q: "Why prefer indices over pointers in data-oriented code?", a: "They are smaller, stay valid when arrays reallocate, serialize easily, and keep data contiguous." },
+  { q: "Why process entities by kind instead of with virtual calls?", a: "Per-object dynamic dispatch causes branch mispredicts and instruction-cache misses; per-kind loops are tight and predictable." },
+  { q: "What is an Entity Component System?", a: "An architecture that stores each component type in its own dense array and runs systems over the arrays, which is data-oriented design as a framework." },
+]} />

@@ -1,0 +1,246 @@
+---
+summary: "The TSS and RSP0, entering ring 3 with iretq, a user address space, the syscall instruction and its MSRs, swapgs, loading a static ELF, write and exit, a page fault in user code, process isolation, and TinyOS: all the parts in one kernel that you can drive."
+---
+import { TinyOsDemo, SyscallEntryDemo } from "@/demos/os/KernelUserDemos";
+
+This is the last piece, and it joins all the others. A **user task** is code that the kernel does not trust. It runs in ring 3, in its own address space, and it can reach the kernel only through a few narrow doors. The kernel must be able to kill it at any instruction and lose nothing else.
+
+**TinyOS** is the kernel of this module as a model. Its page tables are the real `PageTable` of the [paging lesson](/os/vm/paging-and-page-tables), and its frames are the `PhysMem` of the [huge pages lesson](/os/vm/huge-pages). Its programs are real ELF files with real x86-64 machine code, read with the `parseElf` of the [ELF lesson](/os/processes/loading-a-program-elf-and-the-dynamic-linker). Its CPU decodes these bytes, and each fetch, load and store does a real page walk with the rights of ring 3.
+
+<Predict
+  id="isolate"
+  question="Two tasks run. The selected task reads a kernel address in ring 3. What happens to the system?"
+  options={[
+    "The machine resets, because kernel memory was touched",
+    "The kernel panics and stops all tasks, to be safe",
+    "The CPU raises a page fault, and the kernel kills that task only",
+  ]}
+  answer={2}
+  explain="The kernel pages have U = 0, so the walk denies the read. The page fault handler sees that the fault came from ring 3 and the address is not valid for this task. It frees that task's frames, and the other task never notices."
+>
+<TinyOsDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Boot**, then **Step** six times. Each step is a real part of setup: GDT, IDT, the memory map, the kernel's tables, the MSRs and the timer. The memory map leaves 480 frames for the allocator, and the kernel's first tables take 4 of them.
+2. Load **ping** and **pong**, and click **Step** slowly. Find the first page fault in the kernel log. It has error 6: a write from user mode to a page that is not present. The kernel maps a page and the same `push` runs again.
+3. Click **Run**. Watch the console, the syscall log and the run queue. Both programs sleep most of the time, so the idle state appears.
+4. Select a task and click **touch kernel memory**. It dies with error 5: protection, read, user. Look at the other task's instruction count: it keeps rising.
+5. Click **writes its own code**. This dies with error 7. The text page is mapped with no write right.
+6. Click **calls write(1, kernel address, 8)**. This task lives. The syscall log shows a return value of -14. The kernel refused to read kernel memory on its behalf.
+7. Load **spin**. It has no system calls, and the timer still takes the CPU from it. Then click **reads 0x402000** for two different tasks. Each gets its own message from a different frame, at the same address.
+8. Kill all tasks, and read the free frame count. Every frame comes back. The invariant line at the bottom stays green for all of this.
+
+## Entering ring 3
+
+Ring 3 is not a place that you can jump to. No `jmp` lowers the privilege. The CPU has only return instructions for this. So the kernel builds the frame of an interrupt that never happened, and it runs `iretq`.
+
+```rust
+/// Enters ring 3 for the first time: fabricate an interrupt frame, then iretq.
+pub unsafe fn enter_user(rip: u64, rsp: u64, cr3: u64) -> ! {
+    unsafe {
+        asm!(
+            "mov cr3, {cr3}",
+            "push 0x1B",       // ss: user data, RPL 3
+            "push {rsp}",
+            "push 0x202",      // rflags: IF = 1
+            "push 0x23",       // cs: user code, RPL 3
+            "push {rip}",
+            "swapgs",          // user GS base now active, kernel value in the MSR
+            "iretq",
+            cr3 = in(reg) cr3, rsp = in(reg) rsp, rip = in(reg) rip,
+            options(noreturn),
+        )
+    }
+}
+```
+
+This is the same trick as the [fabricated thread stack](/os/kernel/a-simple-scheduler). All samples in this lesson compiled to an object file with rustc 1.96.1, but they were not run. The GDT needs user segments with DPL 3: `0x00AFFA000000FFFF` for code and `0x00CFF2000000FFFF` for data. Selector `0x23` is entry 4 with RPL 3, and `0x1B` is entry 3 with RPL 3.
+
+Once a task runs in ring 3, the next interrupt needs a kernel stack. The CPU takes it from **`TSS.RSP0`**. So the scheduler must write `RSP0` at each switch, to the top of the next task's kernel stack. If it forgets, one task's interrupt frames land on another task's stack. This is the only job left for the TSS in a simple kernel. Linux has a similar update in `__switch_to`, although KPTI adds a small trampoline stack in front.
+
+## A user address space
+
+Each task has its own top-level table, and `CR3` selects it. The lower half is private. The upper half is the same everywhere: TinyOS copies one PML4 entry, index 511, into each new top table. All tasks then share the kernel's PDPT and everything below it, so a new kernel stack appears in all address spaces at once.
+
+Every kernel page has `U = 0`. The hardware walk ANDs the U bit at all levels, so ring 3 can never read these pages, even though they are mapped. [KPTI](/os/processes/kernel-mode-and-user-mode) exists because Meltdown broke this on some CPUs by speculation. TinyOS does not model this.
+
+TinyOS frames are counted exactly. Loading **ping** gives the task 7 frames. They are the top table, a PDPT, a PD, a PT, a text page, a data page and a kernel stack. The first stack touch adds 4 more, because the stack is far from the code and needs its own 3 tables. In all, that is 11 frames.
+
+## Loading a static ELF
+
+A static ELF needs no dynamic linker. The loader reads the program headers. For each `PT_LOAD`, it allocates frames, maps them with the segment's rights, and copies the file bytes. The rest of the segment stays zero. This is `load_elf_binary` with nearly everything removed. Then the loader sets up a stack range and builds the first `iretq` frame with `rip` at `e_entry`.
+
+Rights come from `p_flags`. The text page is read and execute. The data page is read and write, with NX set. So no page is both writable and executable, and the file itself states this.
+
+A new frame must read as zeros. In TinyOS, the bytes of a frame are dropped when it is freed. So a new owner can never read the old owner's data. Forgetting this is a real class of kernel leak.
+
+## System calls: the fast door
+
+`syscall` is the door for ordinary work. It is fast because it does almost nothing. It reads no descriptors and writes no memory.
+
+<Predict
+  id="rsp"
+  question="The syscall instruction has just run. What value is in rsp?"
+  options={[
+    "The top of the kernel stack, from TSS.RSP0",
+    "The user's stack pointer, unchanged",
+    "A value from the LSTAR MSR",
+  ]}
+  answer={1}
+  explain="syscall does not touch rsp or memory. The kernel runs in ring 0 on the user's stack for a few instructions. This is why IF must be off and why the first instruction is swapgs."
+>
+<SyscallEntryDemo />
+</Predict>
+
+Things to try:
+
+1. Step to **syscall**. `rcx` and `r11` change, `rip` jumps and `cs` changes, and `rsp` does not change.
+2. Step to **swapgs**. It swaps two values, and it needs no register or memory. It is the only way that the kernel can find its per-CPU data here.
+3. Turn off **Entry code runs swapgs**. The next instructions use a GS base that the user chose, so the kernel reads its stack pointer from user memory.
+4. Turn off **SFMASK clears IF**. An interrupt arrives while `rsp` is still the user's. The privilege does not change, so the CPU pushes its frame on the user stack.
+5. Step to the end. `rip` equals `rcx`. A program must treat `rcx` and `r11` as lost across a system call.
+
+Four MSRs set up this door.
+
+| MSR | Number | TinyOS value | Meaning |
+|---|---|---|---|
+| `EFER` | `0xC0000080` | set SCE, bit 0 | Allow `syscall` |
+| `STAR` | `0xC0000081` | `0x0010000800000000` | Selector bases |
+| `LSTAR` | `0xC0000082` | `syscall_entry` | Entry point in 64-bit mode |
+| `SFMASK` | `0xC0000084` | `0x40700` | Flags to clear: AC, DF, IF, TF |
+
+`STAR` has a hidden demand on your GDT. `syscall` sets CS to `STAR[47:32]` and SS to that plus 8. `sysretq` sets SS to `STAR[63:48] + 8` and CS to `STAR[63:48] + 16`, both with RPL 3. So kernel code must come right before kernel data, and user data must come right before user code. This is why the TinyOS GDT has that odd order, with base `0x10`. Linux writes `0x0023001000000000`, which gives its selectors `0x10`, `0x18`, `0x2B` and `0x33`.
+
+```rust
+pub unsafe fn init_syscall(percpu: *mut PerCpu) {
+    unsafe {
+        wrmsr(EFER, rdmsr(EFER) | 1); // SCE
+        wrmsr(STAR, (0x10u64 << 48) | (0x08u64 << 32));
+        wrmsr(LSTAR, syscall_entry as *const () as usize as u64);
+        wrmsr(SFMASK, 0x4_0700); // AC, DF, IF, TF
+        wrmsr(KERNEL_GS_BASE, percpu as u64);
+    }
+}
+
+global_asm!(r#"
+    .text
+    .globl syscall_entry
+syscall_entry:
+    swapgs
+    mov gs:[8], rsp       // no free register yet
+    mov rsp, gs:[0]
+    push qword ptr gs:[8] // the user rsp
+    push r11              // user rflags
+    push rcx              // user rip
+    push rax              // syscall number, then the return value
+    push rdi
+    push rsi
+    push rdx
+    push r10
+    push r8
+    push r9
+    mov rdi, rsp          // the argument: &mut SyscallFrame
+    call {handler}
+    pop r9
+    pop r8
+    pop r10
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rax
+    pop rcx
+    pop r11
+    pop rsp               // the user stack; IF stays 0 until sysretq
+    swapgs
+    sysretq
+"#, handler = sym handle_syscall);
+```
+
+`swapgs` must also run on interrupt entry from ring 3, and it must not run on entry from ring 0. So an interrupt stub must check the saved CS. Getting this wrong is a classic bug, and Linux's entry code spends many lines on it, along with speculation fixes. This kernel's stub from the [interrupt lesson](/os/kernel/interrupt-handling) needs this check before user tasks can run. The `sysretq` has one trap of its own: a non-canonical `rcx` raises `#GP` in ring 0 on Intel CPUs, on the user's stack. Check it first, or return with `iretq`.
+
+## write and exit
+
+A system call handler treats every register as hostile. The buffer pointer is the main risk: a task could ask `write` to print kernel memory. So check that the range is in the user half, and take care if it wraps. Linux calls this check `access_ok`. It then copies with `copy_from_user`, which also handles a page that faults. The [system calls lesson](/os/processes/system-calls) has the full path.
+
+```rust
+const USER_TOP: u64 = 1 << 47;
+
+extern "C" fn handle_syscall(f: &mut SyscallFrame) {
+    // A non-canonical rcx would make sysretq raise #GP in ring 0 on Intel CPUs.
+    if f.rcx >= USER_TOP {
+        kill_current();
+    }
+    f.rax = match f.rax {
+        1 => sys_write(f.rdi, f.rsi, f.rdx),
+        60 => kill_current(),
+        _ => -38i64 as u64, // -ENOSYS
+    };
+}
+
+fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
+    if fd != 1 && fd != 2 {
+        return -9i64 as u64; // -EBADF
+    }
+    if buf >= USER_TOP || len > USER_TOP - buf {
+        return -14i64 as u64; // -EFAULT
+    }
+    console_write(buf as *const u8, len as usize);
+    len
+}
+```
+
+`exit` must be careful about order. The task is still running on its own kernel stack and its own page table. So TinyOS loads the kernel's `CR3` before it frees the table frames. A kernel cannot free the table that the CPU is walking.
+
+TinyOS uses the Linux numbers for `write` (1) and `exit` (60). Its number 35 is a simple `sleep` in ticks. On Linux, 35 is `nanosleep`, which takes a pointer.
+
+## A page fault in user code
+
+The handler from the [interrupt lesson](/os/kernel/interrupt-handling) now has a real decision. Each task has a list of valid ranges, which is the [VMA](/os/vm/page-faults-and-demand-paging) idea. TinyOS reuses `VmaTree` for it.
+
+| Fault | Error code | Decision |
+|---|---|---|
+| Not present, in the stack range | 6 | Take a frame, map it, `iretq`. The instruction runs again. |
+| Read of a kernel address | 5 | Kill the task |
+| Write to its own text | 7 | Kill the task |
+| Read of an unmapped address | 4 | Kill the task |
+| Non-canonical address | `#GP`, not `#PF` | Kill the task |
+
+The saved `rip` of a fault points to the faulting instruction, so returning retries it. This is what makes demand paging invisible. Faults in ring 0 are a different case, and their error code has U = 0. With no fix-up entry, they mean a kernel bug, so the right response is a panic.
+
+Killing a task means freeing all that it owns: user frames, tables, the kernel stack. It must also leave the run queue and any sleep list. A property test runs TinyOS with random loads, kills and bugs, and it checks after each few steps that:
+
+- no frame belongs to two tasks, apart from the shared kernel half;
+- no task can reach another task's frame, at the other task's addresses or at random ones;
+- killing a task changes no register, memory or output of any other task;
+- the run queue never holds a dead task, and each live task is in exactly one place;
+- all frames return when all tasks are gone.
+
+## Where to go from here
+
+TinyOS stops where a real kernel starts to grow. Each next step has a lesson in this track.
+
+- **`fork` and `exec`.** Copy the address space with [copy-on-write](/os/memory/copy-on-write), and replace it with the [ELF loader](/os/processes/fork-and-exec). You have most of the parts.
+- **A file system.** Add a [block layer](/os/io/the-block-layer-and-i-o-schedulers) and a virtio driver, then [inodes and directories](/os/fs/files-inodes-and-directories), and `open` and `read` follow.
+- **Drivers.** Read PCI configuration, map device registers, and handle [interrupts and DMA](/os/io/dma-and-the-iommu).
+- **More CPUs.** Send a startup message to each core through the local APIC, give each a GDT, TSS and run queue, and then [balance](/os/scheduling/multiprocessor-scheduling) the load. Each lock in the kernel now matters, and [TLB shootdowns](/os/vm/the-tlb) appear.
+
+On arm64, `svc` enters EL1 and `eret` returns. The CPU saves the return state in `ELR_EL1` and `SPSR_EL1`, and `SP_EL0` and `SP_EL1` are separate registers. So no `swapgs` and no stack puzzle exist: the CPU switches stacks by itself. Much of this lesson's care is a price of x86 history.
+
+## Connect
+
+- [Kernel mode and user mode](/os/processes/kernel-mode-and-user-mode): the rings as a user program sees them.
+- [System calls](/os/processes/system-calls): the same door from the outside, and its cost.
+- [Page faults and demand paging](/os/vm/page-faults-and-demand-paging): the handler in Linux.
+- [Virtual machines and hypervisors](/os/isolation/virtual-machines-and-hypervisors): one more level of the same idea.
+
+<Recall cards={[
+  { q: "How does a kernel enter ring 3 for the first time?", a: "It pushes ss, rsp, rflags, cs and rip, as if an interrupt from ring 3 had happened, with RPL 3 selectors. Then it runs iretq." },
+  { q: "What is TSS.RSP0 for, and when must it change?", a: "The CPU loads it as the stack for an interrupt from ring 3. The scheduler must set it to the next task's kernel stack at each switch." },
+  { q: "What does the syscall instruction change, and what does it leave alone?", a: "It saves rip in rcx and rflags in r11, loads rip from LSTAR and CS from STAR, and clears the SFMASK flags. It leaves rsp and GS alone." },
+  { q: "Why must SFMASK clear IF?", a: "rsp is still the user's after syscall. An interrupt in ring 0 has no stack switch, so its frame would land on the user's stack." },
+  { q: "Why does STAR force an order on the GDT?", a: "sysretq derives its selectors from one base: SS is base plus 8, and CS is base plus 16. So user data must sit right before user code." },
+  { q: "How does a page fault handler decide between mapping a page and killing the task?", a: "It looks up the address in the task's valid ranges. A not-present page in a range with the right access gets a frame and a retry. Anything else from ring 3 kills the task." },
+  { q: "Why must exit load another CR3 before it frees the task's tables?", a: "The CPU walks the table that CR3 names. Freeing it while it is in use lets later reads use a reused frame." },
+]} />

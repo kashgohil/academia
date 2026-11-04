@@ -1,0 +1,226 @@
+---
+summary: "From the reset vector to the first printed byte: UEFI and BIOS, a bootloader, Multiboot2 and Limine, the memory map, the kernel's entry conditions, a linker script, and a freestanding Rust or Zig setup that runs in QEMU on Apple Silicon."
+---
+import { BootTimelineDemo, LinkerExplorerDemo } from "@/demos/os/KernelBootDemos";
+
+A kernel is a program with no one under it. It has no loader that maps its segments for free, no C runtime, no stack it can trust, and no way to print an error. This module builds a small one, piece by piece, on x86-64. The last lesson composes all the pieces into **TinyOS**, a model that you can drive.
+
+The earlier modules showed how Linux behaves when all of this already works. This module shows how it starts to work.
+
+<Predict
+  id="reset"
+  question="You press the power button. Where does the first instruction of the CPU come from, and which mode does it run in?"
+  options={[
+    "From DRAM at address 0, in 64-bit mode",
+    "From flash ROM near the top of 4 GiB, in 16-bit real mode",
+    "From the boot sector on disk at 0x7C00, in 32-bit mode",
+  ]}
+  answer={1}
+  explain="DRAM does not work yet, so the first fetch must come from ROM. Every x86 CPU leaves reset in real mode, with a hidden CS base of 0xFFFF0000 and IP = 0xFFF0. The fetch address is 0xFFFFFFF0."
+>
+<BootTimelineDemo />
+</Predict>
+
+Things to try:
+
+1. Step through **UEFI + Limine**. Watch the mode bar: real, protected, then long mode. The kernel does not cause any of these changes.
+2. Stop at **Kernel entry**. The kernel starts in the higher half with paging on. It has no IDT, so any fault resets the machine.
+3. Select **BIOS + Multiboot2** and go to **Kernel entry**. Now the kernel starts in 32-bit mode with paging off and no stack.
+4. Compare the regions at **ExitBootServices** with the stage before it. The memory of the firmware's boot services becomes free for the kernel.
+5. Go to **First character**. One byte on a serial port proves the mode, the mapping, the stack and the toolchain.
+
+## The reset vector and the firmware
+
+After reset, one core runs. The Intel manuals call it the bootstrap processor. The other cores wait for a startup message that the kernel sends much later. `CR0` holds `0x60000010`, so paging and protection are off and the caches are off.
+
+**Firmware** is the code in flash ROM that runs first. It trains the memory controller, finds devices, and builds tables that describe the machine. Before DRAM works, it uses the CPU cache as RAM.
+
+Two firmware interfaces exist on PCs:
+
+| | BIOS (legacy) | UEFI |
+|---|---|---|
+| CPU mode at hand-off | Real mode | Long mode on x86-64, with an identity map |
+| What it loads | First 512 bytes of the disk, to `0x7C00` | A PE file, normally `\EFI\BOOT\BOOTX64.EFI`, from a FAT partition |
+| How it checks the file | `0x55 0xAA` at offset 510 | File format; optional Secure Boot signature |
+| Memory map | `INT 0x15`, function `0xE820` | `GetMemoryMap` |
+| First display | VGA text at `0xB8000` | A framebuffer from GOP (Graphics Output Protocol) |
+
+An **identity map** maps each virtual address to the same physical address. New machines ship with UEFI, and many no longer support the BIOS path at all. The BIOS path still matters, because QEMU's default firmware (SeaBIOS) uses it and much old teaching material assumes it.
+
+## The bootloader and the boot protocol
+
+A kernel could be a UEFI application itself. Most kernels use a bootloader. It reads the file system, loads the kernel ELF, and hands over a fixed machine state. The rules of this hand-off are a **boot protocol**.
+
+**Multiboot2** is the protocol of GRUB. The kernel places a header in the first 32 KiB of its file. The header has a magic number, an architecture, a length and a checksum, and the four fields must sum to 0. A minimal header is 24 bytes, so its checksum is `0x17ADAF12`.
+
+The kernel starts in 32-bit protected mode with `EAX = 0x36D76289` and `EBX` pointing to the boot information. Paging is off, `ESP` is undefined, and the GDT must not be used. The kernel must do the [long mode](/os/kernel/protected-mode-and-long-mode) work itself.
+
+**Limine** is a newer protocol. The kernel places request structures in its ELF, and the loader fills in response pointers. The kernel asks for a memory map, a framebuffer and a direct map of physical memory in this way. The kernel starts in 64-bit mode, in the higher half, with a stack, a GDT and `IF` clear. This is the path that this module assumes.
+
+The **memory map** is the most important gift. It is a list of address ranges with a type: usable, reserved, ACPI, bootloader data, kernel. The [allocator lesson](/os/kernel/a-simple-allocator) builds on it. Do not assume that any RAM exists. Holes are normal, and a machine can have reserved ranges anywhere.
+
+On UEFI, the loader must call `ExitBootServices` with the key from its latest `GetMemoryMap`. If the map has changed, the call fails and the loader must get the map again. After success, the firmware's timer and drivers are gone. Only runtime services stay.
+
+## A freestanding kernel
+
+**Freestanding** means no operating system below the code. In Rust, `#![no_std]` removes the standard library, and `#![no_main]` removes the normal entry point. You must supply a panic handler, because nothing else can.
+
+```rust
+#![no_std]
+#![no_main]
+use core::arch::{asm, global_asm};
+use core::panic::PanicInfo;
+
+// A Multiboot2 header. GRUB finds it in the first 32 KiB of the file.
+global_asm!(r#"
+    .section .multiboot2, "a"
+    .align 8
+    .long 0xE85250D6              // magic
+    .long 0                       // architecture: i386
+    .long 24                      // header length
+    .long 0x17ADAF12              // checksum: the four fields sum to 0
+    .short 0, 0                   // end tag: type 0, flags 0
+    .long 8                       // end tag: size 8
+"#);
+
+const COM1: u16 = 0x3F8;
+
+unsafe fn outb(port: u16, value: u8) {
+    unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags)) };
+}
+
+fn putc(b: u8) {
+    unsafe { outb(COM1, b) };
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kmain() -> ! {
+    putc(b'H');
+    loop {
+        unsafe { asm!("hlt", options(nomem, nostack)) };
+    }
+}
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    putc(b'!');
+    loop {
+        unsafe { asm!("cli; hlt", options(nomem, nostack)) };
+    }
+}
+```
+
+This sample assumes Rust edition 2024 (`#[unsafe(no_mangle)]`). It compiled to an object file with rustc 1.96.1 for `x86_64-apple-darwin`, with only the section directive changed for Mach-O. It was not linked or run. A real kernel also programs the UART divisor and waits for its ready bit, but QEMU accepts the byte without that setup.
+
+The built-in target `x86_64-unknown-none` has the settings that a kernel needs. The one to understand is the **red zone**. The System V ABI lets a leaf function use 128 bytes below `rsp` without moving `rsp`. An interrupt in ring 0 pushes its frame at `rsp`, so it would destroy that data. A kernel must compile with no red zone. The target also turns off SSE in generated code, so that an interrupt does not need to save those registers.
+
+```toml
+# .cargo/config.toml. Nothing here needs a custom target file or nightly Rust.
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = ["-C", "link-arg=-Tkernel.ld", "-C", "relocation-model=static", "-C", "code-model=kernel"]
+```
+
+Zig has the same parts. This sample has the shape of Zig 0.14. It was not compiled, and the panic declaration in particular changes between Zig versions.
+
+```zig
+// zig build-exe kernel.zig -target x86_64-freestanding-none -mcmodel=kernel -mno-red-zone -T kernel.ld
+const std = @import("std");
+pub const panic = std.debug.no_panic;
+
+fn outb(port: u16, value: u8) void {
+    asm volatile ("outb %[value], %[port]"
+        : // no outputs
+        : [value] "{al}" (value),
+          [port] "N{dx}" (port),
+    );
+}
+
+export fn kmain() noreturn {
+    outb(0x3F8, 'H');
+    while (true) asm volatile ("hlt");
+}
+```
+
+## The linker script
+
+An ordinary program gets its layout from a default linker script. A kernel must choose its own. The script sets the address of each section, and it defines symbols that the code reads. The kernel must clear `.bss` itself when its loader does not, and it finds the range through `__bss_start` and `__bss_end`.
+
+<Predict
+  id="bss-order"
+  question="The script has no page alignment. You move .bss from the end to the place after .text. The memory image has the same size. What happens to the kernel file?"
+  options={[
+    "It stays the same size, because .bss takes no file space",
+    "It grows by about the size of .bss, because the file must store its zeros",
+    "It gets smaller, because .data moves up",
+  ]}
+  answer={1}
+  explain="A segment holds file bytes first and zero-filled bytes only at its end. If file-backed sections follow .bss in one segment, the zeros must be in the file. In this model the file grows by 24,576 bytes."
+>
+<LinkerExplorerDemo />
+</Predict>
+
+Things to try:
+
+1. Read the start state. It has three PT_LOAD segments with rights `r-x`, `r--` and `rw-`. The file holds 25,600 bytes, and memory holds 46,080. The difference is mostly `.bss`.
+2. Turn off **ALIGN(4K)**. One page now holds code and data, so all sections share one RWX segment. That is the warning from recent versions of ld.
+3. With alignment off, move `.bss` up to second place. The file grows to 44,544 bytes.
+4. Select the base `0xFFFF800000100000`. The kernel code model uses signed 32-bit addresses, which reach only the top and bottom 2 GiB. The link fails.
+5. Select the non-canonical base. No linker error stops you in real life, but the first fetch raises `#GP`.
+6. Move `.text` down and read the symbols. `_start` moves with it, so `ENTRY` stays correct.
+
+The top 2 GiB exists for this reason. A higher-half kernel at `0xFFFFFFFF80000000` can use short sign-extended addresses, as Linux does. The [next lesson](/os/kernel/protected-mode-and-long-mode) maps that address.
+
+The `kernel.ld` file for this kernel is short. The demo prints the same form.
+
+```text
+ENTRY(_start)
+SECTIONS {
+  . = 0xFFFFFFFF80000000;
+  _kernel_start = .;
+  .text   : { *(.text .text.*) __text_end = .; }
+  . = ALIGN(4K);
+  .rodata : { *(.rodata .rodata.*) }
+  . = ALIGN(4K);
+  .data   : { *(.data .data.*) }
+  .bss    : { __bss_start = .; *(.bss .bss.*) *(COMMON) __bss_end = .; }
+  _kernel_end = .;
+}
+```
+
+## Running it on Apple Silicon
+
+An x86-64 kernel cannot use the Mac's hardware virtualization, because the guest CPU differs from the host CPU. QEMU's **TCG** (Tiny Code Generator) translates the guest instructions in software. It is slow, but it is enough for a small kernel, and its logs show each interrupt. Install it with `brew install qemu`. The Rust toolchain includes `rust-lld`, so you do not need a cross-compiling GCC.
+
+```sh
+qemu-system-x86_64 -machine q35 -accel tcg -m 256M \
+  -drive if=pflash,format=raw,readonly=on,file="$(brew --prefix qemu)/share/qemu/edk2-x86_64-code.fd" \
+  -cdrom tinyos.iso \
+  -serial stdio -display none \
+  -no-reboot -no-shutdown \
+  -d int,cpu_reset -D qemu.log
+```
+
+This command was not run for this lesson, so check the firmware path on your machine. `-serial stdio` sends COM1 to your terminal. `-no-reboot` stops at a triple fault, so you do not get a silent reboot loop. `-d int,cpu_reset` logs each interrupt and the CPU state at a reset to `qemu.log`, and that log is your first debugger. Add `-s -S` to wait for a GDB connection. Use the Limine tools to build the ISO.
+
+arm64 differs at each step. No real mode exists. A QEMU `virt` machine or a loader starts the kernel at EL2 or EL1 with the MMU off. It passes a device tree in `x0`.
+
+On a Mac, `qemu-system-aarch64 -accel hvf` can run such a kernel at near full speed. Apple's own boot chain for macOS is different. It loads a signed Mach-O kernel collection through iBoot, and this path is not open to a small kernel.
+
+## Connect
+
+- [Loading a program](/os/processes/loading-a-program-elf-and-the-dynamic-linker): the kernel's loader reads the same PT_LOAD headers.
+- [Address spaces](/os/vm/address-spaces): why the kernel lives in the higher half.
+- [Kernel mode and user mode](/os/processes/kernel-mode-and-user-mode): what the rings mean once the machine runs.
+- The [next lesson](/os/kernel/protected-mode-and-long-mode) follows the mode changes bit by bit.
+
+<Recall cards={[
+  { q: "What is the fetch address after an x86 reset, and how does a 16-bit CPU state reach it?", a: "0xFFFFFFF0. CS has a hidden base of 0xFFFF0000 and IP is 0xFFF0. The value is 16 bytes below 4 GiB, in flash ROM." },
+  { q: "What state does a Multiboot2 kernel start in?", a: "32-bit protected mode with paging off. EAX holds 0x36D76289, EBX holds the boot information address, and ESP is undefined." },
+  { q: "Why must ExitBootServices sometimes be retried?", a: "It takes the key of the latest memory map. If the map changed after GetMemoryMap, the call fails, and the loader must get the map again." },
+  { q: "Why must a kernel compile with no red zone?", a: "An interrupt in ring 0 pushes its frame at rsp. A leaf function may keep data in the 128 bytes below rsp, and the frame would destroy that data." },
+  { q: "Why link at 0xFFFFFFFF80000000 and not at the start of the higher half?", a: "The kernel code model uses signed 32-bit absolute addresses, which reach only the top and bottom 2 GiB. A base outside that gives relocation errors." },
+  { q: "Why must an x86-64 kernel on Apple Silicon run under TCG?", a: "Hardware virtualization needs the guest and host CPU to have the same architecture. TCG translates x86-64 instructions in software." },
+]} />

@@ -1,0 +1,193 @@
+---
+summary: "Real mode and segments, the GDT and its descriptor bits, protected mode, then long mode: CR0, CR4.PAE, EFER.LME, paging before the far jump, identity map and higher half, canonical addresses, and what UEFI has already done for you."
+---
+import { ModeStepperDemo, GdtEncoderDemo, HigherHalfDemo } from "@/demos/os/KernelModeDemos";
+
+An x86-64 CPU carries 40 years of history. It wakes as a fast 8086, and software must lead it forward. With UEFI and Limine, you may never write this code. It is still worth one careful read, for two reasons. A secondary core wakes in real mode, so each kernel still has this path for its other CPUs. Also, each GDT and each page table that you write later uses the rules from here.
+
+<Predict
+  id="order"
+  question="Long mode takes eight steps. They are lgdt, PE, a far jump, PAE, CR3, LME, PG and a second far jump. Of all 40,320 orders, how many reach 64-bit mode in this model?"
+  options={[
+    "Only 1: the CPU demands this exact order",
+    "384: some steps can swap, but a wrong order usually kills the machine",
+    "About half: most steps do not depend on each other",
+  ]}
+  answer={1}
+  explain="PAE, CR3 and LME can come in any order before PG, and lgdt has some freedom. So 384 orders work. Of the others, 39,792 end in a triple fault, and 144 stop in compatibility mode."
+>
+<ModeStepperDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Run the usual order** and read each change. `CR0` ends at `0x80000011`, `CR4` at `0x00000020` and `EFER` at `0x00000500`.
+2. Reset and click **CR0.PG = 1** first. PE is clear, so the CPU raises `#GP`. With no usable IDT, that one mistake becomes a shutdown.
+3. Reset and set PE, then far jump, without `lgdt`. The selector indexes a table that was never loaded.
+4. Run the steps up to **EFER.LME = 1**. Look at LMA: it is still 0. Then set PG, and the CPU sets LMA by itself.
+5. Turn off **Page tables include an identity map** and run the usual order. The instruction after `mov cr0` cannot be fetched. Every order fails in this setting.
+
+## Real mode and segments
+
+In **real mode**, an address is a 16-bit segment and a 16-bit offset. The physical address is `segment * 16 + offset`. This form reaches 1 MiB, and a little more: `FFFF:0010` is `0x100000`. The 8086 had only 20 address lines, so that address wrapped to 0. Old programs relied on it.
+
+So PCs gained the **A20 gate**, which can force address line 20 to 0. A boot path through the BIOS must open it.
+
+Real mode has no protection. Any code can write anywhere and run any instruction. In return, BIOS calls work, and this is why the boot sector starts there.
+
+## The GDT
+
+**Protected mode** replaces the segment number with a **selector**. A selector is an index into a table in memory, the **GDT** (Global Descriptor Table), plus a requested privilege level in its low 2 bits. Each entry describes a segment: its base, limit, type and privilege.
+
+An entry has a strange layout, because the 80386 extended the 80286 format without moving the old fields. Base and limit are each split into parts.
+
+<GdtEncoderDemo />
+
+Things to try:
+
+1. Hover over the bits of **Kernel code 64**. Base and limit are split across the word. The value is `0x00AF9A000000FFFF`.
+2. Click **L** (bit 53) to clear it, and then click **D** (bit 54) to set it. You now have `0x00CF9A000000FFFF`, a 32-bit code segment.
+3. Set both L and D. The verdict warns that this pair is reserved.
+4. Change the two DPL bits. `0x9A` becomes `0xFA`, and this is the user code segment. Ring 3 code is only a different number in these bits.
+5. Click **P** to clear it. A load of this selector now raises `#NP`.
+
+In 64-bit mode the CPU ignores base and limit for code and data, so segmentation is nearly gone. Three things remain. CS still decides the mode and the current ring. FS and GS keep their bases through MSRs, which is how thread-local storage works. And the TSS still needs a descriptor, which grows to 16 bytes in long mode.
+
+Set the accessed bit in advance if the GDT is in read-only memory. The CPU writes that bit when it loads a segment. Linux uses `0x9B`, which has that bit set.
+
+## The path to long mode
+
+**Long mode** is the 64-bit architecture. It has two sub-modes: **64-bit mode** runs with `CS.L = 1`, and **compatibility mode** runs old 32-bit code with `CS.L = 0`. Three bits turn it on, in three different registers.
+
+| Register | Bit | Meaning |
+|---|---|---|
+| `CR0` | PE, bit 0 | Protected mode |
+| `CR0` | PG, bit 31 | Paging |
+| `CR4` | PAE, bit 5 | Table entries of 64 bits |
+| `EFER` (MSR `0xC0000080`) | LME, bit 8 | Allow long mode |
+| `EFER` | LMA, bit 10 | Long mode is active. The CPU sets this bit, not software. |
+
+**Paging is not optional in long mode.** LMA turns on at the moment that PG turns on, and the CPU checks the rules at that moment. Setting PG with LME set and PAE clear raises `#GP`. Changing LME while paging is on raises `#GP`.
+
+The instruction right after `mov cr0` still has a low address, and now the CPU translates it. So the page tables must map the running code at its own address. This is the job of the identity map. After that, `CS` still has `L = 0`, so a far jump to a descriptor with `L = 1` finishes the work.
+
+This Rust file holds the whole path as assembly. It starts in 32-bit mode, as Multiboot2 leaves the CPU. The linker must place this code at a low address. It compiled to an object file with rustc 1.96.1, but it was not run.
+
+```rust
+#![no_std]
+use core::arch::global_asm;
+
+// A flat GDT. These are the values that the demo encodes.
+#[repr(C, align(8))]
+pub struct Gdt(pub [u64; 4]);
+#[unsafe(no_mangle)]
+pub static BOOT_GDT: Gdt = Gdt([
+    0,
+    0x00CF_9A00_0000_FFFF, // 0x08: 32-bit code
+    0x00CF_9200_0000_FFFF, // 0x10: data
+    0x00AF_9A00_0000_FFFF, // 0x18: 64-bit code, L = 1
+]);
+
+global_asm!(r#"
+    .text
+    .code32
+    .globl boot32
+boot32:
+    cli
+    mov esp, offset boot_stack_top
+
+    // Page tables are ready in .bss: PML4, PDPT and PD, with 2 MiB leaves.
+    mov eax, cr4
+    or  eax, 1 << 5               // CR4.PAE
+    mov cr4, eax
+
+    mov eax, offset boot_pml4
+    mov cr3, eax
+
+    mov ecx, 0xC0000080           // EFER
+    rdmsr
+    or  eax, 1 << 8               // EFER.LME
+    wrmsr
+
+    mov eax, cr0
+    or  eax, 1 << 31              // CR0.PG: now LMA = 1, compatibility mode
+    mov cr0, eax
+
+    lgdt [gdt_ptr]
+    .byte 0xEA                    // far jump: load CS with the L = 1 descriptor
+    .long boot64
+    .short 0x18
+
+    .code64
+boot64:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    movabs rax, offset high_entry
+    jmp rax
+
+    .data
+gdt_ptr:
+    .short 4 * 8 - 1
+    .long BOOT_GDT
+"#);
+```
+
+Why does a far jump matter so much? The CPU keeps a hidden copy of each segment descriptor. Writing `CR0` does not reload the copy in CS. Only a far jump, or an `iret` or `ret` of the far kind, loads CS. This is why "set PE" alone leaves the CPU decoding 16-bit code.
+
+The real-mode start of a secondary CPU in Linux lives in `arch/x86/realmode/rm/trampoline_64.S`. It follows these same steps.
+
+## Identity map and higher half
+
+Most kernels link at a high address and load at a low one. So the boot tables hold two mappings of one physical range, for a short time. The low mapping keeps the current instruction valid. The high mapping is the real home. After the jump to the high address, the kernel removes the low mapping, so a null pointer faults again.
+
+<Predict
+  id="half"
+  question="The tables map the first 4 MiB at the same addresses, and 2 MiB of kernel at 0xFFFFFFFF80000000, both with 2 MiB leaves. How many 4 KiB table frames does this take?"
+  options={[
+    "3: one top table, one PDPT and one PD",
+    "4: the two mappings share a PDPT",
+    "5: the two mappings share only the top table",
+  ]}
+  answer={2}
+  explain="The two addresses use PML4 entries 0 and 511, so they need separate PDPTs and separate PDs. With the top table, that is 5 frames."
+>
+<HigherHalfDemo />
+</Predict>
+
+Things to try:
+
+1. Read the indices of the kernel address: PML4[511], PDPT[510], PD[0]. That is the top 2 GiB of the address space.
+2. Switch **Kernel pages** to 512 of 4 KiB. One more table appears. A 2 MiB leaf saves it, and it also uses fewer TLB entries.
+3. Turn on **Direct map of the first 1 GiB**. One entry in one new PDPT maps all of it. PML4[256] starts the kernel half of the address space.
+4. Pick **rip before the jump** and turn off the identity map. The walk stops at the top table. A kernel that removes the map too early dies here.
+5. Pick **non-canonical**. The CPU raises `#GP` with no walk at all.
+
+These tables come from the real `PageTable` class of the [paging lesson](/os/vm/paging-and-page-tables). The tree has one shape, and only the leaf rights differ.
+
+A **canonical** address has bits 63 to 47 all equal, with 4-level paging. So `0x00007FFFFFFFFFFF` is valid, and `0x0000800000000000` is not. This rule keeps software from hiding data in the high bits, so that later CPUs can add address bits safely. The [address spaces](/os/vm/address-spaces) lesson draws the two halves.
+
+## What UEFI has already done
+
+On x86-64, UEFI firmware runs in long mode, with an identity map and its own GDT. A UEFI application starts there. Limine then builds higher-half tables and enters the kernel. So a modern kernel can start in long mode and skip this whole lesson at boot.
+
+It still has work to do. The firmware's GDT and tables live in memory that the kernel will reuse, so the kernel must load its own. It needs a GDT with user segments and a TSS anyway. And the secondary CPUs start in real mode, through a startup message, until the kernel has its own low trampoline page. Newer platforms offer ways to start cores in long mode directly, but the real-mode path remains the common one.
+
+arm64 has none of this history. It has no segments and no GDT. A kernel sets `TCR_EL1` and `MAIR_EL1`, loads `TTBR0_EL1` for the low half and `TTBR1_EL1` for the high half, and sets `SCTLR_EL1.M`. It also needs an identity map for the instruction that turns on the MMU. That one problem is the same on every CPU.
+
+## Connect
+
+- [Paging and page tables](/os/vm/paging-and-page-tables): the walk that the identity map must satisfy.
+- [Kernel mode and user mode](/os/processes/kernel-mode-and-user-mode): CS and the current ring.
+- [Booting](/os/kernel/booting): how the CPU reached this code.
+- The [next lesson](/os/kernel/interrupt-handling) uses this GDT for its gates and adds the TSS.
+
+<Recall cards={[
+  { q: "Which three bits in which registers turn on long mode?", a: "CR4.PAE, EFER.LME and CR0.PG, with protected mode already on. The CPU then sets EFER.LMA by itself." },
+  { q: "Why must the page tables hold an identity map when paging turns on?", a: "The next instruction fetch uses the old low address, and the CPU now translates it. Without a mapping, the fetch raises a page fault." },
+  { q: "Why does setting CR0.PE not change how code decodes?", a: "CS keeps a hidden cached descriptor. Only a far jump or similar control transfer reloads it from the GDT." },
+  { q: "What are the L and D bits of a 64-bit code descriptor?", a: "L = 1 and D = 0. The pair L = 1, D = 1 is reserved. The 64-bit kernel code value is 0x00AF9A000000FFFF." },
+  { q: "What makes an address canonical with 4-level paging?", a: "Bits 63 to 47 are all equal. A use of any other address raises #GP with no page walk." },
+  { q: "What does a kernel that starts in long mode from Limine still have to set up?", a: "Its own GDT with user segments and a TSS, its own page tables, and a real-mode trampoline for secondary CPUs." },
+]} />

@@ -1,0 +1,225 @@
+---
+summary: "From the boot memory map to a kernel heap: carving frames, a bitmap and a free-list stack allocator, the page table chicken-and-egg problem, mapping the heap on demand, bump and free list, the Rust GlobalAlloc trait and Zig's Allocator interface."
+---
+import { BootMemMapDemo, HeapBringupDemo } from "@/demos/os/KernelAllocDemos";
+
+Nothing in a kernel can be allocated until the kernel has built an allocator. It has no `malloc`, and it has no mapping for most of memory. Two layers solve this. A **frame allocator** hands out 4 KiB pieces of physical memory. A **kernel heap** maps these frames at virtual addresses and cuts them into objects of any size.
+
+This lesson builds the smallest correct form of both. The allocator algorithms have their own lessons: [bump allocators](/systems/allocators/bump-allocators), [free lists](/systems/allocators/free-lists) and the [slab allocator](/systems/allocators/slab-allocator). For how Linux scales all this, see [kernel memory allocators](/os/memory/kernel-memory-allocators).
+
+<Predict
+  id="carve"
+  question="The firmware reports a usable range from 0x0 to 0x9FC00. How many whole 4 KiB frames can the kernel use from that range?"
+  options={[
+    "160, because 640 KiB divided by 4 KiB is 160",
+    "159, because the range ends inside a frame",
+    "Zero, because low memory is always reserved",
+  ]}
+  answer={1}
+  explain="0x9FC00 is 639 KiB. The last partial frame cannot be used, because the frame above it holds reserved data. Round the start up and the end down. This loses 3,072 bytes in this map."
+>
+<BootMemMapDemo />
+</Predict>
+
+Things to try:
+
+1. Move **Carving stage** through its three settings. Frame 0 and the frame near 640 KiB that the rounding lost turn red.
+2. Click **Allocate 64** with the **bitmap**. Frames come in address order, low frames first. The counter of words read rises slowly, because a hint remembers where the last search ended.
+3. Reset and select **free-list stack**. The first frame is the last usable frame, because setup pushed it last. The metadata is 8 bytes and the bitmap uses 512, but the counter already shows that setup touched each free frame.
+4. Click **Free 8 at random** and then **Allocate 1**. The stack gives back the last frame that was freed. That frame is the most likely to still be in the CPU cache.
+5. Click **Allocate 512** several times until the free count reaches 0. The usable count is smaller than the 4,096 frames of RAM, because the map holds other things.
+
+## Getting memory: the map
+
+The [boot protocol](/os/kernel/booting) gives a list of ranges. This demo uses a map in the style of a small QEMU machine, with 16 MiB of RAM. Three rules apply to any real map.
+
+- Keep only `usable` ranges at first. The loader's ranges become usable later, after the kernel has copied what it needs and has left the loader's page tables.
+- Round each range inward to whole frames.
+- Leave out frame 0, so that a physical address of 0 can mean "no frame". Linux also keeps low memory for itself and for the real-mode trampoline.
+
+This map gives 3,551 whole frames out of 4,096, and 3,550 after frame 0 is left out.
+
+## Two frame allocators
+
+A **bitmap** uses one bit per frame. A set bit means used, so memory that the map never names stays used by default. It costs 1 bit per 4 KiB, which is 1/32,768 of RAM. That is 512 bytes here, 256 KiB for 8 GiB, and 2 MiB for 64 GiB. Allocation scans for a word that is not all ones, and it reads one word for each 64 frames. A hint avoids a repeat scan from the start.
+
+```rust
+pub struct BitmapFrames {
+    words: &'static mut [u64],
+    hint: usize,
+}
+
+impl BitmapFrames {
+    pub fn alloc(&mut self) -> Option<usize> {
+        let n = self.words.len();
+        for k in 0..n {
+            let i = (self.hint + k) % n;
+            let w = self.words[i];
+            if w != u64::MAX {
+                let bit = (!w).trailing_zeros() as usize;
+                self.words[i] = w | (1 << bit);
+                self.hint = i;
+                return Some(i * 64 + bit);
+            }
+        }
+        None
+    }
+    pub fn free(&mut self, frame: usize) {
+        let (i, bit) = (frame / 64, frame % 64);
+        debug_assert!(self.words[i] & (1 << bit) != 0, "double free");
+        self.words[i] &= !(1 << bit);
+        self.hint = self.hint.min(i);
+    }
+}
+```
+
+A **free-list stack** keeps a next pointer inside each free frame, and one head word. Allocation and free both take O(1) time, and the metadata uses no extra memory. But free frames must be mapped, so that the kernel can write the pointer. Also, setup touches every free frame, so a large machine pays for this at boot. Compare the two.
+
+| | Bitmap | Free-list stack |
+|---|---|---|
+| Metadata | 1 bit per frame, in one block | 8 bytes in total, plus a word in each free frame |
+| Allocate one frame | Scan; often 1 word with a hint | O(1) |
+| Contiguous frames | Possible: search for a run of bits | Not practical |
+| Double free | Easy to detect: the bit is already clear | Needs extra work |
+| Needs free frames mapped | No | Yes |
+
+For a first kernel, use the bitmap. Linux uses the [buddy allocator](/systems/allocators/buddy-allocator) for its pages, with per-CPU lists in front of it.
+
+## The chicken and the egg
+
+Where does the bitmap live? It needs memory, and the allocator that gives memory does not exist yet. The solution is an **early bump allocator**: take the first usable range that is large enough, and advance a pointer in it. In this demo it places the bitmap at frame 448. Then mark those frames as used. Linux has a larger form of the same idea, called `memblock`.
+
+Page tables have a harder version of this problem. To map a page, you must write to a table. To write to a table, the table must be mapped. Three solutions are common.
+
+1. **A direct map.** Map all physical memory at a fixed offset, for example with huge pages, as the [higher-half demo](/os/kernel/protected-mode-and-long-mode) did. Then any frame is reachable at `offset + physical address`. Limine provides this map at entry, so this is the easy path. Linux calls it `__va`.
+2. **A boot pool.** Reserve some table frames in `.bss`. They are already mapped, because the kernel image is.
+3. **A recursive entry.** Point one PML4 entry at the PML4 itself, so that tables appear in the address space. This is clever, but it is awkward to reason about. Fewer new kernels use it.
+
+## The kernel heap
+
+The heap is a virtual range, here starting at `0xFFFFC00000000000`. Pages arrive when it grows. Growth needs a frame for the data, and it can need frames for up to 3 new tables.
+
+<Predict
+  id="recursion"
+  question="The page table code calls kmalloc(4096) to get memory for a new table. The heap is empty. What happens on the first kmalloc(64)?"
+  options={[
+    "It works, because the table request is small enough to fit in the first page",
+    "It recurses with no end: the heap needs a page, the page needs a table, and the table needs the heap",
+    "It works once, and fails only when the heap is full",
+  ]}
+  answer={1}
+  explain="No call can finish, because each one waits for a table that needs the heap to grow. The page that would end this is not mapped yet. Page tables must take frames directly from the frame allocator."
+>
+<HeapBringupDemo />
+</Predict>
+
+Things to try:
+
+1. Step through the first `kmalloc(64)` with **frame allocator**. It takes one data frame and 3 table frames. With the top table, that makes 4 table frames for 1 page of data.
+2. Step on to the 3,600-byte request. It crosses into a new page, but that page needs no new table, because the PT has room.
+3. Select **kmalloc** for the table frames. The call stack grows, the page count stays 0, and the model stops at 8 levels.
+4. Back with **frame allocator**, compare **bump** and **free list** at the end. Live data is 9,920 bytes in both. Bump reaches 10,432 bytes, because it never reuses the freed block.
+5. In **free list** mode, watch `kfree(b)`. The next request goes into that hole, at offset 72. Under bump, the same request goes to offset 4,176.
+
+The rule from this hazard is simple: **a lower layer never calls a higher layer**. The frame allocator uses only its bitmap. The page mapper uses only the frame allocator. The heap uses both. Linux has a related rule for reclaim, which is why `GFP_NOIO` and `GFP_NOFS` exist: the allocator must not depend on the code that called it.
+
+A second hazard is interrupts. If an interrupt handler allocates while `kmalloc` holds its lock on the same CPU, the handler spins forever. Either forbid allocation in handlers, or disable interrupts around the lock. The [scheduler lesson](/os/kernel/a-simple-scheduler) proves this by search.
+
+## Plugging into the language
+
+Rust's `alloc` crate gives you `Box` and `Vec` once you provide one global allocator. Its methods are `unsafe`, because a wrong answer breaks memory safety. Use the `Layout` for size and alignment, and return null on failure.
+
+```rust
+#![no_std]
+extern crate alloc;
+use core::alloc::{GlobalAlloc, Layout};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+pub const PAGE: usize = 4096;
+
+unsafe extern "Rust" {
+    // Takes frames from the frame allocator, never from the heap.
+    fn map_heap_page(va: usize) -> bool;
+}
+
+const HEAP_BASE: usize = 0xFFFF_C000_0000_0000;
+
+pub struct Bump {
+    next: AtomicUsize,   // offset of the next free byte
+    mapped: AtomicUsize, // bytes mapped from HEAP_BASE
+}
+
+// One CPU, and callers hold no lock that an interrupt handler also takes.
+unsafe impl GlobalAlloc for Bump {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let start = (self.next.load(Ordering::Relaxed) + l.align() - 1) & !(l.align() - 1);
+        let end = start + l.size();
+        while self.mapped.load(Ordering::Relaxed) < end {
+            let va = HEAP_BASE + self.mapped.load(Ordering::Relaxed);
+            if !unsafe { map_heap_page(va) } {
+                return core::ptr::null_mut();
+            }
+            self.mapped.fetch_add(PAGE, Ordering::Relaxed);
+        }
+        self.next.store(end, Ordering::Relaxed);
+        (HEAP_BASE + start) as *mut u8
+    }
+    unsafe fn dealloc(&self, _p: *mut u8, _l: Layout) {
+        // A bump allocator frees nothing.
+    }
+}
+
+#[global_allocator]
+static HEAP: Bump = Bump { next: AtomicUsize::new(0), mapped: AtomicUsize::new(0) };
+```
+
+This compiled to an object file with rustc 1.96.1, with a panic handler added, but it was not run. A bump allocator is good for the first days of a kernel, because nothing can go wrong in it. Replace it with a free list once the kernel frees objects, and add a slab layer for hot sizes later. The `dealloc` argument gives you the size, so a Rust allocator does not need a size header.
+
+Zig passes the allocator as a value, so a kernel can use different allocators for different jobs. No global registration is needed. This shape follows Zig 0.14, whose interface added `remap`, and it was not compiled.
+
+```zig
+const std = @import("std");
+const Alignment = std.mem.Alignment;
+
+const Bump = struct {
+    next: usize = 0,
+    mapped: usize = 0,
+
+    fn alloc(ctx: *anyopaque, len: usize, a: Alignment, ret: usize) ?[*]u8 {
+        _ = ret;
+        const self: *Bump = @ptrCast(@alignCast(ctx));
+        const start = a.forward(self.next);
+        const end = start + len;
+        while (self.mapped < end) : (self.mapped += 4096) {
+            if (!mapHeapPage(heap_base + self.mapped)) return null;
+        }
+        self.next = end;
+        return @ptrFromInt(heap_base + start);
+    }
+
+    pub fn allocator(self: *Bump) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = std.mem.Allocator.noFree,
+        } };
+    }
+};
+```
+
+## Connect
+
+- [Paging and page tables](/os/vm/paging-and-page-tables): the tables that these frames become.
+- [Kernel memory allocators](/os/memory/kernel-memory-allocators): zones, per-CPU lists, SLUB and vmalloc in Linux.
+- [Fragmentation](/systems/allocators/fragmentation): why the free list cannot always reuse a hole.
+- [A simple scheduler](/os/kernel/a-simple-scheduler): the first user of these allocators, for thread stacks.
+
+<Recall cards={[
+  { q: "How do you turn a usable range into frames?", a: "Round the start up and the end down to 4 KiB. Leave out frame 0 as well, so that a physical address of 0 can mean no frame." },
+  { q: "What share of RAM does a frame bitmap use?", a: "1 bit per 4 KiB, which is 1/32,768. That is 256 KiB for 8 GiB." },
+  { q: "What does a free-list stack need that a bitmap does not?", a: "All free frames must be mapped, because each one holds the next pointer. Setup also touches each free frame." },
+  { q: "Where does the frame allocator's own bitmap come from?", a: "An early bump allocator takes it from the first large usable range. Then the bitmap marks those frames as used." },
+  { q: "How can a kernel write to a page table that has no mapping yet?", a: "Through a direct map of all physical memory, through a boot pool in .bss, or through a recursive PML4 entry." },
+  { q: "Why must page tables not take their memory from kmalloc?", a: "kmalloc may need a new page, and the page may need a new table. That is a cycle with no end. Tables must come from the frame allocator." },
+]} />

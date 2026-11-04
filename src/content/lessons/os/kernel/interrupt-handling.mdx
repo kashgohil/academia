@@ -1,0 +1,273 @@
+---
+summary: "The IDT and its gate layout, exceptions and IRQs, the CPU's interrupt frame, the error code quirk, the assembly stub, iretq, the double fault and the IST, why a triple fault resets, the PIC and the local APIC, end of interrupt, and a page fault handler."
+---
+import { InterruptEntryDemo, GateEncoderDemo, FaultCascadeDemo } from "@/demos/os/KernelIrqDemos";
+
+Until now, any fault has reset the machine with no message. An **interrupt descriptor table** (IDT) changes that. It tells the CPU where to go for each event. So the kernel can print what went wrong. Later, timer ticks and page faults become ordinary work.
+
+The [kernel mode lesson](/os/processes/kernel-mode-and-user-mode) showed why the CPU enters the kernel in three ways. The [interrupts lesson](/os/io/interrupts) covers devices and how Linux handles them. This lesson writes the entry code itself.
+
+<Predict
+  id="frame"
+  question="An interrupt arrives while user code runs. The CPU pushes a frame. On which stack does it push, and who chooses that stack?"
+  options={[
+    "On the user stack, because rsp points there",
+    "On a kernel stack whose address the CPU reads from the TSS",
+    "On the stack that the handler sets up at its first instruction",
+  ]}
+  answer={1}
+  explain="User rsp can be anything, so the CPU cannot trust it. On a change to ring 0, the CPU loads rsp from TSS.RSP0 before it pushes. The handler has no chance to choose, because the frame exists before its first instruction."
+>
+<InterruptEntryDemo />
+</Predict>
+
+Things to try:
+
+1. Step to **The CPU pushes the frame**. Five values take 40 bytes, and `rsp` comes from `TSS.RSP0`. Compare with **ring 0**: the same frame goes on the current stack, after the CPU aligns `rsp` to 16 bytes.
+2. Go to **Rust handles it** and read the size. The whole frame is 176 bytes, and `rsp` is aligned to 16 bytes. The ABI requires this at the `call`.
+3. Turn off **Vector with an error code**. The stub now pushes a dummy, and the frame keeps one shape.
+4. Turn on **Use the stub of the wrong kind** and step to the end. The stack is one slot off, so `iretq` takes the wrong words as `rip` and `cs`, and it raises `#GP`.
+5. Select the **trap** gate and look at `IF`. It stays 1. An interrupt can now nest inside the handler.
+
+## The IDT
+
+The IDT has 256 entries of 16 bytes, so it fills one 4 KiB page. The `lidt` instruction loads its address and limit. Vector numbers 0 to 31 belong to CPU exceptions, and the kernel chooses the rest for hardware and software interrupts.
+
+<GateEncoderDemo />
+
+The address is split into three parts, again because of history. The `0x8E` flags byte means present, ring 0, interrupt gate. An **interrupt gate** clears `IF`, so no other maskable interrupt enters until the handler is ready. A **trap gate** (`0x8F`) leaves `IF` alone. 
+
+Use interrupt gates everywhere at first. A race with `IF` on is much harder to find. Linux itself uses interrupt gates for nearly all its entries.
+
+Set DPL to 3 only for vectors that user code may raise with `int n`, such as `int3` for debuggers.
+
+## Exceptions and IRQs
+
+An **exception** comes from the instruction that the CPU is running. An **IRQ** (interrupt request) comes from a device, and it has no relation to the current instruction. Exceptions come in three kinds.
+
+| Kind | Saved `rip` | Example |
+|---|---|---|
+| Fault | The instruction that faulted, so a fix can retry it | `#PF`, `#GP`, `#UD` |
+| Trap | The next instruction | `int3` |
+| Abort | Not reliable. The state is lost. | `#DF`, `#MC` |
+
+Some exceptions push an error code, and most do not. In this table, vectors 8, 10, 11, 12, 13, 14, 17 and 21 push one. No bit in the frame says which case you have. So each stub must know its own vector, and this is the **error code quirk**. `iretq` will not remove the code for you.
+
+## The stub and iretq
+
+A handler cannot be a normal function. A function ends with `ret`, and it follows the calling convention, so it saves only some registers. So a small assembly **stub** runs first. It gives every vector one stack shape, saves all registers, and calls the Rust handler with a pointer to them.
+
+```rust
+#![no_std]
+use core::arch::{asm, global_asm};
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct Gate {
+    offset_low: u16,
+    selector: u16,
+    ist: u8,        // bits 0..2 are the IST index
+    flags: u8,      // P, DPL, 0, type: 0x8E = interrupt gate, ring 0
+    offset_mid: u16,
+    offset_high: u32,
+    reserved: u32,
+}
+
+impl Gate {
+    pub const fn missing() -> Gate {
+        Gate { offset_low: 0, selector: 0, ist: 0, flags: 0, offset_mid: 0, offset_high: 0, reserved: 0 }
+    }
+    pub fn new(handler: usize, ist: u8) -> Gate {
+        Gate {
+            offset_low: handler as u16,
+            selector: 0x08,
+            ist,
+            flags: 0x8E,
+            offset_mid: (handler >> 16) as u16,
+            offset_high: (handler >> 32) as u32,
+            reserved: 0,
+        }
+    }
+}
+
+#[repr(C)]
+pub struct TrapFrame {
+    pub r15: u64, pub r14: u64, pub r13: u64, pub r12: u64,
+    pub r11: u64, pub r10: u64, pub r9: u64, pub r8: u64,
+    pub rdi: u64, pub rsi: u64, pub rbp: u64, pub rbx: u64,
+    pub rdx: u64, pub rcx: u64, pub rax: u64,
+    pub vector: u64,
+    pub error: u64,
+    // Pushed by the CPU:
+    pub rip: u64, pub cs: u64, pub rflags: u64, pub rsp: u64, pub ss: u64,
+}
+
+// One stub per vector. Vectors with no CPU error code push a dummy.
+global_asm!(r#"
+    .text
+    .macro STUB_NOERR vec
+    .globl isr\vec
+isr\vec:
+    push 0
+    push \vec
+    jmp isr_common
+    .endm
+
+    .macro STUB_ERR vec
+    .globl isr\vec
+isr\vec:
+    push \vec
+    jmp isr_common
+    .endm
+
+    STUB_NOERR 0
+    STUB_ERR 8
+    STUB_ERR 13
+    STUB_ERR 14
+    STUB_NOERR 32
+
+isr_common:
+    push rax
+    push rcx
+    push rdx
+    push rbx
+    push rbp
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+    cld
+    mov rdi, rsp          // the argument: &mut TrapFrame
+    call {handler}
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rbp
+    pop rbx
+    pop rdx
+    pop rcx
+    pop rax
+    add rsp, 16           // the vector and the error code
+    iretq
+"#, handler = sym handle_trap);
+```
+
+This sample compiled to an object file with rustc 1.96.1, but it was not run. The `cld` matters: the ABI requires a clear direction flag at a call, and user code can set it. The handler can change any value in `TrapFrame`, and `iretq` will load it. This is how a context switch and a return to user mode work in later lessons.
+
+## The double fault, the IST and the triple fault
+
+Now consider a kernel stack overflow. A call pushes into an unmapped guard page and raises `#PF`. The CPU tries to deliver it, and it pushes a frame on the same bad stack. What now?
+
+<Predict
+  id="df"
+  question="The #PF handler has a bug: it reads address 0, so it faults at once. Every gate is set up correctly. What does the CPU raise for that second fault?"
+  options={[
+    "#DF, because this is a fault inside a fault handler",
+    "A plain #PF, because the handler has already started",
+    "A triple fault, because the handler cannot recover",
+  ]}
+  answer={1}
+  explain="A #DF means that the CPU failed to reach a handler. Once the handler runs, a new fault is a new exception. The nesting ends only when the stack runs out. In this model, that takes 36 levels."
+>
+<FaultCascadeDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **Kernel stack overflows** and all switches on. `#PF` fails on the bad stack, `#DF` switches to a good IST stack, and the handler can print a message.
+2. Turn off **#DF uses IST1**. `#DF` uses the same bad stack, and the machine resets. This one bit decides whether you get a message.
+3. Turn on IST again and turn off **TSS loaded with ltr**. The IST pointer is in the TSS, so this fails too.
+4. Select **#PF handler itself reads address 0** and read the note on nesting. Each level uses more stack, until delivery fails.
+5. Select **Timer IRQ with the PIC not remapped**. The handler reports a double fault, but no fault happened.
+6. Turn off **lidt ran**. Each trigger now ends in a shutdown.
+
+The Intel manuals give exact rules. A second exception **during delivery** of a first one falls into three cases. Exceptions have classes: **contributory** covers `#DE`, `#TS`, `#NP`, `#SS` and `#GP`; **page fault** is its own class; all others are **benign**.
+
+| First, being delivered | Second | Result |
+|---|---|---|
+| Benign | Any | Handle them one after the other |
+| Contributory | Contributory | `#DF` |
+| Contributory | Page fault | Handle them one after the other |
+| Page fault | Contributory or page fault | `#DF` |
+| `#DF` | Contributory or page fault | Triple fault: shutdown |
+
+**Shutdown** is a CPU state with no more instructions. On a PC, the chipset turns it into a reset. The CPU has run out of ways to report anything, and this is why a bug in early boot looks like a reboot loop. Use the QEMU flags from [booting](/os/kernel/booting): `-no-reboot` stops the loop, and `-d int` prints each exception up to the end.
+
+The **IST** (Interrupt Stack Table) is the fix for a bad stack. It is seven stack pointers in the TSS. A gate with a nonzero IST field makes the CPU load that stack first, even with no change of ring. Give one to `#DF`. Linux gives separate IST stacks to `#DF`, NMI, `#DB` and `#MC`.
+
+The **TSS** (Task State Segment) is a 104-byte structure. It no longer switches tasks in 64-bit mode. It holds `RSP0` at offset 4 and `IST1` at offset 36. Its GDT descriptor takes 16 bytes, and `ltr` loads it. Without it, the first interrupt from ring 3 has no stack.
+
+Across all 384 pairs of switch settings and triggers in this demo, 278 end in a shutdown. Most ways to set this up wrongly give no message at all. So set up the `#DF` gate, its IST and the TSS first.
+
+## The PIC, the local APIC and the timer
+
+The legacy **PIC** (8259 Programmable Interrupt Controller) sends device lines to the CPU. After the BIOS, it maps IRQ 0 to 7 to vectors 8 to 15. These collide with CPU exceptions: a timer tick arrives at vector 8, which is `#DF`. So each kernel must remap the PIC, normally to vector 32 and up, or mask it entirely.
+
+A handler for a PIC line must write `0x20` to port `0x20`. This is the **EOI** (End of Interrupt). Without it, the PIC sends no more interrupts at that level or lower.
+
+Modern kernels mask the PIC and use the **local APIC**, a per-CPU interrupt controller. It is memory-mapped, by default at `0xFEE00000`. EOI is a write to offset `0xB0`. Its timer has a count register at `0x380`, and a vector and mode register at `0x320`. The timer's rate differs per machine, so a kernel calibrates it first against a known clock. Device interrupts arrive through the I/O APIC or as messages (MSI).
+
+## A page fault handler
+
+The CPU pushes an error code, and it puts the address that faulted in `CR2`. The error code bits are the ones from [page faults](/os/vm/page-faults-and-demand-paging). Bit 0 is present, bit 1 is write, bit 2 is user, and bit 4 is instruction fetch. Read `CR2` early. A nested fault would overwrite it, and interrupt gates keep other interrupts out until you read it.
+
+```rust
+fn read_cr2() -> u64 {
+    let v: u64;
+    unsafe { asm!("mov {}, cr2", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+const LAPIC_EOI: *mut u32 = 0xFFFF_8000_FEE0_00B0 as *mut u32; // through the direct map
+
+extern "C" fn handle_trap(f: &mut TrapFrame) {
+    match f.vector {
+        14 => page_fault(f, read_cr2()),
+        32 => {
+            tick();
+            unsafe { LAPIC_EOI.write_volatile(0) };
+        }
+        v => panic!("trap {} at {:#x}, error {:#x}", v, f.rip, f.error),
+    }
+}
+
+fn page_fault(f: &mut TrapFrame, addr: u64) {
+    let present = f.error & 1 != 0;
+    let write = f.error & 2 != 0;
+    let user = f.error & 4 != 0;
+    panic!("page fault at {:#x}: present={} write={} user={}", addr, present, write, user);
+}
+```
+
+For now the handler only reports. In the [last lesson](/os/kernel/userspace), it decides between a demand page and killing a task. Linux splits this work in `exc_page_fault` and `handle_mm_fault`.
+
+arm64 has one table of 16 handlers, at `VBAR_EL1`, and each slot holds 32 instructions. The CPU saves `pc` and flags in `ELR_EL1` and `SPSR_EL1`, not on a stack, and it pushes nothing. Software saves the registers. `ESR_EL1` holds the cause, and `FAR_EL1` holds the address. The interrupt controller is the GIC, and `eret` returns.
+
+## Connect
+
+- [Interrupts](/os/io/interrupts): how Linux splits work into hard and soft parts.
+- [Page faults and demand paging](/os/vm/page-faults-and-demand-paging): what a real handler does next.
+- [Critical sections](/os/sync/critical-sections): `cli` as a lock on one CPU.
+- [A simple allocator](/os/kernel/a-simple-allocator): the next piece, and now its faults can print.
+
+<Recall cards={[
+  { q: "What does the CPU push on an interrupt in 64-bit mode, and how many bytes is that?", a: "ss, rsp, rflags, cs and rip: 40 bytes. Some vectors also push an error code, which makes 48." },
+  { q: "Why does each stub need to know its vector?", a: "Only some vectors push an error code, and nothing in the frame says which. The stub pushes a dummy for the others, so that one return path works." },
+  { q: "What is the difference between an interrupt gate and a trap gate?", a: "An interrupt gate clears IF on entry. A trap gate leaves IF as it was." },
+  { q: "When does the CPU raise #DF for a second exception?", a: "During delivery of the first, not after its handler starts. The pairs are contributory then contributory, or page fault then contributory or page fault." },
+  { q: "Why does the #DF gate need an IST stack?", a: "A stack overflow makes pushes on the current stack fail. Without a switch, delivery of #DF fails on the same stack, which gives a triple fault." },
+  { q: "Why must a kernel remap the legacy PIC?", a: "The BIOS leaves IRQ 0 to 7 at vectors 8 to 15, on top of CPU exceptions. A timer tick would look like a double fault." },
+]} />

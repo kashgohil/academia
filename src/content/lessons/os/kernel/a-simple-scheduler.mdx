@@ -1,0 +1,226 @@
+---
+summary: "Kernel threads with their own stacks, a context switch in assembly, the fabricated first stack, cooperative and preemptive switching, a round-robin run queue, sleep and wake, the idle thread, and races with interrupts found by exhaustive search."
+---
+import { KernelSchedDemo, IrqRaceDemo } from "@/demos/os/KernelSchedDemos";
+
+The kernel can now take interrupts and allocate memory, but it does one thing at a time. A **kernel thread** is a stack and a saved stack pointer. With those two parts and about 15 lines of assembly, one CPU can run many threads.
+
+[Context switching](/os/processes/context-switching) showed what Linux saves. [Round-robin](/os/scheduling/fifo-sjf-round-robin) showed the policy. This lesson writes the code. It has one trick that surprises nearly everyone: the first switch into a new thread returns to a place that never called anything.
+
+<Predict
+  id="first-switch"
+  question="switch_to pops six registers and runs ret. A new thread has never run, so it never pushed anything. What does the first switch into it pop?"
+  options={[
+    "Zeros from fresh memory, and then ret jumps to the thread's function by a special case",
+    "Values that the spawn code wrote on the new stack, to look like an earlier switch_to call",
+    "Nothing: the scheduler jumps to a new thread directly, with no switch_to",
+  ]}
+  answer={1}
+  explain="The spawn code fabricates a frame: six register values and a return address. switch_to cannot tell this from a real frame. Its ret lands in a trampoline, which starts the thread's function."
+>
+<KernelSchedDemo />
+</Predict>
+
+Things to try:
+
+1. Go to step 2 and read A's stack. All 7 rows are fabricated, 56 bytes in all. `r12` holds the function and `ret` holds the trampoline.
+2. Click **first run** in the jump list. `rsp` is now at the top of A's stack, and aligned to 16 bytes. `A` is running on a stack that has nothing on it.
+3. Click **switch** several times. Only `rsp` changes in this step, and the next pop reads the other thread's stack.
+4. Click **timer IRQ** and step on. A's stack gets the CPU frame, 15 saved registers and the saved callee registers. A is frozen in the handler, and all its state is on its stack.
+5. Select **cooperative**. A never yields, so it keeps the CPU. The tick count still rises, but B and C never run. Turn on **A calls yield() in its loop**, and they share again.
+6. Back in **preemptive**, turn off **The trampoline runs sti**. The tick count stays at 0 and A runs forever, because the switch ran with interrupts off.
+
+## The switch
+
+A context switch is a function call that returns on a different stack. Since the compiler treats it as a call, the caller has already saved the caller-saved registers, if it needs them. Only the six callee-saved registers of the System V ABI must survive.
+
+```rust
+#![no_std]
+use core::arch::{asm, global_asm};
+
+#[repr(C)]
+pub struct Thread {
+    rsp: u64, // must stay at offset 0: switch_to uses it
+    stack_top: u64,
+    state: u8,
+}
+
+global_asm!(r#"
+    .text
+    .globl switch_to
+// extern "C" fn switch_to(prev: *mut Thread, next: *const Thread)
+switch_to:
+    push rbp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [rdi], rsp        // save prev's stack pointer
+    mov rsp, [rsi]        // load next's: this is the switch
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret                   // a new thread "returns" to thread_trampoline
+
+    .globl thread_trampoline
+thread_trampoline:
+    sti                   // the switch ran with interrupts off
+    mov rdi, rbx          // the argument
+    call r12              // the thread's function; rsp is 16-byte aligned here
+    call thread_exit
+    ud2
+"#);
+```
+
+This sample compiled to an object file with rustc 1.96.1, with a panic handler added. It was not run. Compare it with `__switch_to_asm` in the [context switching](/os/processes/context-switching) lesson: Linux has the same six pushes. The floating point state needs no work here, because kernel code is compiled with no SSE. A kernel that runs user tasks must add it, on the user-task path.
+
+## The fabricated first stack
+
+`fabricate` writes what `switch_to` will read. The order is the mirror of the pops, and the return address comes first because it is the deepest.
+
+```rust
+unsafe extern "C" {
+    fn switch_to(prev: *mut Thread, next: *const Thread);
+    fn thread_trampoline();
+}
+
+/// Builds the stack that the first switch_to pops.
+pub unsafe fn fabricate(t: &mut Thread, f: extern "C" fn(usize), arg: usize) {
+    let mut sp = t.stack_top as *mut u64;
+    let mut push = |v: u64| unsafe {
+        sp = sp.sub(1);
+        sp.write(v);
+    };
+    push(thread_trampoline as *const () as usize as u64); // ret
+    push(0);                                 // rbp
+    push(arg as u64);                        // rbx
+    push(f as *const () as usize as u64);    // r12
+    push(0);                                 // r13
+    push(0);                                 // r14
+    push(0);                                 // r15
+    t.rsp = sp as u64;
+}
+```
+
+Why a trampoline? Three things must happen before the thread's function, and the function should not have to know them. Interrupts must turn on, because `schedule` runs with `IF` clear. Arguments must move from callee-saved registers to `rdi`. And something must catch the return: a thread function that returns would otherwise pop garbage. The trampoline calls `thread_exit` for this.
+
+The alignment also works out. With a stack top aligned to 16 bytes, seven pops leave `rsp` at the top. So `call r12` happens at a 16-byte boundary, as the ABI requires.
+
+Linux does the same thing. `copy_thread` builds a `fork_frame` on the new kernel stack, and `__switch_to_asm` returns into `ret_from_fork_asm`.
+
+## Cooperative, then preemptive
+
+Start with **cooperative** switching: a thread calls `yield_now`, which picks another thread and calls `switch_to`. No interrupt is involved. This is enough to test the switch, and bugs are easy to reproduce. Its weakness is that one loop that does not yield stops the machine.
+
+**Preemptive** switching adds one thing: the timer handler calls `schedule` too. It looks strange at first. The handler runs on the interrupted thread's stack, and it switches away in the middle of the handler. The frame stays there.
+
+When the thread gets the CPU again, `switch_to` returns into the handler, the handler returns to the stub, and `iretq` resumes the thread. Nothing special is required. Since each thread has its own stack, each stops in the middle of its own call chain.
+
+The queue policy is the simplest one: **round-robin**. `schedule` puts the current thread at the back and takes the head. With three threads that never block, the order in this model matches the output of the [scheduling module's](/os/scheduling/fifo-sjf-round-robin) `simulateClassic`, and a test checks it. From here, you can replace the queue with [multilevel feedback queues](/os/scheduling/multilevel-feedback-queues), or with a tree ordered by [virtual runtime](/os/scheduling/cfs-and-eevdf). The switch does not change.
+
+## Sleep, wake and idle
+
+`sleep(n)` takes a thread off the CPU until a later tick. It sets the wake time, puts the thread on a sleep list, marks it as not runnable, and calls `schedule`. The timer handler checks the list at each tick, and it moves threads whose time has come to the run queue. A real kernel keeps this list ordered, or uses a timer wheel, so that a tick does not scan every sleeper.
+
+What runs when no thread is ready? `schedule` must always find something. So the kernel has an **idle thread**, which is never on the queue. It runs `sti; hlt` in a loop.
+
+`hlt` stops the CPU until an interrupt, and this saves power. The order of those two instructions matters. `sti` takes effect only after the next instruction, so no interrupt can slip in between them and leave the CPU asleep with work to do. In the demo, the boot code becomes the idle thread, as it does in Linux.
+
+A thread cannot free its own stack, because it runs on it. So `thread_exit` marks the thread dead and calls `schedule`, and another thread frees the stack later. Linux does this in `finish_task_switch`.
+
+## Races with interrupts
+
+The run queue has one writer that you did not plan: the timer handler, which wakes sleepers. The thread code and the handler both change the same list. On one CPU, this is still a race, because the handler can arrive between any two instructions of the thread.
+
+<Predict
+  id="race"
+  question="A thread enqueues A in three steps. An interrupt handler enqueues B the same way. On one CPU, the handler can start at any of 4 points in the thread's code. How many points corrupt the queue?"
+  options={[
+    "None: one CPU cannot have a race",
+    "1: only the point just before the last step",
+    "2: both points in the middle lose a node",
+  ]}
+  answer={2}
+  explain="If the handler runs after the thread reads tail, its node is overwritten. If it runs after the thread links its node, it overwrites that link. Only the two points outside the sequence are safe."
+>
+<IrqRaceDemo />
+</Predict>
+
+Things to try:
+
+1. With **One CPU, no protection**, click **Show a corrupting schedule**. The final queue has lost a node. A thread that is not in the queue never runs again.
+2. Read the numbers below: 2 of 4 schedules are correct. A corrupted queue on real hardware might take days to appear.
+3. Select **One CPU, cli and sti**. The handler cannot start inside the section, so all 2 remaining schedules are correct.
+4. Select **One CPU, spinlock only**. Click **Show the deadlock**. The handler spins on a lock, and the thread that holds the lock cannot run until the handler ends. Of 6 schedules, 4 hang.
+5. Select **Two CPUs, cli and sti**. `cli` stops only this CPU's interrupts. Of 126 schedules, 100 corrupt the queue.
+6. Select **Two CPUs, cli and spinlock**. All 50 schedules are correct.
+
+The demo runs the [interleaving machine](/os/sync/critical-sections) from the synchronization module, and `explore` checks every state. So this result covers all schedules, not a sample.
+
+| Setup | Correct | Corrupt | Deadlock |
+|---|---|---|---|
+| One CPU, no protection | 2 | 2 | 0 |
+| One CPU, `cli` and `sti` | 2 | 0 | 0 |
+| One CPU, spinlock only | 2 | 0 | 4 |
+| Two CPUs, `cli` and `sti` | 26 | 100 | 0 |
+| Two CPUs, `cli` and spinlock | 50 | 0 | 0 |
+
+The rule follows from the table. Data that a handler touches needs both: disable local interrupts and take the lock. Linux names this `spin_lock_irqsave`. The save part matters, because the caller may already have interrupts off, and a plain `sti` at the end would turn them on too early. A Rust guard does this well.
+
+```rust
+/// Saves IF and turns interrupts off. The guard restores the old state.
+pub struct IrqGuard(u64);
+impl IrqGuard {
+    pub fn new() -> IrqGuard {
+        let flags: u64;
+        unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem)) };
+        IrqGuard(flags)
+    }
+}
+impl Drop for IrqGuard {
+    fn drop(&mut self) {
+        if self.0 & (1 << 9) != 0 {
+            unsafe { asm!("sti", options(nomem, nostack)) };
+        }
+    }
+}
+
+pub fn yield_now(rq: &mut RunQueue) {
+    let _irq = IrqGuard::new();
+    let prev = rq.current;
+    rq.push(prev);
+    let next = rq.pop();
+    if next != prev {
+        rq.current = next;
+        unsafe { switch_to(prev, next) };
+    }
+}
+```
+
+Read `yield_now` closely. The guard is alive during `switch_to`. The new thread runs, and the guard's `drop` runs only when this thread resumes. So the "unlock" happens long after, in another thread's turn.
+
+In this design, `IF` stays off across the switch, and each thread restores its own state on return. That is why the trampoline needs `sti`: a new thread has no guard to drop. Linux's `finish_task_switch` handles the same problem for the runqueue lock.
+
+Also, an interrupt handler must never sleep. It runs on the stack of whichever thread it interrupted, and it has no thread of its own to block. Linux's `might_sleep` checks catch this in debug builds, and the [spinlock rules](/os/sync/locks-and-spinlocks) list what else is forbidden.
+
+On arm64, `cpu_switch_to` saves `x19` to `x28`, `fp`, `sp` and `lr` in the task's `cpu_context`, not on the stack. The fabricated frame is then a few fields in a struct. The idea is the same.
+
+## Connect
+
+- [Context switching](/os/processes/context-switching): the same switch in Linux, and what it costs.
+- [Critical sections](/os/sync/critical-sections): why `cli` works on one CPU only.
+- [Locks and spinlocks](/os/sync/locks-and-spinlocks): the spinlock that sits behind `spin_lock_irqsave`.
+- [Userspace](/os/kernel/userspace): the next step, where the scheduler runs user tasks.
+
+<Recall cards={[
+  { q: "What does the fabricated frame of a new thread contain?", a: "Six callee-saved register values and a return address that points to the trampoline. That is 56 bytes, in the order that switch_to pops." },
+  { q: "Which single instruction performs the switch?", a: "The load of rsp from next's thread struct. After it, each pop and ret uses the new stack." },
+  { q: "What does the trampoline do, and why?", a: "It runs sti, moves the argument to rdi, calls the function, and catches its return. A new thread has no call chain to do this for it." },
+  { q: "Why can the timer handler switch threads in its own middle?", a: "Each thread has its own stack, and the handler's frame stays on it. When the thread runs again, it returns through the handler and iretq." },
+  { q: "Why does a spinlock alone deadlock against an interrupt on one CPU?", a: "The handler spins on a lock that the interrupted thread holds. That thread cannot run until the handler ends, so neither makes progress." },
+  { q: "Why must sti and hlt be in that order in the idle loop?", a: "sti takes effect after the next instruction. So no interrupt can arrive between them and leave the CPU asleep with work ready." },
+]} />

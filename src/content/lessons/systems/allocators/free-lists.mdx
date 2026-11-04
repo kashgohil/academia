@@ -1,0 +1,63 @@
+---
+summary: Variable-size allocation with headers, splitting and coalescing, and why plenty of free memory can still fail a request.
+---
+import { FreeListDemo } from "@/demos/AllocatorDemos";
+
+To support arbitrary sizes *and* arbitrary frees, the allocator has to remember each block's size and find free space. The classic design, used in K&R `malloc` and in the textbooks, is the **free list**. Every block starts with a small header recording its size and whether it is in use. Allocating means finding a free block that is big enough, **splitting** off the remainder, and returning the bytes after the header. Freeing marks the block free and, ideally, **coalesces** it with free neighbors.
+
+<Predict
+  id="coalesce"
+  question="Coalescing is turned off. You allocate fourteen 120-byte blocks in a 2 KiB heap, free all of them, and then ask for 1 KiB. What happens?"
+  options={[
+    "It succeeds: almost the whole heap is free",
+    "It fails, even though about 1.9 KiB is free",
+    "It succeeds, but only after a slow search",
+  ]}
+  answer={1}
+  explain="Without coalescing, the heap is a row of separate 128-byte free blocks (plus the leftover tail). No single block can hold 1 KiB. Turn coalescing on and the neighbors merge back into one large block as they are freed."
+>
+<FreeListDemo />
+</Predict>
+
+Things to try:
+
+1. Run **Fill, free all, ask for 1 KiB** with coalescing off, then on.
+2. Run **Swiss cheese**. Alternate 100 B and 40 B blocks, then free the 100 B ones. Coalescing can't help here, because live 40 B blocks separate the holes. External fragmentation goes above 50%, and a 200 B request fails despite hundreds of free bytes.
+3. Switch **Placement** and **Churn** for a while. Watch where new blocks land: first fit packs the low addresses, next fit sweeps across the whole heap, and worst fit keeps carving up the biggest block.
+4. Allocate 1 B. It costs 16 B: an 8 B header plus the minimum payload. Small objects are expensive on a general free list.
+
+## Block anatomy
+
+<Steps>
+<div><b>Header</b>: the block size, a multiple of 8, so the low 3 bits are always zero. One of them stores the "allocated" flag for free.</div>
+<div><b>Splitting</b>: if the chosen block exceeds the request by at least the minimum block size, carve off the remainder as a new free block. Otherwise hand over the whole block; the leftover becomes slack.</div>
+<div><b>Coalescing forward</b>: the next block's header is at `block + size`, so that's free to check.</div>
+<div><b>Coalescing backward</b> needs the *previous* block's size. Knuth's <b>boundary tags</b> copy the size into a footer at the end of each free block, so the previous block's footer is just before your header.</div>
+</Steps>
+
+## Placement policies
+
+| Policy | Chooses | Typical result |
+|---|---|---|
+| First fit | lowest-addressed block that fits | good; small fragments collect near the start |
+| Next fit | first fit, starting where the last search ended | spreads allocations everywhere: worse fragmentation and locality |
+| Best fit | smallest block that fits | excellent memory use; needs a size-ordered structure to be fast |
+| Worst fit | largest block | destroys big blocks; poor |
+
+Fragmentation, the last lesson of this module, measures these on the same workloads.
+
+## Making it fast
+
+A single list scanned linearly is O(number of blocks). Real allocators use:
+
+- **Explicit free lists**: link only the free blocks, threading the pointers through their payloads.
+- **Segregated free lists**: one list per size range, which approximates best fit at near O(1). dlmalloc uses small "bins" for exact sizes and trees for large ones.
+- **Deferred coalescing**: keep recently freed blocks unmerged for quick reuse (glibc's tcache and fastbins), and coalesce later.
+
+<Recall cards={[
+  { q: "Why can an allocator store flags in the low bits of a block header?", a: "Block sizes are multiples of 8 (or 16), so the low 3 (or 4) bits of the size are always zero." },
+  { q: "What do boundary tags enable?", a: "O(1) backward coalescing: each free block stores its size in a footer, so the previous block's start can be found from the current header." },
+  { q: "Why does next fit tend to fragment more than first fit?", a: "It keeps cutting into blocks all across the heap, instead of reusing low-address holes and preserving large free regions." },
+  { q: "Lots of free memory but the request fails: what is that called, and what causes it?", a: "External fragmentation: free space is split into blocks separated by live allocations, so none is large enough." },
+  { q: "What is a segregated free list?", a: "Separate free lists per size class, which gives fast, approximately best-fit allocation." },
+]} />

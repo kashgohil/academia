@@ -1,9 +1,4 @@
 [
- "architecture/caches/cache-organization-and-access-patterns",
- "architecture/caches/locality",
- "architecture/caches/multi-level-caches",
- "architecture/caches/prefetching",
- "architecture/caches/write-policies",
  "architecture/multicore/cache-coherence-mesi",
  "architecture/multicore/interconnects",
  "architecture/multicore/memory-consistency-models",

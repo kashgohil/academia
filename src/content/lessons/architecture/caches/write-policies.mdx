@@ -1,55 +1,69 @@
 ---
-summary: "What a cache does on a store: write-back vs write-through, allocate vs no-allocate, and why memset reads memory it is about to overwrite."
+summary: "What a cache does on a store: write-back vs write-through, allocate vs no-allocate, and why memset reads memory that it is about to overwrite."
 ---
 import { WritePolicyDemo } from "@/demos/CacheHierarchyDemos";
+import { WriteStepperDemo } from "@/demos/CacheExtrasDemos";
 
-Loads only fetch data. Stores raise two separate questions, and each combination of answers produces very different memory traffic:
+A load only fetches data. A store raises two separate questions, and each pair of answers gives very different memory traffic:
 
-- **On a write hit**: update memory now (**write-through**), or mark the line *dirty* and write it back when it's evicted (**write-back**)?
-- **On a write miss**: fetch the line into the cache first (**write-allocate**), or send the store straight to memory (**no-write-allocate**)?
+- **On a write hit**: does the cache update memory now? This is **write-through**. Or does it mark the line **dirty** and write it to memory when it removes the line? This is **write-back**. A dirty line has data that memory does not have yet.
+- **On a write miss**: does the cache fetch the line first? This is **write-allocate**. Or does it send the store directly to memory? This is **no-write-allocate**.
 
 <Predict
   id="memset"
-  question="You memset 16 KiB through a 4 KiB write-back, write-allocate cache. Ignoring the final flush, how many bytes does the cache read from memory?"
+  question="You memset 16 KiB through a 4 KiB write-back, write-allocate cache. Do not count the final flush. How many bytes does the cache read from memory?"
   options={["0: memset only writes", "16 KiB", "32 KiB"]}
   answer={1}
-  explain="Every store misses on a line the cache doesn't have yet, and write-allocate fetches the whole line first, even though every byte is about to be overwritten. The traffic doubles: 16 KiB read plus 16 KiB written."
+  explain="Every store misses on a line that the cache does not have yet. Write-allocate fetches the whole line first, although the program then overwrites every byte. The traffic doubles: 16 KiB read plus 16 KiB written."
 >
 <WritePolicyDemo />
 </Predict>
 
 Things to try:
 
-1. **memset**: write-allocate pays 16 KiB of pointless reads; no-allocate writes exactly the data.
-2. **a[i] += 1, 20 passes**: write-back writes each line *once*, whatever the number of passes. Write-through sends all 5,120 stores (20 KiB) to memory.
-3. **Transpose 64×64 ints**: writes jump 256 bytes apart. With write-allocate in a 4 KiB cache, each written line is fetched, dirtied once and evicted: about 270 KiB read and 256 KiB written, for 16 KiB of data. No-allocate moves just 16 KiB in each direction.
-4. **Scattered counters**: count *transactions*, not bytes. Write-through moves fewer bytes, but DRAM transfers whole 64-byte bursts, so a 4-byte write isn't 16× cheaper in practice.
+1. Select **memset 16 KiB**. Write-allocate reads 16 KiB for no purpose. No-allocate writes exactly the data.
+2. Select **a[i] += 1, 20 passes over 1 KiB**. Write-back writes each line *once*, for any number of passes. Write-through sends all 5,120 stores (20 KiB) to memory.
+3. Select **Transpose 64×64 ints**. The writes jump 256 bytes apart. With write-allocate, the cache fetches each written line, changes one int and removes the line again. That is 272 KiB read and 256 KiB written, for 16 KiB of data.
+4. Keep the transpose and read the no-allocate rows. They move only 16 KiB in each direction.
+5. Select **Scattered counters** and count the *transactions*, not only the bytes. Write-through writes 16 KiB in place of 241 KiB, but it needs more transactions: 7,955 in place of 7,718.
 
-## The usual pairings
+DRAM transfers data in bursts of 64 bytes. So a 4-byte write costs almost the same as a 64-byte write, and it is not 16 times cheaper.
 
-| | On hit | On miss | Where |
+## One store at a time
+
+<WriteStepperDemo />
+
+1. Keep **Write-back**, **Write-allocate** and **memset 6 lines**. The first store to each line misses, and the cache reads the whole line. The next 7 stores hit, and the line becomes dirty (D).
+2. Watch the bus when the cache is full. To make space, the cache writes a dirty line to memory. At the end, the cache has read 384 B, written 128 B, and still owes 256 B in dirty lines.
+3. Select **Write-through** and **No-allocate**. The cache reads nothing, but it sends 48 separate 8-byte writes. Write-back needs only 12 transfers of whole lines.
+4. Select **Column writes, 6 lines** with write-back and write-allocate. The program writes one word in each of 6 lines, again and again, but the cache holds only 4 lines. Every store misses, and the traffic is 3,072 B read and 3,072 B written for 384 B of data.
+5. Select **x[i] += 1** and compare write-back with write-through. Write-back writes each line once. Write-through writes every store.
+
+## The usual pairs
+
+| Pair | On a hit | On a miss | Where |
 |---|---|---|---|
-| Write-back + write-allocate | dirty bit, write on eviction | fetch line, then write | L1/L2/L3 data caches on nearly all CPUs |
-| Write-through + no-allocate | write memory every time | bypass cache | simple caches, some GPUs' L1, write buffers |
+| Write-back + write-allocate | set the dirty bit, write on removal | fetch the line, then write | L1, L2 and L3 data caches on almost all CPUs |
+| Write-through + no-allocate | write memory every time | go around the cache | simple caches, the L1 of some GPUs, write buffers |
 
-Write-back exploits locality in *stores*: many writes to a line cost one memory write. Its costs are a dirty bit per line, a write-back on eviction (which can delay the fill that caused it), and memory that is temporarily stale. That is harmless for a single core; multi-core systems need coherence (Multicore → MESI).
+Write-back uses the locality of *stores*: many writes to one line cost one memory write. It needs a dirty bit for each line. When the cache removes a dirty line, it must write it back, and this can delay the fill that caused the removal. Memory is also out of date for a time. This is harmless for one core, but multi-core systems need coherence (Multicore → MESI).
 
-## Why memset reads: read-for-ownership
+## Why memset reads: read for ownership
 
-On a coherent multi-core CPU, a core must *own* a line before modifying it. On a store miss it issues a **read for ownership (RFO)**, which fetches the line and invalidates other copies. That's write-allocate plus coherence. For a full-line overwrite the read is wasted, so CPUs provide escape hatches:
+On a coherent multi-core CPU, a core must *own* a line before it changes the line. On a store miss, the core sends a **read for ownership (RFO)**. The RFO fetches the line and invalidates all other copies. This is write-allocate plus coherence. When the program overwrites the full line, the read is wasted, so CPUs give other options:
 
-- **Non-temporal (streaming) stores**: x86 `MOVNTI` / `MOVNTDQ` (`_mm_stream_si128`), ARM `STNP`. They go through write-combining buffers straight to memory with no RFO, and don't pollute the cache. Use them for large outputs you won't read back soon.
-- **Fast string instructions**: `rep stosb` / `rep movsb` (ERMSB) can avoid RFOs for large aligned regions. Good `memset`/`memcpy` implementations switch strategies by size.
-- **Full-line write detection**: some cores skip the fetch when a store sequence covers an entire line.
+- **Non-temporal (streaming) stores**: x86 `MOVNTI` and `MOVNTDQ` (`_mm_stream_si128`), and the ARM hint `STNP`. They go through write-combining buffers directly to memory, with no RFO, and they do not pollute the cache. Use them for large outputs that you will not read again soon.
+- **Fast string instructions**: `rep stosb` and `rep movsb` (ERMSB) can prevent RFOs for large aligned regions. Good `memset` and `memcpy` implementations change their method by size.
+- **Full-line write detection**: some cores skip the fetch when a sequence of stores covers a full line.
 
 <Callout kind="warn" title="Dirty data is owed traffic">
-The demo counts dirty lines still in the cache as writes "owed". They will be written eventually, on eviction or an explicit flush. For durable storage on persistent memory, that flush (`CLWB` plus a fence) is the program's responsibility.
+The demos count the dirty lines that are still in the cache as owed writes. The cache must write them eventually, when it removes them or when the program flushes them. For durable data on persistent memory, the program must do that flush with `CLWB` and a fence.
 </Callout>
 
 <Recall cards={[
-  { q: "Write-back vs write-through?", a: "Write-back marks the line dirty and writes memory on eviction. Write-through updates memory on every store." },
-  { q: "Write-allocate vs no-write-allocate?", a: "On a store miss, write-allocate fetches the line into the cache first; no-write-allocate sends the store directly to memory." },
-  { q: "Why does memset through a normal CPU cache roughly double memory traffic?", a: "Each store miss triggers a read for ownership that fetches the line before it is completely overwritten." },
-  { q: "What are non-temporal stores for?", a: "Writing large outputs without fetching lines (no RFO) or polluting the cache, via write-combining buffers (e.g. MOVNTDQ, _mm_stream_si128)." },
-  { q: "Why does write-back help a[i] += 1 over a small array?", a: "Repeated stores to the same line coalesce in the cache: one write-back per line, instead of one memory write per store." },
+  { q: "What is the difference between write-back and write-through?", a: "Write-back marks the line dirty and writes memory when the cache removes the line. Write-through updates memory on every store." },
+  { q: "What is the difference between write-allocate and no-write-allocate?", a: "On a store miss, write-allocate fetches the line into the cache first. No-write-allocate sends the store directly to memory." },
+  { q: "Why does memset through a normal CPU cache about double the memory traffic?", a: "Each store miss causes a read for ownership, which fetches the line before the program overwrites all of it." },
+  { q: "What are non-temporal stores for?", a: "Writing large outputs through write-combining buffers, with no RFO and no cache pollution, for example with MOVNTDQ or _mm_stream_si128." },
+  { q: "Why does write-back help a[i] += 1 over a small array?", a: "Repeated stores to the same line combine in the cache. There is one write-back per line, in place of one memory write per store." },
 ]} />

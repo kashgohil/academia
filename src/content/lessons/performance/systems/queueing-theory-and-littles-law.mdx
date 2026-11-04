@@ -1,0 +1,74 @@
+---
+summary: Why response time increases so fast when a server becomes busy, and one simple law that connects throughput, latency and concurrency.
+---
+import { QueueAnimationDemo, LatencyCurveDemo, LittleCalcDemo } from "@/demos/SystemsDemos";
+
+A server does work for requests. When a request arrives and the server is busy, the request waits in a queue. Queueing theory tells you how long the wait is.
+
+The most important result is easy to state: **when utilization goes near 100%, the wait goes to infinity**. It does not increase slowly. It increases very fast at the end.
+
+<Predict
+  id="busy"
+  question="A server needs 1 ms per request on average. Requests arrive at random times. At 50% utilization, the average time in the system is 2 ms. What is it at 90% utilization?"
+  options={["About 3.6 ms", "About 10 ms", "About 100 ms"]}
+  answer={1}
+  explain="For random arrivals and random service times, the average time in the system is S / (1 − ρ). Here S is the service time and ρ is the utilization. At 90%, that is 1 / 0.1 = 10 ms. The work per request is the same. The extra 9 ms is time in the queue."
+>
+<QueueAnimationDemo />
+</Predict>
+
+Do these steps:
+
+1. Set the load to 50%. The queue is usually short. Most jobs are green.
+2. Set the load to 90%. Long queues form and then disappear. Many jobs turn red.
+3. Set the load to 98%. The queue grows for a long time.
+4. Turn on **Every job takes exactly the same time**. The queue is shorter. Variability causes much of the wait.
+5. Compare **L** with **λ × W**. They are almost equal. This is Little's law.
+
+## The curve
+
+<LatencyCurveDemo />
+
+1. Look at the blue line (mean). It is flat until about 70%, then it goes up quickly.
+2. Look at the red line (99th percentile). It goes up earlier and higher than the mean.
+3. Select **4** servers. Four servers share one queue. At the same utilization, the wait is much shorter. One shared queue is better than four separate queues.
+4. Select **fixed** service time. The wait is about half.
+
+The formula for one server with random arrivals and random service times (an M/M/1 queue) is:
+
+$$W = \frac{S}{1 - \rho}$$
+
+| Utilization | Time in system |
+|---|---|
+| 50% | 2 × S |
+| 80% | 5 × S |
+| 90% | 10 × S |
+| 99% | 100 × S |
+
+This is why teams keep servers at 50–70% utilization. The free capacity is not waste. It keeps the latency low.
+
+## Little's law
+
+Little's law is true for any stable system, with any arrival pattern:
+
+$$L = \lambda \times W$$
+
+- L is the average number of items in the system.
+- λ is the throughput (items per second).
+- W is the average time that each item stays in the system.
+
+<LittleCalcDemo />
+
+Use Little's law to size pools and limits:
+
+1. A service sends 2000 queries per second to a database. Each query takes 25 ms. On average, 50 queries are open at the same time. A pool of 20 connections is too small.
+2. A load balancer sees 500 open connections at 10,000 requests per second. The average request takes 50 ms.
+3. A thread pool has 32 threads. Each request takes 40 ms. The maximum throughput is 32 / 0.04 = 800 requests per second.
+
+<Recall cards={[
+  { q: "Average time in an M/M/1 queue?", a: "W = S / (1 − ρ). Here S is the service time and ρ is the utilization." },
+  { q: "At 90% utilization, how many service times does a request spend in the system (M/M/1)?", a: "About 10." },
+  { q: "State Little's law.", a: "L = λ × W: items in the system = throughput × time in the system." },
+  { q: "Why is one shared queue for several servers better than one queue per server?", a: "No server is idle while a request waits somewhere else. The waits are much shorter at the same utilization." },
+  { q: "Why keep servers below about 70% utilization?", a: "Wait time increases very fast as utilization goes near 100%. The free capacity keeps latency low." },
+]} />

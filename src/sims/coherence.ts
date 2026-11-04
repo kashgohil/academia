@@ -51,11 +51,12 @@ export class Coherence {
   }
 
   state(core: number, addr: number): St {
-    return this.caches[core]!.find((l) => l.addr === addr)?.st ?? "I";
+    // An invalidated copy can stay in the array ahead of a newer valid one; skip it.
+    return this.caches[core]!.find((l) => l.addr === addr && l.st !== "I")?.st ?? "I";
   }
 
   value(core: number, addr: number): number | null {
-    const l = this.caches[core]!.find((x) => x.addr === addr);
+    const l = this.caches[core]!.find((x) => x.addr === addr && x.st !== "I");
     return l ? l.val : null;
   }
 

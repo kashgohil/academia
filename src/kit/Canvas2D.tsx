@@ -7,11 +7,13 @@ export function Canvas2D({
   draw,
   deps,
   onPointer,
+  onLeave,
 }: {
   height: number | ((w: number) => number);
   draw: (ctx: CanvasRenderingContext2D, w: number, h: number) => void;
   deps: unknown[];
   onPointer?: (x: number, y: number, e: React.PointerEvent) => void;
+  onLeave?: () => void;
 }) {
   const [wrap, w] = useWidth<HTMLDivElement>();
   const ref = useRef<HTMLCanvasElement>(null);
@@ -39,6 +41,11 @@ export function Canvas2D({
           const r = e.currentTarget.getBoundingClientRect();
           onPointer(e.clientX - r.left, e.clientY - r.top, e);
         })}
+        onPointerDown={onPointer && ((e) => {
+          const r = e.currentTarget.getBoundingClientRect();
+          onPointer(e.clientX - r.left, e.clientY - r.top, e);
+        })}
+        onPointerLeave={onLeave}
       />
     </div>
   );

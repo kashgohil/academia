@@ -133,19 +133,21 @@ pub fn simulate(addrs: &[u32], size: u32, line: u32, ways: u32, policy: Policy) 
 
 // ---------------- WebAssembly C ABI ----------------
 
+fn layout(bytes: usize) -> std::alloc::Layout {
+    // 8-byte alignment so the buffer can be viewed as u32/f64 slices.
+    std::alloc::Layout::from_size_align(bytes.max(1), 8).unwrap()
+}
+
 #[no_mangle]
 pub extern "C" fn alloc(bytes: usize) -> *mut u8 {
-    let mut v = Vec::<u8>::with_capacity(bytes);
-    let p = v.as_mut_ptr();
-    std::mem::forget(v);
-    p
+    unsafe { std::alloc::alloc(layout(bytes)) }
 }
 
 /// # Safety
-/// `p` must come from `alloc(bytes)`.
+/// `p` must come from `alloc(bytes)` with the same `bytes`.
 #[no_mangle]
 pub unsafe extern "C" fn dealloc(p: *mut u8, bytes: usize) {
-    drop(Vec::from_raw_parts(p, 0, bytes));
+    std::alloc::dealloc(p, layout(bytes));
 }
 
 /// Simulates `n` accesses from `addrs` and writes one outcome byte per access into `out`.

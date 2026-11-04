@@ -308,13 +308,16 @@ export const TRACKS: Track[] = [
   ]),
 
   track("databases", "Databases & Storage", "How data survives and gets found.", [
-    ["Storage", 1, ["Disks vs SSDs", "Pages and records", "Heap files", "Buffer pools"]],
-    ["Indexes", 2, ["B+ trees", "LSM trees", "Compaction", "Hash indexes", "Secondary indexes"]],
-    ["Query processing", 2, ["Relational algebra", "Volcano iterator model", "Join algorithms", "Sorting and aggregation", "Vectorized execution"], "query"],
-    ["Query optimization", 3, ["Cost models", "Cardinality estimation", "Join ordering"], "optimizer"],
-    ["Transactions", 2, ["ACID", "Isolation levels and anomalies", "Two-phase locking", "MVCC", "Serializable snapshot isolation"]],
-    ["Recovery", 3, ["Write-ahead logging", "ARIES", "Checkpoints"]],
-    ["Analytical systems", 3, ["Column stores", "Compression", "Late materialization"], "olap"],
+    ["Storage", 1, ["Disks vs SSDs", "Pages and slotted records", "Heap files and free-space maps", "Buffer pools", "Durability: fsync, torn writes and checksums", "Read, write and space amplification"]],
+    ["B-trees", 2, ["B+ trees", "Bulk loading and fill factor", "Latch crabbing and B-link trees", "Copy-on-write B-trees"], "btrees"],
+    ["LSM trees", 2, ["Memtables and SSTables", "Bloom filters", "Compaction: leveled vs tiered", "Tuning an LSM tree"], "lsm"],
+    ["Transactions", 2, ["ACID", "Isolation levels and anomalies", "Two-phase locking and deadlocks", "Optimistic concurrency control", "MVCC", "Serializable snapshot isolation", "MVCC garbage collection"]],
+    ["Recovery", 3, ["Write-ahead logging", "Group commit", "Physical, logical and physiological logging", "ARIES", "Checkpoints"]],
+    ["More indexes", 2, ["Hash indexes", "Secondary and covering indexes", "Tries and adaptive radix trees", "Inverted indexes", "Spatial indexes: R-trees"], "indexes"],
+    ["Query processing", 2, ["Relational algebra", "Volcano iterator model", "Join algorithms", "External sorting and aggregation", "Vectorized execution", "Query compilation"], "query"],
+    ["Query optimization", 3, ["Cost models", "Cardinality estimation", "Join ordering", "Reading query plans"], "optimizer"],
+    ["Analytical systems", 3, ["Column stores", "Compression", "Late materialization", "Zone maps and data skipping"], "olap"],
+    ["Building a storage engine", 4, ["Architecture of an embedded engine", "A tiny key-value store, end to end", "Crash testing the engine", "SQLite, LMDB and RocksDB compared"], "engine"],
   ]),
 
   track("networking", "Networking", "Moving bytes between machines.", [

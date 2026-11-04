@@ -84,11 +84,14 @@ export function* retire(w: World, t: ThreadState, p: Ptr): Frag {
       return;
     case "epoch": {
       w.nodes[p]!.state = "retired";
-      const i = t.epoch % 3;
-      if (t.bagEpoch[i] !== t.epoch) {
+      // Label the bag with the GLOBAL epoch, not this thread's local one: the global epoch can be
+      // one ahead, and a reader pinned in it may still hold p. Freeing at label + 2 is then safe.
+      const g = w.epoch;
+      const i = g % 3;
+      if (t.bagEpoch[i] !== g) {
         for (const q of t.bags[i]!) w.free(q); // stale bag from ≥ 3 epochs ago
         t.bags[i] = [];
-        t.bagEpoch[i] = t.epoch;
+        t.bagEpoch[i] = g;
       }
       t.bags[i]!.push(p);
       if (t.bags.reduce((n, b) => n + b.length, 0) >= w.opts.threshold) yield* tryAdvance(w);

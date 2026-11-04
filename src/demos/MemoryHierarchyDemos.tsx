@@ -126,6 +126,14 @@ const soaSchema = {
   touched: range({ label: "Fields the loop reads", min: 1, max: 32, step: 1, default: 2 }),
 };
 
+/** Linear interpolation between computed points (fields read is an integer slider). */
+function interp(pts: [number, number][], k: number) {
+  const hi = pts.findIndex((p) => p[0] >= k);
+  if (hi <= 0) return pts[Math.max(0, hi)]![1];
+  const [x0, y0] = pts[hi - 1]!, [x1, y1] = pts[hi]!;
+  return y0 + ((y1 - y0) * (k - x0)) / (x1 - x0);
+}
+
 const LAYOUTS: { id: Soa; label: string; color: string }[] = [
   { id: "aos", label: "Array of structs", color: "var(--c4)" },
   { id: "soa", label: "Struct of arrays", color: "var(--c1)" },
@@ -138,16 +146,26 @@ export function SoaDemo() {
   const fields = Number(params.values.fields);
   const touched = Math.min(params.values.touched, fields);
   const N = 262144;
-  const curves = useMemo(() => {
-    if (!w) return null;
-    const ks = Array.from({ length: fields }, (_, i) => i + 1).filter((k) => k <= 4 || k % Math.max(1, fields / 8) === 0 || k === fields);
-    return LAYOUTS.map((l) => ({ ...l, pts: ks.map((k) => [k, evaluate(w, layoutTrace(l.id, N, fields, k), N, false).nsPerElem] as [number, number]) }));
+  // Heavy: compute off the critical path, one layout per tick, so the page stays responsive.
+  const [curves, setCurves] = useState<{ id: Soa; label: string; color: string; pts: [number, number][] }[] | null>(null);
+  useEffect(() => {
+    if (!w) return;
+    setCurves(null);
+    const ks = [...new Set([1, 2, 4, 8, Math.round(fields * 0.75), fields])].filter((k) => k <= fields).sort((a, b) => a - b);
+    const acc: { id: Soa; label: string; color: string; pts: [number, number][] }[] = [];
+    const timers = LAYOUTS.map((l, i) =>
+      setTimeout(() => {
+        acc.push({ ...l, pts: ks.map((k) => [k, evaluate(w, layoutTrace(l.id, N, fields, k), N, false).nsPerElem] as [number, number]) });
+        if (acc.length === LAYOUTS.length) setCurves([...acc]);
+      }, 30 * (i + 1)),
+    );
+    return () => timers.forEach(clearTimeout);
   }, [w, fields]);
-  const now = useMemo(() => (w ? LAYOUTS.map((l) => ({ ...l, c: evaluate(w, layoutTrace(l.id, N, fields, touched), N, false) })) : null), [w, fields, touched]);
-  if (!curves || !now) return <div className="demo" style={{ height: 300 }} />;
+  const now = useMemo(() => (curves ? curves.map((c) => ({ ...c, ns: interp(c.pts, touched) })) : null), [curves, touched]);
+  if (!curves || !now) return <Demo title={`Reading ${touched} of ${fields} fields from ${N.toLocaleString()} entities`} controls={<Controls params={params} />}><div className="muted" style={{ height: 260 }}>simulating {N.toLocaleString()} entities in three layouts…</div></Demo>;
   return (
     <Demo title={`Reading ${touched} of ${fields} fields from ${N.toLocaleString()} entities`} controls={<Controls params={params} />}>
-      <Stats items={now.map((x) => ({ label: `${x.label}: ns/entity · useful bytes`, value: <span>{x.c.nsPerElem.toFixed(2)} <span className="muted" style={{ fontSize: 13 }}>· {Math.round(100 * usefulFraction(x.id, fields, touched))}%</span></span> }))} />
+      <Stats items={now.map((x) => ({ label: `${x.label}: ns/entity · useful bytes`, value: <span>{x.ns.toFixed(2)} <span className="muted" style={{ fontSize: 13 }}>· {Math.round(100 * usefulFraction(x.id, fields, touched))}%</span></span> }))} />
       <div style={{ height: 10 }} />
       <Plot x={[1, fields]} y={[0, Math.max(...curves.flatMap((c) => c.pts.map((p) => p[1]))) * 1.1]} height={220} xLabel="fields read per entity" yLabel="ns per entity">
         <RuleX at={touched} />

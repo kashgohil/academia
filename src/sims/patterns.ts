@@ -56,10 +56,10 @@ export const PATTERNS: Pattern[] = [
     },
   },
   {
-    id: "reuse",
-    label: "Repeated loop over 6 KiB",
-    note: "Loop over a 6 KiB buffer repeatedly. Fits or thrashes depending on cache size.",
-    gen: ({ n }) => Uint32Array.from({ length: n }, (_, i) => (i % 1536) * W),
+    id: "loop-lines",
+    label: "Loop over 6 KiB, one access per line",
+    note: "for pass: for each 64-byte line in a 6 KiB buffer: touch it. Working set 96 lines; no spatial reuse within a pass.",
+    gen: ({ n }) => Uint32Array.from({ length: n }, (_, i) => (i % 96) * 64),
   },
   {
     id: "random",

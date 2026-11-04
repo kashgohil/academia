@@ -1,0 +1,43 @@
+---
+summary: The handful of latencies every programmer should know, what they look like at human scale, and how to measure them on your own machine.
+---
+import { LatencyLadderDemo, LatencyStaircaseDemo } from "@/demos/MemoryHierarchyDemos";
+
+Performance intuition starts with a few numbers. They span eight orders of magnitude, so the gaps matter more than the exact values. A design that does one extra DRAM access per item, or one extra network round trip per request, can be slower than any amount of clever computation.
+
+<Predict
+  id="dram"
+  question="In the time one cache-missing load waits for main memory (DRAM), roughly how many L1 cache hits could a core complete?"
+  options={["About 5", "About 100", "About 10,000"]}
+  answer={1}
+  explain="An L1 hit takes about 1 ns (4–5 cycles); a DRAM access takes about 80–100 ns. At human scale, if an L1 hit took one second, a DRAM access would take a minute and a half, and an NVMe read would take five and a half hours."
+>
+<LatencyLadderDemo />
+</Predict>
+
+Turn on **human scale** and read down the list: L1 is a second; DRAM is a minute and a half; a datacenter round trip is almost six days; a transatlantic round trip is two and a half years.
+
+## The staircase on your machine
+
+The numbers above are typical. The ones that matter are your machine's, and you can measure them with a pointer chase: a linked list laid out in random order inside a buffer of a given size. Each load depends on the previous one, so latencies can't overlap, and the time per step is the latency of whatever level the buffer fits in.
+
+<LatencyStaircaseDemo />
+
+The flat segments are the cache levels; the jumps are where the working set stops fitting. Real measurements (lmbench's `lat_mem_rd`, Intel MLC, or a 20-line pointer-chase loop) show the same shape, with softer edges, because of the TLB, replacement policy and shared L3.
+
+## Rules of thumb that follow
+
+<Steps>
+<div><b>Count the slow operations, not the instructions.</b> A request that does 3 DRAM misses, 1 syscall and 1 network round trip is dominated entirely by the round trip.</div>
+<div><b>Batch across expensive boundaries.</b> One round trip carrying 100 items beats 100 round trips: pipelining, batch APIs, vectored I/O.</div>
+<div><b>Latency and bandwidth are different budgets.</b> DRAM latency is about 90 ns, but a core can stream about 10–20 GB/s, roughly 4 ns per 64-byte line, when accesses are predictable. Most of the next lessons are about turning latency-bound code into bandwidth-bound code.</div>
+<div><b>Keep the numbers current.</b> Jeff Dean's original list (2009) put a disk seek at 10 ms and didn't mention SSDs. The ratios shift with each generation, so re-measure when it matters.</div>
+</Steps>
+
+<Recall cards={[
+  { q: "Approximate latency of an L1 hit, an L3 hit, and DRAM?", a: "About 1 ns, 10–15 ns, and 80–100 ns." },
+  { q: "Roughly how many L1 hits fit in one DRAM access?", a: "About 100." },
+  { q: "Order of magnitude of an NVMe 4 KiB read and a same-datacenter round trip?", a: "Tens of microseconds, and 0.1–0.5 ms." },
+  { q: "How do you measure memory latency at each cache level?", a: "Chase pointers through a randomly ordered list in buffers of increasing size; each load depends on the previous, so time per step is the latency." },
+  { q: "Why batch work across slow boundaries?", a: "Each crossing (syscall, round trip, disk access) has a fixed latency cost; batching amortizes it over many items." },
+]} />

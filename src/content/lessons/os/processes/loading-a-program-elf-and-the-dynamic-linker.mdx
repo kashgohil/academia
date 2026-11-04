@@ -1,0 +1,156 @@
+---
+summary: "From execve to main: ELF headers and segments, how the kernel maps them, the stack at startup, ld.so, relocations, the GOT and PLT with lazy binding, ASLR, and Mach-O in comparison."
+---
+import { ElfLoaderDemo, InitialStackDemo, PltStepperDemo } from "@/demos/os/ProcessesElfDemos";
+
+An executable is a data file with instructions for the loader. On Linux the format is **ELF** (Executable and Linkable Format). Before your first line runs, the kernel maps parts of the file into memory. A second program then loads the libraries and fills in addresses.
+
+The first demo holds a real ELF file of 1,976 bytes. A sim in this lesson builds it byte by byte. It runs on x86-64 Linux with glibc, and `readelf` and `objdump` read it with no complaint.
+
+<Predict
+  id="headers"
+  question="An ELF file has two tables that describe its contents. Which one does the kernel read to map the program into memory?"
+  options={[
+    "The section headers, which name .text, .data and so on",
+    "The program headers, which list segments and their permissions",
+    "Both: it needs the sections to find the code",
+  ]}
+  answer={1}
+  explain="The loader uses only program headers. Section headers are for linkers and debuggers. You can remove them, and the program still runs."
+>
+<ElfLoaderDemo />
+</Predict>
+
+Things to try:
+
+1. Click the first bytes. `7f 45 4c 46` is the magic number. Click the bytes at offset `0x18` to find `e_entry`, the address of the first instruction. `e_phoff` follows at `0x20`.
+2. Step through the loader. Steps 1 to 4 use only the ELF header, the program headers and the `.interp` string. No step reads the grey section data at the end of the file.
+3. Stop at **Map the second PT_LOAD**. Scroll up to `phdr[3]` and click its `p_offset` and `p_vaddr`. The values are `0x2a0` and `0x12a0`. They must agree modulo the page size, so that the kernel can map whole file pages.
+4. Stop at **Add .bss**. `p_memsz` is larger than `p_filesz` by `0x2000` bytes. These bytes cost nothing in the file. They become anonymous zero pages.
+5. Turn on **ASLR** and press **Run again**. The base moves, and all the program's addresses move with it. The code still works, because it uses only offsets from `rip`.
+
+## The format
+
+The **ELF header** is 64 bytes at offset 0. It gives the type, the CPU, the entry point and the places of the two tables.
+
+**Program headers** (56 bytes each) describe segments for the loader. This file has 7:
+
+| Type | Purpose |
+|---|---|
+| `PT_PHDR` | where the program headers are in memory |
+| `PT_INTERP` | the path of the dynamic linker |
+| `PT_LOAD` (3 times) | map this part of the file with these permissions |
+| `PT_DYNAMIC` | where the `.dynamic` table is |
+| `PT_GNU_STACK` | stack permissions: read and write, no execute |
+
+**Section headers** (64 bytes each, 14 here) describe `.text`, `.rodata`, `.data`, `.bss`, `.plt`, `.got.plt`, `.dynsym` and others. Linkers and debuggers read them. One segment holds several sections.
+
+On Linux, try `readelf -lW /bin/ls`, `readelf -SW /bin/ls` and `readelf -d /bin/ls`. These tools do not come with macOS.
+
+## What the kernel does
+
+`load_elf_binary` handles this in the kernel. It checks the magic bytes and reads the program headers. For each `PT_LOAD` it calls `mmap` on the file, with the permissions from `p_flags`. No data is read yet. The first access to each page causes a [page fault](/os/vm/page-faults-and-demand-paging), and the page cache supplies the bytes. So all processes that run one program share one copy of its code.
+
+A writable segment is a private mapping. A write copies the page, and the file does not change. If `p_memsz` is larger than `p_filesz`, the kernel clears the rest of the last file page and adds anonymous pages. That is `.bss`.
+
+If the file has `PT_INTERP`, the kernel also maps that interpreter and starts it, not your program. The interpreter on x86-64 is `/lib64/ld-linux-x86-64.so.2`.
+
+## The stack at startup
+
+The kernel builds the first stack. It holds the arguments, the environment and the **auxiliary vector** (auxv): key and value pairs that the kernel gives to user space.
+
+<InitialStackDemo />
+
+1. Move **Arguments**. Each argument adds a pointer row and moves `rsp`. `rsp` modulo 16 stays 0, because the ABI requires this alignment at entry.
+2. Find `AT_ENTRY`. The kernel starts ld.so, so this is how ld.so learns where your program starts.
+3. Find `AT_SYSINFO_EHDR`. It locates the [vDSO](/os/processes/system-calls).
+
+`_start` is the first code in a normal program. It comes from `crt1.o`. It reads `argc` from `rsp`, and calls `__libc_start_main`, which runs init code and then calls `main`. The file in this demo has no `crt1.o`, so its `_start` is the program itself.
+
+## The dynamic linker
+
+The **dynamic linker** `ld.so` is a normal ELF file with no interpreter of its own. It relocates itself, and then it does three jobs:
+
+1. **Load libraries.** It reads each `DT_NEEDED` entry from `.dynamic` and searches `LD_LIBRARY_PATH`, `DT_RUNPATH`, `/etc/ld.so.cache` and the default directories. It maps each one with `mmap`. The code pages are shared among all processes that use the library.
+2. **Relocate.** A **relocation** is an instruction to write an address somewhere. `R_X86_64_RELATIVE` means "add the load base". `R_X86_64_GLOB_DAT` means "look up this symbol and write its address in a GOT slot". `R_X86_64_JUMP_SLOT` is the form for function calls.
+3. **Initialize.** It runs the init functions of each library, and jumps to the program's entry.
+
+### Position-independent code and ASLR
+
+The code pages are shared and read-only, so ld.so cannot write addresses into them. **PIC** (position-independent code) solves this with two rules. Code reaches its own data with an offset from `rip`, which stays correct at any base. Code reaches anything in another file through the **GOT** (global offset table), a table of addresses in writable data.
+
+**ASLR** (address space layout randomization) depends on this. It loads each file at a random base, so an attacker cannot predict addresses. With ASLR off, a PIE on x86-64 loads at `0x555555554000`. The Kconfig default for `/proc/sys/vm/mmap_rnd_bits` on x86-64 is 28, which gives 268,435,456 page positions over 1 TiB. Some distributions set more bits. A **PIE** (position-independent executable) has type `ET_DYN`, the same type as a library.
+
+### The PLT and lazy binding
+
+A large library has thousands of functions, and a program calls few of them. Looking up each one at startup takes time. So ld.so can wait until the first call. The **PLT** (procedure linkage table) is a set of small stubs in code that make this possible.
+
+<Predict
+  id="lazy"
+  question="A program calls puts 1,000 times. With lazy binding, how many times does the resolver in ld.so run for puts?"
+  options={[
+    "1,000 times: each call goes through the PLT",
+    "Once: the first call writes the address into the GOT",
+    "Never: ld.so resolves all symbols at load time",
+  ]}
+  answer={1}
+  explain="The first call goes through the resolver, which writes the real address into the GOT slot. Each later call still goes through the PLT stub, but the stub's indirect jump now goes straight to puts."
+>
+<PltStepperDemo />
+</Predict>
+
+The stepper decodes the real bytes of the file from the first demo.
+
+1. Step from `_start`. `call puts@plt` lands in the stub. Its `jmp [GOT+24]` goes to the next instruction, because the slot still points back into the stub.
+2. Keep going. The stub pushes index 0, jumps to `PLT0`, pushes the link map, and jumps to the resolver. That is 7 instructions from the call to `puts`.
+3. See the resolver write `GOT[3]`. It reads relocation 0, finds the name `puts` in `.dynsym` and `.dynstr`, and searches the loaded files.
+4. Step through the second call. It takes 2 instructions: the `call` and one indirect `jmp`.
+5. Turn on **Bind at load time**. The resolver never runs, and both calls take 2 instructions.
+
+`GOT[1]` and `GOT[2]` are empty in the file, and ld.so fills them at startup. The resolver, `_dl_runtime_resolve`, must save all argument registers, because the call to `puts` has not happened yet.
+
+Lazy binding has a cost in security: the writable GOT is a target for attackers. **Full RELRO** (`-z relro -z now`) resolves everything at load time and makes the GOT read-only. Many distributions use this default for their packages, so lazy binding is rarer than it was. `-fno-plt` removes the stub altogether: the call becomes `call [rip + got_slot]`. On CPUs with indirect branch tracking, linkers may also add a `.plt.sec` section with `endbr64`.
+
+To see binding on Linux, run `LD_DEBUG=bindings ./prog`. To force eager binding, set `LD_BIND_NOW=1`.
+
+## Static or dynamic
+
+| | Static | Dynamic |
+|---|---|---|
+| Start | kernel jumps to the program | kernel starts ld.so, then the relocations run |
+| Size | one larger file | small file plus shared libraries |
+| Memory | no sharing across programs | library code shared |
+| Security fixes | rebuild each program | replace the library |
+| Portability | runs with no libraries present | needs compatible libraries |
+
+Go builds static binaries by default if no cgo is in use. Rust links glibc dynamically by default on Linux, and it can build static binaries with the musl target. Zig can also link statically against musl. A static glibc binary still has problems with features that use `dlopen`, such as name lookup through NSS.
+
+## Mach-O and dyld
+
+macOS uses **Mach-O** in place of ELF, and `dyld` in place of ld.so. The ideas match, and the names differ:
+
+| ELF | Mach-O |
+|---|---|
+| program headers | load commands such as `LC_SEGMENT_64` |
+| `PT_INTERP` | `LC_LOAD_DYLINKER` |
+| `DT_NEEDED` | `LC_LOAD_DYLIB` |
+| `e_entry` | `LC_MAIN` |
+| `.plt`, `.got.plt` | `__stubs`, `__got` and similar sections |
+
+Apple Silicon uses 16 KiB pages, so segments align to 16 KiB. System libraries live in one prebuilt **dyld shared cache**, and not as separate files. Mach-O records the library for each symbol, which is called a two-level namespace. Try `otool -l ./prog`, `otool -L ./prog` and `vmmap <pid>`. `DYLD_PRINT_LIBRARIES=1 ./prog` lists the loads, but System Integrity Protection removes `DYLD_` variables for protected system binaries.
+
+## Connect
+
+- [fork and exec](/os/processes/fork-and-exec): `execve` starts all of this.
+- [mmap](/os/memory/mmap): how file pages reach memory.
+- [Address spaces](/os/vm/address-spaces): where the kernel places these regions.
+- [Page faults and demand paging](/os/vm/page-faults-and-demand-paging): why loading is lazy.
+
+<Recall cards={[
+  { q: "What is the difference between a segment and a section?", a: "A segment is what the loader maps, with permissions, from program headers. A section is a named part for linkers and debuggers. One segment usually holds several sections." },
+  { q: "What rule links p_offset and p_vaddr, and why?", a: "They must be equal modulo the page size, because mmap maps whole file pages at page-aligned addresses." },
+  { q: "Why is p_memsz larger than p_filesz in a data segment?", a: "The extra bytes are .bss. They hold zeros, so the file does not store them. The kernel maps anonymous pages for them." },
+  { q: "Who runs first with a dynamically linked program, and how does it find the program's entry?", a: "ld.so runs first. The kernel gives it the entry address in AT_ENTRY in the auxiliary vector." },
+  { q: "Describe the first call through the PLT.", a: "The stub jumps through a GOT slot that points back into the stub. It pushes the relocation index, jumps to PLT0, pushes the link map and enters the resolver. The resolver writes the real address in the slot and jumps there." },
+  { q: "What does full RELRO give up, and what does it gain?", a: "It gives up lazy binding, so startup does more lookups. It gains a read-only GOT, which an attacker cannot overwrite." },
+]} />

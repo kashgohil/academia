@@ -1,0 +1,162 @@
+---
+summary: "What the kernel saves when it changes tasks: the kernel stack, switch_to, FPU state, CR3 and PCID. Then direct cost against cache refill, voluntary against involuntary, and how to measure it."
+---
+import { SwitchStepperDemo, SwitchCostDemo } from "@/demos/os/ProcessesSwitchDemos";
+
+A **context switch** makes one CPU stop running one task and start running another. The first task must later continue as if nothing happened. So all of its state must be somewhere safe, and the second task's state must come back. The clever part is how little code this takes. Most of the state is already on the task's own kernel stack.
+
+The demo uses a timer interrupt in user mode, and it switches from A to B. B stopped earlier by the same path, so its stack holds what it needs.
+
+<Predict
+  id="moment"
+  question="The kernel changes many things during a switch. At which single action does the CPU stop working for A and start working for B?"
+  options={[
+    "The write to CR3, because that changes the address space",
+    "The load of rsp from B's saved value, because all later returns use B's stack",
+    "The iretq at the end, because that is when B's user code runs",
+  ]}
+  answer={1}
+  explain="The kernel half of memory is the same in all page tables, so CR3 changes no kernel code. Threads of one process have no CR3 write at all. After the load of rsp, each pop and ret reads B's stack, so the CPU continues B's old call chain."
+>
+<SwitchStepperDemo />
+</Predict>
+
+Things to try:
+
+1. Step to **Build pt_regs**. A's user values (blue) are now all on A's kernel stack. Nothing else needs to save them.
+2. Step to **Save the stack pointer**. One value, `thread.sp`, finds everything. Look at the next step: only `rsp` changes, and `rsp` now points into B's stack.
+3. Step on. The pops bring B's values back in reverse order. They are the same 6 registers that `__switch_to_asm` saved. A's values stay on A's stack the whole time.
+4. Turn on **A and B are threads of one process** and find the address space step. The kernel skips the `CR3` write. `cr3` never changes in this run.
+5. Reach the last step. All of B's registers match what B had when it stopped. B cannot detect the gap, except through the clock.
+
+## What is saved, and where
+
+| State | Where it goes | Who saves it |
+|---|---|---|
+| User general registers, `rip`, `rsp` | `pt_regs` on the kernel stack | CPU and entry code, at kernel entry |
+| Kernel callee-saved registers | the kernel stack | `__switch_to_asm` |
+| Kernel stack pointer | `task_struct`, `thread.sp` | `__switch_to_asm` |
+| FS and GS base | `task_struct`, `thread` | `__switch_to` |
+| FPU, SSE, AVX registers | XSAVE area in `task_struct` | `__switch_to` path |
+| Address space | `mm->pgd`, loaded to `CR3` | `switch_mm_irqs_off` |
+
+Each task has its own **kernel stack**, 16 KiB on x86-64. A task in the kernel has a call chain on this stack. This is why a blocked task can sleep in the middle of a deep function. The chain stays where it is until the task runs again.
+
+The path in the kernel is `schedule`, `__schedule`, `pick_next_task`, `context_switch`. `context_switch` calls `switch_mm_irqs_off`, and then the macro `switch_to`, which is `__switch_to_asm` followed by `__switch_to`.
+
+```asm
+// __switch_to_asm on x86-64, simplified. rdi is prev, rsi is next.
+pushq %rbp
+pushq %rbx
+pushq %r12
+pushq %r13
+pushq %r14
+pushq %r15
+movq  %rsp, TASK_threadsp(%rdi)   // save prev's stack pointer
+movq  TASK_threadsp(%rsi), %rsp   // load next's: the switch happens here
+popq  %r15
+popq  %r14
+popq  %r13
+popq  %r12
+popq  %rbx
+popq  %rbp
+jmp   __switch_to                 // its ret uses next's stack
+```
+
+It saves only six registers, because the C compiler treats this as an ordinary function call. Callers already saved all others. A new task has no old call chain, so `fork` builds a fake frame on its stack. The first switch to it "returns" into `ret_from_fork`.
+
+arm64 differs in detail. `cpu_switch_to` stores `x19` to `x28`, `fp`, `sp` and `lr` in the task's `cpu_context`, not on the stack. It writes `TTBR0_EL1` for the user page table, and the kernel's `TTBR1_EL1` never changes.
+
+The model simplifies the real path in two ways. Hardware interrupt handlers run on a per-CPU interrupt stack, and with KPTI the entry starts on a small trampoline stack. Both end on the task's kernel stack, as the demo shows.
+
+### FPU state: lazy and eager
+
+The FPU and vector registers are large. In the standard XSAVE format, the area is 576 bytes with SSE, 832 bytes with AVX and 2,688 bytes with AVX-512. AMX tile data adds 8,192 bytes.
+
+Old kernels saved this **lazily**. They set a flag (`CR0.TS`), so that the next FPU instruction faulted, and only then swapped the state. If a task used no FPU, the switch saved all that work. Then **LazyFP** (CVE-2018-3665) showed that speculation could read the old task's registers before the fault. Modern CPUs also make `XSAVEOPT` fast, and most programs use vector code in `memcpy`. So Linux now uses eager switching only.
+
+Linux still has one small delay. It saves the old state during the switch, but it restores the new state only on the way back to user mode. Kernel threads normally do not use these registers, so a switch through one saves a reload. This is why the demo restores the FPU in **Restore pt_regs**.
+
+### The address space: CR3 and PCID
+
+A switch between processes writes `CR3`. With no **PCID**, that write drops all non-global TLB entries, and each later access must walk the page tables again. PCID is a 12-bit tag in `CR3` that marks each TLB entry. Linux assigns tags to a few recent address spaces on each CPU, so a return to a recent process finds its entries still valid. On arm64, **ASIDs** do the same work.
+
+A thread switch in one process needs no write. A switch to a kernel thread also keeps the old page table loaded. This is **lazy TLB** mode, and it works because a kernel thread uses only the kernel half.
+
+## Direct cost and indirect cost
+
+The direct cost is the kernel path itself. It is small, and it is the number that people quote. The indirect cost comes later: the task's data has left the caches and TLB, and the task pays with misses in its own code.
+
+<Predict
+  id="indirect"
+  question="A switch has a direct cost of 2 µs in this model. Each of two tasks walks a 1 MiB working set, and the machine makes 1,000 switches per second. About how much CPU is lost?"
+  options={[
+    "About 0.2%: 1,000 times 2 µs",
+    "About 2%: the direct cost plus a small margin",
+    "About 21%: the cache refill is about 100 times the direct cost",
+  ]}
+  answer={2}
+  explain="In this model, half of 16,384 cache lines must come back after each switch. At 25 ns each that is about 205 µs, which is far larger than 2 µs. A task that uses little memory pays much less."
+>
+<SwitchCostDemo />
+</Predict>
+
+Things to try:
+
+1. Read the start state. The direct cost is 2 µs, and the cache refill is about 205 µs. The direct share is about 1%. The model loses 21.1% of the CPU, and the direct cost alone would lose 0.2%.
+2. Move **Working set** to 32 KiB. The loss falls to 0.85%. Tasks with small state switch cheaply, and this is why event loops and goroutines do well.
+3. Move **Working set** to 16 MiB. The cache term stops at the cache size, and the loss is 43.5%. The TLB term still grows, up to 1,536 entries.
+4. Move **Switches per second** to 10,000 with 1 MiB. The loss is 83.7%. The task has only 100 µs per slice, so it spends most of that time on refill.
+5. Turn on **Threads of one process**. The loss changes little, to 20.6%. Threads save the `CR3` write and the TLB loss, but they still lose their caches if they use different data.
+
+The model assumes that a task touches its whole working set after each switch. Real tasks do less, so the numbers are an upper range. All figures in it are model inputs. Published measurements, such as Li, Ding and Shen (2007), also find that the indirect cost can be far above the direct cost.
+
+## Voluntary and involuntary switches
+
+A **voluntary** switch happens when a task blocks: it reads an empty pipe, waits on a lock, or sleeps. An **involuntary** switch happens when the kernel preempts a task that could still run: its slice ended, or a more urgent task woke up.
+
+They mean different things. Many voluntary switches suggest lock contention or small I/O calls. Many involuntary switches suggest more runnable tasks than CPUs.
+
+```text
+$ grep ctxt /proc/1234/status
+voluntary_ctxt_switches:        184220
+nonvoluntary_ctxt_switches:     3120
+```
+
+Other Linux tools are `vmstat 1` (the `cs` column), `pidstat -w 1` and `perf stat -e context-switches`. On macOS, `top -o csw` sorts by switches, and `getrusage` gives `ru_nvcsw` and `ru_nivcsw` on both systems.
+
+## Measuring: pipe ping-pong
+
+The classic test uses two processes and two pipes. Each reads a byte and writes it back, so each round trip forces two switches.
+
+```c
+// Two processes pass one byte back and forth. Works on Linux and macOS.
+int a[2], b[2]; char c = 0;
+pipe(a); pipe(b);
+if (fork() == 0) {
+    for (;;) { read(a[0], &c, 1); write(b[1], &c, 1); }
+}
+for (int i = 0; i < N; i++) { write(a[1], &c, 1); read(b[0], &c, 1); }
+// time / (2 * N) = one switch plus two system calls.
+```
+
+On Linux, `perf bench sched pipe` runs the same test, and `taskset -c 0` pins both tasks to one CPU. Without the pin, the tasks can run on two CPUs. You then measure wake-up latency and cross-CPU cache traffic. The `taskset` tool does not exist on macOS, so its result mixes both effects. To remove the system call part, subtract the cost from the [system calls](/os/processes/system-calls) lesson.
+
+Change the test to touch a buffer between switches. This shows the indirect cost, as in the demo. On Linux, tools like `perf stat -e cache-misses,dTLB-load-misses` show the misses themselves.
+
+## Connect
+
+- [Kernel mode and user mode](/os/processes/kernel-mode-and-user-mode): how the interrupt entry saves state.
+- [The TLB](/os/vm/the-tlb): PCID and what `CR3` flushes.
+- [CFS and EEVDF](/os/scheduling/cfs-and-eevdf): how `pick_next_task` chooses.
+- [Cache-friendly code](/performance/memory/cache-friendly-code): why a working set matters so much.
+
+<Recall cards={[
+  { q: "Where are a task's user registers while it is switched out?", a: "On its own kernel stack, in pt_regs. The entry code pushed them when the task entered the kernel." },
+  { q: "Why does __switch_to_asm save only six registers?", a: "The compiler treats it as a function call, so callers already saved all caller-saved registers. Only the callee-saved ones must survive, and user registers are already in pt_regs." },
+  { q: "What single action really switches the task?", a: "The load of rsp from next's thread.sp. After it, all pops and returns use the new task's stack." },
+  { q: "Why did Linux drop lazy FPU switching?", a: "LazyFP showed that speculation could read the old task's registers before the fault. Also, fast XSAVE variants and common vector code removed most of the benefit." },
+  { q: "What does a thread switch save compared with a process switch?", a: "No CR3 write and no TLB loss. Cache loss remains if the threads use different data." },
+  { q: "How do voluntary and involuntary switches differ, and what does each suggest?", a: "A voluntary switch is a task that blocks, which suggests I/O or lock waits. An involuntary one is a preemption, which suggests more runnable tasks than CPUs." },
+  { q: "Why pin the pipe ping-pong test to one CPU?", a: "Without the pin, the two tasks can run on two CPUs. You then measure wake-up latency and cache traffic, not one switch." },
+]} />

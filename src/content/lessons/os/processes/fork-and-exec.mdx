@@ -1,0 +1,150 @@
+---
+summary: "fork copies a process with one call that returns twice, and exec replaces its image. Why this split makes shell redirection easy, how fds pass across it, and what fork costs on a large process."
+---
+import { ForkStepperDemo, ForkCostDemo } from "@/demos/os/ProcessesForkDemos";
+
+Unix makes a new process in two steps. `fork` makes a copy of the caller. `execve` replaces the image of the caller with a new program. Most other systems have one call that starts a program. The split looks strange, but it gives the shell a simple way to set up pipes and redirects.
+
+The demo runs the work that a shell does for `ls | wc`. Each step is one system call.
+
+<Predict
+  id="eof"
+  question="The shell forks ls and wc with a pipe between them. It forgets to close its own copy of the write end. Then ls exits. What does wc do?"
+  options={[
+    "It prints its counts as normal, because ls has finished",
+    "It hangs: read blocks, because a write end is still open in the shell",
+    "It gets an error, because the writer has gone",
+  ]}
+  answer={1}
+  explain="A reader sees EOF only when every write end is closed, in every process. The shell's forgotten fd keeps the pipe open. So the kernel must assume that more data can come, and wc sleeps forever."
+>
+<ForkStepperDemo />
+</Predict>
+
+Things to try:
+
+1. Step to `fork()`. One call returns two values: 101 in the shell and 0 in the child. All 3 pages turn blue and read-only, because both tasks now share them.
+2. Take the next step. The child writes to its stack, so the CPU faults and the kernel copies that one page. The stats show 1 copy-on-write fault. The other two pages are still shared.
+3. Step through `dup2` and `execve`. Note what the image change keeps: the PID and the fd table. So `ls` writes to fd 1 and does not know that fd 1 is a pipe.
+4. Finish the run. `wc` prints `2 2 12`: 2 lines, 2 words and 12 bytes. The peak was 9 physical frames.
+5. Turn off **The shell closes its pipe ends** and go to the last step. The run has 17 steps, stops at the blocked read, and prints nothing.
+6. Turn off **secrets.db has O_CLOEXEC**. Now `ls` and `wc` both hold fd 3. Any program that you start can read that file.
+
+## The return value trick
+
+`fork` makes a new task, and the new task is a copy of the caller at the same instruction. Both continue from the return of `fork`. The only difference is the value in `rax`. In the kernel, `copy_thread` writes 0 into the child's saved registers, and the parent gets the child's PID.
+
+```c
+pid_t pid = fork();
+if (pid < 0)  { perror("fork"); exit(1); }  // no child was made
+if (pid == 0) { /* child: a copy, in a new process */ }
+else          { /* parent: pid names the child */ }
+```
+
+Which one runs first is not specified. Never depend on the order.
+
+The kernel path is `kernel_clone`, then `copy_process`, which copies the `task_struct` and each resource. For memory it calls `dup_mm`, then `dup_mmap` and `copy_page_range`.
+
+## Copy-on-write
+
+`fork` does not copy your data. It copies the page tables, and it marks each private writable page read-only in both tasks. Each physical page gets a higher reference count.
+
+A later write faults. The fault handler copies that one page and makes it writable. If the writer is now the only owner, it needs no copy. The [copy-on-write](/os/memory/copy-on-write) lesson has the details.
+
+## exec
+
+`execve(path, argv, envp)` throws away the whole address space and loads a new program. See [loading a program](/os/processes/loading-a-program-elf-and-the-dynamic-linker). On success it does not return, because the code that called it is gone. These things survive: the PID, the parent, the fd table, the working directory, the user IDs and any signal that is set to ignore. Signal handlers reset to default, because their code is gone.
+
+## Why the split helps
+
+Between `fork` and `exec`, the child runs your code, in its own process, with your program's data. It can change anything about itself with normal system calls. So Unix needs no large "start a process" call with options for each feature.
+
+```c
+// What a shell does for: ls > out.txt
+pid_t pid = fork();
+if (pid == 0) {
+    int fd = open("out.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    dup2(fd, 1);        // fd 1 now points at the file
+    close(fd);
+    execlp("ls", "ls", (char *)NULL);
+    _exit(127);         // exec failed
+}
+waitpid(pid, NULL, 0);
+```
+
+`dup2(old, new)` makes `new` point at the same open file as `old`. The program that you start knows nothing of this. It writes to fd 1, as it always does.
+
+### File descriptors across fork and exec
+
+An fd is an index into a per-process table. Each slot points at an **open file description**: a kernel object with the file offset and the status flags.
+
+- `fork` copies the table, but both tables point at the same descriptions. So parent and child share one file offset. This is why two processes that write to one log file through an inherited fd do not overwrite each other.
+- `dup2` makes two slots in one table point at one description.
+- `exec` keeps the table, except for slots with the close-on-exec flag.
+
+**Close-on-exec** is a per-slot flag. Set it atomically with `O_CLOEXEC` on `open` or with `pipe2`. If you open first and then call `fcntl`, another thread can fork in the gap and leak the fd. Rust's `std` and Go's `os` package set this flag on the fds that they open. `dup2` clears the flag on the new slot, and the shell depends on this.
+
+## vfork, clone and posix_spawn
+
+| Call | Memory | Parent during child setup | Use |
+|---|---|---|---|
+| `fork` | copy-on-write copy | runs | a real copy of a process |
+| `vfork` | shared, not copied | suspended until `exec` or `_exit` | fast exec, with care |
+| `clone` | your choice of flags | your choice | threads, containers, everything |
+| `posix_spawn` | library decides | library decides | start a program; no setup code of your own |
+
+`fork` on Linux is `clone` with no sharing flags. `vfork` is `clone` with `CLONE_VM | CLONE_VFORK`. In a `vfork` child, a write to a variable changes the parent's memory, so it must do almost nothing before `exec`.
+
+`posix_spawn` is the portable way. You give it a list of file actions and attributes in place of code. On Linux, glibc implements it with `clone(CLONE_VM | CLONE_VFORK)`, so its cost does not depend on your memory size. On macOS, it is a real system call. Rust's `std::process::Command` uses `posix_spawn` when it can, and Go uses `clone` with `CLONE_VM | CLONE_VFORK` for its `exec` package.
+
+## What fork costs
+
+<Predict
+  id="forkcost"
+  question="A process has 64 GiB of resident memory in 4 KiB pages. It calls fork and writes nothing afterward. How does the time compare with fork in a 64 MiB process?"
+  options={[
+    "About the same: copy-on-write means that no data is copied",
+    "About 1,000 times longer: page tables must be copied, and they grow with memory",
+    "Much longer than that: the kernel copies 64 GiB of data",
+  ]}
+  answer={1}
+  explain="fork copies no data, but it copies one page table entry for each resident page and write-protects it. The entry count grows with memory, so fork is linear in resident size."
+>
+<ForkCostDemo />
+</Predict>
+
+Things to try:
+
+1. Move **Resident memory** to 1 GiB. fork copies 262,144 entries in 512 page table pages. In this model it takes 10.7 ms. The model inputs are in the note under the plot.
+2. Move it to 64 GiB. fork takes 681 ms in the model, and the page tables alone use about 128 MiB. That is about 0.2% of memory, because each 4 KiB page has an 8-byte entry.
+3. Compare the 2 MiB line at 64 GiB: 6.6 ms in the model. Huge pages need far fewer entries.
+4. Compare `posix_spawn`: 190 µs at any size. It includes the exec, and it copies no page tables.
+5. Raise **Pages that the parent writes after fork**. The cost moves to later, and it does not go away. At 64 GiB and 10%, the model has 2.5 s of faults spread over the following writes.
+
+The cost has real effects. During `fork`, the kernel holds the parent's `mmap_lock`, so its other threads can stall on page faults. Redis forks to write a snapshot, and it reports the time in `latest_fork_usec`. Compare the real table in the Redis documentation before you trust this model. With strict overcommit (`vm.overcommit_memory=2`), `fork` of a large process can fail with `ENOMEM`, even if the child would exec at once.
+
+## fork in threaded programs
+
+`fork` copies only the calling thread. The child has the memory of all threads, but those threads do not exist there. So any lock that another thread held at that moment stays locked forever. A `malloc` in the child can then hang.
+
+The rule from POSIX is short: between `fork` and `exec` in a threaded program, call only async-signal-safe functions. `pthread_atfork` tries to help, but it is hard to use correctly. In Rust, this is why `CommandExt::pre_exec` is `unsafe`.
+
+macOS is stricter. Many Apple frameworks do not work in a child after `fork` with no `exec`, and `CoreFoundation` can abort with a message about this. Use `posix_spawn` there.
+
+The paper "A fork() in the road" (Baumann and others, HotOS 2019) argues that `fork` is now a poor default for these reasons. New code that only starts a program should use `posix_spawn` or a library that does so.
+
+## Connect
+
+- [Copy-on-write](/os/memory/copy-on-write): the page fault path after fork.
+- [Pipes](/os/ipc/pipes): buffers, EOF and SIGPIPE.
+- [Threads](/os/processes/threads): `clone` with sharing flags.
+- [Huge pages](/os/vm/huge-pages): why fewer entries make fork faster.
+
+<Recall cards={[
+  { q: "How can one call to fork return two different values?", a: "The kernel makes a second task with a copy of the saved registers. It writes 0 into the child's saved rax and the child's PID into the parent's." },
+  { q: "What survives execve, and what does not?", a: "The PID, parent, fds without close-on-exec, working directory and user IDs survive. The address space and signal handlers do not." },
+  { q: "Why does a forgotten pipe fd in the shell hang wc?", a: "read returns EOF only when no write end is open in any process. The shell's copy keeps one open." },
+  { q: "Why is fork linear in resident memory if it copies no data?", a: "It copies and write-protects one page table entry for each resident page. A dense GiB of 4 KiB pages has 262,144 entries." },
+  { q: "Why should a threaded program call only async-signal-safe functions between fork and exec?", a: "Only the calling thread exists in the child, so locks held by other threads never unlock. malloc or printf can then hang." },
+  { q: "What does parent and child sharing an open file description mean in practice?", a: "They share one file offset, so writes through inherited fds append in order and do not overwrite each other." },
+]} />

@@ -1,0 +1,130 @@
+---
+summary: "What threads share and do not share, clone flags, 1:1 against M:N, Go's G, M and P with hand-off and work stealing, TLS, guard pages, and the memory of a million tasks."
+---
+import { CloneFlagsDemo, GmpDemo, TaskMemoryDemo } from "@/demos/os/ProcessesThreadDemos";
+
+A **thread** is a separate line of execution in a process. It has its own registers and stack, and it shares the rest with the other threads of the process. Linux has no separate thread object. It has **tasks**, and one call, `clone`, makes them. Flags choose what the new task shares with its creator. A "thread" and a "process" are two points in that space of choices.
+
+<Predict
+  id="clonevm"
+  question="You call clone with CLONE_VM and CLONE_FILES, but not CLONE_THREAD. The two tasks share memory and fds. What does getpid return in the new task?"
+  options={[
+    "The same PID as the caller: shared memory makes it a thread",
+    "A new PID: only CLONE_THREAD puts it in the same thread group",
+    "0, as in the child of fork",
+  ]}
+  answer={1}
+  explain="getpid returns the thread group ID, and only CLONE_THREAD joins a group. So this task is a separate process in ps, and the parent must wait for it. It simply happens to share memory and fds."
+>
+<CloneFlagsDemo />
+</Predict>
+
+Things to try:
+
+1. Start with `CLONE_VM` and `CLONE_FILES`. Press **x = 42**. Both tasks see it at once, with no system call. The PIDs differ.
+2. Press **fork**, and write `x` again. Only task A changes. Then press **pthread_create**. All rows but `gettid` are now shared.
+3. Press **exit_group** under each setting. In a thread group, one exit ends both tasks. As separate processes, the other task lives.
+4. Turn on `CLONE_THREAD` and turn off `CLONE_SIGHAND`. `clone` fails with `EINVAL`. All threads of a process must share signal handlers. In turn, `CLONE_SIGHAND` needs `CLONE_VM`, because a handler is an address.
+
+## What is shared
+
+| Shared by all threads | Private to each thread |
+|---|---|
+| address space: code, heap, globals, all stacks | registers and stack pointer |
+| open files and the fd table | kernel stack |
+| signal handlers | signal mask and thread ID |
+| working directory, user IDs | scheduling state, CPU affinity |
+| PID and process-wide limits | TLS block and `errno` |
+
+The last row of the left column matters for `exit_group`: `exit` in libc and a return from `main` end all threads. A fatal signal does too. A signal handler is shared, but the signal mask is per thread. The kernel gives a process-directed signal to one thread that does not block it.
+
+A private stack is private by custom only. All stacks are in one address space, so a bad pointer in one thread can corrupt another thread's stack.
+
+On x86-64, `pthread_create` in glibc calls `clone` with flags `0x3d0f00`: `CLONE_VM`, `CLONE_FS`, `CLONE_FILES`, `CLONE_SIGHAND`, `CLONE_THREAD`, `CLONE_SYSVSEM`, `CLONE_SETTLS`, `CLONE_PARENT_SETTID` and `CLONE_CHILD_CLEARTID`. The last flag lets the kernel clear a word and wake a [futex](/os/sync/futexes) when the thread exits. That is how `pthread_join` works. See each task in `/proc/<pid>/task/` on Linux, or with `ps -M` on macOS. macOS has no `clone`. It uses Mach threads inside a task.
+
+## TLS and stacks
+
+**TLS** (thread-local storage) gives each thread its own copy of a variable. C has `_Thread_local`, C++ has `thread_local`, Rust has `thread_local!` and Zig has `threadlocal`. `errno` is a TLS variable, so threads do not overwrite each other's errors.
+
+The CPU needs a register that differs for each thread and points at the block. On x86-64 it is the FS base, and code reads `fs:offset`. On Linux arm64 it is `TPIDR_EL0`. `CLONE_SETTLS` sets it for the new task.
+
+A thread stack is normally an `mmap` region:
+
+| Item | Default |
+|---|---|
+| glibc thread stack | `RLIMIT_STACK`, usually 8 MiB of address space |
+| Rust `std::thread` | 2 MiB |
+| macOS secondary thread | 512 KiB |
+| Kernel stack on x86-64 and arm64 | 16 KiB, not swappable |
+| Go goroutine | starts at 2 KiB, limit 1 GiB on 64-bit |
+
+The memory is virtual. Pages become resident only when they are touched. Below the stack, glibc leaves a **guard page**: one page with no access. A stack overflow hits the guard and faults, which is much better than silent corruption. A function with a large local array can jump past a single page, so compilers can add stack probes (`-fstack-clash-protection`). Rust probes large frames by default.
+
+A goroutine stack is different, because it grows. The function entry code checks the stack limit, and if needed the runtime allocates a larger stack, copies the frames and fixes the pointers. A C compiler cannot do this, because C pointers cannot be found and moved.
+
+## 1:1 and M:N
+
+Linux's **NPTL** thread library uses 1:1: each user thread is one kernel task. The kernel schedules them all, so blocking and preemption work with no extra effort. The costs are a kernel stack per thread, a mode change for each creation and switch, and a scheduler that knows nothing about your program.
+
+**M:N** runs many user tasks on few kernel threads. A runtime does the scheduling in user mode. Older M:N thread libraries lost to NPTL on Linux, because of signal and blocking problems. It came back in languages whose runtime controls all code: Go, Erlang, and Java virtual threads.
+
+**Async tasks** are a third form. A Rust `Future` is a state machine, so its size is known at compile time, and it has no stack of its own. A runtime such as Tokio polls tasks on a few threads. The trade-off is the opposite of goroutines: a task must yield with `.await`. A task that blocks or loops holds its worker thread until it stops.
+
+Go's scheduler has three objects:
+
+- **G**: a goroutine. It holds a stack and a saved program counter.
+- **M**: an OS thread, a real kernel task.
+- **P**: a processor. It holds a local run queue, and it is the right to run Go code. `GOMAXPROCS` sets the count of Ps.
+
+<Predict
+  id="handoff"
+  question="GOMAXPROCS is 1. G1 enters a blocking read that takes a long time. G2 is in the run queue. What happens to G2?"
+  options={[
+    "It waits for G1's read, because only one P exists",
+    "The runtime gives the P to another thread, and G2 runs during the read",
+    "G1 is preempted, and the read moves to a helper thread",
+  ]}
+  answer={1}
+  explain="The blocking read holds its OS thread M in the kernel, but it must not hold the P. A monitor thread, sysmon, sees this and hands the P to another M. So GOMAXPROCS limits threads that run Go code, not threads that exist."
+>
+<GmpDemo />
+</Predict>
+
+Things to try:
+
+1. Select **Blocking syscall** and set **GOMAXPROCS** to 1. Step until G1 enters its syscall. On the next tick sysmon takes P0 away, and M1 starts to run the other goroutines. The run ends at tick 13, with 2 OS threads and 1 hand-off.
+2. Watch G1 at the end of its syscall. If no P is free, G1 goes on the global queue and its M parks. The run still has only one P.
+3. Select **Work stealing** with 1, 2 and then 4 Ps. All 8 goroutines start on P0. The run takes 32, 16 and then 8 ticks. An idle P takes half of a victim's queue, so the work spreads with no central lock.
+4. Select **Fan-out**. A new goroutine goes in `runnext`, so it runs next on that P. This keeps a sender and its receiver close, with warm caches.
+
+The rules in this model come from `runtime/proc.go`. Each P has a queue of 256 entries, and a full queue moves half to the global queue. Each P checks the global queue on every 61st pass, so that no G there starves. A G that runs for 10 ms is preempted, by a signal if needed (SIGURG, since Go 1.14). `sysmon` checks for stuck syscalls from about every 20 µs. A cgo call counts as a blocking call, which adds to its cost.
+
+Blocking calls can make threads grow. If many goroutines block in file reads, the runtime makes about as many Ms. The default limit is 10,000, and the program dies past that. Network I/O avoids this, because the runtime uses non-blocking sockets and `epoll` (`kqueue` on macOS).
+
+## A million of them
+
+<TaskMemoryDemo />
+
+1. The slider starts at 1 million. Threads take about 7.6 TiB of address space, and about 30.5 GiB of real memory in this model.
+2. Goroutines take about 2.4 GiB, and async tasks about 488 MiB. Task and struct sizes are model inputs, and the 16 KiB kernel stack and the 2 KiB first goroutine stack are real.
+3. Note the orange line. Each thread stack with a guard page is two mappings, and `vm.max_map_count` defaults to 65,530. So the default limit is about 32,765 threads, before any memory problem. `pid_max` and `threads-max` are also limits.
+
+Creation has the same shape. In this model, with round inputs, a small `fork` costs 60 µs, a thread costs 15 µs and a goroutine costs 0.3 µs. So a thread costs 4 times less than a process, and a goroutine costs 50 times less than a thread. A thread pool avoids the creation cost altogether, and this is why servers use them.
+
+Use threads when you need real parallel CPU work or must call blocking code. Use goroutines or async tasks when you have many tasks that mostly wait.
+
+## Connect
+
+- [Context switching](/os/processes/context-switching): what a switch between threads costs, and why it is cheaper than between processes.
+- [Futexes](/os/sync/futexes): how threads sleep and wake with no system call in the fast path.
+- [Multiprocessor scheduling](/os/scheduling/multiprocessor-scheduling): work stealing in the kernel.
+- [Blocking, non-blocking and async I/O](/os/io/blocking-non-blocking-and-async-i-o): what makes M:N work for network code.
+
+<Recall cards={[
+  { q: "Which clone flag makes getpid return the same value in both tasks?", a: "CLONE_THREAD. It puts the new task in the caller's thread group. getpid returns the group ID, and gettid still differs." },
+  { q: "Name three things that threads do not share.", a: "Registers and stack pointer, the signal mask and thread ID, and TLS, including errno. Each also has its own kernel stack." },
+  { q: "What does a guard page do, and why is one page not always enough?", a: "It has no access, so a stack overflow faults at once. A large local array can jump past one page, so compilers add stack probes." },
+  { q: "In Go, what does the P give to an M, and why does it exist?", a: "The right to run Go code, and a local run queue. Separating it from the M lets the runtime hand off work when an M blocks in the kernel." },
+  { q: "What happens when an M returns from a blocking syscall and no P is free?", a: "The G goes on the global run queue, and the M parks." },
+  { q: "What usually limits thread count first on default Linux settings, and why?", a: "vm.max_map_count at 65,530. Each stack and guard page is two mappings, so the limit is about 32,765 threads." },
+]} />

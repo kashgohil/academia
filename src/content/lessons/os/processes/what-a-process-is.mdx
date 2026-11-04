@@ -1,0 +1,154 @@
+---
+summary: "A process is an address space, an execution state and a set of resources. Follow its states, the parent tree, and what exit and wait really do, with zombies and orphans."
+---
+import { ProcessStatesDemo, ProcessTreeDemo } from "@/demos/os/ProcessesLifecycleDemos";
+
+A program is a file. A **process** is a program that runs: the kernel's record of one running instance. Two shells from one file are two processes. Each has its own memory, its own registers and its own open files.
+
+The kernel shares one CPU among many processes. It runs one, then stops it, and then runs another. So each process is always in some state, and only events move it to another state. The first demo has one CPU and four processes.
+
+<Predict
+  id="zombie"
+  question="A child calls exit. Its parent is busy and never calls wait. What does ps show for the child one hour later?"
+  options={[
+    "Nothing: the process ended, so the kernel removed it",
+    "A line with state Z: the kernel keeps a small record until the parent calls wait",
+    "A line with state R: the child runs until the parent reads its status",
+  ]}
+  answer={1}
+  explain="The kernel frees the memory and files at exit, but it must keep the exit status for the parent. The record stays as a zombie until the parent calls wait. If the parent dies first, PID 1 takes over and reaps it."
+>
+<ProcessStatesDemo />
+</Predict>
+
+Things to try:
+
+1. Press **Schedule** twice. The shell runs, and then A runs. Only one chip is ever in the Running box, because this machine has one CPU.
+2. With A running, press **Block on I/O**. The CPU is idle until you press **Schedule**. Now press **I/O done: A**. A goes to Ready, not to Running. The event only makes A eligible to run.
+3. Press **Exit** when the CPU is idle. The demo refuses, because only the running process can call exit. A process does this to itself. The same rule applies to block and wait.
+4. Let B exit. The ps table prints `Z` and `<defunct>`. Press **Schedule** until the shell runs, and then press **Call wait**. The zombie goes away.
+5. Press **Call wait** in the shell again while its other children are alive. The shell blocks. Run a child and let it exit. The exit wakes the shell, and its wait finishes only when the shell runs again.
+
+## What a process is
+
+A process has three parts:
+
+| Part | What it holds | In Linux |
+|---|---|---|
+| Address space | code, data, heap, stacks, the page tables | `mm_struct`, with a list of mapped areas |
+| Execution state | registers, a program counter, a kernel stack | `thread_struct` and the kernel stack |
+| Resources | open files, working directory, signal handlers, user IDs, limits | `files_struct`, `fs_struct`, `sighand_struct`, `cred` |
+
+The kernel ties these parts together with one structure, `task_struct`. It holds the state, the PID, pointers to the parts above, scheduler data and parent and child links. Its size depends on the kernel configuration, and it is several kilobytes.
+
+Linux has one `task_struct` for each thread. A **PID** (process ID) is a number that names a process. What the kernel calls a "process" is a group of tasks with one thread group ID. The call `getpid` returns that group ID. The [threads](/os/processes/threads) lesson explains this.
+
+## The states
+
+| ps letter | Kernel name | Meaning |
+|---|---|---|
+| R | `TASK_RUNNING` | on a CPU, or in a run queue and ready |
+| S | `TASK_INTERRUPTIBLE` | asleep; a signal or the event wakes it |
+| D | `TASK_UNINTERRUPTIBLE` | asleep; only the event wakes it, usually I/O |
+| T | `__TASK_STOPPED` | stopped by a signal or a debugger |
+| Z | `EXIT_ZOMBIE` | has exited; the parent has not reaped it |
+
+Linux has no separate "ready" state. Running and ready are both `TASK_RUNNING`, so ps prints `R` for both. The difference is only whether the task is on a CPU or in a run queue.
+
+A task in D state ignores signals, and this includes SIGKILL. A process that hangs on a dead NFS server cannot be killed for this reason. The Linux state `TASK_KILLABLE` exists to reduce this problem: it is a D-like sleep that fatal signals can end.
+
+## A window on the kernel: /proc
+
+On Linux, `/proc/<pid>` shows the kernel's data as files. No system call is special here: `cat` reads them, and the kernel builds the text on each read.
+
+```text
+$ cat /proc/self/status
+Name:   cat
+State:  R (running)
+Tgid:   4182
+Pid:    4182
+PPid:   3990
+Threads:        1
+VmRSS:      1052 kB
+voluntary_ctxt_switches:        0
+nonvoluntary_ctxt_switches:     1
+```
+
+Other useful entries are `maps` (the address space), `fd/` (open files) and `stat` (the same data for programs). `cmdline`, `exe` and `cwd` are also there, and `task/` has one directory for each thread.
+
+macOS has no `/proc`. Use `ps -o pid,ppid,stat,command` for the table, `lsof -p <pid>` for open files and `vmmap <pid>` for the address space. In XNU, the macOS kernel, a process is two linked objects: a BSD `proc` and a Mach `task`.
+
+## The tree: exit, wait and orphans
+
+Every process except the first has a parent. The kernel starts PID 1, usually `systemd` on Linux and `launchd` on macOS. All other processes come from `fork`, so the processes form a tree.
+
+<Predict
+  id="reparent"
+  question="make has two children: cc1, which is already a zombie, and as, which is still running. You kill make. What happens to the two children?"
+  options={[
+    "The kernel kills both, because their parent is gone",
+    "Both become orphans with no parent, and the zombie stays forever",
+    "Both move to PID 1. PID 1 reaps the zombie at once, and as keeps running",
+  ]}
+  answer={2}
+  explain="At exit, the kernel gives all children to a new parent before it notifies anyone. The new parent is the nearest subreaper ancestor, or else PID 1. A process with no living parent cannot exist in the table, so a zombie can always be reaped."
+>
+<ProcessTreeDemo />
+</Predict>
+
+Things to try:
+
+1. Kill **cc1**. The table still has 9 processes, and 1 is a zombie. The zombie stays because make is alive and has not called wait.
+2. Now kill **make**. Its 2 children move to PID 1. PID 1 reaps cc1 at once. The table has 8 processes, and the only zombie is make itself, under bash.
+3. Press **Reset**. Select **bash** and turn on **subreaper**. Kill cc1 and then make. The children move to bash, not to PID 1. Both zombies wait for bash to call wait.
+4. Select **nginx** and turn on **ignores SIGCHLD**. Kill **wrk1**. It never becomes a zombie. A parent that ignores SIGCHLD tells the kernel that it does not want the status.
+
+### What exit does
+
+The kernel's `do_exit` frees the address space (`exit_mm`) and closes the files (`exit_files`). Then `exit_notify` moves the children to a new parent, sends SIGCHLD to the parent and sets the state to `EXIT_ZOMBIE`. The task then calls the scheduler one last time and never runs again.
+
+What remains is the `task_struct`, the PID and the exit status. A later `wait4` copies the status to the parent. Then `release_task` frees what remains.
+
+```c
+#include <stdio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+    pid_t pid = fork();
+    if (pid == 0) _exit(7);    // the child ends here
+    sleep(30);                 // now run: ps -o pid,ppid,stat,comm
+    int status;
+    waitpid(pid, &status, 0);  // this reaps it, and the Z line goes away
+    printf("child %d status %d\n", pid, WEXITSTATUS(status));
+}
+```
+
+This program works on both Linux and macOS. The same bug is easy to write at a higher level. In Rust, dropping a `std::process::Child` does not wait for it. In Go, `cmd.Start()` with no `cmd.Wait()` leaves a zombie until the program ends.
+
+### How it breaks
+
+- **Zombie leak.** A zombie uses little memory, but it holds a PID. The kernel's `PID_MAX_DEFAULT` is 32,768, although many systems set a higher `/proc/sys/kernel/pid_max`. At that default, a leak of one zombie per second uses all PIDs in about 9.1 hours. Then `fork` fails with `EAGAIN` for every user.
+- **You cannot kill a zombie.** It is already dead, so a signal does nothing. Kill or fix its parent instead.
+- **PID 1 in a container.** A PID namespace has its own PID 1, and orphans go there. If that process is your server, and it never calls wait, zombies pile up. This is why `docker run --init` exists. See [namespaces](/os/isolation/namespaces).
+- **PID reuse.** After the parent reaps a child, the kernel can give that PID to a new process. A `kill` with an old PID can hit the wrong process. On Linux, `pidfd_open` gives a handle that cannot be reused.
+
+The status of a process that a signal killed is the signal number. Shells print it as 128 plus the number, so a SIGKILL shows as 137. The demo uses that value.
+
+`PR_SET_CHILD_SUBREAPER` is a `prctl` option that makes a process the reaper for its descendants. Service managers and container runtimes use it. They track a whole subtree, and daemons cannot escape by a double fork. The real search also tries other threads of the dying process first.
+
+## Connect
+
+- [fork and exec](/os/processes/fork-and-exec): how the tree grows.
+- [Context switching](/os/processes/context-switching): what happens at each move out of the Running box.
+- [FIFO, SJF and round-robin](/os/scheduling/fifo-sjf-round-robin): how the scheduler chooses from the Ready box.
+- [Signals](/os/ipc/signals): SIGCHLD and how a kill reaches a sleeping task.
+
+<Recall cards={[
+  { q: "What three parts make up a process?", a: "An address space, an execution state (registers and kernel stack), and resources such as open files and signal handlers." },
+  { q: "Why does ps print R for a process that is not on a CPU?", a: "Linux has one state, TASK_RUNNING, for running and ready. The only difference is whether the task is on a CPU or in a run queue." },
+  { q: "What stays in the kernel after exit, and why?", a: "The task_struct, the PID and the exit status. The parent may still ask for the status with wait." },
+  { q: "A parent exits. Who gets its children?", a: "The nearest ancestor that set PR_SET_CHILD_SUBREAPER, or else PID 1 in that PID namespace. Zombies move too, and PID 1 reaps them." },
+  { q: "Name two ways to avoid a zombie without calling wait for each child.", a: "Ignore SIGCHLD in the parent, or let the parent exit so that PID 1 reaps the child." },
+  { q: "What resource does a zombie leak use up?", a: "PIDs. At the default limit of 32,768, one leak per second uses them all in about 9.1 hours, and then fork fails." },
+]} />

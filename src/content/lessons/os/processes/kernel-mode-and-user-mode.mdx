@@ -1,0 +1,123 @@
+---
+summary: "Why hardware privilege exists, what rings and exception levels do, which instructions trap, and the three ways into the kernel: syscall, exception and interrupt. KPTI and Meltdown in brief."
+---
+import { InstructionRunnerDemo, ModeTimelineDemo } from "@/demos/os/ProcessesModeDemos";
+
+Software alone cannot protect a machine. If any program can turn off interrupts, the kernel can never take the CPU back. If any program can load a new page table, it can read all memory. So the CPU itself must refuse. It keeps one small piece of state, the **current privilege level**, and it checks this level on each sensitive action.
+
+The kernel runs at the high level, and programs run at the low level. A program can only move up through entry points that the kernel chose at boot. This one rule makes all other protection possible.
+
+<Predict
+  id="cli"
+  question="A normal program in ring 3 runs the x86-64 instruction cli, which turns off interrupts. What happens?"
+  options={[
+    "Interrupts go off until the program turns them on again",
+    "The CPU ignores the instruction, and the program continues",
+    "The CPU raises a general protection fault, and the kernel sends SIGSEGV",
+  ]}
+  answer={2}
+  explain="cli is privileged, so ring 3 gets a fault and the kernel takes over. The second answer is true for a different instruction: popfq in ring 3 silently ignores the interrupt flag. That quiet case was a real problem for early virtual machines."
+>
+<InstructionRunnerDemo />
+</Predict>
+
+Things to try:
+
+1. In ring 3, run **cli**, **hlt** and **mov cr3, rax**. All three fault. Change to ring 0 and run them again. All three run. Of the 17 x86-64 instructions here, 11 fault in ring 3 and run in ring 0.
+2. In ring 3, run **popfq (IF = 0)**. It runs with no fault, and the interrupts stay on. The CPU drops the change with no warning.
+3. In ring 3, run **syscall**. The mode changes to ring 0, and the target address is not your choice. This is the only instruction here that moves up. Run **sysretq** to go back.
+4. In ring 0, run **mov rax, [user]**. The kernel itself faults. Run **stac** and try again. This is the SMAP check, and the [system calls](/os/processes/system-calls) lesson uses it.
+5. Change the CPU to **arm64**. The same ideas have other names. A privileged instruction in EL0 gives SIGILL, not SIGSEGV.
+
+## The hardware
+
+| | x86-64 | arm64 |
+|---|---|---|
+| User code | ring 3 | EL0 |
+| Kernel | ring 0 | EL1 |
+| Hypervisor | root mode, a separate axis | EL2 |
+| Where the level is | low 2 bits of the CS register | PSTATE.EL |
+| Syscall instruction | `syscall` | `svc #0` |
+| Return | `sysretq` or `iretq` | `eret` |
+| Entry address | `MSR_LSTAR` and the IDT | `VBAR_EL1` |
+
+x86 has four rings, but Linux uses only rings 0 and 3. **EL** means exception level. On a Mac, programs also run in EL0.
+
+Privilege protects three things:
+
+1. **Instructions.** Writes to control registers, port I/O, `hlt`, `cli`, TLB flushes and model-specific registers need the high level.
+2. **Memory.** Each page table entry has a user bit. If it is clear, a low-privilege access faults. On arm64, the AP bits in the entry do this.
+3. **The entry points.** A program cannot jump into the kernel. It can only ask, through `syscall` or a fault, and the CPU then goes to an address that the kernel set in a privileged register.
+
+The opposite direction also has checks. **SMAP** (Supervisor Mode Access Prevention) makes the kernel fault on user pages, unless it opens a short window with `stac`. **SMEP** stops the kernel from running code in user pages. On arm64, PAN and PXN do the same work. These checks stop an attacker from pointing a kernel bug at memory that the attacker controls.
+
+## The kernel half of the address space
+
+With 4-level paging on x86-64, an address has 48 useful bits. The low half, 128 TiB, is for the user. The high half, from `0xffff800000000000`, is for the kernel. All addresses between them are invalid. With 5-level paging, the user half grows to 64 PiB.
+
+The kernel's half is in every process's page tables, with the user bit clear. So entry to the kernel needs no address space change, and the kernel can follow its own pointers at once. On arm64 the split is in the hardware: `TTBR0_EL1` maps the low half and `TTBR1_EL1` maps the high half. The [address spaces](/os/vm/address-spaces) lesson has more detail.
+
+## Three ways in
+
+| Entry | Cause | Timing | Examples | x86-64 path |
+|---|---|---|---|---|
+| System call | the program asks | synchronous, at this instruction | `read`, `write` | `MSR_LSTAR`, `entry_SYSCALL_64` |
+| Exception | this instruction has a problem | synchronous | page fault, `#GP`, divide by zero | IDT, `asm_exc_page_fault` |
+| Interrupt | a device or timer | asynchronous, at any instruction | timer tick, disk, network, IPI | IDT, `asm_sysvec_apic_timer_interrupt` |
+
+An **IDT** (interrupt descriptor table) lists the kernel entry for each vector. An **IPI** is an interrupt from another CPU. On arm64, one table at `VBAR_EL1` handles all three, and the register `ESR_EL1` says why the CPU came.
+
+The hardware saves very little. For an interrupt or exception on x86-64, the CPU loads a kernel stack pointer from the TSS (task state segment). It then pushes `ss`, `rsp`, `rflags`, `cs` and `rip`. The faster `syscall` pushes nothing and does not change the stack. It puts `rip` in `rcx` and `rflags` in `r11`, and the kernel entry code does the rest.
+
+A system call runs in **process context**: the kernel acts for this process, and it can sleep. An interrupt handler has no such process, because it arrived at a random moment. It must not sleep. This difference shapes most kernel code.
+
+<Predict
+  id="tick"
+  question="The timer ticks while the CPU is in the kernel, in a long read call. How many user-to-kernel mode changes does this tick add?"
+  options={[
+    "One: every interrupt enters the kernel",
+    "Zero: the CPU is already in kernel mode, so the handler only nests",
+    "Two: the CPU goes to user mode and comes back",
+  ]}
+  answer={1}
+  explain="An interrupt in kernel mode uses the same stack and does not change the level. The cost is the handler only. So the count of mode changes can be lower than the count of interrupts."
+>
+<ModeTimelineDemo />
+</Predict>
+
+Things to try:
+
+1. Read the start state. It has 5 events at 250 Hz. The long syscall contains the 1 timer tick, so the CPU makes 5 user-to-kernel entries, and the kernel takes 32.4% of the time. All kernel times are model inputs.
+2. Select **1000 Hz**. Now 6 ticks hit, and 2 of them land inside the long syscall. Entries go to 9, not to 11. The kernel share changes little, because a tick is short.
+3. Select **100 Hz**. No tick lands in this short window.
+4. Press **Short syscall** many times. The entries grow fast, but the kernel share falls. A system call is cheap until you make millions.
+
+Linux counts this time for you. `time ./prog` prints `user` and `sys`, on both Linux and macOS. A high `sys` value means that the program spends its time in these slices. `CONFIG_HZ` sets the tick rate, and common values are 100, 250 and 1000. A kernel with `CONFIG_NO_HZ_IDLE` also stops the tick on an idle CPU.
+
+## KPTI and Meltdown
+
+Meltdown (CVE-2017-5754) broke the memory rule on many Intel CPUs and some others. The CPU ran a load of a kernel address speculatively, before it finished the permission check. The fault arrived later and undid the registers, but the cache kept a trace. A program could read that trace with a timing test. So the user bit did not protect the kernel half.
+
+The fix is **KPTI** (kernel page-table isolation). Each process gets two page tables. The user table has only a small part of the kernel: the entry code and per-CPU data. The kernel table has everything. Each entry and each return now writes `CR3`, the register that holds the page table address.
+
+That write costs time, and without **PCID** (process-context IDs) it also empties the TLB. PCID tags TLB entries, so that both tables can keep theirs. CPUs with a hardware fix do not need KPTI. arm64 has a similar option, which unmaps the kernel while in EL0. To check a Linux machine, read this file:
+
+```text
+/sys/devices/system/cpu/vulnerabilities/meltdown
+```
+
+## Connect
+
+- [System calls](/os/processes/system-calls): the full path of one entry, step by step.
+- [Interrupts](/os/io/interrupts): how a device reaches the CPU.
+- [Page faults and demand paging](/os/vm/page-faults-and-demand-paging): the most common exception.
+- [The TLB](/os/vm/the-tlb): PCID and what a CR3 write costs.
+
+<Recall cards={[
+  { q: "Why must privilege live in hardware?", a: "A check in software can be skipped by the program that it should stop. The CPU checks the level on each privileged instruction and each memory access." },
+  { q: "Name the three entries to the kernel and which of them is asynchronous.", a: "System call, exception and interrupt. Only the interrupt is asynchronous: a device or timer causes it, not the current instruction." },
+  { q: "What does the x86-64 syscall instruction save, and where?", a: "rip goes in rcx and RFLAGS goes in r11. It saves nothing on a stack, and it does not change rsp." },
+  { q: "Why is the kernel mapped into every process?", a: "So that entry needs no address space change and the kernel can use its own pointers at once. The user bit is clear on those pages." },
+  { q: "What did Meltdown break, and how does KPTI answer it?", a: "A speculative load could read kernel memory before the permission check took effect. KPTI removes most kernel mappings while in user mode, at the cost of a CR3 write on each entry and return." },
+  { q: "What does SMAP stop, and how does the kernel get past it when it must?", a: "It stops the kernel from touching user pages by accident. copy_from_user opens a short window with stac and closes it with clac." },
+]} />

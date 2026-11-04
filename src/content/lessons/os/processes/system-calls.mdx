@@ -1,0 +1,167 @@
+---
+summary: "The Linux system call path on x86-64 and arm64: registers, entry, table lookup, the copy from user memory, errno, the vDSO, and what a call costs with mitigations."
+---
+import { WriteStepperDemo, SyscallCostDemo } from "@/demos/os/ProcessesSyscallDemos";
+
+A **system call** is a function that runs in the kernel. A program cannot call it with a normal `call`, because the kernel pages are not accessible and the CPU is in the wrong mode. So the program puts a number and the arguments in registers, and it runs one special instruction. The CPU changes mode and jumps to a kernel address.
+
+The demo follows the simplest useful call: `write(1, "hi", 2)`. Watch the registers, the mode bar, and the two bytes as they move into the kernel.
+
+<Predict
+  id="clobber"
+  question="The syscall instruction returns after write. Besides rax, which registers has this call changed from the view of the program?"
+  options={[
+    "None: the kernel saves and restores all registers",
+    "Only rcx and r11, because the CPU uses them to save rip and RFLAGS",
+    "All caller-saved registers, as in the C calling convention",
+  ]}
+  answer={1}
+  explain="The CPU itself writes rip into rcx and RFLAGS into r11, so these two are lost. The kernel restores all other registers from pt_regs. This is a better promise than a C function makes."
+>
+<WriteStepperDemo />
+</Predict>
+
+Things to try:
+
+1. Step through the normal call. With KPTI on, it takes 15 steps. Find the step where the mode bar changes. Note that `rsp` stays at the user value for one more step, because `syscall` does not touch the stack.
+2. Turn **KPTI** off. The run has 13 steps. The two steps that it loses are the two page table writes, and they cost time on each call.
+3. Select **write(99, msg, 2)**. The kernel finds an empty fd slot and returns -9 in `rax`. At the last step, libc turns this into a return of -1 with errno 9.
+4. Select **write(1, kernel address, 2)**. `access_ok` refuses the pointer, and `rax` is -14. A program cannot use the kernel to read kernel memory.
+5. Select **write(1, unmapped address, 2)**. This pointer passes `access_ok`, and the copy itself faults. The kernel survives and returns -14. Compare this with a stray pointer in your own code.
+
+## The calling convention
+
+| | x86-64 Linux | arm64 Linux | arm64 macOS |
+|---|---|---|---|
+| Instruction | `syscall` | `svc #0` | `svc #0x80` |
+| Number in | `rax` | `x8` | `x16` |
+| Arguments | `rdi rsi rdx r10 r8 r9` | `x0` to `x5` | `x0` and up |
+| Result in | `rax` | `x0` | `x0` |
+| Error signal | -4095 to -1 | -4095 to -1 | carry flag set |
+| Lost | `rcx`, `r11` | none | not a stable interface |
+
+The 4th argument is in `r10`, not in `rcx` as in the C convention, because `syscall` overwrites `rcx`. C wrappers move it. No system call takes more than 6 arguments.
+
+The numbers are not the same across CPUs. `write` is 1 on x86-64 and 64 on arm64. `exit_group` is 231 and 94. arm64 has no `open` or `fork` at all, only `openat` and `clone`, because the newer table dropped the old forms.
+
+Linux keeps this interface stable, so a static binary from years ago still runs. macOS does not promise this. Its stable interface is `libSystem`, and the numbers can change. This is why Go moved to `libSystem` on macOS and why Apple does not support static binaries there.
+
+## The path through the kernel
+
+1. **Entry.** The CPU jumps to `entry_SYSCALL_64`. `swapgs` gives access to per-CPU data. With KPTI the code writes `CR3`. It loads the kernel stack, and it pushes all registers as `struct pt_regs`.
+2. **Dispatch.** `do_syscall_64` checks the number and selects the function. For years this was an indirect call through `sys_call_table`, an array of function pointers. Recent x86-64 kernels use a `switch` in `x64_sys_call`, because an indirect branch can be a Spectre target.
+3. **Work.** `__x64_sys_write` reads its arguments from `pt_regs`. `ksys_write` looks up the fd, and `vfs_write` calls the file's write method.
+4. **Exit.** `syscall_exit_to_user_mode` checks the thread flags. Signal delivery and a pending reschedule happen here. Then `sysretq` goes back to ring 3.
+
+### Copying from user memory
+
+The kernel must never trust a user pointer. It takes three separate steps:
+
+1. `access_ok` checks that the range is in the user half. This stops a program from naming kernel memory.
+2. `stac` opens the SMAP window, and `copy_from_user` (or an iterator built on the same code) copies the bytes.
+3. If the page is absent, a page fault happens inside the copy. If the page can be loaded, the fault handler loads it and the copy continues. If not, the handler finds this instruction in the **exception table**, a list of instructions that may fault and where to go next. The copy stops, and the call returns `-EFAULT`.
+
+The copy also solves a race. Another thread of the program can change its memory at any moment. If the kernel checks a value in user memory and then reads it again, the value can differ. This bug class is **TOCTOU** (time of check to time of use). A single copy into a kernel buffer closes it.
+
+### errno
+
+The kernel returns a negative error number in `rax`, and any value from -4095 to -1 means an error. A C wrapper turns this into a return of -1 and stores the positive value in `errno`, a thread-local variable. Rust's `std` and Go's `syscall` package read the same value and give you a typed error. The raw instruction gives you the negative number.
+
+## Raw system calls
+
+```c
+// C, x86-64 Linux.
+static long raw_write(int fd, const void *buf, unsigned long n) {
+    long ret;
+    __asm__ volatile ("syscall" : "=a"(ret)
+                      : "a"(1L), "D"((long)fd), "S"(buf), "d"(n)
+                      : "rcx", "r11", "memory");
+    return ret;  // -9 means EBADF: no errno here
+}
+```
+
+```rust
+// Rust, x86-64 Linux. The clobbers are the same two registers.
+use std::arch::asm;
+fn raw_write(fd: i32, buf: *const u8, n: usize) -> isize {
+    let ret: isize;
+    unsafe {
+        asm!("syscall", inlateout("rax") 1isize => ret,
+             in("rdi") fd as isize, in("rsi") buf, in("rdx") n,
+             lateout("rcx") _, lateout("r11") _, options(nostack));
+    }
+    ret
+}
+```
+
+```zig
+// Zig: the standard library has the raw call for each CPU.
+const linux = @import("std").os.linux;
+const msg = "hi";
+pub fn main() void {
+    _ = linux.syscall3(.write, 1, @intFromPtr(msg.ptr), msg.len);
+}
+```
+
+These work only on Linux. To watch real calls, use `strace -e write ./prog` on Linux. macOS has `dtruss`, but System Integrity Protection limits it.
+
+## The vDSO
+
+Some calls only read a value that the kernel can publish. Time is the main example, because programs read it very often. So the kernel maps two regions into each process. One is a data page that it keeps current. The other is a small library of code, the **vDSO** (virtual dynamic shared object).
+
+`clock_gettime` in libc calls the vDSO function. That function runs in user mode. It reads the data page under a sequence counter, reads the CPU's cycle counter with `rdtsc`, and computes the time. It has no mode change. The auxiliary vector entry `AT_SYSINFO_EHDR` tells libc where the vDSO is, and `ldd` prints it as `linux-vdso.so.1`.
+
+x86-64 has vDSO versions of `clock_gettime`, `gettimeofday`, `time` and `getcpu`. arm64 reads `cntvct_el0` in place of `rdtsc`. macOS has a similar idea, the **commpage**.
+
+The vDSO has one failure mode. If the clock source cannot be read from user mode, the function falls back to a real system call. Some virtual machines do this, and code that reads the clock often can slow down a lot. This Linux file names the clock source:
+
+```text
+/sys/devices/system/clocksource/clocksource0/current_clocksource
+```
+
+<Predict
+  id="mitigate"
+  question="You turn on all mitigations. What happens to the speed of vDSO clock_gettime?"
+  options={[
+    "It slows by the same amount as a system call",
+    "It does not change, because it has no mode change",
+    "It slows a little, because the kernel keeps the data page current",
+  ]}
+  answer={1}
+  explain="The mitigations in this model run at kernel entry and exit. The vDSO never enters the kernel, so these costs do not touch it."
+>
+<SyscallCostDemo />
+</Predict>
+
+Things to try:
+
+1. Move **User work between calls** to the left. With little work between calls, the lines separate. At the right, all lines meet, because the call is a small part of the loop.
+2. With no mitigations, an empty call is 60 ns in this model, and the vDSO is 20 ns: a factor of 3.
+3. Turn on all four toggles. The direct cost is 200 ns: a factor of 10.
+4. Turn off **PCID** with KPTI on. The direct cost goes to 400 ns, because each call also loses TLB entries.
+5. Raise **Cache and TLB refill**. The kernel's work evicts your cache lines, and you pay later, in your own code. With all mitigations and 100 ns of refill, 1 million calls per second take 30% of one CPU.
+
+All these figures are model inputs, not measurements. Measure your own CPU with a loop:
+
+```c
+for (int i = 0; i < N; i++) getppid();                        // a real system call
+for (int i = 0; i < N; i++) clock_gettime(CLOCK_MONOTONIC, &ts);  // normally no mode change
+```
+
+This loop works on both Linux and macOS. On Linux, the files in `/sys/devices/system/cpu/vulnerabilities/` show which mitigations are on. To reduce the number of calls, batch the work: `writev`, `io_uring`, or a user-space buffer.
+
+## Connect
+
+- [Kernel mode and user mode](/os/processes/kernel-mode-and-user-mode): the hardware rules that this path depends on.
+- [io_uring](/os/io/io-uring): batches of work with fewer mode changes.
+- [seccomp and sandboxing](/os/isolation/seccomp-and-sandboxing): a filter that runs at dispatch.
+- [ptrace and strace](/os/observability/ptrace-and-strace): how strace stops a program at each call.
+
+<Recall cards={[
+  { q: "On x86-64 Linux, which registers hold the number and the first four arguments?", a: "rax holds the number. The arguments are in rdi, rsi, rdx and r10. The 4th uses r10 because syscall overwrites rcx." },
+  { q: "How does a C program learn that a system call failed?", a: "The kernel returns a value from -4095 to -1. The libc wrapper stores the positive value in errno and returns -1." },
+  { q: "What do access_ok and the exception table each protect against?", a: "access_ok stops a pointer into the kernel half. The exception table lets a fault on a bad user page end the copy with -EFAULT, not with an oops." },
+  { q: "Why does the kernel copy user data into its own buffer?", a: "Other threads can change user memory at any time. A copy gives one stable value, which closes time-of-check-to-time-of-use races." },
+  { q: "How does clock_gettime avoid a mode change?", a: "The kernel maps a data page and vDSO code into each process. The function reads the page and the CPU counter in user mode." },
+  { q: "Name two costs of a syscall beyond the entry instructions.", a: "KPTI page table writes and other mitigations on entry and exit, and later cache and TLB misses in user code." },
+]} />

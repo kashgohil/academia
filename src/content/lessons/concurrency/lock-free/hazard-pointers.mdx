@@ -18,7 +18,7 @@ The problem from the last two lessons: a thread holds the address of a node that
   answer={1}
   explain="A reclaimer that scanned the hazard slots before T0's publish became visible could already have freed A. If head is still A after the publish, A can't have been removed and freed in between: any later scan will see the hazard. If head changed, start over."
 >
-<LockFreeStepper title="Treiber stack: compare free-immediately with hazard pointers" scenario={HP} scripts={HP_SCRIPTS} scheme="immediate" schemes={["immediate", "hazard"]} />
+<LockFreeStepper title="Free immediately vs hazard pointers" scenario={HP} scripts={HP_SCRIPTS} scheme="immediate" schemes={["immediate", "hazard"]} />
 </Predict>
 
 1. With **Free immediately**, run **T1 pops and frees while T0 holds A**. T0's next step, `read A.next`, is a use-after-free: A is drawn red, with T0 still pointing at it.

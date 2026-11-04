@@ -1,58 +1,75 @@
 ---
-summary: How CPUs guess which way a branch goes, which patterns they learn, and when replacing a branch with arithmetic wins.
+summary: How the CPU guesses the direction of a branch, which patterns it learns, and when code without branches is faster.
 ---
 import { BranchDemo } from "@/demos/CpuDemos";
+import { TwoBitStepperDemo } from "@/demos/CpuExtrasDemos";
 
-A pipelined, out-of-order core fetches instructions 15–20 cycles before it knows the outcome of the branches among them. Waiting would waste most of its capacity, so it **predicts** each branch and runs ahead speculatively. When the guess is wrong, everything after the branch is thrown away. That costs about 15–20 cycles per misprediction: the "bad speculation" category from the hardware-counters lesson.
+A modern core fetches instructions 15 to 20 cycles before it knows the result of a branch. If the core waited, it would lose most of its speed. So it **predicts** the direction of each branch and continues on the predicted path. When the prediction is wrong, the core discards that work. Each misprediction costs about 15 to 20 cycles.
+
+## How a 2-bit counter predicts
+
+A simple predictor keeps a small counter for each branch. The counter has 4 states. "Taken" moves it to the right. "Not taken" moves it to the left. The two right states predict "taken".
+
+<TwoBitStepperDemo />
+
+1. Select **Loop of 8**. The branch is taken 7 times, then not taken once. The counter makes one mistake per loop: at the exit.
+2. Select **95% taken**. Mistakes are rare.
+3. Select **Alternating**. The counter cannot learn this pattern. It is wrong about half the time.
+4. Select **Random**. No predictor can learn random data.
+
+## Compare four predictors
 
 <Predict
   id="loop"
-  question="An inner loop runs exactly 8 iterations each time it's entered: its back-edge branch goes taken, taken, … then not taken once. A 1-bit predictor just repeats the branch's last outcome. What fraction does it mispredict?"
-  options={["1/8 (only the exit)", "2/8 (the exit, and the first iteration of the next run)", "1/2"]}
+  question="An inner loop runs 8 times each time. A 1-bit predictor repeats the last result of the branch. What fraction of the loop branches does it mispredict?"
+  options={["1/8: only the exit", "2/8: the exit, and the first iteration of the next loop", "1/2"]}
   answer={1}
-  explain="It mispredicts the exit (last outcome was taken), then remembers 'not taken' and mispredicts the next loop's first iteration too. A 2-bit counter needs two wrong outcomes in a row to flip, so it only misses the exit: 1/8. A history-based predictor (gshare) learns the whole pattern: 0%."
+  explain="It mispredicts the exit, because the last result was 'taken'. Then it remembers 'not taken' and mispredicts the first iteration of the next loop. A 2-bit counter needs two wrong results to change its prediction, so it misses only the exit."
 >
 <BranchDemo />
 </Predict>
 
 1. **Inner loop of 8**: 1-bit 25%, 2-bit 12.5%, gshare 0%.
-2. **Alternating** and **correlated branches**: per-branch counters fail; gshare learns them from the recent history of all branches.
-3. **Random data** at p = 50%: every predictor is at a coin flip. Slide p up: at 95% taken, mispredicts fall to about 5%.
-4. **Sorted data**: the same condition is perfectly predictable. That's the famous "why is processing a sorted array faster" result.
+2. **Alternating** and **Two correlated branches**: only gshare learns these. It uses the recent results of all branches.
+3. **Random data**: all predictors are wrong about 50% of the time. Move the probability to 95%: the mispredictions drop to about 5%.
+4. **Sorted data**: the same condition becomes almost free.
 
-## Predictors
-
-| Design | Idea | Learns |
+| Predictor | How it works | What it learns |
 |---|---|---|
-| Static | always taken (loops) or backward-taken / forward-not-taken | loop back-edges |
-| 1-bit | repeat last outcome | stable branches |
-| 2-bit saturating counter | flip only after two misses in a row | stable branches with rare exceptions |
-| gshare / two-level | index counters by recent global branch history ⊕ PC | patterns and correlations between branches |
-| TAGE, perceptron | several history lengths, tagged tables or learned weights | long, irregular patterns |
+| Static | always predicts "taken" | loop branches |
+| 1-bit | repeats the last result | stable branches |
+| 2-bit counter | changes after two wrong results | stable branches with rare exceptions |
+| gshare | uses recent branch history | patterns and branches that depend on other branches |
+| TAGE, perceptron | several history lengths, or learned weights | long and irregular patterns |
 
-Modern cores use TAGE-style or perceptron-based designs (often both, with a loop predictor added). They predict typical code with over 95% accuracy. What they can't predict is data: a branch on random input is a coin flip for any predictor.
+Modern cores use TAGE-style or perceptron predictors. They are correct more than 95% of the time on typical code. They cannot predict random data.
 
-## Branchless code
+## Code without branches
 
-The plot shows the trade-off for `if (x < t) sum += x` on random data. A branch costs about 1 cycle plus 16 × (mispredict rate). A branchless version (compute both sides and select with `cmov`, or with a mask) costs a fixed 2 cycles. Branchless wins when mispredicts exceed about 6%: data closer to 50/50 than about 94/6.
+Look at the plot in the demo. It shows `if (x < t) sum += x` on random data:
+
+- With a branch, the cost is about 1 cycle plus 16 × (misprediction rate).
+- Without a branch, the code calculates both results and selects one (`cmov`, or a mask). The cost is always about 2 cycles.
+
+So code without branches is faster when more than about 6% of the branches are mispredicted.
 
 ```rust
-// branchy
+// with a branch
 if x < t { sum += x; }
-// branchless: the comparison becomes a mask
+// without a branch: the comparison becomes a mask
 sum += x & -((x < t) as i32);
-// or ask the compiler for a conditional move:
+// or ask the compiler for a conditional move
 sum += std::hint::select_unpredictable(x < t, x, 0);
 ```
 
-C and C++ have `__builtin_unpredictable` (Clang) and `__builtin_expect_with_probability` (GCC) as hints. Compilers already turn simple ternaries into `cmov` when they judge it profitable. Check the assembly before hand-rolling bit tricks.
+In C and C++, use `__builtin_unpredictable` (Clang) or `__builtin_expect_with_probability` (GCC). Compilers often make conditional moves without help. Look at the assembly before you write bit tricks.
 
-When *not* to go branchless: when the branch is predictable (then it's nearly free, and branchless always pays both sides), or when one side is expensive (computing it unconditionally costs more than the occasional miss). Other options: sort or partition the data so the branch becomes predictable, or vectorize (SIMD lesson), which uses masks anyway.
+Do not remove a branch that is predictable. A predictable branch costs almost nothing. Do not remove a branch if one side is expensive, because code without branches always runs both sides. You can also sort or partition the data, so the branch becomes predictable.
 
 <Recall cards={[
-  { q: "Typical cost of a branch misprediction?", a: "About 15–20 cycles: the pipeline is flushed and refilled from the correct path." },
-  { q: "Why does a 2-bit counter beat a 1-bit predictor on loop exits?", a: "It needs two consecutive wrong outcomes to change its prediction, so one loop exit doesn't make it mispredict the next loop's first iteration." },
-  { q: "What do history-based predictors (gshare, TAGE) add?", a: "They index predictions by the recent outcomes of branches, so they learn patterns (alternation, loop counts) and correlations between branches." },
-  { q: "When does branchless code win?", a: "When the branch is unpredictable enough that the expected misprediction cost exceeds the fixed cost of computing both sides (roughly above 5–10% mispredicts)." },
-  { q: "Why is processing sorted data faster for `if (x >= 128)`?", a: "Sorted input makes the branch outcome change only once, so it's predicted almost perfectly." },
+  { q: "About how much does a branch misprediction cost?", a: "About 15 to 20 cycles. The core discards the work on the wrong path." },
+  { q: "Why is a 2-bit counter better than a 1-bit predictor for loop exits?", a: "It needs two wrong results to change its prediction, so one loop exit does not cause a second mistake." },
+  { q: "What do history-based predictors such as gshare add?", a: "They use the recent results of branches, so they learn patterns and branches that depend on other branches." },
+  { q: "When is code without branches faster?", a: "When the branch is unpredictable, about more than 6% mispredictions in this example." },
+  { q: "Why is a sorted array faster for `if (x >= 128)`?", a: "With sorted data, the result of the branch changes only once, so the prediction is almost always correct." },
 ]} />

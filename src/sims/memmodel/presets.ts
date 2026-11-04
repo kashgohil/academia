@@ -200,7 +200,7 @@ T2:
   b.await(1, acquire)
   r0 = data
 `),
-    p("hb-release-seq", "Release sequence through an RMW", "T1's relaxed fetch_add sits between T0's release store and T2's acquire load. RMWs continue the release sequence, so T2 still synchronizes with T0. (If T1 runs before T0, flag never reaches 2 and T2 spins forever: the "hangs" outcome.)", `
+    p("hb-release-seq", "Release sequence through an RMW", "T1's relaxed fetch_add sits between T0's release store and T2's acquire load. RMWs continue the release sequence, so T2 still synchronizes with T0. (If T1 runs before T0, flag never reaches 2 and T2 spins forever: the “hangs” outcome.)", `
 T0:
   data = 42
   flag.store(1, release)

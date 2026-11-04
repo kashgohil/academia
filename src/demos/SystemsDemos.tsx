@@ -16,17 +16,8 @@ export function QueueAnimationDemo() {
   const [c, setC] = useState(1);
   const [fixed, setFixed] = useState(false);
   const st = useRef({ t: 0, next: 0, id: 0, queue: [] as Job[], servers: [] as Server[], done: 0, respSum: 0, area: 0, lastT: 0, busy: 0, r: mulberry32(1) });
-  const reset = () => {
-    st.current = { t: 0, next: 0, id: 0, queue: [], servers: Array.from({ length: c }, () => ({ job: null, start: 0, until: 0 })), done: 0, respSum: 0, area: 0, lastT: 0, busy: 0, r: mulberry32(1) };
-  };
-  if (st.current.servers.length !== c) reset();
   const lambda = (rho * c) / 1; // service mean = 1 time unit
-  const sim = useSim({
-    dt: 1 / 60,
-    speed: 2,
-    autoplay: true,
-    reset,
-    step: (dt) => {
+  const advance = (dt: number) => {
       const s = st.current;
       const inSystem = s.queue.length + s.servers.filter((x) => x.job).length;
       s.area += inSystem * dt;
@@ -41,8 +32,14 @@ export function QueueAnimationDemo() {
           sv.until = s.t + (fixed ? 1 : expo(s.r, 1));
         }
       }
-    },
-  });
+  };
+  // Start from a steady state: run 400 time units silently, so the averages already mean something.
+  const reset = () => {
+    st.current = { t: 0, next: 0, id: 0, queue: [], servers: Array.from({ length: c }, () => ({ job: null, start: 0, until: 0 })), done: 0, respSum: 0, area: 0, lastT: 0, busy: 0, r: mulberry32(1) };
+    for (let i = 0; i < 8000; i++) advance(0.05);
+  };
+  if (st.current.servers.length !== c) reset();
+  const sim = useSim({ dt: 1 / 60, speed: 2, autoplay: true, reset, step: advance });
   const s = st.current;
   const L = s.t > 0 ? s.area / s.t : 0;
   const X = s.t > 0 ? s.done / s.t : 0;
@@ -126,16 +123,17 @@ export function LatencyCurveDemo() {
 // ---------------- 3. Little's law calculator ----------------
 
 export function LittleCalcDemo() {
-  const [rate, setRate] = useState(2000);
-  const [ms, setMs] = useState(25);
+  const [rateRaw, setRate] = useState(2000);
+  const [msRaw, setMs] = useState(25);
+  const rate = Math.round(rateRaw), ms = Math.round(msRaw);
   const L = rate * (ms / 1000);
   return (
     <Demo
       title="How many requests are in progress?"
       controls={
         <>
-          <Param spec={range({ label: "Requests per second (λ)", min: 10, max: 100000, default: 2000, log: true, format: (v) => Math.round(v).toLocaleString() })} value={rate} onChange={(v) => setRate(Math.round(v as number))} />
-          <Param spec={range({ label: "Time per request (W)", min: 1, max: 1000, default: 25, log: true, format: (v) => `${Math.round(v)} ms` })} value={ms} onChange={(v) => setMs(Math.round(v as number))} />
+          <Param spec={range({ label: "Requests per second (λ)", min: 10, max: 100000, default: 2000, log: true, format: (v) => Math.round(v).toLocaleString() })} value={rateRaw} onChange={(v) => setRate(v as number)} />
+          <Param spec={range({ label: "Time per request (W)", min: 1, max: 1000, default: 25, log: true, format: (v) => `${Math.round(v)} ms` })} value={msRaw} onChange={(v) => setMs(v as number)} />
         </>
       }
     >
@@ -148,17 +146,18 @@ export function LittleCalcDemo() {
 // ---------------- 4. fan-out ----------------
 
 export function FanoutDemo() {
-  const [n, setN] = useState(10);
+  const [nRaw, setN] = useState(10);
+  const n = Math.round(nRaw);
   const curve = useMemo(() => [1, 2, 5, 10, 20, 50, 100, 200].map((k) => { const f = S.fanout(k, 2000); return [k, f.p50, f.p99] as const; }), []);
   const cur = useMemo(() => S.fanout(n, 3000), [n]);
   const bins = useMemo(() => { const h = histogram(cur.samples.map((x) => Math.log10(x)), 0.5, 3, 40); return h.map((b) => ({ x0: b.x0, x1: b.x1, y: b.count / cur.samples.length })); }, [cur]);
   return (
-    <Demo title="One request waits for all of its backends" controls={<Param spec={range({ label: "Backends per request", min: 1, max: 200, default: 10, log: true, format: (v) => String(Math.round(v)) })} value={n} onChange={(v) => setN(Math.round(v as number))} />}>
+    <Demo title="One request waits for all of its backends" controls={<Param spec={range({ label: "Backends per request", min: 1, max: 200, default: 10, log: true, format: (v) => String(Math.round(v)) })} value={nRaw} onChange={(v) => setN(v as number)} />}>
       <Stats items={[{ label: "requests slower than 50 ms", value: pct(cur.slowShare, 1) }, { label: "1 − 0.99ⁿ", value: pct(1 - 0.99 ** n, 1) }, { label: "request median", value: `${cur.p50.toFixed(0)} ms` }, { label: "request p99", value: `${cur.p99.toFixed(0)} ms` }]} />
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 16, marginTop: 12 }}>
         <div>
           <div className="muted" style={{ fontSize: 12.5 }}>Request latency distribution (log scale)</div>
-          <Plot x={[0.5, 3]} y={[0, Math.max(...bins.map((b) => b.y)) * 1.1]} height={180} xTicks={[1, 1.699, 2, 2.699, 3]} xFormat={(t) => `${Math.round(10 ** t)} ms`} yFormat={(t) => pct(t, 0)}>
+          <Plot x={[0.5, 3]} y={[0, Math.max(...bins.map((b) => b.y)) * 1.1]} height={180} xTicks={[1, 1.699, 2, 2.699]} xFormat={(t) => `${Math.round(10 ** t)} ms`} yFormat={(t) => pct(t, 0)}>
             <Bars bins={bins} />
             <RuleX at={Math.log10(cur.p99)} label="p99" color="var(--c4)" />
           </Plot>
@@ -197,14 +196,24 @@ export function HedgingDemo() {
       }
     >
       <Stats items={[{ label: "p99", value: `${h.p99.toFixed(0)} ms` }, { label: "p99.9", value: `${h.p999.toFixed(0)} ms` }, { label: "p99.9 without hedging", value: `${base.p999.toFixed(0)} ms` }, { label: "extra requests sent", value: pct(h.extraLoad, 1) }]} />
-      <div className="muted" style={{ fontSize: 12.5, margin: "12px 0 4px" }}>p99.9 latency (blue) and extra load (orange) vs when the copy is sent</div>
-      <Plot x={[12, 120]} y={[0, 120]} height={190} xLabel="send the copy after (ms)">
-        <Line points={curve.map((p) => [p[0], p[1]])} color="var(--c1)" width={2} />
-        <Dots points={curve.map((p) => [p[0], p[1]])} color="var(--c1)" r={2.5} />
-        <Line points={curve.map((p) => [p[0], p[2] * 10])} color="var(--c2)" width={2} />
-        <RuleX at={after} />
-        <RuleY at={10} label="1% extra load" color="var(--c2)" />
-      </Plot>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 16, marginTop: 12 }}>
+        <div>
+          <div className="muted" style={{ fontSize: 12.5 }}>p99.9 latency (ms)</div>
+          <Plot x={[12, 120]} y={[0, 140]} height={170} xLabel="send the copy after (ms)">
+            <Line points={curve.map((p) => [p[0], p[1]])} color="var(--c1)" width={2} />
+            <Dots points={curve.map((p) => [p[0], p[1]])} color="var(--c1)" r={2.5} />
+            <RuleX at={after} />
+          </Plot>
+        </div>
+        <div>
+          <div className="muted" style={{ fontSize: 12.5 }}>Extra requests sent (%)</div>
+          <Plot x={[12, 120]} y={[0, 14]} height={170} xLabel="send the copy after (ms)">
+            <Line points={curve.map((p) => [p[0], p[2]])} color="var(--c2)" width={2} />
+            <Dots points={curve.map((p) => [p[0], p[2]])} color="var(--c2)" r={2.5} />
+            <RuleX at={after} />
+          </Plot>
+        </div>
+      </div>
     </Demo>
   );
 }
@@ -296,11 +305,12 @@ export function BufferSizeDemo() {
 // ---------------- 9. queue depth ----------------
 
 export function QueueDepthDemo() {
-  const [qd, setQd] = useState(1);
+  const [qdRaw, setQd] = useState(1);
+  const qd = Math.round(qdRaw);
   const QD = [1, 2, 4, 8, 16, 32, 64, 128, 256];
   const colors = ["var(--c4)", "var(--c2)", "var(--c1)"];
   return (
-    <Demo title="Random 4 KiB reads: operations per second vs requests in flight" controls={<Param spec={range({ label: "Queue depth (requests in flight)", min: 1, max: 256, default: 1, log: true, format: (v) => String(Math.round(v)) })} value={qd} onChange={(v) => setQd(Math.round(v as number))} />}>
+    <Demo title="Random 4 KiB reads: operations per second vs requests in flight" controls={<Param spec={range({ label: "Queue depth (requests in flight)", min: 1, max: 256, default: 1, log: true, format: (v) => String(Math.round(v)) })} value={qdRaw} onChange={(v) => setQd(v as number)} />}>
       <Stats items={S.DEVICES.map((d) => { const x = S.deviceIops(d, qd); return { label: `${d.label}: IOPS · latency`, value: <span>{Math.round(x.iops).toLocaleString()} <span className="muted" style={{ fontSize: 13 }}>· {x.latencyUs >= 1000 ? `${(x.latencyUs / 1000).toFixed(0)} ms` : `${Math.round(x.latencyUs)} µs`}</span></span> }; })} />
       <div style={{ height: 8 }} />
       <Plot x={[1, 256]} y={[100, 1e6]} logX logY height={220} xTicks={QD} xFormat={String} yTicks={[100, 1000, 10000, 100000, 1000000]} yFormat={(t) => (t >= 1e6 ? "1M" : t >= 1000 ? `${t / 1000}k` : String(t))} xLabel="queue depth" yLabel="IOPS">

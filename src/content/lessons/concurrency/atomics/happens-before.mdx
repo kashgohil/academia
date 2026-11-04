@@ -1,0 +1,52 @@
+---
+summary: The relation that defines data races, how synchronization builds it, and why race-free programs can be reasoned about as interleavings.
+---
+import { LitmusDemo } from "@/demos/LitmusDemo";
+import { LESSON_PRESETS } from "@/sims/memmodel/presets";
+
+Every ordering rule in this module exists to build one relation: **happens-before**. It decides two things. First, which writes a read is allowed to see. Second, whether a program has a **data race**, meaning two conflicting accesses (same location, at least one a write, at least one non-atomic) not ordered by happens-before. In C, C++, Rust and Zig a data race is undefined behavior for the whole program, not just a wrong value.
+
+<Predict
+  id="race"
+  question="T0: data = 42 (plain); flag.store(1, relaxed). T1: spin until flag.load(relaxed) == 1; then r0 = data (plain). T1 only reads data after seeing the flag. Is this a data race?"
+  options={["No: T1 waits for the flag first", "Yes: the relaxed flag creates no happens-before edge"]}
+  answer={1}
+  explain="Waiting for a value isn't synchronization. Only a release write read by an acquire read (or the fence equivalents) creates happens-before between threads. With relaxed, the compiler and CPU may reorder data = 42 after the flag store, and the language calls the whole program undefined."
+>
+<LitmusDemo presets={LESSON_PRESETS.hb} />
+</Predict>
+
+Compare **Plain data, relaxed flag** (race) with **release/acquire flag** (race-free, and `r0` is always 42). Then:
+
+- **Happens-before is transitive**: T2 never touches T0's flag, yet reads T0's plain write safely through T1.
+- **Release sequence**: a relaxed `fetch_add` by a third thread doesn't break the chain, because RMWs extend the release sequence. (The "hangs" row is the schedule where T1 runs before T0, so the flag never reaches 2.)
+- **Spinlock** vs **relaxed spinlock**: mutexes are exactly this. Unlock is a release and lock is an acquire.
+
+## Building the relation
+
+<Steps>
+<div><b>Sequenced-before</b>: within one thread, program order.</div>
+<div><b>Synchronizes-with</b>: a release operation (or fence) in thread A, and an acquire operation (or fence) in thread B that reads the value A wrote, or a later value in its release sequence.</div>
+<div><b>Happens-before</b>: the transitive closure of the two. A happens-before B if a chain of program order and synchronizes-with edges leads from A to B.</div>
+<div><b>Visibility</b>: a read sees the last write that happens-before it, or a write it isn't ordered with. That second case is legal only for atomics, and is exactly where relaxed reads get their freedom.</div>
+</Steps>
+
+## The guarantee that makes this usable
+
+**SC for DRF** (sequential consistency for data-race-free programs): if a program has no data races and uses only seq_cst atomics, every execution looks like a simple interleaving of the threads. You can reason about it with the mental model from the SC column. Weaker orders keep the "no race" part but give up the "simple interleaving" part. That's the real trade you make when you write `relaxed`.
+
+## Finding races in practice
+
+The explorer detects races the same way **ThreadSanitizer** does: each thread carries a vector clock (one counter per thread), release/acquire pairs merge clocks, and an access races if the clock of the conflicting access isn't covered.
+
+- C/C++: `-fsanitize=thread`. Rust: `RUSTFLAGS="-Zsanitizer=thread"` on nightly. Go: `go test -race`. Zig: `-fsanitize-thread`.
+- Sanitizers only check the schedules that actually ran. Model checkers explore *all* schedules, like the explorer here: **loom** (Rust), **GenMC** and **CDSChecker** (C/C++), and TLA+ for designs.
+- Rust's type system rules out data races on safe references at compile time (`Send`/`Sync`). Ordering mistakes between atomics are still yours to make.
+
+<Recall cards={[
+  { q: "Define a data race.", a: "Two accesses to the same location, at least one a write and at least one non-atomic, not ordered by happens-before." },
+  { q: "What creates a synchronizes-with edge?", a: "An acquire operation (or fence) reading the value written by a release operation (or fence), or by a later write in its release sequence." },
+  { q: "What is SC for DRF?", a: "A data-race-free program that uses only seq_cst atomics behaves as some interleaving of its threads." },
+  { q: "Why is spinning on a relaxed flag before reading plain data a race?", a: "Relaxed accesses create no happens-before edge, so the plain write and read remain unordered." },
+  { q: "How does ThreadSanitizer detect races?", a: "Vector clocks per thread, merged by synchronization. An access races if the conflicting access's clock isn't covered by the current thread's clock." },
+]} />

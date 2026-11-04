@@ -6,7 +6,7 @@ import { mulberry32, normal } from "../sims/rng";
 
 const schema = {
   surface: select({ label: "Loss surface", options: SURFACES.map((s) => ({ value: s.id, label: s.label })), default: "bowl" }),
-  lr: range({ label: "Learning rate (SGD, momentum)", min: 0.001, max: 1, default: 0.05, log: true }),
+  lr: range({ label: "Learning rate (SGD, momentum)", min: 0.001, max: 1, default: 0.09, log: true }),
   adamLr: range({ label: "Learning rate (Adam)", min: 0.001, max: 2, default: 0.1, log: true }),
   beta: range({ label: "Momentum β", min: 0, max: 0.99, step: 0.01, default: 0.9 }),
   noise: range({ label: "Gradient noise σ", min: 0, max: 10, step: 0.1, default: 0 }),

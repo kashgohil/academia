@@ -1,0 +1,84 @@
+---
+summary: Why gradient descent zig-zags, what sets the maximum learning rate, and what momentum and Adam actually fix.
+---
+import { GradientDescentDemo } from "@/demos/GradientDescentDemo";
+
+Every neural network is trained by some variant of one line:
+
+$$\theta \leftarrow \theta - \eta\,\nabla L(\theta)$$
+
+Real loss surfaces have millions of dimensions, but nearly everything that goes wrong with that line also happens in two: oscillation, divergence, slow progress along flat directions, getting stuck at saddles, and ending in different minima. This lesson builds the intuition in 2D and then derives the numbers that carry over to high dimensions.
+
+<Predict
+  id="max-lr"
+  question={<>On the bowl $f(x, y) = \tfrac12(x^2 + 20y^2)$, plain gradient descent converges only if the learning rate is below some threshold. What is it?</>}
+  options={["2", "1", "0.1", "0.01"]}
+  answer={2}
+  explain="The steep direction has curvature 20. Each step multiplies the y-error by (1 − 20η), which has magnitude below 1 only when η < 2/20 = 0.1. The flat direction plays no part in the limit."
+>
+<GradientDescentDemo />
+</Predict>
+
+Things to try on the **ill-conditioned bowl**:
+
+1. Turn off momentum and Adam. With SGD at η = 0.09, the path zig-zags across the narrow valley and creeps along the long one.
+2. Drag the learning rate just past **0.1**. SGD diverges, and the loss-gap plot shoots upward.
+3. Turn momentum back on. With the same η it reaches the minimum far sooner, despite overshooting.
+4. Set momentum β to 0.99. It now spirals around the minimum for a long time: too much inertia.
+
+Then switch surfaces:
+
+- **Rosenbrock**: a curved, banana-shaped valley. Every method finds the valley quickly and then crawls along it.
+- **Saddle point**: SGD starts almost exactly on the ridge (y = 0.01) and stalls before escaping. Add **gradient noise** and it escapes sooner.
+- **Himmelblau**: click different starting points. The minimum you end in depends on which *basin* you started in. Lower the learning rate first, because the gradients here are large.
+
+## The quadratic model
+
+Near any minimum, a smooth loss is approximately quadratic: $L(\theta) \approx L^* + \tfrac12(\theta - \theta^*)^\top H\,(\theta - \theta^*)$, where $H$ is the Hessian. So understanding quadratics means understanding the endgame of every optimization.
+
+<Steps>
+<div>The gradient of the quadratic is $H(\theta - \theta^*)$. Writing $e = \theta - \theta^*$, the update becomes $e_{k+1} = (I - \eta H)\,e_k$.</div>
+<div>In the eigenbasis of $H$ (eigenvalues $\lambda_i$, the curvatures) the coordinates decouple: $e^{(i)}_{k+1} = (1 - \eta\lambda_i)\,e^{(i)}_k$.</div>
+<div><b>Stability</b> needs $|1 - \eta\lambda_i| < 1$ for every $i$, i.e. $\eta < 2/\lambda_{\max}$. The *sharpest* direction sets the limit.</div>
+<div><b>Speed</b> is set by the slowest factor. The best fixed step, $\eta = 2/(\lambda_{\max} + \lambda_{\min})$, gives the per-step contraction $\dfrac{\kappa - 1}{\kappa + 1}$, where $\kappa = \lambda_{\max}/\lambda_{\min}$ is the <b>condition number</b>.</div>
+</Steps>
+
+For the bowl, κ = 20, so the best rate is 19/21 ≈ 0.905 per step. That means about 23 steps per factor of 10 in error. A step size large enough for the flat direction would overshoot the steep one. **Ill-conditioning, not non-convexity, is the everyday reason training is slow.**
+
+<Callout title="It's the same instability as Euler">
+Gradient descent is explicit Euler applied to the gradient flow $\dot\theta = -\nabla L$. The condition $\eta < 2/\lambda_{\max}$ is the same stability limit as $\Delta t < 2\tau$ in the RC circuit lesson, with $\tau = 1/\lambda$.
+</Callout>
+
+## Momentum
+
+The heavy-ball method keeps a velocity: $v \leftarrow \beta v + \nabla L$, $\theta \leftarrow \theta - \eta v$.
+
+- In the steep direction, gradients alternate in sign and largely cancel in $v$, which damps the zig-zag.
+- In the flat direction, gradients keep pointing the same way and accumulate, so the effective step grows toward $\eta/(1-\beta)$.
+
+With tuned $\eta$ and $\beta$, the contraction rate improves to $\dfrac{\sqrt\kappa - 1}{\sqrt\kappa + 1}$. For κ = 20 that is 0.63 instead of 0.905, so a factor of 10 takes about 5 steps instead of 23. For κ = 10⁴ it is the difference between ~100 and ~10,000 steps. The cost is overshoot and spiralling when β is too high, which you can see in the demo.
+
+## Adam
+
+Adam keeps running averages of the gradient ($m$) and of its square ($s$), and steps by $\eta\,\hat m / (\sqrt{\hat s} + \epsilon)$:
+
+- **Per-coordinate scaling.** Dividing by the RMS gradient makes the step size roughly $\eta$ in *every* coordinate, whatever the curvature. On the axis-aligned bowl this undoes the conditioning, which is why Adam heads almost diagonally to the minimum.
+- **Bias correction.** $\hat m = m/(1-\beta_1^t)$ and $\hat s = s/(1-\beta_2^t)$ undo the zero initialization in the first steps.
+- **What it doesn't fix.** The scaling is diagonal, so curvature that isn't aligned with the axes (Rosenbrock's curved valley) is only partly corrected. Near the minimum the steps stay around $\eta$ in size, so Adam hovers instead of converging. This is one reason training uses learning-rate decay.
+
+## Noise, saddles and basins
+
+Minibatch gradients are the true gradient plus noise with variance $\propto 1/B$ (the CLT lesson explains why).
+
+- **With a constant learning rate, SGD doesn't converge.** It settles into a cloud around the minimum whose size grows with $\eta\sigma^2$. Schedules that shrink $\eta$, such as cosine or step decay, shrink the cloud.
+- **Saddles are common in high dimensions.** A critical point needs *every* one of millions of curvatures to be positive to count as a minimum. Most critical points have some negative curvature, so they are saddles. Exactly on a saddle the gradient points along the ridge, and escape along the unstable direction grows only like $(1 + \eta|\lambda|)^k$ from wherever you started. Noise provides a nonzero starting push.
+- **Which minimum you reach depends on the start and the step size.** Large learning rates cannot settle in minima sharper than $2/\eta$: an *implicit bias* toward flat minima that is linked to better generalization. In practice, training often sits right at that edge: the "edge of stability" phenomenon.
+
+<Recall cards={[
+  { q: "What is the maximum stable learning rate for gradient descent on a quadratic with Hessian H?", a: "η < 2/λ_max, where λ_max is the largest eigenvalue (sharpest curvature) of H." },
+  { q: "Best-case per-step contraction for gradient descent on a quadratic with condition number κ?", a: "(κ − 1)/(κ + 1), at η = 2/(λ_max + λ_min)." },
+  { q: "Heavy-ball momentum improves the contraction rate to what?", a: "(√κ − 1)/(√κ + 1). The dependence on κ becomes a dependence on √κ." },
+  { q: "Why does Adam converge quickly on an axis-aligned ill-conditioned bowl?", a: "It divides each coordinate's step by that coordinate's RMS gradient, a diagonal preconditioner that roughly equalizes the step size across directions." },
+  { q: "Why doesn't SGD with a constant learning rate converge to the exact minimum?", a: "Gradient noise keeps it moving in a region whose size grows with η·σ². Decaying η shrinks that region." },
+  { q: "Gradient descent is which numerical integrator applied to which ODE?", a: "Explicit Euler applied to the gradient flow dθ/dt = −∇L." },
+]} />

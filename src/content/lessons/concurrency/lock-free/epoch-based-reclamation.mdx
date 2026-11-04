@@ -1,0 +1,49 @@
+---
+summary: Free memory in bulk once every thread has moved past the epoch in which it was retired. Cheap reads, but one stalled thread blocks everything.
+---
+import { LockFreeStepper } from "@/demos/LockFreeStepper";
+import { StressDemo, StallDemo } from "@/demos/LockFreeStress";
+import { EBR, EBR_SCRIPTS, STRESS_EBR } from "@/demos/lockfreeConfigs";
+
+Hazard pointers protect individual nodes. **Epoch-based reclamation** (EBR, Keir Fraser, 2004) protects *time periods* instead. A global counter, the **epoch**, advances slowly. A thread entering an operation **pins** itself: it announces "I'm active in epoch e". Nodes retired in epoch e go into a bag labelled e. The epoch can only advance when every active thread has announced the current one. Once the global epoch is e + 2, nobody can still hold a pointer obtained in epoch e, so that bag is freed in one go.
+
+<Predict
+  id="stall"
+  question="One thread pins itself, starts a pop, and is then descheduled indefinitely. Other threads keep pushing and popping. What happens to unreclaimed memory under EBR?"
+  options={["It stays bounded, as with hazard pointers", "It grows without bound until the stalled thread unpins", "It is freed anyway after a timeout"]}
+  answer={1}
+  explain="The stalled thread is still active in an old epoch, so the global epoch can never advance two steps past it. Every node retired from then on waits, and memory grows like a leak. Hazard pointers only hold the few nodes the stalled thread actually announced."
+>
+<StallDemo />
+</Predict>
+
+The plot replays the same workload under three schemes, with T0 stalled after pinning or protecting. **Never free** grows linearly. **Epoch-based** tracks it exactly, because no bag can be freed. **Hazard pointers** stay under a handful of nodes.
+
+## Step through it
+
+<LockFreeStepper title="Treiber stack with epoch-based reclamation" scenario={EBR} scripts={EBR_SCRIPTS} scheme="epoch" />
+
+1. Run **T0 pinned while T1 retires three nodes**. T1's attempts to advance the epoch fail at `check T0's epoch`, and its bags fill up.
+2. Reset, run T0's whole pop first, then T1's three pops. With nobody pinned in an old epoch, T1's advance attempts succeed and the global epoch reaches 2. The bags still aren't freed by the end: a bag is emptied only when its owner next pins two epochs later. EBR frees lazily, in batches.
+3. Count the steps per operation and compare with hazard pointers: pin, unpin and occasional advance attempts, but **no fence per node visited**.
+
+## Correctness and cost
+
+<StressDemo configs={STRESS_EBR} />
+
+| | Hazard pointers | Epoch-based |
+|---|---|---|
+| Read-side cost | store + fence per protected pointer | one announcement per *operation* |
+| Long traversals | expensive | cheap: any number of nodes inside one pin |
+| Unreclaimed memory | bounded | unbounded if a thread stalls while pinned |
+| Freeing | per-node scans | in bulk, by epoch |
+
+That trade-off decides most real choices. EBR suits data structures where operations are short and threads don't block inside them: crossbeam-epoch underlies Rust's crossbeam channels and maps. Linux's RCU is the same idea, with "quiescent states" (a context switch means a CPU holds no RCU-protected pointers) instead of explicit epochs. Hazard pointers suit long-lived readers and systems that must bound memory. Hybrids exist (hazard eras, interval-based reclamation) to get EBR's speed with bounded memory.
+
+<Recall cards={[
+  { q: "When can EBR free nodes retired in epoch e?", a: "Once the global epoch reaches e + 2: every active thread has since pinned in a later epoch, so none can hold those nodes." },
+  { q: "What blocks the epoch from advancing?", a: "Any thread still active (pinned) in an older epoch." },
+  { q: "EBR's main weakness?", a: "A thread stalled while pinned prevents all reclamation, so memory grows without bound." },
+  { q: "Why is EBR cheaper than hazard pointers for traversals?", a: "One pin covers any number of node accesses; there is no per-pointer publish and fence." },
+  { q: "How does Linux RCU relate to EBR?", a: "Same grace-period idea, but it detects quiescent states (e.g. context switches) instead of explicit epoch announcements." },
+]} />

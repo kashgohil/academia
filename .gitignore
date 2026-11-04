@@ -1,0 +1,6 @@
+node_modules
+dist
+target
+public/wasm/*.wasm
+tests/e2e/shots
+*.log

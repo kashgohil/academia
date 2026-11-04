@@ -1,0 +1,57 @@
+---
+summary: Coherence orders writes to one address; consistency orders everything else. How store buffers break sequential consistency, and what x86, ARM and RISC-V promise.
+---
+import { StoreBufferDemo } from "@/demos/MulticoreDemos";
+import { LitmusDemo } from "@/demos/LitmusDemo";
+import { LESSON_PRESETS } from "@/sims/memmodel/presets";
+
+Coherence (previous lesson) guarantees that all cores agree on the order of writes to **one** address. It says nothing about how accesses to **different** addresses appear to interleave. That's the job of the **memory consistency model**: the hardware's contract about which reorderings other cores can observe. Lamport's *sequential consistency* (1979) is the intuitive one: results as if all operations ran in some single interleaving, each core in program order. No mainstream CPU implements it, because it would forbid the most important optimization of all: the store buffer.
+
+<Predict
+  id="tso"
+  question="Core 0: x = 1; r0 = y. Core 1: y = 1; r1 = x. Each core has a FIFO store buffer and loads read from memory (or from their own buffer). Can both cores read 0?"
+  options={["No: each store happens before its core's load", "Yes: both stores can sit in their buffers while both loads read memory"]}
+  answer={1}
+  explain="A store enters the buffer immediately, and the core moves on without waiting for it to reach the cache. Both loads then read memory, where neither store has arrived yet. Every x86 CPU allows this outcome. Try it: execute both stores, execute both loads, then drain."
+>
+<StoreBufferDemo />
+</Predict>
+
+1. **Store buffering** on TSO: execute all four instructions *before* draining anything, then drain. The outcome is marked impossible under SC.
+2. Same program, **No buffer (SC)**: the outcome can't be reached.
+3. **Message passing, relaxed** on TSO: no order of drains shows stale data, because the FIFO buffer keeps stores in order. Switch to **PSO** and drain `flag` before `data`: the reader sees the flag with old data.
+4. **Message passing, release fence only** on PSO: the fence keeps `flag` behind `data` in the buffer.
+5. **Store buffering with seq_cst fences**: the fence blocks until the buffer is empty. That's x86's `MFENCE`, and why it costs tens of cycles.
+
+## Why hardware reorders
+
+- **Store buffers**: a store missing the cache would stall the core for hundreds of cycles. Buffering it, and letting later loads go ahead, hides that. This creates store → load reordering.
+- **Out-of-order loads**: loads execute as soon as their address is known. x86 keeps them *looking* ordered by squashing and replaying if a line is invalidated in between. Weaker architectures don't bother.
+- **Non-FIFO draining and invalidation queues**: letting stores to different lines complete out of order, or acknowledging invalidations before applying them, gives store → store and load → load reordering.
+- **Shared store buffers or non-atomic write propagation** between hardware threads can let different cores see two writes in different orders (IRIW).
+
+## The major models
+
+| Model | Allows | Used by |
+|---|---|---|
+| Sequential consistency | nothing | none at full speed (the ideal) |
+| **TSO** | store → load reordering, reading your own buffered stores early | x86, SPARC TSO, RISC-V with Ztso, Apple M-series in Rosetta mode |
+| **PSO** | also store → store | SPARC PSO |
+| **ARMv8 / RVWMO** | all four reorderings unless ordered by dependencies or barriers; multi-copy atomic | ARMv8+, RISC-V default |
+| **POWER** | all of the above, and not multi-copy atomic (IRIW observable) | IBM POWER |
+
+Barriers per architecture: x86 `MFENCE` (or any `LOCK`ed instruction); ARM `DMB ISH`, plus `LDAR`/`STLR` for acquire/release; RISC-V `fence rw,rw`. Compilers map C++ and Rust atomics onto these (Atomics → Memory orderings).
+
+<LitmusDemo presets={LESSON_PRESETS.orderings} />
+
+## The contract you program against
+
+Nobody writes portable code against a hardware model directly. Languages define their own model (C++, Rust, Java, Go), and compilers insert the barriers each architecture needs. The core promise is **SC for data-race-free programs**: synchronize correctly (locks, or atomics with proper orderings) and you can reason as if the hardware were sequentially consistent. The hardware models matter when you write those synchronization primitives, read compiler output, or debug a race that "only happens on ARM".
+
+<Recall cards={[
+  { q: "Coherence vs consistency?", a: "Coherence: agreement on the order of writes to a single location. Consistency: which orderings of accesses to different locations other cores can observe." },
+  { q: "What single reordering does TSO allow?", a: "A store followed by a load to a different address: the store waits in the store buffer while the load proceeds." },
+  { q: "Why does message passing work on x86 without fences?", a: "TSO's FIFO store buffer keeps stores in order, and loads are kept in order, so seeing the flag implies seeing the earlier data write." },
+  { q: "What does 'multi-copy atomic' mean, and who isn't?", a: "A write becomes visible to all other cores at the same time. POWER is not, so readers can disagree on the order of independent writes (IRIW)." },
+  { q: "What does an x86 MFENCE do in store-buffer terms?", a: "It waits until the core's store buffer has drained before later loads execute." },
+]} />

@@ -1,0 +1,44 @@
+---
+summary: Why arrays beat linked lists, why open addressing beats chaining, and why allocation order matters more than the data structure.
+---
+import { CacheFriendlyDemo } from "@/demos/MemoryHierarchyDemos";
+
+Big-O counts operations. Real code is often limited by **memory access patterns** instead: whether each access is predictable (the prefetcher fetches ahead, and many misses overlap) or unpredictable (each miss stalls for full latency). Two structures with identical complexity can differ by 40×.
+
+<Predict
+  id="list"
+  question="Summing 262,144 integers: once from an array, and once from a linked list whose nodes are scattered through the heap after a lot of allocation churn. Roughly how much slower is the list?"
+  options={["About 2× (one extra pointer per node)", "About 10×", "About 40×"]}
+  answer={2}
+  explain="The array streams: about 0.3 ns per element, with 16 ints arriving per cache line. The scattered list costs about 13 ns per node, because every node is a dependent, unpredictable load that misses L1 and L2. A list allocated in order is much better (about 1.1 ns), but still slower than the array."
+>
+<CacheFriendlyDemo />
+</Predict>
+
+1. Compare the three iteration patterns at 262,144 elements: array 0.3 ns, sequential list 1.1 ns, scattered list 13 ns.
+2. Switch to **4,096** elements: everything fits in L2, and the scattered list drops to about 3.6 ns. Layout matters most once the data outgrows a cache level.
+3. Compare **hash lookups**: chaining needs two dependent misses per lookup (bucket, then node), while open addressing usually needs one. At 262,144 keys: about 43 ns vs 11 ns.
+
+## Patterns that recur
+
+| Instead of | Prefer | Why |
+|---|---|---|
+| Linked list | Vector / array (plus index links if you must) | contiguous, prefetchable, 1 access per element |
+| `HashMap` with chaining (`std::unordered_map`) | Open addressing (Swiss tables: Rust's `HashMap`, Abseil `flat_hash_map`) | key and value inline; metadata probed with SIMD |
+| Binary tree (`std::map`, `BTreeMap` with tiny nodes) | B-tree with cache-line-sized nodes, sorted vector for read-mostly data | one miss per node covers many keys |
+| Vector of pointers to objects | Vector of objects | removes a dependent miss per element |
+| Allocating nodes one at a time | Arena or pool allocation in traversal order | nodes end up adjacent (the allocators module) |
+
+## How to tell whether this is your problem
+
+- `perf stat -e cycles,instructions,L1-dcache-load-misses,LLC-load-misses`: IPC well below 1, with misses per instruction in the percent range, means memory bound (top-down: backend-memory).
+- `perf mem record` / `perf c2c` show which loads miss and how far they travel.
+- A loop that slows sharply as the data size crosses a cache boundary (the staircase from the previous lesson) is latency bound.
+
+<Recall cards={[
+  { q: "Why is traversing a scattered linked list so much slower than an array?", a: "Each node is a dependent, unpredictable load: it can't be prefetched or overlapped, so every cache miss pays full latency." },
+  { q: "Why does open addressing usually beat separate chaining?", a: "Keys and values are stored inline in the table, so a lookup typically takes one cache miss instead of two dependent ones." },
+  { q: "Why does allocation order affect linked-list speed?", a: "Nodes allocated in traversal order sit adjacent in memory, so accesses become sequential and prefetchable." },
+  { q: "What hash table do Rust's std and Abseil use?", a: "Swiss tables: open addressing with a metadata byte per slot, probed with SIMD." },
+  { q: "Signs that a loop is memory-latency bound?", a: "Low IPC, high LLC-miss counts, and a sharp slowdown when the working set crosses a cache size." },
+]} />

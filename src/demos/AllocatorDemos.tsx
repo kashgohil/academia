@@ -1,5 +1,7 @@
 import { Controls, useParams, select, toggle } from "../kit";
 import { REGION, type Heap } from "../wasm/heapsim";
+
+const { live: L, free: F, meta: M, pad: P, slack: S, dead: D } = REGION;
 import { HeapPlayground, type Scenario } from "./heap/HeapPlayground";
 
 const hex = (n: number | null) => (n === null ? "null" : "0x" + n.toString(16).padStart(4, "0"));
@@ -14,7 +16,7 @@ export function BumpDemo() {
     { label: "char, double, char, double", run: (h) => [...fields(h, [["a", 1, 1], ["b", 8, 8], ["c", 1, 1], ["d", 8, 8]]), `${h.stats().pad} B of padding`] },
     { label: "double, double, char, char", run: (h) => [...fields(h, [["b", 8, 8], ["d", 8, 8], ["a", 1, 1], ["c", 1, 1]]), `${h.stats().pad} B of padding`] },
   ];
-  return <HeapPlayground title="Bump allocator · 1 KiB" config={{ kind: "bump", cap: 1024 }} bytesPerRow={64} scope scenarios={scenarios} defaultSize={24} />;
+  return <HeapPlayground title="Bump allocator · 1 KiB" config={{ kind: "bump", cap: 1024 }} kinds={[L, F, P, D]} bytesPerRow={64} scope scenarios={scenarios} defaultSize={24} />;
 }
 
 // ---------------- Arena ----------------
@@ -46,6 +48,7 @@ export function ArenaDemo() {
     <HeapPlayground
       title="Chunked arena · 2 KiB backing memory"
       config={{ kind: "arena", cap: 2048, a: chunk }}
+      kinds={[L, F, M, P, S, D]}
       controls={<Controls params={params} />}
       bytesPerRow={128}
       scope
@@ -80,6 +83,7 @@ export function PoolDemo() {
     <HeapPlayground
       title="Pool allocator · 1 KiB"
       config={{ kind: "pool", cap: 1024, a: slot }}
+      kinds={[L, F, S]}
       controls={<Controls params={params} />}
       bytesPerRow={128}
       links
@@ -131,6 +135,7 @@ export function FreeListDemo() {
     <HeapPlayground
       title="Free-list allocator · 2 KiB · 8-byte headers"
       config={{ kind: "freelist", cap: 2048, a: Number(fit), b: coalesce ? 1 : 0 }}
+      kinds={[L, F, M, P, S]}
       controls={<Controls params={params} />}
       bytesPerRow={128}
       links
@@ -168,6 +173,7 @@ export function BuddyDemo() {
     <HeapPlayground
       title="Binary buddy allocator · 1 KiB · 16 B minimum"
       config={{ kind: "buddy", cap: 1024 }}
+      kinds={[L, F, S]}
       bytesPerRow={64}
       scenarios={scenarios}
       defaultSize={33}
@@ -217,6 +223,7 @@ export function SlabDemo() {
     <HeapPlayground
       title="Slab allocator · 4 KiB · 512 B pages"
       config={{ kind: "slab", cap: 4096, a: 512, b: keep ? 1 : 0 }}
+      kinds={[L, F, M, S]}
       controls={<Controls params={params} />}
       bytesPerRow={512}
       scenarios={scenarios}
@@ -242,6 +249,7 @@ export function SizeClassDemo() {
     <HeapPlayground
       title="Size-class allocator · 16 KiB · 1 KiB pages"
       config={{ kind: "sizeclass", cap: 16384, a: 1024, b: fine ? 1 : 0 }}
+      kinds={[L, F, S]}
       controls={<Controls params={params} />}
       bytesPerRow={1024}
       scenarios={[

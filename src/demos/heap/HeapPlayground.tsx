@@ -26,6 +26,8 @@ export interface HeapPlaygroundProps {
   links?: boolean;
   /** Hide external fragmentation (meaningless when every block is the same size). */
   hideFrag?: boolean;
+  /** Region kinds this allocator produces (legend). */
+  kinds?: number[];
   /** Extra readouts computed from the heap. */
   extraStats?: (h: Heap, s: HeapStats) => { label: string; value: ReactNode }[];
   children?: ReactNode;
@@ -48,7 +50,7 @@ export function HeapPlayground(p: HeapPlaygroundProps) {
   const [, setVersion] = useState(0);
   const bump = () => setVersion((v) => v + 1);
   const [log, setLog] = useState<string[]>([]);
-  const say = (...lines: string[]) => setLog((l) => [...lines.reverse(), ...l].slice(0, 6));
+  const say = (...lines: string[]) => setLog((l) => [...l, ...lines].slice(-6));
   const [size, setSize] = useState(p.defaultSize ?? 32);
   const [align, setAlign] = useState("8");
   const marks = useRef<number[]>([]);
@@ -142,6 +144,7 @@ export function HeapPlayground(p: HeapPlaygroundProps) {
         cap={cap}
         bytesPerRow={p.bytesPerRow}
         links={p.links ? heap.links() : undefined}
+        kinds={p.kinds}
         onPick={(r) => r.kind === REGION.live && doFree(r.off)}
       />
       <div style={{ height: 14 }} />
@@ -160,7 +163,7 @@ export function HeapPlayground(p: HeapPlaygroundProps) {
         ]}
       />
       <div style={{ marginTop: 12, fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12, color: "var(--muted)", minHeight: 18 * 3 }}>
-        {log.length ? log.map((l, i) => <div key={i} style={{ opacity: 1 - i * 0.13 }}>{l}</div>) : <div>Allocate, or click a live block to free it.</div>}
+        {log.length ? log.map((l, i) => <div key={i} style={{ opacity: 1 - (log.length - 1 - i) * 0.13 }}>{l}</div>) : <div>Allocate, or click a live block to free it.</div>}
       </div>
       {p.children}
     </Demo>

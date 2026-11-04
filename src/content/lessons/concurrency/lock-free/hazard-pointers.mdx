@@ -1,0 +1,54 @@
+---
+summary: Announce what you're about to touch, check it's still there, and free only what nobody announced. Bounded memory, at a per-access cost.
+---
+import { LockFreeStepper } from "@/demos/LockFreeStepper";
+import { StressDemo } from "@/demos/LockFreeStress";
+import { HP, HP_SCRIPTS, STRESS_HP } from "@/demos/lockfreeConfigs";
+
+The problem from the last two lessons: a thread holds the address of a node that another thread may free at any moment. **Hazard pointers** (Maged Michael, 2004) make that holding visible. Each thread owns a few shared slots. Before dereferencing a node, it writes the node's address into a slot. A thread that wants to free nodes first scans every slot and keeps anything announced there.
+
+<Predict
+  id="recheck"
+  question="T0 loads head = A, then publishes hazard = A. Why must it load head again and check it is still A before reading A.next?"
+  options={[
+    "To refresh its cache",
+    "Between the first load and the publish, A may have been popped and freed; the re-check proves A was still in the stack after the hazard became visible",
+    "It doesn't need to; publishing is enough",
+  ]}
+  answer={1}
+  explain="A reclaimer that scanned the hazard slots before T0's publish became visible could already have freed A. If head is still A after the publish, A can't have been removed and freed in between: any later scan will see the hazard. If head changed, start over."
+>
+<LockFreeStepper title="Treiber stack: compare free-immediately with hazard pointers" scenario={HP} scripts={HP_SCRIPTS} scheme="immediate" schemes={["immediate", "hazard"]} />
+</Predict>
+
+1. With **Free immediately**, run **T1 pops and frees while T0 holds A**. T0's next step, `read A.next`, is a use-after-free: A is drawn red, with T0 still pointing at it.
+2. Switch to **Hazard pointers** and run the same script. T0's steps now include `hazard[0] = A` and the re-check. When T1 has retired two nodes it scans, finds A in T0's slot, and frees only B. A stays on T1's retired list until a later scan finds it unprotected.
+3. Watch each thread's **retired** list: nodes wait there until a scan proves them unprotected.
+
+## The protocol
+
+<Steps>
+<div><b>Protect</b>: <code>p = head.load(); hazard[i].store(p, SeqCst); if head.load() != p, retry</code>. The seq_cst store-then-load is the store-buffering pattern from the memory-ordering lesson: without it, the reclaimer's scan and the reader's re-check could both miss each other.</div>
+<div><b>Use</b>: dereference <code>p</code> freely while it stays in the slot.</div>
+<div><b>Retire</b>: after unlinking a node, put it on a thread-local retired list instead of freeing it.</div>
+<div><b>Scan</b>: when the list reaches a threshold R, read every thread's hazard slots and free every retired node not found there.</div>
+</Steps>
+
+## Costs and guarantees
+
+<StressDemo configs={STRESS_HP} />
+
+- **Correct**: no violations in any random schedule, for the stack or the queue. Hazard pointers solve ABA too, since a protected node can't be freed and reused.
+- **Bounded memory**: at most H × T nodes (hazards per thread × threads) can be protected, so each thread's retired list stays under about R + H·T, *even if another thread stalls forever*. That robustness is their main advantage (Epoch-based reclamation lesson).
+- **Per-access cost**: every protected pointer needs a store and a full fence, plus a re-load. That's acceptable for occasional accesses, but expensive for traversing a long list node by node.
+- **Scan cost**: amortized O(1) per retire if R is proportional to H·T. Scans sort or hash the hazard set.
+
+C++26 adds `std::hazard_pointer`, based on Facebook's Folly implementation. Rust has the `haphazard` crate.
+
+<Recall cards={[
+  { q: "The hazard-pointer protect sequence?", a: "Load the pointer, publish it to a hazard slot (seq_cst), re-load and confirm it is unchanged; retry if not." },
+  { q: "Why is the re-check after publishing necessary?", a: "The node may have been removed and freed between the first load and the publish. Seeing it still in place proves later scans will find the hazard." },
+  { q: "When does a thread actually free retired nodes under hazard pointers?", a: "When its retired list reaches a threshold, it scans all hazard slots and frees retired nodes that nobody has announced." },
+  { q: "Main advantage of hazard pointers over epoch-based reclamation?", a: "Memory stays bounded even if a thread stalls, because only individually announced nodes are held." },
+  { q: "Main cost of hazard pointers?", a: "A store plus a full fence (and a re-check) for every pointer protected, which is expensive for long traversals." },
+]} />

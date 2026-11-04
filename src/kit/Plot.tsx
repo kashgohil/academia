@@ -13,7 +13,7 @@ export function usePlot(): Ctx {
   return c;
 }
 
-const M = { t: 10, r: 14, b: 34, l: 48 };
+const BASE_M = { t: 10, r: 14, b: 34, l: 48 };
 
 export interface PlotProps {
   x: [number, number];
@@ -26,6 +26,9 @@ export interface PlotProps {
   logX?: boolean;
   logY?: boolean;
   ticks?: number;
+  /** Explicit tick values (override automatic ticks). */
+  xTicks?: number[];
+  yTicks?: number[];
   /** Lock aspect so 1 unit in x equals 1 unit in y (for geometry / loss surfaces). */
   equal?: boolean;
   grid?: boolean;
@@ -33,7 +36,8 @@ export interface PlotProps {
 }
 
 /** SVG chart with axes. Children are drawn in data coordinates via the primitives below. */
-export function Plot({ x, y, height = 260, xLabel, yLabel, xFormat, yFormat, logX, logY, ticks = 6, equal, grid = true, children }: PlotProps) {
+export function Plot({ x, y, height = 260, xLabel, yLabel, xFormat, yFormat, logX, logY, ticks = 6, xTicks, yTicks, equal, grid = true, children }: PlotProps) {
+  const M = { ...BASE_M, t: yLabel ? 24 : BASE_M.t };
   const [ref, width] = useWidth<HTMLDivElement>();
   const iw = Math.max(10, width - M.l - M.r);
   const ih = equal ? (iw * (y[1] - y[0])) / (x[1] - x[0]) : height - M.t - M.b;
@@ -43,8 +47,8 @@ export function Plot({ x, y, height = 260, xLabel, yLabel, xFormat, yFormat, log
     return { x: xs, y: ys, w: iw, h: ih };
   }, [x[0], x[1], y[0], y[1], iw, ih, logX, logY]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const xt = ctx.x.ticks(Math.max(2, Math.round((ticks * iw) / 600)));
-  const yt = ctx.y.ticks(Math.max(2, Math.round((ticks * ih) / 260)));
+  const xt = xTicks ?? ctx.x.ticks(Math.max(2, Math.round((ticks * iw) / 600)));
+  const yt = yTicks ?? ctx.y.ticks(Math.max(2, Math.round((ticks * ih) / 260)));
   const fx = xFormat ?? ctx.x.tickFormat(xt.length);
   const fy = yFormat ?? ctx.y.tickFormat(yt.length);
 
@@ -74,7 +78,7 @@ export function Plot({ x, y, height = 260, xLabel, yLabel, xFormat, yFormat, log
               <text key={t} x={-8} y={ctx.y(t)} dy="0.32em" textAnchor="end">{fy(t)}</text>
             ))}
             {xLabel && <text x={iw} y={ih + 30} textAnchor="end">{xLabel}</text>}
-            {yLabel && <text x={-M.l + 2} y={-2} textAnchor="start" dy="0.32em" transform={`translate(0,0)`}>{yLabel}</text>}
+            {yLabel && <text x={-M.l + 2} y={-14} textAnchor="start" dy="0.32em">{yLabel}</text>}
           </g>
           <PlotCtx.Provider value={ctx}>
             <g clipPath={`url(#clip-${iw}-${ih})`}>{children}</g>

@@ -23,8 +23,8 @@ The tn order is the serial order. Validation and write run as one short critical
 <OccStepperDemo />
 </Predict>
 
-1. Step through **Stale read** with **Backward** validation. T2 commits with tn = 1. T1 compares its read set {x, y} with the write set {x} of T2. The overlap {x} aborts T1, and 3 operations are wasted.
-2. Select **Forward**. Now T2, at its validation, compares its write set {x} with the read sets of the active transactions. T1 read x, so T1 aborts at once. Only 1 operation is wasted.
+1. Step through **Stale read** with **Backward** validation. T2 commits with tn = 1. T1 compares its read set `{x, y}` with the write set `{x}` of T2. The overlap `{x}` aborts T1, and 3 operations are wasted.
+2. Select **Forward**. Now T2, at its validation, compares its write set `{x}` with the read sets of the active transactions. T1 read x, so T1 aborts at once. Only 1 operation is wasted.
 3. Select **Started after the commit**. T3 reads x after T2 committed. Its start tn is 1, so backward validation ignores T2, and all three transactions commit.
 4. Select **Two blind writes**. Both transactions write x and read nothing. Both pass validation, and the tn order (T2, then T1) decides which value stays.
 

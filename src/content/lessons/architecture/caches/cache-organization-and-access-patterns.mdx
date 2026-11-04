@@ -1,0 +1,87 @@
+---
+summary: How an address maps to a cache set, the three kinds of miss, and why the same data can be 15× slower to read in a different order.
+---
+import { CacheDemo } from "@/demos/CacheDemo";
+
+A load that hits in L1 cache takes about 1 ns. A load that goes to DRAM takes about 80 ns. Whether your loop runs at memory speed or cache speed depends on two things: **how the cache maps addresses** and **the order in which you touch memory**. The simulator below is a real set-associative cache written in Rust and compiled to WebAssembly. Every access you see is actually simulated.
+
+<Predict
+  id="col-major"
+  question="A 64×64 matrix of 4-byte ints (16 KiB) is summed through a 4 KiB direct-mapped cache with 64-byte lines. Row by row, the hit rate is 93.8%. What is it if you sum column by column instead?"
+  options={["About the same, 93.8%", "About half, ~47%", "About 0%"]}
+  answer={2}
+  explain="Each column access jumps 256 bytes, onto a new line. By the time the walk comes back for the next column (which uses the same lines), those lines have been evicted. Load the column-major pattern in the demo to see it."
+>
+<CacheDemo />
+</Predict>
+
+## Anatomy of an address
+
+A cache of size $S$ with $B$-byte lines and associativity $W$ (ways per set) has $S/(B \cdot W)$ sets. Every address splits into three fields:
+
+| tag | set index | offset |
+|---|---|---|
+| everything else | $\log_2(\text{sets})$ bits | $\log_2 B$ bits |
+
+The default setup (4 KiB, 64 B lines, direct-mapped) has 64 sets: 6 offset bits, 6 index bits, and the remaining 20 bits of a 32-bit address as tag. A line can live **only** in the set its index bits select. Within that set it can occupy any of the $W$ ways. Direct-mapped means $W = 1$; fully associative means a single set containing every line.
+
+Back to the column walk. A row of the matrix is 256 B = 4 lines, so row $i$ starts at line $4i$, which maps to set $4i \bmod 64$. **Only 16 of the 64 sets are ever used**, and 64 rows compete for them. The cache has room for the whole column. It just can't *place* it.
+
+<Predict
+  id="full-assoc"
+  question="Same column-major walk, same 4 KiB, but the cache is now fully associative (LRU). Hit rate?"
+  options={["Still about 0%: the cache is too small", "93.8%, the same as row-major", "About 50%"]}
+  answer={1}
+  explain="One column touches 64 distinct lines, and the cache holds exactly 64. With free placement, all of them stay resident, and the next 15 columns reuse those lines. The misses were caused by the mapping, not by the capacity."
+/>
+
+## The three C's
+
+Mark Hill's classification splits every miss by its cause. The simulator labels each access this way, using a shadow fully-associative LRU cache of the same size:
+
+- **Compulsory**: first touch of a line. No cache avoids it, apart from prefetching. Larger lines reduce it, because more bytes arrive per miss.
+- **Capacity**: the working set doesn't fit; even a fully associative cache would miss. Fix it by making the cache bigger or the working set smaller (tiling, compact data).
+- **Conflict**: the line was evicted only because too many lines mapped to its set. Fix it with associativity, or by changing the address pattern (padding, a different layout).
+
+Try **Two arrays, 8 KiB apart** at 4 KiB direct-mapped: every access is a conflict miss, because `a[i]` and `b[i]` have the same index bits. Switching to 2-way, or growing the cache to 16 KiB, takes it to 93.8%. Power-of-two strides and sizes are a classic cause of conflict misses in real code; the usual fix is to pad arrays by one cache line.
+
+## Replacement policy and a counter-intuitive case
+
+When a set is full, something must be evicted. **LRU** (least recently used) is the textbook answer, and hardware approximates it (tree pseudo-LRU, RRIP).
+
+<Predict
+  id="lru-loop"
+  question="A loop repeatedly touches 96 distinct lines (6 KiB) in the same order. The cache is fully associative with 64 lines (4 KiB). Which policy gets the most hits?"
+  options={["LRU", "FIFO", "Random", "They're all about the same"]}
+  answer={2}
+  explain="With a cyclic working set larger than the cache, LRU always evicts exactly the line that will be needed soonest, so it gets 0% hits. Random replacement keeps some lines by chance and gets about 41% here. Even direct-mapped beats fully associative LRU (about 33%)."
+/>
+
+Check it: choose **Loop over 6 KiB, one access per line**, set Full associativity, and switch between LRU, FIFO and Random. Then try 8 KiB. Once the working set fits, every policy is near-perfect. This pathology is why modern last-level caches use scan-resistant policies (RRIP, adaptive insertion) rather than pure LRU.
+
+## The cost model
+
+$$
+\text{AMAT} = t_\text{hit} + \text{miss rate} \times \text{miss penalty}
+$$
+
+With a 1 ns hit and an 80 ns penalty, a 93.8% hit rate gives about 6 ns per access, and 0% gives 81 ns. That is a **13× slowdown** for touching the same bytes in a different order. Real hierarchies (L1 ≈ 32–48 KiB, 8–12-way; L2 ≈ 1–2 MiB; L3 shared; all with 64-byte lines) soften this, and hardware prefetchers detect constant strides. The principle still holds at every level.
+
+Associativity isn't free: every way in the set must be compared in parallel on each access, which costs energy and hit latency. That is why L1 caches stay small and modestly associative.
+
+## What to do in your code
+
+- **Traverse memory in layout order.** In C, C++, Rust, Zig and Go, the last index varies fastest (row-major), so put it in the innermost loop.
+- **Tile (block) loops** so the working set fits in cache. This is the key optimization in matrix multiplication, convolutions and stencils.
+- **Prefer struct-of-arrays** when a hot loop reads only some fields, so lines aren't wasted on cold data (Performance → Data-oriented design).
+- **Avoid power-of-two strides** between hot arrays, or pad them.
+- **Measure.** `perf stat -e cache-misses,L1-dcache-load-misses` tells you which case you are in.
+
+<Recall cards={[
+  { q: "How is an address split for a cache with S bytes, B-byte lines and W ways?", a: "offset = log2(B) bits; index = log2(S / (B·W)) bits; tag = the remaining high bits." },
+  { q: "Name the three C's of cache misses and the fix for each.", a: "Compulsory (larger lines or prefetching), capacity (larger cache or smaller working set), conflict (more associativity, or padding/changing the layout)." },
+  { q: "How do you tell a conflict miss from a capacity miss?", a: "A conflict miss would have hit in a fully-associative cache of the same size; a capacity miss would miss there too." },
+  { q: "Cyclic access to a working set slightly larger than a fully-associative LRU cache: hit rate?", a: "0%. LRU always evicts the line that is needed next. Random replacement does better." },
+  { q: "Formula for average memory access time?", a: "AMAT = hit time + miss rate × miss penalty." },
+  { q: "Why can column-major traversal of a row-major matrix miss on every access even when a column fits in the cache?", a: "The row stride maps successive elements to only a few sets (conflict misses), and each access touches a new line, so there is no spatial locality." },
+]} />

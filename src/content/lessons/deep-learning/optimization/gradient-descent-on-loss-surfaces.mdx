@@ -2,6 +2,7 @@
 summary: Why gradient descent zig-zags, what sets the maximum learning rate, and what momentum and Adam actually fix.
 ---
 import { GradientDescentDemo } from "@/demos/GradientDescentDemo";
+import { Tex } from "@/kit";
 
 Every neural network is trained by some variant of one line:
 
@@ -11,7 +12,7 @@ Real loss surfaces have millions of dimensions, but nearly everything that goes 
 
 <Predict
   id="max-lr"
-  question={<>On the bowl $f(x, y) = \tfrac12(x^2 + 20y^2)$, plain gradient descent converges only if the learning rate is below some threshold. What is it?</>}
+  question={<>On the bowl <Tex>{"f(x, y) = \\tfrac12(x^2 + 20y^2)"}</Tex>, plain gradient descent converges only if the learning rate is below some threshold. What is it?</>}
   options={["2", "1", "0.1", "0.01"]}
   answer={2}
   explain="The steep direction has curvature 20. Each step multiplies the y-error by (1 − 20η), which has magnitude below 1 only when η < 2/20 = 0.1. The flat direction plays no part in the limit."

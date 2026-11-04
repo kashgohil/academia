@@ -10,7 +10,9 @@
  * - Relaxed reads collect message views into a pending set that a later acquire fence applies;
  *   relaxed writes after a release fence carry the view from that fence.
  * - RMWs read the latest message and extend its release sequence.
- * - seq_cst operations and fences synchronize through one global view (a total order).
+ * - seq_cst operations and fences agree on one global view of the ATOMIC locations (a total order).
+ *   That view constrains which values seq_cst reads may return. It carries no thread clocks and no
+ *   plain locations, because seq_cst alone does not create happens-before (C++20 [atomics.order]).
  * - Views also carry one event counter per thread, which makes them vector clocks:
  *   a plain access races if it isn't ordered by happens-before with a conflicting access.
  *
@@ -34,6 +36,8 @@ const clockKey = (i: number) => `#${i}`;
 const canon = (v: View) => Object.keys(v).sort().map((k) => `${k}:${v[k]}`).join(",");
 
 export function runCxx(p: Program): Result {
+  const atomicLocs = new Set(p.threads.flat().filter((ins) => ins.op !== "fence" && ins.ord !== "na").map((ins) => (ins as { loc: string }).loc));
+  const scPart = (v: View): View => Object.fromEntries(Object.entries(v).filter(([k]) => atomicLocs.has(k)));
   const start: S = {
     mem: Object.fromEntries(p.locs.map((l) => [l, [{ v: p.init[l] ?? 0, view: {} }]])),
     th: p.threads.map(() => ({ pc: 0, regs: {}, cur: {}, acq: {}, rel: null, clock: 0 })),
@@ -54,7 +58,7 @@ export function runCxx(p: Program): Result {
     if (ins.op === "fence") {
       let cur = t.cur, acq = t.acq, rel = t.rel, sc = s.sc;
       if (isAcq(ins.ord)) cur = join(cur, acq);
-      if (ins.ord === "sc") { cur = join(cur, sc); sc = join(sc, cur); }
+      if (ins.ord === "sc") { cur = join(cur, sc); sc = join(sc, scPart(cur)); }
       if (isRel(ins.ord)) rel = { ...cur };
       return [commit({ ...t, pc: t.pc + 1, cur, rel }, { sc })];
     }
@@ -86,7 +90,7 @@ export function runCxx(p: Program): Result {
         let acq = t.acq;
         if (isAcq(ins.ord)) cur = join(cur, m.view);
         else acq = join(acq, m.view);
-        const sc = ins.ord === "sc" ? join(s.sc, cur) : s.sc;
+        const sc = ins.ord === "sc" ? join(s.sc, scPart(cur)) : s.sc;
         const regs = ins.reg ? { ...t.regs, [ins.reg]: m.v } : t.regs;
         out.push(commit({ ...t, pc: t.pc + 1, regs, cur, acq, clock }, { sc, race, reads }));
       }
@@ -100,7 +104,7 @@ export function runCxx(p: Program): Result {
       const cur = tick({ ...pre, [ins.loc]: ts }, clock);
       const view = isRel(ins.ord) ? cur : t.rel ? join(t.rel, { [ins.loc]: ts }) : { [ins.loc]: ts };
       const mem = { ...s.mem, [ins.loc]: [...msgs, { v: evalVal(ins.val, t.regs), view }] };
-      const sc = ins.ord === "sc" ? join(s.sc, cur) : s.sc;
+      const sc = ins.ord === "sc" ? join(s.sc, scPart(cur)) : s.sc;
       return [commit({ ...t, pc: t.pc + 1, cur, clock }, { mem, sc, race })];
     }
 
@@ -118,7 +122,7 @@ export function runCxx(p: Program): Result {
     else acq = join(acq, m.view);
     const regs = ins.reg ? { ...t.regs, [ins.reg]: ins.kind === "cas" ? +(nv !== null) : m.v } : t.regs;
     if (nv === null) {
-      const sc = ins.ord === "sc" ? join(s.sc, cur) : s.sc;
+      const sc = ins.ord === "sc" ? join(s.sc, scPart(cur)) : s.sc;
       return [commit({ ...t, pc: t.pc + 1, regs, cur, acq, clock }, { sc })];
     }
     const ts = latest + 1;
@@ -127,7 +131,7 @@ export function runCxx(p: Program): Result {
     const own = isRel(ins.ord) ? cur : t.rel ? join(t.rel, { [ins.loc]: ts }) : { [ins.loc]: ts };
     const view = join(own, m.view);
     const mem = { ...s.mem, [ins.loc]: [...msgs, { v: nv, view }] };
-    const sc = ins.ord === "sc" ? join(s.sc, cur) : s.sc;
+    const sc = ins.ord === "sc" ? join(s.sc, scPart(cur)) : s.sc;
     return [commit({ ...t, pc: t.pc + 1, regs, cur, acq, clock }, { mem, sc })];
   };
 

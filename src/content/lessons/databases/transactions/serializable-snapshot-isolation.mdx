@@ -1,0 +1,118 @@
+---
+summary: "Why snapshot isolation allows write skew, how rw-antidependencies and dangerous structures find it, and how PostgreSQL implements serializable snapshot isolation with SIREAD locks, commit-order rules and safe snapshots."
+---
+import { SsiStepperDemo, SsiCountsDemo } from "@/demos/db/TxnDemos";
+
+Snapshot isolation (SI) gives each transaction a frozen view and stops lost updates. It prevents every anomaly in the ANSI list. One anomaly remains: **write skew**. The classic example is a hospital rule: at least one doctor must be on call. Alice and Bob are both on call, and both feel ill at the same moment.
+
+Each transaction counts the doctors on call. Each one sees 2, so each decides that it is safe to leave, and each updates its own row. The two writes touch different rows, so first-updater-wins sees no conflict. Both commit, and nobody is on call.
+
+<Predict
+  id="doctors"
+  question="Under snapshot isolation, T1 and T2 each count the doctors on call (2), and then each sets its own doctor off call. Both start before either commits. What happens?"
+  options={["The second transaction to commit aborts with a write conflict", "Both commit, and no doctor is on call", "The second transaction waits for the first, then sees 1 doctor"]}
+  answer={1}
+  explain="The writes go to different rows (alice and bob), so there is no write-write conflict to detect. Each snapshot still shows 2 doctors. Under SSI, the engine sees that each transaction missed the write of the other, and it aborts one."
+>
+<SsiStepperDemo />
+</Predict>
+
+1. Play the classic order under **Snapshot isolation**. The graph gets two red rw edges: T2 → T1 on alice and T1 → T2 on bob. Both commit, and the final state matches no serial order.
+2. Select **Serializable snapshot isolation** and play again. When T1 commits, the structure T1 → T2 → T1 is complete and T1 committed first. T2 is marked, and it aborts at its commit.
+3. Select **Read-only anomaly**. T3 only reads, and it still sees a state that no serial order explains: the deposit without the penalty that T2 charges later. Under SSI, T2 is the pivot and aborts.
+4. Select **False positive** under SSI. T1 → T2 → T3 is a dangerous structure, and T2 aborts. But no cycle exists: the order T1, T2, T3 explains every read.
+5. Pick your own orders with the T1, T2 and T3 buttons. Find an order where SSI lets every transaction commit in the read-only scenario.
+
+## Dependencies between transactions
+
+Adya (1999) describes a history with three kinds of edges between committed transactions. Each edge says "this one must come first in any equivalent serial order":
+
+- **wr** (read dependency): T1 writes a version, and T2 reads it.
+- **ww** (write dependency): T1 writes a version, and T2 writes the next version of the same row.
+- **rw** (anti-dependency): T1 reads a version, and T2 writes the next version. T1 did not see the write of T2, so T1 must come first.
+
+The history is serializable if this graph has no cycle. Under SI, two concurrent transactions cannot have a ww edge, because first-updater-wins aborts one. They cannot have a wr edge either, because neither sees the other. So between concurrent transactions, only rw edges can exist.
+
+Fekete, Liarokapis, O'Neil, O'Neil and Shasha proved in 2005 that every cycle under SI has a special shape. It contains two rw edges in a row, T_in → T_pivot → T_out, between concurrent transactions. This shape is a **dangerous structure**, and T_pivot is the **pivot**. T_in and T_out can be the same transaction, as in the doctors example. In addition, T_out is the first transaction in the cycle to commit.
+
+## SSI: abort the pivot
+
+Cahill, Röhm and Fekete (SIGMOD 2008) turned the theorem into an algorithm: **serializable snapshot isolation** (SSI). Run SI as usual, track the rw edges, and abort a transaction when a dangerous structure appears. Not every dangerous structure is part of a cycle, so SSI has **false positives**. It never needs to block a reader.
+
+To find rw edges, the engine must remember what each transaction read. It cannot use a normal lock, because reads must not block. So it uses a **SIREAD lock**, which only records the read and blocks nothing. An rw edge appears in two ways:
+
+1. A reader finds a version that it cannot see, written by a concurrent transaction. This gives reader → writer.
+2. A writer creates a new version of a row (or of a predicate) on which a concurrent transaction holds a SIREAD lock. This gives reader → writer as well.
+
+SIREAD locks must outlive the commit. A committed reader can still be T_in of a structure that a later write completes. PostgreSQL keeps them until every overlapping transaction has finished.
+
+## What PostgreSQL adds
+
+PostgreSQL has used SSI for SERIALIZABLE since version 9.1. Ports and Grittner described the design (VLDB 2012). It adds several rules to reduce false positives:
+
+- **Commit order**: abort only if T_out commits first, before T_pivot and T_in. This is the extra fact from the theorem. In the demo, it is the difference between the two SSI rows.
+- **Read-only transactions**: if T_in is read-only, the structure is dangerous only if T_out committed before T_in took its snapshot.
+- **Safe retry**: when possible, abort a transaction that will not hit the same conflict at once on retry. The pivot that has not committed is usually the right choice.
+- **Safe snapshots**: a read-only transaction whose snapshot can never be part of a dangerous structure needs no tracking. `SERIALIZABLE READ ONLY DEFERRABLE` waits until such a snapshot exists, then runs with no SSI cost and no risk of abort.
+
+SIREAD locks live in shared memory at three levels: tuple, page and relation. When a transaction holds too many, PostgreSQL promotes them to a coarser level. A page lock covers rows that the transaction never read, so promotion adds false positives. The limit is `max_pred_locks_per_transaction` (64 by default). A sequential scan takes a relation lock at once, so good indexes reduce aborts under SSI. The error is SQLSTATE 40001: "could not serialize access due to read/write dependencies among transactions".
+
+## How often does it abort?
+
+The next demo runs every interleaving of each scenario under three rules. It counts the runs with an anomaly and the runs where the engine aborted a transaction.
+
+<Predict
+  id="fp"
+  question="In the false-positive scenario, no interleaving under plain SI produces an anomaly. Does SSI with the PostgreSQL rules still abort transactions there?"
+  options={["No: SSI aborts only real cycles", "Yes, in some runs", "Only when a transaction is read-only"]}
+  answer={1}
+  explain="SSI sees only two rw edges in a row, not the whole cycle. In this scenario, T1 → T2 → T3 with T3 committing first looks dangerous, although no edge leads back to T1. The PostgreSQL rules abort in 159 of 524 runs. Without the commit-order rule, the engine aborts in 261 of 407 runs."
+>
+<SsiCountsDemo />
+</Predict>
+
+1. Read **Write skew**. SI breaks the rule in 18 of 20 interleavings. SSI breaks it in none and aborts in 18 of 20. Only the 2 serial orders need no abort.
+2. Read **Read-only anomaly**. SI breaks it in 141 of 4,200 interleavings. SSI with the PostgreSQL rules aborts in 102 of 4,161 runs. Without the commit-order rule, it aborts in 2,413 of 3,064 runs.
+3. Read **False positive**. Every abort here is unnecessary. The commit-order rule removes many of them, but not all.
+
+An abort ends a transaction early, so the number of distinct runs is different for each rule. Compare the shares, not the raw counts.
+
+## Alternatives
+
+SSI is not the only way to stop write skew.
+
+| Method | How | Cost |
+|---|---|---|
+| Strict 2PL with predicate locks | lock what you read, hold it to the end | readers block writers; deadlocks |
+| `SELECT ... FOR UPDATE` | lock the rows that the check reads | does not help when the check finds no rows (the booking case) |
+| Materialize the conflict | add a row that stands for the rule (for example one row per shift), and update it in every transaction | a hot row; you must remember it in every code path |
+| A constraint | `UNIQUE` or a PostgreSQL exclusion constraint on time ranges | only for rules that a constraint can express |
+| SSI | track rw edges, abort the pivot | false positives; every transaction must be able to retry |
+
+For the doctors, the materialized conflict looks like this:
+
+```sql
+-- Both transactions update the same shift row, so first-updater-wins
+-- makes the second one wait and then abort under REPEATABLE READ.
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+UPDATE shift SET version = version + 1 WHERE shift_id = 1234;
+SELECT count(*) FROM doctors WHERE on_call AND shift_id = 1234;
+UPDATE doctors SET on_call = false WHERE name = 'alice' AND shift_id = 1234;
+COMMIT;
+```
+
+## Connect
+
+- [Isolation levels and anomalies](/databases/transactions/isolation-levels-and-anomalies): the matrix in which only SSI and 2PL are clean in every row.
+- [MVCC](/databases/transactions/mvcc): the snapshots and version chains that SSI builds on.
+- [Two-phase locking and deadlocks](/databases/transactions/two-phase-locking-and-deadlocks): the other way to serializability, with waiting instead of aborts.
+- [Spanner and TrueTime](/distributed/transactions/spanner-and-truetime): serializable transactions across machines.
+
+<Recall cards={[
+  { q: "What is an rw-antidependency?", a: "T1 reads a version of a row, and T2 writes the next version. T1 did not see the write of T2, so T1 must come before T2 in any equivalent serial order." },
+  { q: "What is a dangerous structure?", a: "Two rw edges in a row between concurrent transactions: T_in → T_pivot → T_out. Every cycle under snapshot isolation contains one, and T_out is the first in the cycle to commit." },
+  { q: "Why can SSI abort a serializable execution?", a: "It sees only two consecutive rw edges, not the whole cycle. A dangerous structure without an edge back to T_in is not a cycle, but SSI still aborts. This is a false positive." },
+  { q: "What is a SIREAD lock, and why must it outlive the commit?", a: "A record that a transaction read a row, page or relation. It blocks nothing. A committed reader can still become T_in of a structure that a later write completes." },
+  { q: "What does SERIALIZABLE READ ONLY DEFERRABLE do in PostgreSQL?", a: "It waits for a safe snapshot, which can never be part of a dangerous structure. Then the transaction runs with no SIREAD tracking and can never fail with a serialization error." },
+  { q: "Why does SELECT ... FOR UPDATE not fix the room booking write skew?", a: "The check finds no existing bookings, so there are no rows to lock. Both transactions insert. You need a predicate lock, a constraint, a materialized conflict or SSI." },
+]} />

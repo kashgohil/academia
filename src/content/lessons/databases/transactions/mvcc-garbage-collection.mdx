@@ -1,0 +1,101 @@
+---
+summary: "Why old row versions pile up, the oldest-snapshot horizon, PostgreSQL VACUUM, autovacuum, freezing and 32-bit transaction id wraparound, InnoDB purge and the history list, and HOT pruning."
+---
+import { BloatTimelineDemo, XidRingDemo } from "@/demos/db/TxnMvccDemos";
+
+MVCC keeps an old version for every reader that might still need it. Each update and each delete leaves one version behind. When no snapshot can see a version any more, it is **dead**, and its space can be used again. Finding and removing dead versions is **garbage collection**. If it falls behind, the table **bloats**: it grows, scans read dead data, and caches hold less useful data.
+
+A version that died at time d can go only when every running snapshot started after d. So the engine computes a **horizon**: the start of the oldest snapshot that is still running. Everything that died before the horizon is removable. One old snapshot holds back the horizon for the whole database.
+
+<Predict
+  id="bloat"
+  question="A table of 1,000 rows gets 20 updates per tick, and autovacuum keeps the dead versions at a few hundred. Then one transaction holds a snapshot for 300 ticks. What is the peak number of dead versions?"
+  options={["About 400, because autovacuum still runs", "About 6,000", "About 1,000: one per row"]}
+  answer={1}
+  explain="Every version that dies after the snapshot started must stay, because the snapshot might read it. 300 ticks of 20 updates gives 6,000 versions. Autovacuum keeps running, but most of its runs remove nothing."
+>
+<BloatTimelineDemo />
+</Predict>
+
+1. Read the plot with the default 300 ticks. The red area grows in a straight line while the long transaction runs, to a peak of 6,000 dead versions. When it ends, the next vacuum removes them all at once.
+2. Read the vacuum marks. Autovacuum runs 44 times, and 28 runs remove nothing. Each run still reads the table. The dead count stays above the trigger, so autovacuum starts again and again.
+3. Move the duration to 0. The peak is 400 dead versions, and the file ends at 28 pages instead of 140. The dashed line is the file size. It never goes down, because VACUUM makes space reusable but does not give it back to the file system.
+4. Move **Updates per tick** up. The bloat grows with the update rate times the duration of the oldest snapshot.
+
+## What holds the horizon back
+
+In PostgreSQL, the horizon is the oldest xmin among several sources. Each one can cause bloat:
+
+- a long query or transaction, also a read-only one at REPEATABLE READ;
+- a session that is **idle in transaction**: the application opened a transaction and forgot it (`idle_in_transaction_session_timeout` can end it);
+- a **replication slot** whose consumer is slow or gone;
+- a standby with `hot_standby_feedback = on` that runs a long query;
+- a **prepared transaction** of two-phase commit that nobody finished.
+
+The `backend_xmin` column of `pg_stat_activity` and the `xmin` columns of `pg_replication_slots` and `pg_prepared_xacts` show the culprits. The root cause is almost always a long-running transaction. Tuning VACUUM cannot fix it.
+
+## PostgreSQL VACUUM
+
+A plain `VACUUM` runs beside normal traffic. It works in phases:
+
+1. Scan the heap and collect the ids of dead tuples. Skip pages that the **visibility map** marks all-visible. The map has 2 bits per heap page: all-visible and all-frozen.
+2. Remove the dead entries from every index.
+3. Free the dead tuples in the heap, record the space in the **free space map**, and set visibility map bits again.
+
+VACUUM truncates only empty pages at the end of the file. `VACUUM FULL` rewrites the whole table into a new file, but it holds an ACCESS EXCLUSIVE lock for the whole time.
+
+**Autovacuum** wakes every `autovacuum_naptime` (1 minute by default). It vacuums a table when its dead tuples exceed `autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor × reltuples`. The defaults are 50 and 0.2. So a table of 1,000 rows needs 250 dead tuples, and a table of 1,000,000 rows needs 200,050. For a large table, 20% dead is a lot of bloat, so busy large tables often get a smaller scale factor.
+
+Many dead tuples go away even without VACUUM. When a query reads a page that is nearly full, PostgreSQL **prunes** it. It removes dead tuples of HOT chains inside the page and leaves a redirect line pointer for the index. Pruning needs no index work, because a HOT chain has only one index entry.
+
+## InnoDB purge
+
+InnoDB keeps the newest version in the table, so its table does not fill with dead rows. The old versions are in the **undo log**. When a transaction commits, its update undo records go to the **history list**. **Purge threads** (`innodb_purge_threads`, 4 by default) remove the records that no read view can need. They also remove index entries that were delete-marked.
+
+`SHOW ENGINE INNODB STATUS` reports the **history list length**: the number of committed transactions whose undo is not yet purged. A long transaction holds an old read view, so purge stops and the history list grows. Then the undo tablespace grows, and every query that reads an old version must walk a longer undo chain. The symptom is different from PostgreSQL, but the root cause is the same.
+
+## Transaction id wraparound
+
+PostgreSQL stores xmin and xmax as 32-bit numbers. There are 2^32 = 4,294,967,296 transaction ids, and the counter wraps around. So "older" cannot mean "smaller". PostgreSQL compares two normal ids on a ring. Id a is older than id b when the 32-bit difference a − b is negative as a signed integer. Each id sees 2^31 = 2,147,483,648 ids in its past and the same number in its future.
+
+```rust
+/// TransactionIdPrecedes for normal XIDs (3 and above): compare on a ring of 2^32.
+fn xid_precedes(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+```
+
+<Predict
+  id="wrap"
+  question="A row was inserted and committed, and nobody ever froze it. Since then, 2.2 billion transactions have used ids. What does a new query see?"
+  options={["The row, as usual", "Nothing: the row seems to be in the future, so it disappears", "An error that asks you to run VACUUM"]}
+  answer={1}
+  explain="2.2 billion is more than 2^31. On the ring, the old xmin is now on the future side of the current id. The visibility rule then treats the row as written by a transaction that has not started yet. Freezing prevents this, and PostgreSQL refuses new ids before it can happen."
+>
+<XidRingDemo />
+</Predict>
+
+1. Move the slider past 2.15 G. The row crosses from the past half into the future half, and it becomes invisible. Committed data disappears, although it is still on disk.
+2. Turn on **VACUUM froze the row**. A frozen row is older than every normal id, at any age. Before 9.4, freezing wrote the special id 2 (FrozenTransactionId) into xmin. Now it sets two hint bits and keeps xmin for debugging.
+3. Set 1,000 write transactions per second. The ring is half used in 24.9 days. With the default `autovacuum_freeze_max_age` of 200 million, an aggressive anti-wraparound vacuum starts every 2.3 days.
+4. Set 10,000 per second. The ring is half used in 2.5 days. A busy database depends on freezing to keep running.
+
+Freezing has three settings. `vacuum_freeze_min_age` (50 million) says how old a tuple must be before a normal VACUUM freezes it. `vacuum_freeze_table_age` (150 million) makes VACUUM scan every page that is not all-frozen. `autovacuum_freeze_max_age` (200 million) starts an anti-wraparound autovacuum on a table even if autovacuum is off. The oldest unfrozen id of each table is `relfrozenxid`, and `age(datfrozenxid)` shows it for each database.
+
+If freezing cannot keep up, PostgreSQL warns when fewer than 40 million ids remain. Close to the limit, it refuses to assign new ids, so the database accepts only reads until an administrator runs VACUUM. What stops freezing? The same things that stop garbage collection: a long transaction, a forgotten replication slot or an old prepared transaction. A frozen tuple must be visible to everyone, so VACUUM cannot freeze past the horizon.
+
+## Connect
+
+- [MVCC](/databases/transactions/mvcc): where the versions come from in each engine.
+- [Read, write and space amplification](/databases/storage/read-write-and-space-amplification): bloat is space amplification, and it costs reads too.
+- [Compaction: leveled vs tiered](/databases/lsm/compaction-leveled-vs-tiered): LSM trees also keep old versions until a background job drops them, and snapshots hold them back the same way.
+- [Epoch-based reclamation](/concurrency/lock-free/epoch-based-reclamation): one stalled thread stops reclamation for everyone, exactly like one old snapshot.
+
+<Recall cards={[
+  { q: "What is the horizon in MVCC garbage collection?", a: "The start of the oldest snapshot that is still running. Only versions that died before it can be removed, so one old snapshot holds back cleanup for the whole database." },
+  { q: "Name three things in PostgreSQL that can hold back the horizon.", a: "A long-running transaction, a session that is idle in transaction, and a slow or abandoned replication slot. A standby with hot_standby_feedback and a forgotten prepared transaction also do it." },
+  { q: "When does autovacuum vacuum a table?", a: "When its dead tuples exceed autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor × reltuples, by default 50 + 0.2 × rows. It checks every autovacuum_naptime, 1 minute by default." },
+  { q: "Why does a plain VACUUM not shrink the table file?", a: "It only marks the space of dead tuples as free for new rows in the free space map. Only empty pages at the end of the file are truncated. VACUUM FULL rewrites the table, under an exclusive lock." },
+  { q: "Why does PostgreSQL need to freeze tuples?", a: "XIDs are 32 bits and are compared on a ring with 2^31 ids in the past. An unfrozen xmin older than that would look like a future id, and the row would disappear. A frozen tuple counts as older than every id." },
+  { q: "What does a growing InnoDB history list length tell you?", a: "Purge cannot remove committed undo records, usually because a long transaction holds an old read view. The undo log grows, and reads of old versions walk longer chains." },
+]} />

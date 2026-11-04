@@ -1,0 +1,136 @@
+---
+summary: "What atomicity, consistency, isolation and durability mean exactly, and how schedules and precedence graphs tell you if concurrent transactions are safe."
+---
+import { BankCrashDemo, ScheduleBuilderDemo } from "@/demos/db/TxnDemos";
+
+A **transaction** is a group of reads and writes that the database treats as one unit. The unit either happens completely or does not happen at all. Other transactions see it as if it ran alone. The four letters of **ACID** name these promises. Each letter has a precise meaning, and each one fails in a different way.
+
+<Predict
+  id="crash"
+  question="Three transfers run one after another. T1 moves 30 from A to B, T2 moves 50 from B to C, and T3 moves 20 from C to A. Each account starts at 100. The database writes each balance in place, with no log. The machine crashes after step 4: T2 has debited B but not credited C. After restart, what is the total money?"
+  options={["300, because each transfer keeps the total", "250", "270"]}
+  answer={1}
+  explain="The debit of 50 from B reached the disk, but the credit to C did not. Restart sees only the disk, so 50 is gone. With an undo log, recovery sees that T2 has no commit record and writes back the old value of B."
+>
+<BankCrashDemo />
+</Predict>
+
+1. Move the slider from 0 to 9 without the log. The total is wrong after steps 1, 4 and 7, so 3 of the 10 crash points break the invariant. Each bad point is between a debit and its credit.
+2. Turn on **Undo log** and move the slider again. The total is 300 at every crash point. Recovery removes the effects of each transfer that has no commit record.
+3. Set the crash after step 4 with the log. Recovery undoes T2, so B goes back from 80 to 130. T1 stays, because its commit record reached the disk.
+
+## The four letters, precisely
+
+| Letter | Promise | Who keeps it | Typical mechanism |
+|---|---|---|---|
+| Atomicity | all or nothing, on abort or crash | the engine | undo log, write-ahead log, shadow pages |
+| Consistency | the data satisfies its invariants | the application, helped by constraints | `CHECK`, `UNIQUE`, `FOREIGN KEY`, triggers |
+| Isolation | concurrent transactions act like some serial order | the engine, to the level you ask for | locks, multiversion snapshots, validation |
+| Durability | a committed transaction survives a crash | the engine and the storage stack | log forced to disk (`fsync`) before the commit returns |
+
+**Atomicity** is about failure, not about concurrency. A transaction can end in two ways: commit or abort. An abort can come from the application, from the engine (for example a deadlock victim) or from a crash. In each case, the engine must remove every change of the transaction.
+
+Engines do this in different ways. PostgreSQL never overwrites a row in place. It writes a new row version and marks the transaction committed or aborted in its commit log. InnoDB writes rows in place and keeps the old values in an **undo log**. SQLite uses a rollback journal or a write-ahead log, which is a log that gets each change before the data file does.
+
+**Consistency** is the odd letter. The engine cannot know that the total money must stay 300. Only declared constraints are checked by the engine. All other invariants are the job of the application: each transaction must move the data from one valid state to another valid state. The other three letters make sure that this local promise still holds under crashes and concurrency.
+
+**Isolation** says that concurrent transactions behave as if they ran in some serial order. Full isolation is called **serializability**. Most engines give a weaker level by default, as the next lesson shows.
+
+**Durability** says that after the commit returns, the changes survive a power loss. The engine forces the log to stable storage before it reports success. The [durability lesson](/databases/storage/durability-fsync-torn-writes-and-checksums) shows why this is harder than it looks.
+
+## Schedules
+
+To reason about isolation, we use a simple model. A **schedule** is the order in which the operations of several transactions run. We write `r1(x)` for "T1 reads x" and `w2(x)` for "T2 writes x". A **serial schedule** runs the transactions one after another, with no interleaving. A schedule is **serializable** if it has the same effect as some serial schedule.
+
+Two operations **conflict** if they come from different transactions, touch the same item, and at least one of them writes. There are three kinds: read-write, write-read and write-write. You can swap two adjacent operations that do not conflict, and no transaction can see the difference. Two schedules are **conflict equivalent** if such swaps turn one into the other.
+
+The **precedence graph** has one node for each transaction. It has an edge Ti → Tj when an operation of Ti comes before a conflicting operation of Tj. The edge says: in any equivalent serial order, Ti must come first.
+
+<Steps>
+1. If the graph has no cycle, sort it topologically. This gives a serial order where every edge points forward.
+2. Every conflicting pair is already in this order in the schedule. So we can swap the non-conflicting pairs until the schedule is serial.
+3. If the graph has a cycle T1 → T2 → T1, any serial order must put T1 before T2 and T2 before T1. No such order exists.
+4. So a schedule is **conflict serializable** exactly when its precedence graph has no cycle.
+</Steps>
+
+<Predict
+  id="two-updates"
+  question="T1 runs r1(x) w1(x). T2 runs r2(x) w2(x). There are 6 ways to interleave them while each keeps its own order. How many are conflict serializable?"
+  options={["6, because each transaction is short", "4", "2: only the serial schedules"]}
+  answer={2}
+  explain="If one read comes before the other transaction's write, and the other read comes before this transaction's write, you get edges in both directions. Every interleaving that is not serial has that shape. So only the 2 serial schedules are safe. This is the lost update."
+>
+<ScheduleBuilderDemo />
+</Predict>
+
+1. Select **Two updates of x** and tap `r(x)` of T2 to move it before `w(x)` of T1. The graph gets edges in both directions. The serial orders give x = 220 or x = 210, but this schedule gives a value that neither order gives.
+2. Select **Transfer and audit**. Of its 15 interleavings, 10 are conflict serializable. Move both reads of T2 between `w(A)` and `w(B)`. The audit sees A after the debit and B before the credit, so it reads a total of 190.
+3. Select **Three transactions in a ring** and press **Shuffle** a few times. Of 90 interleavings, 42 are conflict serializable. A cycle needs all three edges, so it can be long.
+4. Move the **Operations run** slider. The graph grows one conflict at a time. An engine that checks serializability must act before the cycle closes.
+
+For these three sets, the schedules that give a serial result are exactly the conflict serializable ones. This is not true in general. A schedule with **blind writes** (writes with no read before them) can give a serial result and still have a cycle. **View serializability** accepts these schedules too, but testing it is NP-complete (Papadimitriou, 1979). So real engines aim for conflict serializability or something close to it.
+
+A cycle check is short. The graph is small, because it holds only the active transactions:
+
+```go
+// Conflict-serializability test: build the precedence graph, then look for a cycle.
+type Op struct {
+	Txn   int
+	Write bool
+	Item  string
+}
+
+func Serializable(s []Op, n int) bool {
+	adj := make([][]bool, n)
+	for i := range adj {
+		adj[i] = make([]bool, n)
+	}
+	for j := range s {
+		for i := 0; i < j; i++ {
+			a, b := s[i], s[j]
+			if a.Txn != b.Txn && a.Item == b.Item && (a.Write || b.Write) {
+				adj[a.Txn][b.Txn] = true
+			}
+		}
+	}
+	state := make([]int, n) // 0 new, 1 on stack, 2 done
+	var cyclic func(u int) bool
+	cyclic = func(u int) bool {
+		state[u] = 1
+		for v := 0; v < n; v++ {
+			if adj[u][v] && (state[v] == 1 || state[v] == 0 && cyclic(v)) {
+				return true
+			}
+		}
+		state[u] = 2
+		return false
+	}
+	for u := 0; u < n; u++ {
+		if state[u] == 0 && cyclic(u) {
+			return false
+		}
+	}
+	return true
+}
+```
+
+## Commits and aborts in the schedule
+
+Serializability ignores failures, so we need two more rules. A schedule is **recoverable** if each transaction commits only after every transaction that it read from has committed. If T2 reads a value of T1 and commits first, an abort of T1 cannot be undone correctly.
+
+A schedule **avoids cascading aborts** if transactions read only committed values. Otherwise, one abort can force many readers to abort. A schedule is **strict** if no transaction reads or overwrites an item until its last writer has finished. Strict schedules let the engine undo a write by restoring the old value. Most engines produce strict schedules, and the [locking lesson](/databases/transactions/two-phase-locking-and-deadlocks) shows how.
+
+## Connect
+
+- [Isolation levels and anomalies](/databases/transactions/isolation-levels-and-anomalies): what you get when the engine gives less than serializability.
+- [Write-ahead logging](/databases/recovery/write-ahead-logging) and [ARIES](/databases/recovery/aries): how atomicity and durability survive a crash in a real engine.
+- [Happens-before](/concurrency/atomics/happens-before): the same question, which orders are allowed, asked for memory operations in one machine.
+
+<Recall cards={[
+  { q: "Which kinds of failure does atomicity cover?", a: "Any abort: one that the application asks for, one that the engine forces (for example a deadlock victim), and a crash. In each case every change of the transaction must disappear." },
+  { q: "Why is consistency mostly the job of the application?", a: "The engine checks only declared constraints. Other invariants, like a fixed total of money, are known only to the application, which must keep them in each transaction." },
+  { q: "When do two operations conflict?", a: "When they come from different transactions, touch the same item, and at least one of them is a write." },
+  { q: "How do you test conflict serializability?", a: "Build the precedence graph, with an edge Ti → Tj when an operation of Ti comes before a conflicting operation of Tj. The schedule is conflict serializable exactly when the graph has no cycle." },
+  { q: "How many of the 6 interleavings of r1(x) w1(x) and r2(x) w2(x) are conflict serializable?", a: "2: only the serial ones. Every other interleaving gives edges in both directions." },
+  { q: "What makes a schedule strict, and why do engines want it?", a: "No transaction reads or overwrites an item until the last writer of that item has committed or aborted. Then an abort can restore the old value, and no other transaction must abort with it." },
+]} />

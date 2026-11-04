@@ -1,0 +1,117 @@
+---
+summary: "Multiversion concurrency control: version chains, snapshots and the visibility rule, PostgreSQL tuples with xmin and xmax against InnoDB and Oracle undo, and write-write conflicts under snapshot isolation."
+---
+import { VersionChainDemo, VersionLayoutDemo } from "@/demos/db/TxnMvccDemos";
+
+With locks, a reader waits for a writer, and a writer waits for readers. **Multiversion concurrency control** (MVCC) removes most of this waiting. A write does not destroy the old value. It creates a new **version** of the row, and the old version stays for readers that still need it. Each reader sees the versions that were committed when it took its **snapshot**. So readers never block writers, and writers never block readers.
+
+Three questions define an MVCC design. How does a reader decide which version it may see? Where do the old versions live? And what happens when two writers change the same row? PostgreSQL, InnoDB and Oracle answer each question differently.
+
+<Predict
+  id="snap"
+  question="T101 updates row a from 10 to 20 but has not committed. R1 takes a snapshot now and reads a. Then T101 commits, and R1 reads a again. What does the second read of R1 return?"
+  options={["20, because T101 committed", "10, the same as the first read", "An error, because the row changed"]}
+  answer={1}
+  explain="The snapshot of R1 lists 101 as a running transaction. A change by a transaction in that list stays invisible to R1 forever, even after the commit. So R1 keeps seeing 10. A snapshot taken after the commit (R2) sees 20."
+>
+<VersionChainDemo />
+</Predict>
+
+1. Step to event 4. R1 takes the snapshot xmin = 101, xmax = 102, xip = [101]. Click R1 and read the rule for tuple (0,2): its xmin 101 is in xip, so the tuple is invisible.
+2. Step past the commit of T101. Nothing in the heap changes: only the commit log does. R1 still sees 10. R2 takes a new snapshot and sees 20.
+3. Step through the update and abort of T102. The heap now holds a tuple with a = 30 that no snapshot will ever see. Tuple (0,2) has xmax = 102, but an aborted xmax does not count.
+4. Step through the delete by T103. A delete only sets xmax. R3 took its snapshot while 103 was running, so R3 still sees 20. R4, after the commit, sees no row.
+
+## Snapshots and the visibility rule
+
+Each writing transaction gets a **transaction id** (XID) from a counter. A read-only transaction in PostgreSQL gets no XID at all, only a virtual id. A snapshot is three things:
+
+- **xmin**: every XID below it has finished.
+- **xmax**: the next XID to assign. Every XID at or above it started after the snapshot.
+- **xip**: the XIDs between them that were still running.
+
+An XID is **visible to the snapshot** if it committed, it is below xmax, and it is not in xip. A tuple is visible if its creator is visible and its deleter (if any) is not. In code:
+
+```rust
+#[derive(Clone, Copy, PartialEq)]
+enum Xact { InProgress, Committed, Aborted }
+
+struct Snapshot { xmin: u32, xmax: u32, xip: Vec<u32> }
+
+impl Snapshot {
+    fn sees(&self, xid: u32, state: impl Fn(u32) -> Xact) -> bool {
+        state(xid) == Xact::Committed && xid < self.xmax && !self.xip.contains(&xid)
+    }
+}
+
+/// Reduced HeapTupleSatisfiesMVCC for a reader without its own XID.
+/// (Real XIDs wrap around; the MVCC garbage collection lesson shows how comparisons handle that.)
+fn visible(t_xmin: u32, t_xmax: u32, s: &Snapshot, state: impl Fn(u32) -> Xact + Copy) -> bool {
+    if !s.sees(t_xmin, state) {
+        return false; // creator aborted, still running, or started after the snapshot
+    }
+    t_xmax == 0 || !s.sees(t_xmax, state) // no deleter, or the delete is not in the snapshot
+}
+```
+
+The commit state of each XID is in **pg_xact** (formerly called clog), 2 bits per transaction. To avoid a lookup each time, PostgreSQL sets **hint bits** on the tuple when it first learns the outcome.
+
+InnoDB uses a **read view** with the same meaning. It holds the smallest active id, the next id to assign, and the list of active ids. Each row has a hidden 6-byte `DB_TRX_ID` (the last writer) and a 7-byte `DB_ROLL_PTR` (a pointer into the undo log). If the read view cannot see the writer, InnoDB follows the roll pointer and rebuilds the older version from undo records.
+
+When is a snapshot taken? Under snapshot isolation (PostgreSQL REPEATABLE READ), at the first statement of the transaction. Under READ COMMITTED, at the start of each statement. This one difference explains most of the rows in the [anomaly matrix](/databases/transactions/isolation-levels-and-anomalies).
+
+## Where the old versions live
+
+Wu et al. compared MVCC designs in "An Empirical Evaluation of In-Memory Multi-Version Concurrency Control" (VLDB 2017). They found three ways to store versions and two orders for the chain.
+
+| Design | Old versions | Chain order | Engines |
+|---|---|---|---|
+| Append-only | full copies in the same table | oldest to newest (O2N) or newest to oldest (N2O) | PostgreSQL (O2N, inside the heap) |
+| Delta storage | only the changed columns, in a separate undo area | newest to oldest | InnoDB, Oracle |
+| Time-travel | full copies in a separate area, newest in the main table | newest to oldest | SAP HANA, some research systems |
+
+In PostgreSQL, an UPDATE writes a complete new tuple and sets xmax on the old one. The `t_ctid` field of the old tuple points to the new one. If no indexed column changed and the page has room, the update is a **heap-only tuple** (HOT) update, and the indexes get no new entry. Otherwise each index gets a new entry for the new tuple.
+
+<Predict
+  id="layout"
+  question="A row was updated 5 times, so it has 6 versions. A new reader wants the newest version. With InnoDB, how many versions does it examine?"
+  options={["1: the clustered index record is the newest version", "6: it walks the whole chain", "2"]}
+  answer={0}
+  explain="InnoDB updates the row in place and pushes the old values to the undo log. The record in the clustered index is always the newest version, so a current reader stops there. In a PostgreSQL HOT chain, the index points to the oldest tuple, and before pruning the reader checks all 6."
+>
+<VersionLayoutDemo />
+</Predict>
+
+1. Keep **PostgreSQL, HOT update** with 5 updates. A reader that needs version 1 checks 2 tuples. A reader of the newest version checks all 6, until pruning removes the dead ones.
+2. Select **PostgreSQL, indexed column changed**. Now the row has 6 index entries, and an index scan must check all 6 tuples. This is one reason why updates of indexed columns are expensive in PostgreSQL.
+3. Select **InnoDB (undo log)**. The newest version costs 1 visit, but the reader of version 1 walks back 4 undo records and checks 5 versions. Old snapshots pay, and new snapshots do not.
+4. Move **Updates of the row** to 8 and the reader to 0. Compare the two engines. N2O favors new readers, and O2N favors old ones.
+
+There are more trade-offs. Append-only storage needs no undo work at abort: the aborted tuple simply stays invisible. But it writes a full row for each update and fills the heap with dead tuples. Delta storage writes less and keeps the table compact. But an abort must apply the undo records, and a long reader can make the undo chain long. Oracle reports `ORA-01555: snapshot too old` when the undo that a reader needs was overwritten already.
+
+## Two writers, one row
+
+MVCC removes read-write waiting, but two writers on the same row still conflict. Snapshot isolation needs a rule, because the second writer cannot see the version of the first.
+
+- **First-committer-wins**: both writers continue. At commit, a transaction aborts if a concurrent transaction already committed a write to the same row. This is the original definition of Berenson et al.
+- **First-updater-wins**: the second writer waits for the row lock of the first. If the first commits, the second aborts. If the first aborts, the second continues. PostgreSQL and Oracle work this way.
+
+In PostgreSQL, the error is "could not serialize access due to concurrent update" under REPEATABLE READ. Under READ COMMITTED, the second writer does not abort. It rereads the newest version, checks its WHERE clause again, and writes on top. So `UPDATE t SET x = x + 1` is safe under READ COMMITTED, but a separate SELECT followed by an UPDATE is not.
+
+MVCC does not make old versions free. Every update leaves one behind, and someone must remove it. The [garbage collection lesson](/databases/transactions/mvcc-garbage-collection) shows what happens when that cannot keep up.
+
+## Connect
+
+- [Isolation levels and anomalies](/databases/transactions/isolation-levels-and-anomalies): snapshot per statement and snapshot per transaction, side by side.
+- [Serializable snapshot isolation](/databases/transactions/serializable-snapshot-isolation): how to close the one gap that snapshots leave.
+- [Copy-on-write B-trees](/databases/btrees/copy-on-write-b-trees): LMDB gets snapshots from old tree pages instead of row versions.
+- [Epoch-based reclamation](/concurrency/lock-free/epoch-based-reclamation): readers that may still see old nodes, the same problem in memory.
+
+<Recall cards={[
+  { q: "What are xmin, xmax and xip in a PostgreSQL snapshot?", a: "Every XID below xmin has finished. The xmax is the next XID to assign, so XIDs at or above it started later. The list xip holds the XIDs in between that were still running." },
+  { q: "When is a PostgreSQL tuple visible to a snapshot?", a: "Its xmin must have committed, be below the snapshot xmax, and not be in xip. Its xmax must be zero, aborted, or not visible to the snapshot by the same test." },
+  { q: "Where does InnoDB keep old versions, and how does a reader reach them?", a: "In undo records. Each row has DB_TRX_ID and DB_ROLL_PTR. If the read view cannot see the writer, the reader follows the roll pointer and rebuilds the older version." },
+  { q: "What is a HOT update in PostgreSQL?", a: "An update that changes no indexed column and fits on the same page. The new tuple gets no new index entries; the old tuple's t_ctid points to it." },
+  { q: "What is the difference between first-committer-wins and first-updater-wins?", a: "First-committer-wins checks at commit and aborts the later committer. First-updater-wins makes the second writer wait for the first and abort if the first commits; PostgreSQL and Oracle do this." },
+  { q: "Which readers pay for long chains in an N2O design like InnoDB, and which in a PostgreSQL HOT chain?", a: "In InnoDB, old snapshots walk back through undo; the newest version is in the record. In a HOT chain, the index points to the oldest tuple, so new readers walk forward until pruning." },
+]} />

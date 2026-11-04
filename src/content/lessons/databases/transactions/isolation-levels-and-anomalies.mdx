@@ -1,0 +1,128 @@
+---
+summary: "The anomalies that weak isolation lets through, why the ANSI level definitions are ambiguous, and what PostgreSQL, MySQL, SQL Server, Oracle and SQLite really give at each level."
+---
+import { AnomalyExplorerDemo, AnomalyMatrixDemo } from "@/demos/db/TxnDemos";
+
+Serializability is expensive, so most engines give a weaker **isolation level** by default. A weaker level allows some **anomalies**: results that no serial order can give. To choose a level, you must know which anomalies it allows. The names of the levels do not tell you this reliably.
+
+The demo runs a small engine with eight modes. Four use locks: none, read uncommitted (RU), read committed (RC) and repeatable read (RR). One is full two-phase locking with predicate locks (2PL). Three use **snapshots**, which are frozen views of the committed data. These are read committed with a snapshot per statement (RC-s), snapshot isolation (SI) and serializable SI (SSI).
+
+<Predict
+  id="lost"
+  question="x = 10. T1 reads x and writes x + 1. T2 reads x and writes x + 5. Both reads happen before both writes, under READ COMMITTED with locks. Can the final x be 15, which loses the update of T1?"
+  options={["No: read committed prevents it", "Yes: read committed allows a lost update", "Only under read uncommitted"]}
+  answer={1}
+  explain="Read committed only stops you from reading uncommitted data. Both transactions read the committed 10. T2 waits for the write lock of T1, and then writes 10 + 5 on top of 11. The update of T1 is lost."
+>
+<AnomalyExplorerDemo />
+</Predict>
+
+1. Press **Play** with **Lost update** and **Read committed (locks)**. T2 waits at its write, then overwrites 11 with 15. The result matches no serial order: those give 16.
+2. Select **Repeatable read (locks)**. Both transactions now hold shared locks on x, and each one waits for the other to convert to exclusive. This is a deadlock, and the engine aborts T2.
+3. Select **Snapshot isolation**. T2 waits for T1, and then aborts when T1 commits, because x changed after its snapshot. This is **first-updater-wins**.
+4. Select **Write skew** and **Snapshot isolation**. Each doctor counts 2 on call and goes off call. Neither write touches the row of the other, so nothing stops them.
+5. Select **Phantom** and **Repeatable read (locks)**. T1 locks the rows it found, but the new row did not exist then. The second count sees 3 rows.
+
+## The anomalies
+
+Berenson et al. (1995) gave each anomaly a short code and a pattern. Here `r1[P]` is a read of all rows that match a predicate P, and `c1` is a commit.
+
+| Code | Name | Pattern | What goes wrong |
+|---|---|---|---|
+| P0 | dirty write | `w1[x] w2[x]` before T1 ends | an abort of T1 can erase the write of T2; rows can mix two transactions |
+| A1 | dirty read | `w1[x] r2[x] a1` | T2 used a value that never existed |
+| A2 | non-repeatable (fuzzy) read | `r1[x] w2[x] c2 r1[x]` | the same read gives two values |
+| A3 | phantom | `r1[P] w2[y in P] c2 r1[P]` | the same query returns a new row |
+| P4 | lost update | `r1[x] w2[x] w1[x] c1` | one increment disappears |
+| A5A | read skew | `r1[x] w2[x] w2[y] c2 r1[y]` | T1 sees half of a transfer |
+| A5B | write skew | `r1[x] r2[y] w1[y] w2[x]` | each transaction keeps the invariant, together they break it |
+
+Write skew is the subtle one. Each transaction reads a set of rows, checks a condition, and writes a different row. No row gets two writes, so no write-write check can see the problem. Sometimes the read set is empty, as in a booking that checks that no other booking exists. Then the problem is a phantom and a write skew at the same time.
+
+## Every interleaving, every level
+
+The explorer tries one order at a time. The matrix below runs the engine on **every** interleaving of each scenario. A cell shows the number of interleavings with the anomaly. It is A when the engine prevented it by aborting a transaction, and W when a transaction only had to wait.
+
+<Predict
+  id="si-hole"
+  question="Snapshot isolation gives each transaction a frozen view of the committed data and aborts a write to a row that changed after the snapshot. Which anomaly does it still let through?"
+  options={["Phantom", "Lost update", "Write skew"]}
+  answer={2}
+  explain="A snapshot cannot change, so phantoms and fuzzy reads cannot happen, and first-updater-wins stops the lost update. Write skew writes two different rows, so no write ever conflicts. In the matrix, write skew gets through SI in 18 of 20 interleavings."
+>
+<AnomalyMatrixDemo />
+</Predict>
+
+1. Read the **SI** column. Only the two write skew rows are red: 18 of 20 interleavings break the invariant. Only the 2 serial orders are safe.
+2. Read the **RR** column. Locks on rows stop write skew on the doctors, because each transaction locks the two rows it counted. The deadlock aborts one transaction in 4 of 8 runs. But **write skew by insert** gets through in 12 of 16 runs, because no row existed to lock.
+3. Compare **RC** with **RC-s**. The lost update gets through in 8 of 12 runs with locks and in 12 of 14 runs with a snapshot per statement. The row of red cells is the same, so both kinds of read committed allow the same anomalies here.
+4. Read the **2PL** column. Every anomaly is prevented. Predicate locks stop the inserts, and deadlocks cost aborts.
+5. Click a few cells. The caption gives one bad order, which you can enter in the explorer with the **T1** and **T2** buttons.
+
+## Why the ANSI definitions are ambiguous
+
+SQL-92 defines four levels by the phenomena that each one must prevent: dirty read, non-repeatable read and phantom. Berenson, Bernstein, Gray, Melton, O'Neil and O'Neil showed three problems in "A Critique of ANSI SQL Isolation Levels" (1995).
+
+1. The English text allows two readings. The **strict** reading forbids only the anomaly itself, for example a dirty read followed by an abort. The **broad** reading forbids the dangerous pattern, for example any read of uncommitted data. Only the broad reading makes the top level serializable.
+2. The list misses anomalies. Dirty write (P0) is not in it, but every real level must forbid it, or rollback cannot work. Lost update and the two skews are also missing.
+3. Snapshot isolation fits nowhere. It prevents all three ANSI phenomena in the strict reading, so it looks serializable. It still allows write skew.
+
+So a level name is a promise about a few patterns, not a guarantee. The real behavior depends on the mechanism, locks or snapshots, and each engine maps the names differently.
+
+## What engines give at each name
+
+| Engine | READ UNCOMMITTED | READ COMMITTED | REPEATABLE READ | SERIALIZABLE | default |
+|---|---|---|---|---|---|
+| PostgreSQL | same as RC | snapshot per statement | snapshot isolation | SSI (since 9.1) | RC |
+| MySQL InnoDB | reads the newest row, even uncommitted | snapshot per statement, few gap locks | snapshot for plain reads; locking reads and UPDATE use the newest row and next-key locks | RR where plain SELECTs take shared locks | RR |
+| SQL Server | no shared locks | short shared locks, or a snapshot per statement with `READ_COMMITTED_SNAPSHOT` | shared locks held to the end | key-range locks (2PL) | RC with locks |
+| Oracle | not available | snapshot per statement | not available | snapshot isolation | RC |
+| SQLite | (shared cache only) | not available | not available | one writer at a time, always serializable | serializable |
+
+Three entries need care. PostgreSQL REPEATABLE READ is snapshot isolation, so it allows write skew. It aborts a lost update with "could not serialize access due to concurrent update". Oracle SERIALIZABLE is also snapshot isolation, so it also allows write skew (error ORA-08177 is its write conflict).
+
+InnoDB REPEATABLE READ is not snapshot isolation. A plain SELECT reads the snapshot, but an UPDATE reads the newest committed row and does not abort. So a read-modify-write in two statements loses updates under the MySQL default. SQL Server also has a SNAPSHOT level, which is SI, and it reports a write conflict as error 3960.
+
+## Living with weak levels
+
+The practical rules follow from the matrix. Under any snapshot level, protect a read-modify-write with `SELECT ... FOR UPDATE`, or do the change in one statement, such as `UPDATE t SET x = x + 1`. A check across rows ("at least one doctor on call") needs SERIALIZABLE, or a lock on a row that stands for the whole check. And at SERIALIZABLE, every transaction must be ready to retry:
+
+```go
+// Retry a transaction that fails with SQLSTATE 40001 (serialization failure)
+// or 40P01 (deadlock detected). The work must be safe to run again.
+func WithRetry(ctx context.Context, db *sql.DB, work func(*sql.Tx) error) error {
+	for attempt := 0; ; attempt++ {
+		tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+		if err != nil {
+			return err
+		}
+		if err = work(tx); err == nil {
+			err = tx.Commit()
+		} else {
+			tx.Rollback()
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01") && attempt < 10 {
+			time.Sleep(time.Duration(1<<attempt) * time.Millisecond) // back off, then try again
+			continue
+		}
+		return err
+	}
+}
+```
+
+## Connect
+
+- [Two-phase locking and deadlocks](/databases/transactions/two-phase-locking-and-deadlocks): the lock-based levels in the matrix.
+- [MVCC](/databases/transactions/mvcc): how a snapshot is built from row versions.
+- [Serializable snapshot isolation](/databases/transactions/serializable-snapshot-isolation): how the SSI column turns the write skew cells into aborts.
+- [Linearizability](/distributed/consistency/linearizability): a different guarantee, about single objects and real time, that is often confused with serializability.
+
+<Recall cards={[
+  { q: "What is write skew?", a: "Two transactions read overlapping data, check a condition, and write different rows. Each keeps the invariant alone, but together they break it. No row gets two writes, so write-write checks cannot see it." },
+  { q: "Which anomaly does snapshot isolation allow?", a: "Write skew, including the phantom form where the check reads an empty set. SI prevents dirty reads, fuzzy reads, phantoms in its snapshot and lost updates." },
+  { q: "Name two problems that Berenson et al. found in the ANSI definitions.", a: "The English allows a strict and a broad reading, and only the broad one gives serializability. The list also misses dirty write, lost update and the skews, so snapshot isolation looks serializable when it is not." },
+  { q: "What does PostgreSQL give for REPEATABLE READ and SERIALIZABLE?", a: "REPEATABLE READ is snapshot isolation. SERIALIZABLE is serializable snapshot isolation (SSI), which aborts transactions in dangerous structures." },
+  { q: "Why can a read-modify-write lose updates under the MySQL default?", a: "InnoDB REPEATABLE READ reads a snapshot for plain SELECTs, but an UPDATE reads the newest committed row and does not abort. So the write can be based on an old value." },
+  { q: "Why does repeatable read with row locks stop the doctors write skew but not the booking write skew?", a: "The doctors transactions lock the rows they counted, so they deadlock and one aborts. The booking transactions count zero rows, so there is no row to lock, and both inserts go through." },
+]} />

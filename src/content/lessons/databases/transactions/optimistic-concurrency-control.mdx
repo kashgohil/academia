@@ -1,0 +1,138 @@
+---
+summary: "Run first, check at commit: the read, validate and write phases of Kung and Robinson, backward and forward validation, Silo-style version words, version columns in applications, and when optimism loses."
+---
+import { OccStepperDemo, OccSkewDemo } from "@/demos/db/TxnLockDemos";
+
+Locking assumes that conflicts are common, so it makes every transaction ask first. **Optimistic concurrency control** (OCC) assumes that conflicts are rare. A transaction runs without locks, keeps its writes private, and checks for conflicts only at the end. If the check fails, the transaction aborts and runs again.
+
+Kung and Robinson described the method in 1981. Each transaction has three phases:
+
+1. **Read phase**: read committed data, and record each item in the **read set**. Put each write in a private buffer, the **write set**.
+2. **Validation phase**: check that no conflicting transaction makes this one non-serializable.
+3. **Write phase**: copy the write set into the database, and take the next **transaction number** (tn) from a global counter.
+
+The tn order is the serial order. Validation and write run as one short critical section, so two transactions never validate at the same time.
+
+<Predict
+  id="stale"
+  question="T1 reads x. Then T2 reads x, writes x, validates and commits. Then T1 reads y, writes y and validates with backward validation. T1 never writes x. What happens to T1?"
+  options={["It commits, because it does not write x", "It aborts, because it read an old x", "It waits until T2 finishes"]}
+  answer={1}
+  explain="T2 committed after T1 started, and the write set of T2 contains x, which is in the read set of T1. So T1 may have used an old value of x. Backward validation aborts T1 after all its work: 3 operations are thrown away."
+>
+<OccStepperDemo />
+</Predict>
+
+1. Step through **Stale read** with **Backward** validation. T2 commits with tn = 1. T1 compares its read set {x, y} with the write set {x} of T2. The overlap {x} aborts T1, and 3 operations are wasted.
+2. Select **Forward**. Now T2, at its validation, compares its write set {x} with the read sets of the active transactions. T1 read x, so T1 aborts at once. Only 1 operation is wasted.
+3. Select **Started after the commit**. T3 reads x after T2 committed. Its start tn is 1, so backward validation ignores T2, and all three transactions commit.
+4. Select **Two blind writes**. Both transactions write x and read nothing. Both pass validation, and the tn order (T2, then T1) decides which value stays.
+
+## Backward and forward validation
+
+**Backward validation** looks into the past. Transaction Tj records the counter value when it starts. At validation, it checks every Ti that committed with a larger tn. If the write set of Ti overlaps the read set of Tj, Tj may have read an old value, and Tj aborts. The committed write sets must be kept until no active transaction started before them.
+
+**Forward validation** looks at the transactions that are still running. Tj checks its own write set against the read sets of the active transactions. On a conflict, the engine can abort Tj or the readers. Forward validation has two advantages. It can abort a doomed reader early, and a read-only transaction always passes, because its write set is empty. Its cost: the read sets of active transactions must be visible to the validator while they still change.
+
+Backward validation does not record when each read happened. So it also aborts Tj when Tj read the new value, after Ti committed. That schedule is serializable, but the set check cannot tell. This is the price of a simple check.
+
+## Silo: OCC without a central counter
+
+A global counter and a validation lock serialize every commit, which limits a multi-core machine. **Silo** (Tu et al., SOSP 2013) removed both. Each record has a 64-bit **TID word** that holds a lock bit and the transaction id of the last writer. A read copies the value and the TID word, then checks that the word did not change during the copy.
+
+The commit protocol has three steps:
+
+1. Lock every record in the write set, in a fixed order (so that two committers cannot deadlock). Then read the current **epoch**, a global number that a background thread advances every 40 ms.
+2. Validate the read set: each TID word must be unchanged, and no other transaction may hold its lock.
+3. Choose a new TID that is larger than every TID seen, inside the current epoch. Write the values, and store the new TID while it releases the lock.
+
+Reads never write shared memory, so readers do not move cache lines between cores. Durability and the serial order work per epoch, not per transaction. The TID word is the same idea as a seqlock and a tagged pointer from the [compare-and-swap lesson](/concurrency/atomics/compare-and-swap).
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering::*};
+
+const LOCK: u64 = 1 << 63;
+
+struct Record { tid: AtomicU64, value: AtomicU64 }
+
+/// Silo-style read: retry until the TID word is stable and unlocked.
+fn read(r: &Record) -> (u64, u64) {
+    loop {
+        let t1 = r.tid.load(Acquire);
+        if t1 & LOCK != 0 { std::hint::spin_loop(); continue; }
+        let v = r.value.load(Acquire);
+        if r.tid.load(Acquire) == t1 { return (v, t1); }
+    }
+}
+
+/// Phase 2 of commit: the read set is valid if no TID changed and no other committer holds a lock.
+fn validate(reads: &[(&Record, u64)], my_writes: &[&Record]) -> bool {
+    reads.iter().all(|(r, seen)| {
+        let now = r.tid.load(Acquire);
+        let locked_by_other = now & LOCK != 0 && !my_writes.iter().any(|w| std::ptr::eq(*w, *r));
+        now & !LOCK == *seen && !locked_by_other
+    })
+}
+```
+
+## OCC in your application
+
+The same idea works on top of any database. Give each row a **version column**. Read the row and its version, compute, and then write only if the version did not change:
+
+```go
+// Optimistic update with a version column. Zero rows changed means that someone else won.
+func Rename(ctx context.Context, db *sql.DB, id int64, name string) error {
+	for {
+		var version int64
+		if err := db.QueryRowContext(ctx, `SELECT version FROM item WHERE id = $1`, id).Scan(&version); err != nil {
+			return err
+		}
+		res, err := db.ExecContext(ctx,
+			`UPDATE item SET name = $1, version = version + 1 WHERE id = $2 AND version = $3`,
+			name, id, version)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 1 {
+			return nil
+		}
+		// Lost the race: read again and retry.
+	}
+}
+```
+
+JPA uses this with `@Version`, and Rails with a `lock_version` column. HTTP has the same pattern with `ETag` and `If-Match`. It holds no lock while a user edits a form for minutes, which a database lock could not do.
+
+## When optimism wins and when it loses
+
+<Predict
+  id="skew"
+  question="16 transactions share 4 cores. Each touches 8 of 1,000 items, and the access skew grows until one item gets 23% of all accesses. Which method throws away a larger share of its work?"
+  options={["2PL, because deadlocks abort transactions", "OCC, because it aborts only at the end", "Both waste about the same"]}
+  answer={1}
+  explain="OCC finds a conflict only at validation, after the whole read phase. So every abort wastes a full transaction. 2PL waits instead, and its deadlock victims are often young. At θ = 1.2, OCC throws away 71% of its work and 2PL 49%."
+>
+<OccSkewDemo />
+</Predict>
+
+1. Read θ = 0, which is uniform access. 2PL gives 0.43 commits per tick and OCC 0.39. OCC already aborts 12% of attempts, but a real lock manager also costs CPU, which this model does not count.
+2. Read θ = 0.8, where the hottest item gets 6.5% of accesses. 2PL throws away 11% of its work and OCC 47%. For OCC, the abort rate and the wasted work are the same line, because every abort happens at the end.
+3. Turn off **CPU limit**. Wasted work now costs nothing, and at θ = 1.4 OCC gives 0.29 commits per tick against 0.10 for 2PL. With free resources, restarting beats waiting in a long queue.
+4. Move **Concurrent transactions** down to 4. Conflicts become rare, and the two methods give almost the same throughput.
+
+So OCC wins with short transactions, low contention, many reads and cheap restarts. It avoids a lock table and its latches, and it can never deadlock. It loses on **hot spots**, such as a counter or the newest rows of a queue. It also loses with long transactions, which have a long window for conflicts. SQL Server In-Memory OLTP (Hekaton) uses OCC and validates at commit. FoundationDB checks read and write sets at commit and limits each transaction to 5 seconds.
+
+## Connect
+
+- [Two-phase locking and deadlocks](/databases/transactions/two-phase-locking-and-deadlocks): the pessimistic method, and its own contention curve.
+- [MVCC](/databases/transactions/mvcc): keep old versions, so that readers never wait and never abort.
+- [Compare-and-swap](/concurrency/atomics/compare-and-swap) and [the lock-free stack](/concurrency/lock-free/lock-free-stack): OCC on one word.
+
+<Recall cards={[
+  { q: "What are the three phases of OCC?", a: "Read phase: read committed data and buffer writes privately. Validation: check for conflicts. Write phase: install the writes and take a transaction number, which gives the serial order." },
+  { q: "What does backward validation check?", a: "The read set of the validating transaction against the write sets of the transactions that committed after it started. An overlap means it may have read an old value, so it aborts." },
+  { q: "Why does a read-only transaction always pass forward validation?", a: "Forward validation compares the write set of the validator with the read sets of active transactions. A read-only transaction has an empty write set." },
+  { q: "What is in a Silo TID word, and how does a read use it?", a: "A lock bit and the id of the last writer. A read loads the word, copies the value, and loads the word again. If the word changed or was locked, it retries." },
+  { q: "How do you do OCC in an application with a version column?", a: "Read the row and its version. Update with WHERE id = ? AND version = ?, and increment the version. If no row changed, another writer won, so read again and retry." },
+  { q: "Why does OCC lose on hot spots?", a: "It finds conflicts only at commit, so each abort throws away a whole transaction, and under skew most transactions conflict. Locking waits instead of redoing work." },
+]} />

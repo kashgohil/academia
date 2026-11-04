@@ -1,0 +1,134 @@
+---
+summary: "Shared and exclusive locks, why two-phase locking gives serializability, intention locks on a hierarchy, and the four ways to deal with deadlocks: detection, timeouts, wait-die and wound-wait."
+---
+import { LockStepperDemo, LockHierarchyDemo, DeadlockSweepDemo } from "@/demos/db/TxnLockDemos";
+
+The oldest way to get serializability is to make transactions wait. Before a transaction reads an item, it takes a **shared lock** (S). Before it writes, it takes an **exclusive lock** (X). Many transactions can hold S on the same item, but X excludes every other lock. A **lock manager** keeps a table of the locks: for each item, the granted group and a queue of waiters.
+
+Waiting has a cost. Two transactions can each wait for a lock that the other holds, and then neither can continue. This is a **deadlock**, and every locking engine must break it.
+
+<Predict
+  id="wound"
+  question="T1 started first, so it is older. T1 holds X on A, and T2 holds X on B. Now T1 asks for X on B. The engine uses wound-wait. What happens?"
+  options={["T1 waits for T2", "T2 is aborted, and T1 gets B at once", "T1 is aborted, because it would cause a deadlock"]}
+  answer={1}
+  explain="Under wound-wait, an older requester never waits for a younger holder. It wounds the holder: the engine aborts T2 and gives its locks away. A younger requester would wait instead. The deadlock never forms."
+>
+<LockStepperDemo />
+</Predict>
+
+1. Keep **Two-way deadlock** and **Detect cycles**. Step to the fourth line. The waits-for graph gets edges T1 → T2 and T2 → T1, the cycle turns red, and the youngest member, T2, is the victim.
+2. Select **Wait-die** and step again. T1 is older, so it waits for B. T2 is younger, so when it asks for A, it dies at once. There is never a cycle.
+3. Select **Upgrade deadlock**. Both transactions hold S on A and want to convert to X. Each conversion waits for the other S lock. This is why engines offer `SELECT ... FOR UPDATE`: take X at the first read.
+4. Select **Three-way cycle** with each policy. Detection aborts T3. Wait-die also aborts T3. Wound-wait aborts T2, the holder that T1 needs. No-wait aborts T1 and T2.
+5. Select **FIFO queue, no deadlock**. T4 asks for S while T1 and T2 hold S. Its request is compatible with them, but T4 still waits behind the X request of T3. A strict queue prevents **starvation** of writers.
+
+## Two-phase locking
+
+Locks alone do not give serializability. If a transaction releases a lock and later takes another one, a second transaction can run between the two parts. **Two-phase locking** (2PL) adds one rule: a transaction must not take a new lock after it releases any lock. So each transaction has a **growing phase**, then a **shrinking phase**. The moment it holds its last new lock is its **lock point**.
+
+<Steps>
+1. Suppose the precedence graph has an edge Ti → Tj. Then an operation of Ti came before a conflicting operation of Tj on some item x.
+2. The two locks on x are incompatible. So Ti released its lock on x before Tj got its lock on x.
+3. Ti released a lock, so Ti was past its lock point. Tj got a lock, so Tj had not passed its lock point. So the lock point of Ti comes before the lock point of Tj.
+4. A cycle T1 → T2 → … → T1 would put the lock point of T1 before itself. This is impossible, so the graph has no cycle.
+5. So every 2PL schedule is conflict serializable, and the order of the lock points is an equivalent serial order.
+</Steps>
+
+Basic 2PL can still release a write lock before commit. Then another transaction can read the uncommitted value, and an abort cascades. **Strict 2PL** holds every X lock until the end of the transaction. **Rigorous 2PL** (also called strong strict 2PL) holds every lock until the end. Real engines use rigorous 2PL, because the end of the transaction is the only moment that the engine knows the transaction will take no more locks.
+
+Row locks do not stop phantoms. A row that does not exist yet has no lock. A serializable engine must lock the **predicate**, which is the set of rows that a query could match. Exact predicate locks are expensive to test, so engines lock ranges of an index. InnoDB uses **next-key locks**: a lock on an index record plus the **gap** before it. An insert into a locked gap must wait. Under REPEATABLE READ, InnoDB takes next-key locks for locking reads, UPDATE and DELETE. The inserter first takes an **insert intention** lock on the gap, which conflicts only with gap locks.
+
+## Lock granularity and intention locks
+
+One lock per row is precise, but a scan of ten million rows would need ten million locks. One lock per table is cheap, but it stops all concurrency on the table. **Multi-granularity locking** (Gray et al., 1976) lets each transaction choose, on a tree of table, page and row. Before a transaction locks a node, it puts an **intention** lock on each ancestor:
+
+- **IS** (intention shared): I will take S somewhere below.
+- **IX** (intention exclusive): I will take X somewhere below.
+- **SIX**: S on this whole node, and X on some nodes below. A scan that updates a few rows uses it.
+
+| held \ requested | IS | IX | S | SIX | X |
+|---|---|---|---|---|---|
+| IS | yes | yes | yes | yes | no |
+| IX | yes | yes | no | no | no |
+| S | yes | no | yes | no | no |
+| SIX | yes | no | no | no | no |
+| X | no | no | no | no | no |
+
+<Predict
+  id="hier"
+  question="T1 reads row r1, so it holds IS on the table, IS on page P1 and S on r1. Can T2 update row r3 on page P2 at the same time?"
+  options={["No: T1 locks the table", "Yes: T2 takes IX on the table, and IX is compatible with IS", "Only if T2 waits for T1 to commit"]}
+  answer={1}
+  explain="IS and IX are compatible, because they only announce locks lower down. The real conflicts happen at the rows, and r1 and r3 are different rows. A whole-table update (X on the table) would conflict with T1."
+>
+<LockHierarchyDemo />
+</Predict>
+
+1. Press **Request** for T2, **Update one row**, r3. T2 gets IX on T, IX on P2 and X on r3.
+2. Select T3 and **Read the whole table**. T3 needs only one lock, S on T. The compatibility table shows the red cell: IX of T2 conflicts with S.
+3. Select **Update the whole table** for T3. X on the table conflicts with both intention locks. The intention locks let the lock manager see this at the root, without a look at any row.
+4. Commit T2 and try **Read all, update one row** for T3. It takes SIX on T. Then T1 can still hold IS, but no other transaction can update a row.
+
+A transaction that takes many row locks can trade them for one table lock. This is **lock escalation**. SQL Server tries it when one statement holds about 5,000 locks on one object. Escalation saves memory, but it can block other transactions and cause new deadlocks. InnoDB never escalates. It stores row locks as a bitmap for each page, so many locks on one page are cheap.
+
+## Deadlocks
+
+There are four ways to deal with deadlocks.
+
+- **Detection**: keep a **waits-for graph**, with an edge A → B when A waits for a lock that B holds. A cycle is a deadlock, and the engine aborts one member, the **victim**. InnoDB checks at each wait (`innodb_deadlock_detect`, on by default) and picks the transaction that changed the fewest rows. PostgreSQL waits `deadlock_timeout` (1 s by default) before it searches, because most waits end quickly. The SQL Server lock monitor looks for cycles every 5 seconds.
+- **Timeouts**: abort any transaction that waits too long. InnoDB uses `innodb_lock_wait_timeout`, 50 s by default. A timeout is simple, but it aborts long waits that were not deadlocks, and it is slow for real ones.
+- **Wait-die** (non-preemptive): each transaction gets a timestamp when it first starts. An older requester waits for a younger holder. A younger requester dies.
+- **Wound-wait** (preemptive): an older requester wounds (aborts) a younger holder. A younger requester waits.
+
+In both timestamp schemes, a wait always goes in one direction of age, so a cycle cannot form. A restarted transaction keeps its first timestamp. It gets older with each restart, so eventually it wins every conflict and cannot starve.
+
+```rust
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Decision { Grant, Wait, AbortRequester, AbortHolders }
+
+/// Wait-die and wound-wait: a smaller timestamp means an older transaction.
+fn decide(policy: &str, requester_ts: u64, holder_ts: &[u64]) -> Decision {
+    if holder_ts.is_empty() {
+        return Decision::Grant;
+    }
+    let older_than_all = holder_ts.iter().all(|&h| requester_ts < h);
+    match policy {
+        "wait-die" if older_than_all => Decision::Wait,
+        "wait-die" => Decision::AbortRequester,
+        // wound-wait: wound the younger holders; wait for the older ones
+        "wound-wait" if holder_ts.iter().any(|&h| requester_ts < h) => Decision::AbortHolders,
+        "wound-wait" => Decision::Wait,
+        _ => Decision::Wait, // detection: wait, then look for a cycle
+    }
+}
+```
+
+## Contention: how the policies compare
+
+The next demo runs a closed system. A fixed number of transactions run at the same time, and when one commits, a new one starts. Each transaction locks 8 random items, half of them for writing.
+
+<DeadlockSweepDemo />
+
+1. With 100 items and no CPU limit, detection is best at 6 transactions, with 0.38 commits per tick. At 32 transactions it falls to 0.15, with 70% of attempts aborted. Long chains of waiting transactions block each other. This is **thrashing**.
+2. Read wait-die and wound-wait. They keep about 0.44 to 0.46 commits per tick, but they abort 83% to 88% of attempts at 32 transactions. They abort early, before a long wait chain can form.
+3. Turn on **CPU limit: 4 cores**. Now each aborted attempt wastes a core. Every curve falls after 6 transactions, and wait-die falls fastest, to 0.09 at 32. Agrawal, Carey and Livny (1987) found the same: with limited resources, blocking beats restarting.
+4. Move **Items in the database** to 5,000. Conflicts become rare, and the four throughput curves stay within 10% of each other. But at 32 transactions, no-wait still aborts 14% of attempts and detection almost none. The timestamp schemes abort on conflicts that would never become deadlocks.
+
+The general lesson: past some number of concurrent transactions, more concurrency gives less throughput. Engines limit concurrency with connection pools and admission control for this reason.
+
+## Connect
+
+- [ACID](/databases/transactions/acid): the precedence graph that the lock-point argument uses.
+- [Optimistic concurrency control](/databases/transactions/optimistic-concurrency-control): no locks during the work, a check at commit.
+- [Latch crabbing and B-link trees](/databases/btrees/latch-crabbing-and-b-link-trees): latches protect pages for microseconds; locks protect data for a whole transaction.
+- [Contention](/performance/concurrency/contention) and [compare-and-swap](/concurrency/atomics/compare-and-swap): the same wait-or-retry trade-off inside one process.
+
+<Recall cards={[
+  { q: "What is the rule of two-phase locking?", a: "A transaction must not take a new lock after it has released any lock. So it has a growing phase and then a shrinking phase." },
+  { q: "Why does 2PL give conflict serializability?", a: "An edge Ti → Tj means Ti released a lock that Tj later took, so the lock point of Ti comes before that of Tj. A cycle would put a lock point before itself, which is impossible." },
+  { q: "Why do engines use strict or rigorous 2PL instead of basic 2PL?", a: "Basic 2PL can release a write lock before commit, so others can read uncommitted data and an abort cascades. Holding locks to the end gives strict schedules." },
+  { q: "What does an IX lock on a table mean, and what does it conflict with?", a: "The transaction will take X locks on some rows below. IX conflicts with S, SIX and X on the table, but not with IS or IX." },
+  { q: "Under wait-die and wound-wait, who waits and who aborts?", a: "Wait-die: an older requester waits, a younger requester dies. Wound-wait: an older requester aborts the younger holder, a younger requester waits. Restarted transactions keep their old timestamp." },
+  { q: "How does InnoDB stop phantoms under REPEATABLE READ?", a: "Locking reads, UPDATE and DELETE take next-key locks: a lock on the index record plus the gap before it. An insert into a locked gap must wait." },
+]} />

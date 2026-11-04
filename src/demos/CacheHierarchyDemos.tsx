@@ -123,9 +123,9 @@ export function HierarchyDemo() {
     for (let i = 0; i < 30000; i++) { a[2 * i] = (i % 32) * 64; a[2 * i + 1] = (1 << 24) + i * 64; }
     return MODES.map((m) => {
       const s = runHier(w, a, levels, 64, m.id);
-      let n = 0, mem = 0;
-      for (let i = 4000; i < s.length; i += 2) { n++; if (s[i] === levels.length) mem++; }
-      return { ...m, mem: mem / n };
+      let n = 0, miss = 0;
+      for (let i = 4000; i < s.length; i += 2) { n++; if (s[i] !== 0) miss++; }
+      return { ...m, mem: miss / n };
     });
   }, [w, l1, l2, l3]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -147,7 +147,7 @@ export function HierarchyDemo() {
         ))}
       </Plot>
       <Legend items={curves.map((c) => ({ label: c.label, color: c.color }))} />
-      <div className="muted" style={{ fontSize: 12.5, margin: "18px 0 6px" }}>A 2 KiB hot set used between reads of a streaming scan: how often the hot data goes to memory</div>
+      <div className="muted" style={{ fontSize: 12.5, margin: "18px 0 6px" }}>A 2 KiB hot set used between reads of a streaming scan: how often the hot data misses L1</div>
       <Stats items={hot.map((h) => ({ label: h.label, value: pct(h.mem, 1) }))} />
     </Demo>
   );

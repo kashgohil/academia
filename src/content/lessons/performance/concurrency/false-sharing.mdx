@@ -1,0 +1,73 @@
+---
+summary: Two threads write different variables, but the variables share one cache line. The line moves between cores on every write.
+---
+import { PingPongDemo, FalseSharingScalingDemo, StructLayoutDemo } from "@/demos/ConcurrencyPerfDemos";
+
+A core can write to a cache line only when it owns the line. When a different core writes to the same line, the line must move to that core. This move takes about 40 ns.
+
+**False sharing** occurs when threads write to different variables in the same cache line. The threads share no data. But the hardware sees one line, and it moves the line on each write.
+
+<Predict
+  id="pingpong"
+  question="Four threads each increment their own counter. The four counters are next to each other in memory. What limits the speed?"
+  options={["Nothing: each thread uses its own counter", "The cache line moves between the cores on almost every write", "The counters overflow"]}
+  answer={1}
+  explain="The four counters fit in one 64-byte cache line. Each write by a different core moves that line. The cores take turns, so they work one at a time."
+>
+<PingPongDemo />
+</Predict>
+
+Do these steps:
+
+1. Watch the dark bar. It is the cache line. It moves to the core that writes next.
+2. Look at **line transfers**. Almost every increment causes one.
+3. Turn on **Put each counter on its own cache line**. Each core now keeps its own line. The transfers stop.
+
+## How much it costs
+
+<FalseSharingScalingDemo />
+
+With one cache line, more threads do not help. The throughput stays at about 43 million increments per second. With separate lines, the throughput increases with each thread. At 8 threads, separate lines are about 66 times faster.
+
+## Find it in your own structs
+
+False sharing is easy to cause by accident. Select a struct below. Red lines have fields that more than one thread writes.
+
+<StructLayoutDemo />
+
+1. Select **Single-producer, single-consumer queue**. The producer writes `tail`. The consumer writes `head`. Both fields are in line 0.
+2. Turn on **Align written fields to 64 bytes**. Each written field now starts on its own line.
+3. Select **Server stats struct**. Four threads write four counters. Some counters share a line.
+
+## How to prevent it
+
+- Put each hot field that a thread writes on its own cache line.
+- Use 128 bytes, not 64, on x86. The adjacent-line prefetcher fetches lines in pairs. Rust's `crossbeam_utils::CachePadded` uses 128 for this reason.
+- Use the language tools:
+
+```rust
+#[repr(align(128))]
+struct Padded(AtomicU64);
+```
+
+```zig
+const Padded = struct { value: std.atomic.Value(u64) align(std.atomic.cache_line) };
+```
+
+```cpp
+struct alignas(std::hardware_destructive_interference_size) Padded { std::atomic<uint64_t> value; };
+```
+
+- Keep data that only one thread writes in that thread's own memory. Combine the results at the end.
+
+## How to find it
+
+Run `perf c2c record`, then `perf c2c report`. The report shows cache lines with many "HITM" events. A HITM is a load that found the line modified in a different core's cache. Look for lines where different threads write different offsets.
+
+<Recall cards={[
+  { q: "What is false sharing?", a: "Threads write different variables that are in the same cache line. The line moves between cores on each write." },
+  { q: "Why does false sharing make code slow?", a: "Each write needs ownership of the line. The cores take turns, and each turn moves the line (about 40 ns)." },
+  { q: "Why pad to 128 bytes on x86?", a: "The adjacent-line prefetcher fetches lines in pairs. Two fields 64 bytes apart can still interfere." },
+  { q: "Which tool finds false sharing on Linux?", a: "perf c2c. It reports cache lines with many HITM events." },
+  { q: "In a single-producer queue, which fields need separate lines?", a: "head and tail. The consumer writes one and the producer writes the other." },
+]} />

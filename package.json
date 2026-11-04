@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "start": "node scripts/start.mjs",
     "dev": "vite",
     "build": "pnpm build:wasm && tsc -b && vite build",
     "build:wasm": "node scripts/build-wasm.mjs",

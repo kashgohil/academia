@@ -9,18 +9,10 @@ Interactive lessons for learning deeply: electronics, statistics, ML, systems, c
 ## Run
 
 ```bash
-pnpm install
+pnpm start
 ```
 
-```bash
-pnpm build:wasm
-```
-
-```bash
-pnpm dev
-```
-
-`build:wasm` needs Rust with `rustup target add wasm32-unknown-unknown`.
+This installs missing dependencies, builds the WASM, starts the dev server and opens the browser. It needs Node and pnpm. Rust is optional: without it, only the cache and allocator demos stop working. Use `--no-open` to keep the browser closed. Other arguments go to Vite, for example `pnpm start --port 3000`.
 
 ## Stack
 

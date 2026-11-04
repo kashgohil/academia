@@ -108,3 +108,50 @@ describe("fragmentation replay (Wilson-style footprint / peak live)", () => {
     expect(ratio({ kind: "bump", cap: 1 << 20 }, "random")).toBeGreaterThan(8);
   });
 });
+
+describe("free-list scenarios", () => {
+  test("swiss cheese: >50% external fragmentation, 200 B fails, with or without coalescing", () => {
+    for (const b of [0, 1]) withHeap({ kind: "freelist", cap: 2048, a: 0, b }, (h) => {
+      const big: number[] = [];
+      for (let i = 0; i < 200; i++) {
+        const x = h.alloc(i % 2 ? 40 : 100, 8);
+        if (x === null) break;
+        if (i % 2 === 0) big.push(x);
+      }
+      big.forEach((x) => h.free(x));
+      expect(extFrag(h.stats())).toBeGreaterThan(0.5);
+      expect(h.alloc(200, 8)).toBeNull();
+    });
+  });
+  test("fill 14 × 120, free all, 1 KiB: fails without coalescing, succeeds with", () => {
+    for (const b of [0, 1]) withHeap({ kind: "freelist", cap: 2048, a: 0, b }, (h) => {
+      const xs = Array.from({ length: 14 }, () => h.alloc(120, 8)!);
+      xs.forEach((x) => h.free(x));
+      expect(h.alloc(1024, 8) !== null).toBe(b === 1);
+    });
+  });
+  test("one byte costs a 16-byte block", () => {
+    withHeap({ kind: "freelist", cap: 2048, a: 0, b: 1 }, (h) => {
+      h.alloc(1, 8);
+      // The block: 8 B header + 1 B payload + 7 B slack. (The rest of the heap is one free block with its own header.)
+      const s = h.stats();
+      expect(s.live + s.pad + s.slack).toBe(8);
+      expect(h.regions()[3]!.off).toBe(16);
+    });
+  });
+});
+
+describe("slab scenarios", () => {
+  test("mixed objects: 15 objects, 5 caches, 5 slabs", () => {
+    withHeap({ kind: "slab", cap: 4096, a: 512, b: 0 }, (h) => {
+      [24, 24, 24, 60, 60, 120, 120, 200, 16, 16, 16, 16, 48, 48, 100].forEach((s) => expect(h.alloc(s, 8)).not.toBeNull());
+      expect(h.regions().filter((r) => r.kind === REGION.meta).length).toBe(5);
+    });
+  });
+  test("128 B objects in a 512 B page leave 96 B slack", () => {
+    withHeap({ kind: "slab", cap: 4096, a: 512, b: 0 }, (h) => {
+      for (let i = 0; i < 3; i++) h.alloc(128, 8);
+      expect(h.stats().slack).toBe(96);
+    });
+  });
+});

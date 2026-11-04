@@ -114,10 +114,15 @@ export function FreeListDemo() {
     {
       label: "Swiss cheese",
       run: (h) => {
-        const xs = Array.from({ length: 14 }, (_, i) => h.alloc(i % 2 ? 40 : 100, 8));
-        xs.forEach((x, i) => i % 2 === 0 && x !== null && h.free(x));
+        const big: number[] = [];
+        for (let i = 0; i < 200; i++) {
+          const x = h.alloc(i % 2 ? 40 : 100, 8);
+          if (x === null) break;
+          if (i % 2 === 0) big.push(x);
+        }
+        big.forEach((x) => h.free(x));
         const s = h.stats();
-        return [`alternate 100 B and 40 B, free every 100 B block`, `${s.free} B free, largest block ${s.largestFree} B`, `alloc(200) → ${hex(h.alloc(200, 8))}`];
+        return [`alternate 100 B and 40 B until full, free every 100 B block`, `${s.free} B free, largest block ${s.largestFree} B`, `alloc(200) → ${hex(h.alloc(200, 8))}`];
       },
     },
   ];

@@ -11,7 +11,7 @@ export function Recall({ cards }: { cards: CardDef[] }) {
   const [open, setOpen] = useState<Set<number>>(new Set());
   useEffect(() => {
     void registerCards(path, cards);
-  }, [path, cards]);
+  }, [path]); // eslint-disable-line react-hooks/exhaustive-deps -- cards are a literal in MDX
 
   return (
     <div className="recall">

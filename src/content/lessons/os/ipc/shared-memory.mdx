@@ -1,0 +1,200 @@
+---
+summary: "Map one physical page into two address spaces. shm_open, memfd_create and the System V history, why stored pointers break, process-shared futexes, an SPSC ring with explicit orderings, false sharing on its indices, and how the cost compares with pipes and sockets."
+---
+import { IpcShmMapDemo, IpcSpscRingDemo, IpcSpscLinesDemo, IpcCompareDemo } from "@/demos/os/IpcShmDemos";
+
+[Pipes](/os/ipc/pipes) and sockets copy each message into the kernel and out again. **Shared memory** removes that. Two processes map the same physical pages, so a store by one process is a load for the other. No system call and no copy lie on the data path.
+
+The price is that the kernel no longer helps you. It gives you no message boundaries, no wakeups and no ordering. You build all of them yourself, and this lesson shows where that goes wrong.
+
+## Making a shared region
+
+The usual POSIX path has three calls. `shm_open` creates a named object, `ftruncate` sets its size, and `mmap` maps it.
+
+```c
+int fd = shm_open("/ring", O_CREAT | O_RDWR, 0600);   // on Linux: a file in /dev/shm
+ftruncate(fd, 1 << 20);
+void *p = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+shm_unlink("/ring");   // once all peers have it open: the mappings stay, and the name goes
+```
+
+On Linux, `/dev/shm` is a tmpfs mount, so the object is a file with pages in memory. Link with `-lrt` on an old glibc.
+
+| Interface | Name | Lifetime | Notes |
+|---|---|---|---|
+| `shmget`, `shmat` | an integer key | until `shmctl(IPC_RMID)` or reboot | System V, from the 1980s. It leaks when a process forgets. See `ipcs` and `ipcrm` |
+| `shm_open`, `mmap` | a path in `/dev/shm` | until `shm_unlink` | POSIX. File permissions apply |
+| `memfd_create`, `mmap` | no name, only an fd | until the last fd closes | Linux. Pass it with [SCM_RIGHTS](/os/ipc/unix-domain-sockets) |
+| `mmap(MAP_SHARED \| MAP_ANONYMOUS)` | none | until the last unmap | Only for a parent and its `fork` children |
+
+`memfd_create` is the modern choice on Linux. It needs no name, so no other process can guess it, and it cannot leak after a crash. With `MFD_ALLOW_SEALING`, the owner can add **seals** by `fcntl(F_ADD_SEALS)`. `F_SEAL_SHRINK` stops a peer from truncating the file. A truncate is dangerous, because a later access past the end raises [SIGBUS](/os/memory/mmap). Wayland clients often share buffers through memfds with this seal.
+
+## One frame, two addresses
+
+Each process has its own [page tables](/os/vm/paging-and-page-tables). The first access in each process takes a [minor fault](/os/vm/page-faults-and-demand-paging), and the fault finds the page in the shmem page cache. So two PTEs in two tables point at one frame, usually at two different virtual addresses.
+
+<Predict
+  id="pointer"
+  question="Process A builds a linked list in a shared region and stores normal pointers. Process B maps the same region at another address and follows the head pointer. What occurs?"
+  options={[
+    "It works: the two processes share the memory, so they share the pointers",
+    "B uses an address that is valid only in A, so it faults or reads wrong data",
+    "The kernel translates the pointers during the page fault",
+  ]}
+  answer={1}
+  explain="A pointer holds a virtual address, and that address has a meaning only in one address space. The kernel does not know which words are pointers."
+>
+<IpcShmMapDemo />
+</Predict>
+
+Things to try:
+
+1. Click **B walks the list**. B follows A's address and has no mapping there. The result is SIGSEGV.
+2. Select B's heap at A's base, and walk again. B reads 0 with no fault. This is the worse failure.
+3. Select **The same address as A**. The pointers work. This is fragile: [ASLR](/os/vm/address-spaces) or any other mapping can take that address, and `MAP_FIXED` silently replaces what is there.
+4. Select **Offsets**. Store `node - base`, and compute `base + offset` in each process. The list now works at any address.
+
+The frame numbers are the same in both columns. Each frame has 3 references: one from the page cache, and one from each PTE. The two mappings use 2 frames in total, however many processes join.
+
+The same rule covers anything that holds an address: a `std::string`, a Rust `Vec`, a vtable or a function pointer. Boost.Interprocess gives C++ an `offset_ptr` for this. Most high-speed designs avoid the problem. They store flat records, with offsets or indices. `MAP_PRIVATE` is a different trap: the first store gives the writer its own copy, so it no longer shares that page.
+
+## Synchronization is your job
+
+A plain lock in shared memory does not work unless you ask for it. A `pthread_mutex_t` must have `PTHREAD_PROCESS_SHARED`. Then glibc leaves out `FUTEX_PRIVATE_FLAG`, and the kernel keys the [futex](/os/sync/futexes) by inode and page offset, not by address space and address. So two processes with different addresses reach one wait queue.
+
+```c
+pthread_mutexattr_t a;
+pthread_mutexattr_init(&a);
+pthread_mutexattr_setpshared(&a, PTHREAD_PROCESS_SHARED);
+pthread_mutexattr_setrobust(&a, PTHREAD_MUTEX_ROBUST);
+pthread_mutex_init(&shared->lock, &a);
+```
+
+Processes can die, and threads in one process rarely do so alone. A process that dies with the lock held blocks all others forever. A **robust** mutex solves this. The next `pthread_mutex_lock` returns `EOWNERDEAD`, and the new owner must repair the data and call `pthread_mutex_consistent`.
+
+Trust is the other issue. A peer can change a shared word at any time. If you check a length in shared memory and then use it, the peer can change it between the two steps. This is a **double fetch**. Copy a value out once, and then check the copy. Treat the region as untrusted input if the peer is less privileged than you.
+
+## A ring in shared memory
+
+With one producer and one consumer, you need no lock. A **single-producer single-consumer ring** has an array and two indices. Only the producer writes `tail`, and only the consumer writes `head`.
+
+```rust
+// `T: Copy`, because the bytes cross a process boundary. head and tail are in shared memory.
+fn push(&self, v: T) -> bool {
+    let t = self.tail.load(Relaxed);                // only we write it
+    if t - self.head.load(Acquire) == N { return false; }
+    unsafe { *self.slot(t % N) = v; }
+    self.tail.store(t + 1, Release);                // publishes the slot
+    true
+}
+fn pop(&self) -> Option<T> {
+    let h = self.head.load(Relaxed);
+    if self.tail.load(Acquire) == h { return None; }
+    let v = unsafe { *self.slot(h % N) };
+    self.head.store(h + 1, Release);                // gives the slot back
+    Some(v)
+}
+```
+
+The orderings do the real work. The [release store](/concurrency/atomics/memory-orderings-relaxed-acquire-release-seq-cst) on `tail` and the acquire load of it form a [happens-before](/concurrency/atomics/happens-before) edge. The edge says: if you see the new tail, you also see the slot.
+
+<Predict
+  id="stale"
+  question="Remove release and acquire from the ring, so that all index operations are relaxed. The consumer sees tail = 1. What can it read from slot 0?"
+  options={[
+    "Only the new message: the tail changes after the slot, so the slot must be ready",
+    "The new message or the old contents: nothing orders the slot and the tail",
+    "Nothing: the load blocks until the store reaches memory",
+  ]}
+  answer={1}
+  explain="Relaxed atomics give no order between two locations. The consumer can see the new tail and still read the old slot. In C++ and Rust terms, this is also a data race, so it is undefined behavior."
+>
+<IpcSpscRingDemo />
+</Predict>
+
+Things to try:
+
+1. With correct orderings, step the producer through one message, and then the consumer. When the consumer reads the tail, the old value in slot 0 gets crossed out. It has only one choice.
+2. The search covers all schedules of 3 messages in a 2-slot ring: 122 states, and no stale read.
+3. Turn on **Drop release and acquire**. Click **Show the stale read**. In 5 steps, the consumer has read tail = 1 and slot 0 = 0.
+4. Look at the outcomes from `src/sims/memmodel`, a separate C++ memory model explorer. It runs this ring with 2 messages as a litmus test, and it agrees. With relaxed orderings, it finds 4 outcomes, and only one is correct.
+5. Read the x86-TSO outcome. It stays correct.
+
+The last step explains why this bug survives. x86 keeps stores in order and loads in order, so relaxed code often works there. The compiler can still reorder it. Apple Silicon and other arm64 CPUs have a weaker model, so they can show the stale read in hardware. Rosetta runs x86 code under a TSO mode that Apple's CPUs provide, which can also hide the bug. Test ring code natively, and with a tool such as ThreadSanitizer or Loom.
+
+A consumer that spins burns a core. If it must sleep, it needs a doorbell. A futex on the tail or an `eventfd` works. To avoid a system call for each message, the producer rings the bell only when the consumer has set a "sleeping" flag. That flag brings back the [lost wakeup](/os/sync/futexes) problem, so it needs a fence.
+
+## False sharing on the indices
+
+`head` and `tail` have different writers. If they share a cache line, each write takes the line from the other core. This is [false sharing](/performance/concurrency/false-sharing). The usual fix is `alignas(64)`, which is correct only if the line has 64 bytes. M-series Macs report 128 bytes in `sysctl hw.cachelinesize`.
+
+<Predict
+  id="lines"
+  question="Each side of a ring reads the other side's index on every message. You move head and tail to separate cache lines. How many line transfers does this save?"
+  options={[
+    "About half: the false sharing is gone",
+    "None in this schedule: each side still reads the other index, so each line still moves",
+    "All of them: each core now owns its line",
+  ]}
+  answer={1}
+  explain="The read of the other index is true sharing. It pulls the line across for each message. Padding helps only after a side stops reading the other index each time."
+>
+<IpcSpscLinesDemo />
+</Predict>
+
+Things to try:
+
+1. Compare the top two bars. One line or two lines: both give 5.00 transfers per message.
+2. Compare the third bar. Cached copies with one line still give 5.00, because each index write takes the shared line.
+3. Turn on both. The count falls to 2.26. Index reads fall from 2 per message to 0.14.
+4. Raise **Messages between head and tail**. With more backlog, a side needs the other index less often.
+
+The trick is to keep a private copy of the other index. Read the real index only when the copy says full or empty. Most of the remaining transfers are the message data itself, which must move. At the model input of 40 ns per transfer, the message cost falls from 200 ns to 90 ns. See [cache coherence](/architecture/multicore/cache-coherence-mesi) for why each transfer occurs.
+
+## How it compares
+
+<Predict
+  id="compare"
+  question="A reader sleeps until a 64-byte message arrives. Shared memory has no copies through the kernel. How much lower is its latency than a pipe's?"
+  options={[
+    "About 5 times lower, as with a spinning reader",
+    "Only a little lower: the wakeup costs far more than the rest",
+    "About 100 times lower",
+  ]}
+  answer={1}
+  explain="With a sleeping reader, shared memory needs a futex wake too. The model gives 5.25 µs against 5.42 µs. The wakeup dominates both."
+>
+<IpcCompareDemo />
+</Predict>
+
+Things to try:
+
+1. Keep the reader spinning at 64 bytes. The latency is 98.8 ns for shared memory, 459 ns for a pipe and 659 ns for a Unix socket.
+2. Turn off the spin option. The values become 5.25 µs, 5.42 µs and 5.62 µs. Most of the gain is gone.
+3. Show **Messages per second** at 64 bytes: 19 million, 3.9 million and 2.19 million. System calls set this limit.
+4. Show **Bytes per second**, and move to 64 KiB. All three are between 4.71 and 4.75 GiB/s. At this size, moving bytes between cores sets the limit.
+
+So shared memory wins for many small messages with a reader that does not sleep. It wins nothing for a large message that the reader must touch anyway, unless the producer builds the message in place. The model counts one copy into the ring and one cold read out of it. All costs are model inputs, and your CPU will differ.
+
+Use the simplest tool that meets your need. A pipe or a socket gives you wakeups, boundaries, backpressure and EOF with no extra code. Move to shared memory after a measurement shows that the kernel path is your limit.
+
+<Callout title="macOS">
+`shm_open` and `mmap` work on macOS, but there is no `/dev/shm` and no `memfd_create`. There is no futex syscall either. Since macOS 14.4, `os_sync_wait_on_address` has a shared flag for this use. Process-shared pthread mutexes work. The page size on Apple Silicon is 16 KiB, so query it with `sysconf(_SC_PAGESIZE)`.
+</Callout>
+
+## Connect
+
+- [mmap](/os/memory/mmap): shared mappings, the page cache and SIGBUS.
+- [Futexes](/os/sync/futexes): shared keys, and the lost wakeup.
+- [Memory orderings](/concurrency/atomics/memory-orderings-relaxed-acquire-release-seq-cst): release and acquire in full.
+- [False sharing](/performance/concurrency/false-sharing): the same effect in one process.
+- [Unix domain sockets](/os/ipc/unix-domain-sockets): how to pass a memfd to another process.
+
+<Recall cards={[
+  { q: "Why does a pointer stored in shared memory fail in another process?", a: "It holds a virtual address of the writer. The reader can map the region elsewhere, so the address faults or reaches other data. Store offsets from the base." },
+  { q: "What must change for a pthread mutex to work across processes, and what does the kernel do differently?", a: "Set PTHREAD_PROCESS_SHARED. The futex then has no private flag, and the kernel keys it by inode and page offset." },
+  { q: "What does a robust mutex give you?", a: "If the owner dies, the next lock returns EOWNERDEAD. The new owner repairs the data and calls pthread_mutex_consistent." },
+  { q: "In an SPSC ring, what does the release store on tail guarantee?", a: "A consumer that sees the new tail with an acquire load also sees the slot that the producer wrote before the store." },
+  { q: "Why can a relaxed ring pass all its tests on x86 and fail on arm64?", a: "x86 keeps stores in order and loads in order, so the hardware hides the bug. arm64 can reorder them." },
+  { q: "Why does padding alone not reduce line transfers in a ring?", a: "Each side still reads the other index on each message, so the lines move anyway. It helps when combined with a cached copy of the other index." },
+]} />

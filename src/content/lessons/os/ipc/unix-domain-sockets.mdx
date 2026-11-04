@@ -1,0 +1,188 @@
+---
+summary: "Sockets with no network: stream, datagram and seqpacket, path and abstract names, skbs with no protocol stack, a comparison with loopback TCP, file descriptor passing with SCM_RIGHTS, peer credentials, and how systemd, Docker, Wayland, Chrome and PostgreSQL use them."
+---
+import { IpcScmRightsDemo, IpcBoundaryDemo, IpcLoopbackDemo } from "@/demos/os/IpcUdsDemos";
+
+A **Unix domain socket** (`AF_UNIX`) has the socket API but no network. Both ends are on one machine, so the kernel moves bytes directly from one socket to the other. It offers three things that a [pipe](/os/ipc/pipes) does not: two directions, a choice of message types, and the ability to pass open files.
+
+Create a connected pair with `socketpair`, or use `bind`, `listen` and `accept` with an address, as for TCP.
+
+## Three socket types
+
+| Type | Connection | Boundaries | Peer closes | A short read |
+|---|---|---|---|---|
+| `SOCK_STREAM` | yes | none | `read` returns 0 | the rest stays queued |
+| `SOCK_SEQPACKET` | yes | kept | `read` returns 0 | the rest of the message is gone |
+| `SOCK_DGRAM` | no | kept | no EOF | the rest of the message is gone |
+
+Unix datagrams are reliable, unlike UDP. A sender blocks when the queue of the receiver is full, and the kernel never drops one silently. `SOCK_SEQPACKET` joins the best parts: a connection with EOF, and messages with edges.
+
+<Predict
+  id="short"
+  question="A sender makes three sends of 5, 3 and 6 bytes on SOCK_SEQPACKET. The reader calls read with a 4-byte buffer each time. How many bytes does the reader get in total?"
+  options={[
+    "14: the remainder of each message waits for the next read",
+    "11: it gets 4, then 3, then 4, and the tails of two messages are gone",
+    "4: the first read fails, and the socket closes",
+  ]}
+  answer={1}
+  explain="One read takes one whole message from the queue. Bytes that do not fit are thrown away, and recvmsg sets MSG_TRUNC. A stream keeps them, but it loses the message edges."
+>
+<IpcBoundaryDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Read once more** until both columns stop. The stream reads `AAAA`, `ABBB`, `CCCC` and `CC`. It loses nothing, and the message edges are gone.
+2. The seqpacket column reads `AAAA`, `BBB` and `CCCC`. It loses 3 bytes.
+3. Set the buffer to 6 bytes, and reset. Now seqpacket loses nothing and keeps the edges. So size the buffer for the largest message.
+
+To learn a size first, call `recv` with `MSG_PEEK | MSG_TRUNC`. It returns the real length of the next message and consumes nothing. On a stream, you must add your own framing, such as a length prefix.
+
+## Two namespaces
+
+A socket address can be a path or an abstract name.
+
+| | Path | Abstract (Linux only) |
+|---|---|---|
+| Address | `/run/app.sock` | `sun_path[0] == 0`, then a name |
+| Shown by `ss -xl` as | the path | `@name` |
+| Access control | file permissions on the path | none. Check the peer yourself |
+| After the last close | the file stays. The next `bind` fails with `EADDRINUSE` | the name goes away |
+| Scope | the mount namespace | the network namespace |
+
+The stale file is a common bug: a server that restarts must `unlink` the path before `bind`. The length limit also bites. `sun_path` has 108 bytes on Linux and 104 on macOS, so deep paths in a temporary folder can fail.
+
+Abstract names have no permissions. Any process in the network namespace can connect, which has caused container escapes when a container shares the host's network. Prefer a path in a private directory, unless you check the peer.
+
+## No network stack
+
+A send on a stream socket calls `unix_stream_sendmsg`. It allocates an skb (`struct sk_buff`, the kernel's packet buffer) and copies the bytes from user memory. Then it adds the skb to the queue of the peer and wakes the peer. The read in `unix_stream_read_generic` copies the bytes out and frees the skb. There are no headers, no routes, no checksums and no retransmits.
+
+Loopback TCP does all of the protocol work, even though both ends are on one machine.
+
+<Predict
+  id="tcp"
+  question="A reader sleeps until each 64-byte message arrives. How much slower is loopback TCP than a Unix socket for one message?"
+  options={[
+    "About 2.6 times, because TCP has more than twice as many layers",
+    "About 1.2 times, because the wakeup costs far more than the layers",
+    "About 10 times, because TCP must also send an ACK",
+  ]}
+  answer={1}
+  explain="A wakeup costs 5 µs in this model, and it occurs on both paths. That hides most of the difference. With a reader that does not sleep, the ratio is 2.56."
+>
+<IpcLoopbackDemo />
+</Predict>
+
+Things to try:
+
+1. With the defaults, compare the lists. TCP has 14 layers and costs 1.66 µs. A Unix socket has 6 layers and costs 649 ns. The ratio is 2.56.
+2. Turn on **The reader sleeps**. The ratio falls to 1.18.
+3. Move the size to 64 KiB. The copies dominate, and the ratio falls to 1.05.
+4. Add 100 netfilter rules. The ratio rises to 17.97, because the packet passes 4 hooks. A Unix socket never meets a firewall rule.
+
+Each layer cost is a model input, and the layer list is simplified. The order of the layers is real. On `lo`, the skb goes through `loopback_xmit` into the backlog of the same CPU. Then a softirq runs the receive side of IP and TCP. The device MTU is 65,536 bytes, and it skips the checksum, so the stack is less slow than it looks.
+
+TCP gives you something in return: you can move a service to another host and change only the address. Choose it when that is likely. Otherwise, a Unix socket gives lower cost, simpler security and a real peer identity.
+
+## Passing a file descriptor
+
+The most unusual feature is **SCM_RIGHTS**. A process can send an open file to another process, inside a message on the socket. The receiver gets a working fd, with no need for permission to open that file.
+
+```c
+// Send fd over sock. A stream needs at least one data byte.
+char data = 'x', ctl[CMSG_SPACE(sizeof(int))] = {0};
+struct iovec iov = { &data, 1 };
+struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl };
+struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
+memcpy(CMSG_DATA(c), &fd, sizeof(int));
+sendmsg(sock, &m, 0);
+```
+
+```go
+// The same in Go.
+rights := syscall.UnixRights(int(f.Fd()))
+conn.WriteMsgUnix([]byte{'x'}, rights, nil)
+```
+
+<Predict
+  id="inflight"
+  question="A sends a file with SCM_RIGHTS and closes its fd at once. B has not called recvmsg yet. What does B get when it reads the message?"
+  options={[
+    "An error: the file closed before B received it",
+    "A working fd: the message holds its own reference to the file",
+    "The same fd number as A, which is now invalid",
+  ]}
+  answer={1}
+  explain="The kernel takes a reference for each fd at the send, and hangs it on the skb. While the message is in the queue, the file stays open, even if no process has an fd for it."
+>
+<IpcScmRightsDemo />
+</Predict>
+
+Things to try:
+
+1. Click **A: open**, **A: sendmsg** and **A: close**. `f_count` goes 1, 2, 1. No table holds the file, and it is still alive in flight.
+2. Click **B: recvmsg**. The file gets fd 5 in B, the lowest free slot. A had fd 4. The number means nothing outside its table.
+3. Reset, and keep A's fd open during the send. After the receive, click **A: read 100** and **B: read 100**. The offset reaches 200, because both processes use one description.
+4. Reset, send, close in A, and click **B: close socket**. The kernel purges the queue, drops the reference, and frees the file.
+
+In the receiver, three facts matter.
+
+- The new fd is a new slot in the receiver's table, and the lowest free number. The sender's number does not travel.
+- The slot points at the same **open file description**, the object from [fork and exec](/os/processes/fork-and-exec). So the offset and `O_NONBLOCK` are shared. `FD_CLOEXEC` belongs to the slot, so pass `MSG_CMSG_CLOEXEC` to `recvmsg`.
+- Rights are not checked again. The access mode was set at `open`. So an fd works like a capability: a privileged broker can open a file, and hand it to a sandboxed process.
+
+A peer can also send fds that you did not ask for. If your control buffer is too small, the extra fds close, and `MSG_CTRUNC` is set. Always loop over the control messages and close what you do not want, or a hostile peer can fill your fd table. One message holds at most 253 fds (`SCM_MAX_FD`).
+
+On a stream, the fds arrive with the first byte of the send that carried them, and that read stops after that send. So keep a framing rule that says which message has fds.
+
+### Cycles in flight
+
+A socket can travel over a socket. So a socket can end up in its own queue, with no process holding it. Its reference count stays above zero, because the skb holds it, and only a read could remove the skb. No normal close can free it.
+
+`unix_gc` in `net/unix/garbage.c` finds these. It starts from sockets that some process holds, follows the fds in their queues, and frees what it cannot reach. The tests build such a cycle and check the rule that holds throughout: `f_count` equals the table slots plus the in-flight references.
+
+## Who is on the other end
+
+The kernel knows the identity of the peer, and it cannot be faked by the peer.
+
+- `SO_PEERCRED` returns `struct ucred` with the PID, UID and GID at the time of `connect`. PostgreSQL's `peer` login method rests on this.
+- `SO_PASSCRED` with **SCM_CREDENTIALS** attaches the sender's IDs to each message. A sender can claim other IDs only if it has the privilege to use them.
+- With `SO_PASSCRED`, a stream read does not join bytes from two different senders.
+- `SO_PEERPIDFD` (Linux 6.5) gives a pidfd. A PID alone can be reused after the process exits.
+
+## Real uses
+
+| System | Socket | What it uses |
+|---|---|---|
+| systemd | any unit's socket | socket activation: systemd binds first, starts the service on demand, and passes the sockets from fd 3 with `LISTEN_FDS` |
+| Docker | `/var/run/docker.sock` | an HTTP API on a stream socket. Write access is about equal to root on the host |
+| Wayland | `$XDG_RUNTIME_DIR/wayland-0` | messages on a stream, with [shared memory](/os/ipc/shared-memory) buffers passed by SCM_RIGHTS |
+| Chrome on Linux | socket pairs | channels between processes that pass fds, so a sandboxed renderer opens almost nothing itself |
+| PostgreSQL | `.s.PGSQL.5432` in a socket directory | local clients, with `peer` authentication and no TCP overhead |
+
+Socket activation shows the power of fd passing. Clients can connect before the service runs, because the kernel holds the listening socket. A restart loses no connection attempts, because the socket outlives the process.
+
+To look at sockets on Linux, use `ss -xlp` or `/proc/net/unix`.
+
+<Callout title="macOS">
+macOS has `AF_UNIX` with paths, `SOCK_STREAM`, `SOCK_DGRAM` and SCM_RIGHTS, so you can try fd passing on your Mac. It has no abstract namespace and does not offer `SOCK_SEQPACKET` for this family. For peer identity, use `getpeereid` or `LOCAL_PEERCRED`. Native services use **XPC** in place of sockets. XPC sends typed messages over Mach ports, `launchd` starts services on demand, and a port right moves between tasks much as an fd moves with SCM_RIGHTS.
+</Callout>
+
+## Connect
+
+- [Pipes](/os/ipc/pipes): the one-way, simpler tool.
+- [Shared memory](/os/ipc/shared-memory): pass a memfd, and then stop using the socket for data.
+- [Fork and exec](/os/processes/fork-and-exec): fd tables and open file descriptions.
+- [Signals](/os/ipc/signals): SIGPIPE on a closed stream peer. Use `MSG_NOSIGNAL` to avoid it.
+
+<Recall cards={[
+  { q: "What happens to the tail of a message when a seqpacket read has a short buffer?", a: "It is gone. recvmsg sets MSG_TRUNC. A stream would keep the bytes, but it has no message edges." },
+  { q: "Why does a restarted server fail to bind a path socket, and why does an abstract socket not have this problem?", a: "The socket file stays after close, so bind gets EADDRINUSE until someone unlinks it. An abstract name goes away with its last close." },
+  { q: "What does the kernel do with an fd at sendmsg with SCM_RIGHTS?", a: "It takes a reference on the open file description and hangs it on the skb. No number travels. The file stays open while the message is in flight." },
+  { q: "What do sender and receiver share after fd passing, and what do they not share?", a: "They share the description: offset and status flags. Each has its own fd number and its own FD_CLOEXEC flag." },
+  { q: "Why does the kernel need a garbage collector for Unix sockets?", a: "A socket can sit in its own queue with no process holding it. The skb's reference keeps it alive, and only a read could remove the skb. unix_gc frees what no process can reach." },
+  { q: "Why is SO_PEERPIDFD better than the PID from SO_PEERCRED?", a: "A PID can be reused after the process exits. A pidfd refers to that one process." },
+]} />

@@ -1,0 +1,217 @@
+---
+summary: "How the kernel delivers a signal: pending and blocked masks, the return to user mode, the frame on the user stack and rt_sigreturn. Why printf in a handler can deadlock, the self-pipe trick and signalfd, EINTR and SA_RESTART, threads, SIGSEGV handlers and Go's preemption."
+---
+import { IpcSignalDeliveryDemo, IpcSignalDeadlockDemo, IpcSignalCoalesceDemo } from "@/demos/os/IpcSignalDemos";
+
+A **signal** is a small notice that the kernel gives to a process. It has a number and little else. It can arrive between any two instructions, so a signal handler is the first concurrent code that most programs have, even with one thread.
+
+Signals come from three places. Another process calls `kill`. The kernel reports an event, such as SIGCHLD or SIGPIPE. Or the CPU faults, and the kernel turns the fault into SIGSEGV, SIGBUS or SIGFPE.
+
+## Standard and real-time signals
+
+Linux has 64 signal numbers. Numbers 1 to 31 are **standard signals**. The rest are **real-time signals**. glibc keeps 32 and 33 for its threads library, so `SIGRTMIN` is 34 and `SIGRTMAX` is 64.
+
+| Signal | Number on Linux | Default action | Usual source |
+|---|---|---|---|
+| SIGINT | 2 | terminate | Ctrl-C |
+| SIGKILL | 9 | terminate, cannot be caught | `kill -9`, the OOM killer |
+| SIGSEGV | 11 | terminate with a core dump | a bad memory access |
+| SIGPIPE | 13 | terminate | a write with no reader |
+| SIGTERM | 15 | terminate | a polite stop request |
+| SIGCHLD | 17 | ignore | a child stopped or exited |
+| SIGSTOP | 19 | stop, cannot be caught | a debugger or a job control tool |
+| SIGURG | 23 | ignore | urgent socket data, and Go's runtime |
+| real-time | 34 to 64 | terminate | `sigqueue` |
+
+Only SIGKILL and SIGSTOP cannot be caught, blocked or ignored. A shell reports death by signal `n` as status `128 + n`, so 137 means SIGKILL.
+
+## Delivery
+
+A send does not run anything. It only records the signal. The kernel keeps two pending lists: one for the thread, `task_struct.pending`, and one for the process, `signal_struct.shared_pending`. Each thread also has a mask of **blocked** signals. The kernel sets `TIF_SIGPENDING` on a thread when a pending signal is not blocked.
+
+The handler can start only when the thread returns to user mode. On that path, `exit_to_user_mode_loop` checks the flag, and `get_signal` takes the lowest-numbered signal. If the thread runs on another CPU, the sender sends an interrupt, which forces it through this path. If the thread sleeps in an interruptible wait, the kernel wakes it.
+
+<Predict
+  id="eintr"
+  question="A thread sleeps in read on an empty pipe. A signal arrives, and its handler has no SA_RESTART flag. Which stack does the handler run on, and what does read return afterward?"
+  options={[
+    "The kernel stack, and read keeps sleeping",
+    "The user stack, on a frame that the kernel pushes, and read returns -1 with EINTR",
+    "A new thread's stack, and read is not affected",
+  ]}
+  answer={1}
+  explain="The handler is user code, so it runs in user mode on the user stack. The kernel builds a frame there and points rip at the handler. The frame holds a saved rax of -EINTR."
+>
+<IpcSignalDeliveryDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Next step** twice. The read sleeps. Send SIGUSR1. The `pending` bit is set, the task wakes, and `rax` shows `-ERESTARTSYS`.
+2. Step on. The kernel pushes a frame and clears the pending bit. SIGUSR1 is now blocked, and `rsp` drops below the 128-byte red zone.
+3. Step through the handler. It returns to `__restore_rt`, which calls `rt_sigreturn`. The frame goes away, and the old mask comes back.
+4. Reset, and turn on **SA_RESTART**. Repeat. The saved `rip` now points at the read, and the read sleeps again. The program sees nothing.
+5. Reset, and step until the read sleeps. Click the blocked bit of SIGUSR1, and then send SIGUSR1. The task does not wake. Clear the bit, and it does.
+6. Run the handler halfway, and send SIGUSR2. A second frame goes on top of the first. Now turn on the `sa_mask` option, and SIGUSR2 waits for `sigreturn`.
+
+## The frame
+
+`setup_rt_frame` writes a `struct rt_sigframe` on the user stack, below the red zone. The **red zone** is 128 bytes below `rsp` that a leaf function may use without moving `rsp`. The frame holds these parts.
+
+- `pretcode`: the return address of the handler. It points at `__restore_rt` in libc. x86-64 needs this from `sa_restorer`, which glibc fills in.
+- `uc_mcontext`: all the user registers that the interrupted code had.
+- `uc_sigmask`: the mask to restore.
+- `siginfo`: the signal number, the sender and, for a fault, the address.
+- `fpstate`: the XSAVE area, so a handler can use vector registers.
+
+Then the kernel changes the saved registers: `rip` to the handler, `rsp` to the frame, and `rdi`, `rsi` and `rdx` to the arguments. It also adds the signal and `sa_mask` to the blocked set. The return to user mode then "resumes" in the handler.
+
+`__restore_rt` is two instructions. It loads 15, the number of `rt_sigreturn`, and it makes the syscall. The kernel reads the frame and restores everything. This system call never returns in the normal way. On arm64, the number is 139, and the handler returns through a trampoline in the vDSO.
+
+A process with a deep stack, or a stack overflow, has no room for this frame. For this reason, a SIGSEGV handler for stack overflow needs `sigaltstack` and `SA_ONSTACK`.
+
+## EINTR and SA_RESTART
+
+A sleeping `read` returns `-ERESTARTSYS` inside the kernel. Then the signal code decides.
+
+- No handler will run: the kernel moves `rip` back 2 bytes, to the `syscall` instruction, and the call repeats. The program sees nothing.
+- A handler has `SA_RESTART`: the same rewind goes into the frame, so the call repeats after the handler.
+- A handler has no `SA_RESTART`: the saved `rax` becomes `-EINTR`.
+
+Some calls never restart, even with the flag. These include `poll`, `epoll_wait`, `select` and `nanosleep`. So correct code handles `EINTR` for these calls. Rust's `std::io::Write::write_all` retries on `ErrorKind::Interrupted`.
+
+## What a handler may do
+
+The handler runs on top of whatever the thread was doing. The thread may be in the middle of `malloc`.
+
+<Predict
+  id="lock"
+  question="The main flow holds the malloc lock when a signal arrives. The handler calls malloc on the same thread. What happens next?"
+  options={[
+    "The handler waits a moment. The scheduler runs the main flow, which unlocks",
+    "The handler waits forever. The main flow cannot run until the handler returns",
+    "The kernel detects the problem and postpones the handler",
+  ]}
+  answer={1}
+  explain="There is one thread. The main flow can continue only when the handler returns, and the handler cannot return until the main flow unlocks. No other thread will help."
+>
+<IpcSignalDeadlockDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Show the deadlock**. Main takes the lock, and the signal arrives. The schedule has 2 steps, and nothing can run after it.
+2. Run the handler first, and then main. That order is fine. So this bug depends on timing, and tests rarely find it.
+3. Select **Allocator with no lock**. Click **Show the corruption**. Now nothing hangs, but both flows own one block.
+4. Select **Block the signal around malloc**. The search covers every arrival point in 31 states. It finds no deadlock.
+5. Select **Handler only writes to a pipe**. The search covers 29 states, and it also finds nothing. The real work moves to normal code.
+
+These two flows run on the interleaving machine from the [critical sections](/os/sync/critical-sections) lesson. A `gate` stops main while the handler runs. That gate is the only new rule.
+
+A function is **async-signal-safe** if a handler may call it at any point. The list in `signal-safety(7)` includes `write`, `read`, `_exit`, `kill`, `sigaction` and `sem_post`. It does not include `malloc` or `printf`.
+
+`printf` is unsafe for two reasons. It can call `malloc`, and the malloc lock is not recursive, so the deadlock above can occur. It also changes the buffer of the stream. The stream lock in glibc is recursive for one thread, so a nested `printf` does not hang on that lock. It corrupts the buffer instead.
+
+The glibc per-thread cache serves many small requests with no lock, so this deadlock is rare. A rare bug is still a bug. CVE-2024-6387, called regreSSHion, came from a SIGALRM handler in OpenSSH that called `syslog`, which is not safe. It allowed remote code execution as root on some systems.
+
+A handler should do very little. Set a `volatile sig_atomic_t` or a lock-free atomic flag, or write one byte to a pipe. Also save and restore `errno`, because `write` can change it.
+
+## The self-pipe trick and signalfd
+
+An event loop sleeps in `poll`. A flag does not wake it at the right time: the signal can arrive just after the check and just before the sleep. The **self-pipe trick** closes this gap. The handler writes one byte to a non-blocking pipe, and the loop polls the read end.
+
+```c
+static int pipefd[2];   // both ends O_NONBLOCK and O_CLOEXEC
+static void on_sig(int sig) {
+    int saved = errno;
+    unsigned char b = sig;
+    write(pipefd[1], &b, 1);   // async-signal-safe. A full pipe is fine.
+    errno = saved;
+}
+```
+
+Linux also has `signalfd`, which turns signals into a file descriptor. You block the signals first, so that no handler runs. Then `read` returns one `struct signalfd_siginfo` for each signal.
+
+```c
+sigset_t set; sigemptyset(&set); sigaddset(&set, SIGTERM);
+sigprocmask(SIG_BLOCK, &set, NULL);         // all threads must block it
+int fd = signalfd(-1, &set, SFD_CLOEXEC);   // add fd to epoll
+```
+
+The trap is the mask. A blocked mask survives `exec`, so a child starts with SIGTERM blocked unless you reset it. Go's `os/signal.Notify` and Rust's `signal-hook` crate give you a channel or a pipe, so you write no handler of your own.
+
+## Merging and queueing
+
+A standard signal has one bit in the pending set. A second send before delivery does nothing. A real-time signal has one queue entry for each send, and it carries a value from `sigqueue`.
+
+<Predict
+  id="merge"
+  question="Five children exit quickly while the SIGCHLD handler is still running from the first exit. The handler calls waitpid once. How many children does the parent reap?"
+  options={[
+    "Five: each child sends its own signal",
+    "Two: one for the handler that runs now and one for the bit that stays pending",
+    "One: the handler runs only once",
+  ]}
+  answer={1}
+  explain="The first signal starts the handler, which blocks SIGCHLD. The second sets the pending bit. The next three find that bit set, and they merge. So the handler runs twice."
+>
+<IpcSignalCoalesceDemo />
+</Predict>
+
+Things to try:
+
+1. With the defaults, read the counts. SIGCHLD runs the handler 2 times, and 3 sends merge. The real-time signal runs it 5 times, in order.
+2. Look at **zombies left**: 3. Turn on the loop option, and it becomes 0. A SIGCHLD handler must call `waitpid(-1, ..., WNOHANG)` until no child remains.
+3. Set **Signal blocked at the start** to 20 ticks. All sends merge into 1 handler run.
+4. Lower **Handler time** to 2 and raise **Ticks between sends** to 10. Nothing merges, so the bug hides in slow tests.
+
+The real-time queue has a limit, `RLIMIT_SIGPENDING`. A `sigqueue` past that limit fails with `EAGAIN`. So never treat signals as a reliable message queue. When several signals are ready, the kernel takes the lowest number first.
+
+## Signals and threads
+
+Handlers belong to the process, because threads share `sighand_struct`. The mask belongs to each thread.
+
+- A signal from `kill` goes to the process. `complete_signal` picks the main thread if it does not block the signal, and otherwise any thread that does not block it.
+- `tgkill` and `pthread_kill` choose one thread.
+- A fault goes to the thread that caused it.
+- `fork` copies the mask and clears the pending list. `exec` resets handlers to the default, and keeps ignored signals, the mask and the pending list.
+
+A common design blocks all signals in all threads, and gives one thread the job of calling `sigwaitinfo`, or of reading a `signalfd`.
+
+## SIGSEGV handlers
+
+A handler for a fault can do more than report it. When it returns, the CPU runs the faulting instruction again. So the handler must fix the cause, for example with `mprotect`, or it must jump away. If it does neither, the fault repeats forever.
+
+Runtimes use this on purpose. A JVM can leave out null checks and take the fault for a null dereference. It finds the faulting address in `siginfo` and throws an exception. Go's handler turns a nil dereference into a panic, through `sigpanic`. Write barriers and page-based dirty tracking can use `mprotect` and a handler in the same way, though `userfaultfd` is now a cleaner tool.
+
+If SIGSEGV is blocked or ignored when a fault occurs, the kernel resets it to the default and kills the process. A program cannot ignore its own bad access.
+
+## How Go uses signals for preemption
+
+A tight loop with no function calls gives the Go scheduler no safe point. Since Go 1.14, `sysmon` finds a goroutine that has run for 10 ms and sends SIGURG to its thread with `tgkill`. The handler runs on the thread's signal stack, `gsignal`.
+
+The handler checks that the interrupted point is safe, in `isAsyncSafePoint`. If so, it edits the saved registers in the signal frame, so that `sigreturn` "returns" into a call of `asyncPreempt`. The goroutine then yields as if it had called the scheduler. Go chose SIGURG because few programs use it, and because its default action does nothing.
+
+This is the frame from the demo, used as a tool. Go installs its handlers with `SA_RESTART`, but some calls still return `EINTR`. So the standard library retries them. You can turn this off with `GODEBUG=asyncpreemptoff=1`. See [threads](/os/processes/threads) for the rest of the scheduler.
+
+<Callout title="macOS">
+XNU has only the 31 standard signals, with no real-time range. Numbers differ: SIGCHLD is 20 and SIGUSR1 is 30, so use the names. There is no `signalfd`. Use `kqueue` with `EVFILT_SIGNAL`, or the self-pipe trick. Hardware faults start as Mach exceptions, and the BSD layer turns them into signals if no exception port takes them.
+</Callout>
+
+## Connect
+
+- [Page faults](/os/vm/page-faults-and-demand-paging): where SIGSEGV comes from.
+- [What a process is](/os/processes/what-a-process-is): zombies and `waitpid`.
+- [System calls](/os/processes/system-calls): the entry and exit path where delivery occurs.
+- [Pipes](/os/ipc/pipes): SIGPIPE, and the pipe in the self-pipe trick.
+- [Deadlock](/os/sync/deadlock): a handler that waits on its own thread is a cycle of one.
+- [Fork and exec](/os/processes/fork-and-exec): the same async-signal-safe rule applies after `fork`.
+
+<Recall cards={[
+  { q: "When can a pending signal start its handler?", a: "Only when the thread returns to user mode. The kernel forces this with an interrupt for a running thread, and with a wakeup for a thread in an interruptible sleep." },
+  { q: "What does the kernel push on the user stack for a handler, and what removes it?", a: "It pushes an rt_sigframe with pretcode, registers, the old mask, siginfo and the XSAVE area. The handler returns to __restore_rt, which calls rt_sigreturn, and the kernel restores all of it." },
+  { q: "What decides between EINTR and a transparent restart of a blocking read?", a: "The call returns -ERESTARTSYS in the kernel. With no handler or with SA_RESTART, rip goes back 2 bytes to the syscall. A handler without SA_RESTART gets a saved rax of -EINTR." },
+  { q: "Why can malloc in a handler hang when no other thread exists?", a: "The handler runs on top of the main flow. If the main flow holds the lock, it cannot run to unlock until the handler returns, and the handler waits for the lock." },
+  { q: "Why must a SIGCHLD handler call waitpid in a loop?", a: "SIGCHLD is a standard signal with one pending bit. Several exits can merge into one handler run." },
+  { q: "How does Go stop a goroutine in a loop with no calls?", a: "sysmon sends SIGURG to the thread. The handler checks for an async safe point and edits the signal frame, so that sigreturn enters asyncPreempt." },
+]} />

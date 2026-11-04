@@ -1,0 +1,183 @@
+---
+summary: "A pipe is a ring of pages in the kernel. Why 64 KiB does not always hold 64 KiB, what PIPE_BUF promises, how EOF and SIGPIPE work, named pipes, and zero copy with splice and vmsplice."
+---
+import { IpcPipeRingDemo, IpcPipeInterleaveDemo, IpcPipeThroughputDemo } from "@/demos/os/IpcPipeDemos";
+
+A **pipe** is a one-way byte stream between two file descriptors. The kernel holds the bytes in its own memory. The writer calls `write`, the reader calls `read`, and neither process knows much about the other.
+
+The structure is `struct pipe_inode_info` in `fs/pipe.c`. It holds a ring of `struct pipe_buffer` entries. Each entry, or **slot**, points at one page. Two counters, `head` and `tail`, mark the used part of the ring. One mutex protects each read and each write.
+
+A new pipe has 16 slots. With 4 KiB pages, its capacity is 65,536 bytes. On arm64, a kernel with 16 KiB pages gives a default pipe of 262,144 bytes.
+
+<Predict
+  id="fit"
+  question="A new pipe has a capacity of 65,536 bytes, and no reader runs. A process calls write in a loop with 2049 bytes each time. How many bytes are in the pipe when a write first blocks?"
+  options={[
+    "63,519: 31 writes fit, and the next write would pass 65,536",
+    "32,784: each write takes a slot of its own",
+    "65,536: the last write fills the pipe and then blocks",
+  ]}
+  answer={1}
+  explain="Two writes of 2049 bytes do not fit in one 4096-byte page. So each write takes a new slot, and 2047 bytes at the end of each page stay empty. After 16 slots, the ring is full."
+>
+<IpcPipeRingDemo />
+</Predict>
+
+Things to try:
+
+1. With **2049 B**, click **Write until it stops**. The pipe holds 32,784 bytes, and the 17th write sleeps. Look at **wasted at slot ends**.
+2. Select **2048 B**, and repeat. Two writes share each page, so all 65,536 bytes fit.
+3. Select **100 B**, and repeat. Each page takes 40 writes, because a 41st write does not fit. The pipe stops at 64,000 bytes.
+4. Fill the pipe, select a read size of **1000 B**, and click **read**. The writer still sleeps. It wakes only when a whole slot becomes free.
+5. Read until the reader sleeps. Close the writer. The reader wakes with `read` = 0, which is EOF.
+6. Fill the pipe with a large write, and close the reader. The sleeping writer wakes and gets SIGPIPE.
+
+## The write path
+
+`pipe_write` takes the mutex and then does two things.
+
+First, it tries to **merge**. It computes `total & (PAGE_SIZE - 1)`, the part of the write below one page. If all of this part fits at the end of the last slot, it copies the part there. If only some of it fits, it does not merge at all. A slot can accept a merge only if it has the flag `PIPE_BUF_FLAG_CAN_MERGE`.
+
+Then it fills new slots, one page at a time, until the write ends or the ring is full. If the ring is full, the writer drops the mutex and sleeps on `wr_wait`. The next read that frees a slot wakes it.
+
+```c
+// fs/pipe.c, simplified
+chars = total_len & (PAGE_SIZE - 1);
+if (chars && !was_empty) {
+    buf = &pipe->bufs[(head - 1) & mask];
+    if ((buf->flags & PIPE_BUF_FLAG_CAN_MERGE) && buf->offset + buf->len + chars <= PAGE_SIZE)
+        /* copy chars bytes into the last page */;
+}
+for (;;) {
+    if (!pipe->readers) { send_sig(SIGPIPE, current, 0); ret = ret ?: -EPIPE; break; }
+    if (!pipe_full(head, pipe->tail, pipe->max_usage)) { /* take a slot, copy one page */ }
+    if (no bytes left) break;
+    if (still full) { unlock; wait_event_interruptible_exclusive(pipe->wr_wait, ...); lock; }
+}
+```
+
+So the capacity in bytes depends on the sizes of your writes. The table shows what the ring does with a 16-slot pipe.
+
+| Write size | Bytes in each page | Bytes when the writer blocks |
+|---|---|---|
+| 100 | 4000 | 64,000 |
+| 2048 | 4096 | 65,536 |
+| 2049 | 2049 | 32,784 |
+| 3000 | 3000 | 48,000 |
+| 4096 | 4096 | 65,536 |
+
+## Blocking and non-blocking
+
+| Call | Ring state | Blocking | `O_NONBLOCK` |
+|---|---|---|---|
+| `read` | has data | returns what exists, up to the count | same |
+| `read` | empty, a writer exists | sleeps | `EAGAIN` |
+| `read` | empty, no writer | returns 0 (EOF) | returns 0 (EOF) |
+| `write` | room for all | returns the count | same |
+| `write` | full, a reader exists | sleeps | `EAGAIN`, or a partial count |
+| `write` | no reader | SIGPIPE and `EPIPE` | SIGPIPE and `EPIPE` |
+
+A `read` can return fewer bytes than you asked for. Code that reads a pipe must loop.
+
+## F_SETPIPE_SZ
+
+`fcntl(fd, F_SETPIPE_SZ, n)` changes the capacity. The kernel rounds `n` up to a power of two pages and returns the real size. So a request for 5000 bytes gives 8192. The limit for a normal user is in `/proc/sys/fs/pipe-max-size`, and its default is 1,048,576 bytes. A shrink that cannot hold the current slots fails with `EBUSY`.
+
+The total memory for pipes also has a limit for each user. The default of `/proc/sys/fs/pipe-user-pages-soft` is 16,384 pages, which is 1024 default pipes. After that limit, a new pipe gets only 2 slots. Code that needs a large pipe must check the result of `F_SETPIPE_SZ`.
+
+## PIPE_BUF: when writes stay whole
+
+Several processes can write to one pipe. POSIX promises that a write of at most `PIPE_BUF` bytes is **atomic**: its bytes stay together in the stream. On Linux, `PIPE_BUF` is 4096. The POSIX minimum and the macOS value are both 512.
+
+<Predict
+  id="atomic"
+  question="Two writers share a pipe that has 2 slots. Each writer sends 4096-byte writes, and a reader reads 4096 bytes at a time. Can the reader get part of one write, then bytes of the other writer, then the rest of the first write?"
+  options={[
+    "Yes: the kernel can switch to the other writer in the middle of a copy",
+    "No: a write of this size needs one free slot, and it sleeps before it copies anything",
+    "Yes, but only when the ring is full",
+  ]}
+  answer={1}
+  explain="The mutex covers the copy. A writer drops the mutex only to sleep on a full ring. A write of at most one page takes a merge or one slot. So it sleeps with zero bytes written, or it does not sleep at all."
+>
+<IpcPipeInterleaveDemo />
+</Predict>
+
+Things to try:
+
+1. Select **4096 B**. Run A, B and the reader in any order that you like. No order splits a write. The search covers all 190 states.
+2. Select **4097 B**. Click **Show a split**. The second write of A puts 1 byte in the last slot, and then the ring is full. A sleeps, and B gets in. The schedule has 6 steps.
+3. Select **12288 B**, and click **Show a split**. A large write fills the ring and sleeps, so the other writer can enter the gap.
+4. Select **512 B**, and run A twice. Both writes share one page. The bytes merge, and each write stays whole.
+
+The tests also search mixed sizes. A small write stays whole even when a large write from the other process is split around it.
+
+One limit is important. On Linux, a large write splits only when it must sleep. POSIX allows a split at any byte. So do not build on the Linux behavior. A log line from many processes is safe at 4096 bytes or less. Use a lock or a socket for anything larger.
+
+## EOF, SIGPIPE and pipelines
+
+`read` returns 0 only when the ring is empty and `pipe->writers` is 0. This counter includes each open write end in every process. So one forgotten fd in any process makes the reader wait forever. The lesson on [fork and exec](/os/processes/fork-and-exec) shows how a shell builds `ls | wc` with `pipe`, `fork` and `dup2`. It also shows how this mistake hangs `wc`.
+
+A write with no reader sends **SIGPIPE**, and the default action kills the writer. This is why `yes | head -1` stops: `head` exits, and the next write of `yes` kills it. Shells report that as status 141, which is 128 + 13.
+
+Languages differ here. A Go program dies from SIGPIPE only for a write to fd 1 or fd 2. For other fds, it gets `EPIPE`. Rust's runtime ignores SIGPIPE at startup, so `println!` panics when the pipe closes. A network server usually ignores SIGPIPE and handles `EPIPE`.
+
+## Named pipes
+
+`mkfifo path` makes a **named pipe**, or FIFO. It has a name in the file system, but no data goes to the disk. It uses the same `pipe_inode_info` as a normal pipe. An `open` for reading blocks until a writer opens it, and the same is true the other way. So unrelated processes can meet at a path, and normal file permissions control access.
+
+## Throughput
+
+<Predict
+  id="speed"
+  question="A writer sends 4 KiB writes to a reader on the same core. Which change gives the largest gain at first: a larger pipe, or larger writes?"
+  options={[
+    "Larger writes, because each write is one system call",
+    "A larger pipe, because each full pipe forces two context switches",
+    "Neither: the copies set the speed",
+  ]}
+  answer={1}
+  explain="With a 4 KiB pipe, 77% of the model's time is wake and switch. A 64 KiB pipe cuts the switches by 16 times. Larger writes then save system calls, and at the end the copies set the limit."
+>
+<IpcPipeThroughputDemo />
+</Predict>
+
+Things to try:
+
+1. Read the line for 4 KiB writes at the left. A 4 KiB pipe with 4 KiB writes gives 0.73 GiB/s in the model. It rises to 2.91 GiB/s at the default 64 KiB.
+2. Compare the writes at 64 KiB. 512-byte writes give 1.62 GiB/s, and 64 KiB writes give 3.26 GiB/s.
+3. Read the right side. A 1 MiB pipe with 64 KiB writes gives 4.08 GiB/s, and copies take 86% of the time.
+4. Turn on **Move pages with splice**. The copies leave, so the line rises by a large factor.
+
+Each point runs the real ring and counts its system calls, slots and switches. All costs are model inputs. The model has no cache effects, and a large pipe in a real system can push data out of the cache. Measure your own case with `pv` or `dd` on Linux.
+
+## Zero copy: splice and vmsplice
+
+A slot points at a page, and the page need not belong to the pipe. Linux uses this for three calls.
+
+- `splice` moves data between a pipe and another fd. From a file, the slot points at a page cache page, with no copy.
+- `vmsplice` puts pages of user memory into a pipe. With `SPLICE_F_GIFT`, the caller gives up the page. Without it, the caller must not change the page until the reader is done.
+- `tee` copies slot references from one pipe to another, with no copy of the data.
+
+A borrowed page must not take merges. A write that merged into a page cache page would change the file. That was **Dirty Pipe** (CVE-2022-0847). A slot from a splice kept a stale `PIPE_BUF_FLAG_CAN_MERGE` flag, so an unprivileged write could change a read-only file in the page cache. The merge rule in this lesson is the code that it reached.
+
+<Callout title="macOS">
+macOS has `pipe` and `mkfifo`, and the rules for EOF and SIGPIPE are the same. `PIPE_BUF` is 512, so a portable program must not assume 4096. It has no `F_SETPIPE_SZ`, `splice`, `vmsplice` or `tee`. The kernel chooses the buffer size. Try this in bash: `yes | head -1; echo ${PIPESTATUS[0]}` prints 141.
+</Callout>
+
+## Connect
+
+- [fork and exec](/os/processes/fork-and-exec): how a shell connects the two ends.
+- [Semaphores](/os/sync/semaphores): a pipe is a bounded buffer in the kernel.
+- [Signals](/os/ipc/signals): what SIGPIPE does when it arrives.
+- [Unix domain sockets](/os/ipc/unix-domain-sockets): the two-way stream, with message types and fd passing.
+- [The mmap lesson](/os/memory/mmap): the page cache pages that `splice` borrows.
+
+<Recall cards={[
+  { q: "Why can a 64 KiB pipe block after only 32,784 bytes?", a: "Writes of 2049 bytes do not fit two to a page, so each takes one slot. The ring has 16 slots, and the empty end of each page stays unused." },
+  { q: "Why does a write of at most PIPE_BUF bytes never split?", a: "The mutex covers each copy, and a writer drops it only to sleep. A write of at most one page uses a merge or one slot, so it sleeps with no bytes written or it does not sleep." },
+  { q: "What must be true for read on a pipe to return 0?", a: "The ring is empty, and no write end stays open in any process." },
+  { q: "What happens to a writer that sleeps on a full pipe when the last reader closes?", a: "It wakes and gets SIGPIPE. If it had written some bytes, write returns that partial count. Otherwise it returns EPIPE." },
+  { q: "What does F_SETPIPE_SZ do with a request for 5000 bytes?", a: "It rounds up to a power of two pages, so the pipe gets 8192 bytes, and the call returns that size." },
+  { q: "What was the root cause of Dirty Pipe?", a: "A slot that pointed at a page cache page kept a stale merge flag. A later small write merged into the page and changed the file in the cache." },
+]} />

@@ -76,6 +76,9 @@ try {
         }
         if ((await demo.innerHTML()) === before) failures.push(`[${theme}] ${path}: slider did not change the demo`);
       }
+      // A pipe table that did not parse shows up as literal text starting with "|".
+      const rawTables = await page.locator("p").evaluateAll((ps) => ps.filter((p) => p.textContent.trim().startsWith("|")).length);
+      if (rawTables) failures.push(`[${theme}] ${path}: ${rawTables} table(s) rendered as raw text`);
       const short = path.split("/").pop();
       await demo.screenshot({ path: `${SHOTS}${theme}-${short}.png` });
       if (errors.length) failures.push(`[${theme}] ${path}: ${errors.join(" | ")}`);
@@ -88,7 +91,7 @@ try {
 
   // Phone width: no horizontal page scroll.
   const phone = await browser.newPage({ viewport: { width: 390, height: 844 } });
-  for (const path of ["", LIVE[1], "systems/allocators/free-lists"]) {
+  for (const path of ["", ...LIVE]) {
     await phone.goto(`${BASE}/${path}`, { waitUntil: "networkidle" });
     const overflow = await phone.evaluate(() => document.documentElement.scrollWidth - innerWidth);
     if (overflow > 1) failures.push(`phone ${path || "home"}: horizontal overflow ${overflow}px`);

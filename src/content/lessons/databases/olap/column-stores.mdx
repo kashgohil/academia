@@ -1,0 +1,154 @@
+---
+summary: "Why analytical engines store each column on its own: NSM, DSM and PAX page layouts, bytes and cache lines read per query, the cost of rebuilding rows and of inserts, delta stores, and the Parquet, ORC, DuckDB, ClickHouse and Snowflake formats."
+---
+import { LayoutDemo, BytesReadDemo, TableBlockDemo } from "@/demos/db/OlapColumnDemos";
+
+A transaction-processing (OLTP) query touches a few whole rows: "get order 13", "insert one order". An **analytical** (OLAP) query touches a few columns of very many rows: "the total price of all orders in 2026, per region". The two kinds of query want opposite layouts on disk.
+
+The earlier lessons stored a table as rows in [slotted pages](/databases/storage/pages-and-slotted-records). That layout is good for OLTP. This lesson shows why it wastes most of the bytes that an analytical query reads, and what column stores do instead.
+
+## Three ways to put a table in pages
+
+- **NSM** (n-ary storage model) is the row store. A page holds whole rows, one after the other. PostgreSQL, InnoDB and SQLite use NSM.
+- **DSM** (decomposition storage model) is the column store. Each column has its own pages, and a page holds values of one column only. Copeland and Khoshafian described it in 1985.
+- **PAX** (partition attributes across) is a hybrid by Ailamaki and others (2001). A page holds whole rows, like NSM. Inside the page, each column has its own **minipage**, so the values of one column are next to each other.
+
+In all three layouts, a row has no stored ID. Row *i* is the value at position *i* in every column. Early DSM designs stored a (row ID, value) pair for each value. For 4-byte values, that doubles the size. Modern column stores use the position only.
+
+<Predict
+  id="nsm-lines"
+  question="A row is 32 bytes and price is 8 of them. SUM(price) runs on a row store. What share of the table's 64-byte cache lines does it touch?"
+  options={["25%, because price is a quarter of each row", "100%: every line holds a price", "50%"]}
+  answer={1}
+  explain="A 64-byte line holds two whole rows, and each row has a price. So the scan touches every line, and the CPU moves 4 bytes for each useful byte. In DSM, the prices are contiguous and the scan touches only 4 of 16 lines."
+>
+<LayoutDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **SUM(price)** and **NSM**. All 8 pages and all 16 cache lines are touched, but only 256 of the 1,024 bytes are useful: 25%.
+2. Select **DSM**. The query reads 2 pages and 4 cache lines, and every byte is useful.
+3. Select **PAX**. The query still reads all 8 pages from disk, but it touches only 8 cache lines. PAX is a row store for the disk and a column store for the cache.
+4. Select **one row**. NSM reads 1 page and 1 line. DSM must read 7 pages, one for each column. This is the cost of **tuple reconstruction**.
+5. Select **insert**. The same 7 pages change in DSM. Each of them must be written back, and each write goes into a compressed block.
+
+## Bytes read per query
+
+For a full scan of $N$ rows, a row store reads every page. A column store reads only the pages of the columns that the query names:
+
+$$
+\text{NSM bytes} \approx N \cdot \sum_{\text{all columns}} w_c \qquad \text{DSM bytes} \approx N \cdot \sum_{\text{query columns}} w_c
+$$
+
+Here $w_c$ is the width of column $c$ in bytes. The ratio is the share of the row that the query needs. Real fact tables are often wide, with many tens of columns, and a typical analytical query names only a few of them.
+
+<Predict
+  id="wide-scan"
+  question="A table has 100 columns of 8 bytes and 100 million rows. A query reads 3 columns. How much less does a column store read from disk?"
+  options={["The same: both read whole 8 KiB pages", "About 34 times less", "About 3 times less"]}
+  answer={1}
+  explain="The row store reads 81.92 GB, because each page holds 10 rows of 800 bytes. The column store reads only the 3 columns: 2.4 GB. The ratio is about 100 / 3."
+>
+<BytesReadDemo />
+</Predict>
+
+1. Read the default point. NSM reads 81.92 GB for any number of columns. DSM reads 2.4 GB for 3 columns, about 34 times less.
+2. Move **Columns the query reads** to 100. Now all three layouts read the same bytes. A column store helps only when the query is narrow.
+3. Set **Columns the query reads** to 1 and select **memory traffic, scan**. Here NSM moves 6.4 GB through the cache: one 64-byte line per 800-byte row. DSM moves 0.8 GB, and PAX 1.28 GB.
+4. Select **pages, fetch one row** and read 100 columns. NSM reads 1 page, and DSM reads 100 pages. A column store is slow at OLTP.
+
+## Rebuilding rows
+
+A query result is rows. So a column store must stitch columns back together at some point. For a scan, this is cheap: the engine reads the columns in parallel, in the same position order, and zips them.
+
+```rust
+/// Reconstruct (date, qty, price) rows from three column vectors.
+/// The row ID is the index i, so no join is needed: only aligned reads.
+fn stitch(date: &[i32], qty: &[i32], price: &[f64]) -> impl Iterator<Item = (i32, i32, f64)> + '_ {
+    date.iter().zip(qty).zip(price).map(|((&d, &q), &p)| (d, q, p))
+}
+```
+
+For a point lookup, the same stitch costs one page per column, as the demo showed. When to stitch is a real design choice. The [late materialization lesson](/databases/olap/late-materialization) covers it.
+
+<TableBlockDemo />
+
+Things to try:
+
+1. Keep **NSM** and **SUM(c3)**. All 8 pages lift out of the block, because every page holds part of column c3. Most of the lifted cells are waste.
+2. Select **DSM**. The block is now cut into vertical slices, one per column. Only the slice of c3 lifts out.
+3. Select **row 21, all columns**. In DSM all 8 slices lift out for 8 values. In NSM one horizontal slab lifts out.
+4. Select **PAX**. The cuts are the same as NSM, so the disk reads the same pages. Inside each slab, the columns are separate, so the CPU reads only the needed parts.
+
+## The write path
+
+A column store makes writes hard, for three reasons:
+
+- One inserted row changes one page per column, not one page.
+- Column data is compressed in blocks (see [compression](/databases/olap/compression)). To change one value, the engine must decode and encode a whole block.
+- The data is often sorted. A new row in the middle of the order cannot fit in place.
+
+So most column stores do not write in place. They collect new rows in a **delta store** and merge them into the column data in large batches.
+
+**C-Store** (Stonebraker and others, 2005) had two parts. The **WOS** (write-optimized store) held new rows in memory. The **ROS** (read-optimized store) held sorted, compressed columns on disk. A background **tuple mover** moved batches from the WOS to the ROS. A query read both parts and merged them.
+
+**ClickHouse** MergeTree tables use the same idea as an [LSM tree](/databases/lsm/memtables-and-sstables). Each `INSERT` writes a new immutable **part**: a directory with the rows sorted by the table's `ORDER BY` key. A wide part stores one file per column. Background merges combine small parts into larger ones, like [compaction](/databases/lsm/compaction-leveled-vs-tiered). Many small inserts make many parts, and ClickHouse then slows or rejects inserts with a "too many parts" error. So clients send rows in large batches.
+
+**DuckDB** stores a table as **row groups** of 122,880 rows. Inside a row group, each column is a separate column segment in 256 KiB blocks. Updates and deletes go to versioned in-memory structures, and a checkpoint writes new compressed segments.
+
+**Snowflake** stores each table as immutable **micro-partitions** of 50 to 500 MB of uncompressed data, with a columnar layout inside. A DML statement does not change a micro-partition. It writes new micro-partitions and marks the old ones as removed.
+
+## File formats are PAX at a larger scale
+
+Parquet and ORC are the column file formats of data lakes. Both cut the file into horizontal groups of rows first, and then store each column of a group on its own. This is the PAX idea, with a row group in place of a page.
+
+| | Parquet | ORC |
+|---|---|---|
+| Horizontal unit | row group (writers default to about 128 MiB) | stripe (default 64 MiB) |
+| One column inside it | column chunk | stream(s) per column |
+| Smallest unit | page (default about 1 MiB), the unit of encoding and compression | row index entry every 10,000 rows |
+| Metadata | footer (Thrift) with the schema, offsets and min/max statistics | file footer and postscript, plus an index per stripe |
+
+A Parquet file starts and ends with the 4 bytes `PAR1`. A reader seeks to the end, reads the footer length and the footer, and then reads only the column chunks that the query needs. The [zone maps lesson](/databases/olap/zone-maps-and-data-skipping) shows how the footer statistics skip whole row groups.
+
+```go
+// The Parquet tail: ... column chunks ... | footer (Thrift) | uint32 footer length | "PAR1"
+func footerOffset(f *os.File, size int64) (int64, uint32, error) {
+	tail := make([]byte, 8)
+	if _, err := f.ReadAt(tail, size-8); err != nil {
+		return 0, 0, err
+	}
+	if string(tail[4:]) != "PAR1" {
+		return 0, 0, errors.New("not a Parquet file")
+	}
+	n := binary.LittleEndian.Uint32(tail[:4])
+	return size - 8 - int64(n), n, nil
+}
+```
+
+## Where each engine sits
+
+| System | Layout | Write path |
+|---|---|---|
+| PostgreSQL, InnoDB, SQLite | NSM pages | in place, with a WAL |
+| DuckDB | row groups of 122,880 rows, column segments | in-memory changes, checkpoint rewrites segments |
+| ClickHouse MergeTree | one file per column per part, sorted | new part per insert, background merges |
+| Snowflake | micro-partitions, columnar inside | new micro-partitions, never in place |
+| Parquet, ORC files | row groups or stripes, column chunks inside | write once; table formats add new files |
+
+## Connect
+
+- [Pages and slotted records](/databases/storage/pages-and-slotted-records) shows the NSM page and its per-row header, which DSM avoids.
+- [Compaction](/databases/lsm/compaction-leveled-vs-tiered) is the same merge process that ClickHouse runs on its parts.
+- [Locality](/architecture/caches/locality) explains why contiguous values use each cache line fully.
+- [Compression](/databases/olap/compression) and [late materialization](/databases/olap/late-materialization) build on this layout.
+
+<Recall cards={[
+  { q: "What do the NSM, DSM and PAX layouts put in one page?", a: "NSM: whole rows, one after the other. DSM: values of one column only. PAX: whole rows, but each column in its own minipage inside the page." },
+  { q: "For a scan of 3 columns of a 100-column table, about how much less does DSM read than NSM, and why?", a: "About 34 times less (2.4 GB in place of 81.92 GB for 100 million rows). DSM reads only the pages of the 3 columns; NSM reads every page." },
+  { q: "Why does PAX read the same bytes from disk as NSM, but fewer cache lines?", a: "A PAX page holds whole rows, so a scan still reads every page. Inside the page, each column is contiguous, so the CPU touches only the lines of the needed columns." },
+  { q: "What does it cost a column store to fetch one whole row, and why?", a: "One page (or block) per column, because each column is stored separately. NSM needs one page." },
+  { q: "How do C-Store and ClickHouse avoid in-place writes to compressed columns?", a: "They buffer new rows and merge them in batches. C-Store had a WOS in memory and a tuple mover into the ROS. ClickHouse writes an immutable part per insert and merges parts in the background." },
+  { q: "How is a Parquet file organized?", a: "Row groups, each with one column chunk per column, each chunk made of pages. A Thrift footer with the schema, offsets and statistics is at the end, before the footer length and the magic bytes PAR1." },
+]} />

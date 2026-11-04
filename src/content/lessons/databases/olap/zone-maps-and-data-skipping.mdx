@@ -1,0 +1,130 @@
+---
+summary: "How analytical engines skip data they never read: min/max zone maps per block, Parquet statistics, ClickHouse skip indexes, Snowflake pruning and PostgreSQL BRIN, why the sort order decides everything, Z-order for two columns, and Bloom filters for point predicates."
+---
+import { ZoneMapDemo, PruningSweepDemo } from "@/demos/db/OlapZoneDemos";
+
+The fastest way to read a block is to not read it. A column store has no B+ tree on most columns, because a tree per column costs too much space and too much write work. It keeps a tiny summary per block instead. A **zone map** stores the minimum and the maximum value of each column in each block. For a query with `WHERE a BETWEEN 400 AND 501`, any block with `max(a) < 400` or `min(a) > 501` cannot hold a match. The engine skips it.
+
+This is called **data skipping** or **pruning**. It is not an index in the usual sense, because it never points at a row. It can only say "no match here" or "maybe a match here". So the result is always correct: a block that holds a matching value has a [min, max] range that overlaps the predicate. The worst case is that it skips nothing.
+
+## The same idea in every engine
+
+| System | Unit | Summary | Name |
+|---|---|---|---|
+| Parquet | row group, and page with the page index | min, max, null count per column | statistics, column index |
+| ORC | stripe, and every 10,000 rows | min, max, sum, count | row index |
+| DuckDB | row group and column segment | min, max per column | zonemaps (automatic) |
+| ClickHouse | granule of 8,192 rows, or N granules | min/max, set, Bloom filter | data-skipping index |
+| Snowflake | micro-partition | min, max, distinct count per column | partition pruning |
+| PostgreSQL | range of 128 heap pages by default | min/max, or a Bloom filter (version 14 and later) | BRIN index |
+| Delta Lake | data file | min, max, null count of the first 32 columns | data skipping |
+
+A zone map is tiny. A PostgreSQL BRIN index on a 100 GiB table with the default `pages_per_range = 128` has one entry per 1 MiB: 102,400 entries. A B+ tree on the same column has one entry per row.
+
+```sql
+-- PostgreSQL: one min/max summary per 128 pages (1 MiB) of the heap.
+CREATE INDEX orders_ts_brin ON orders USING brin (created_at) WITH (pages_per_range = 128);
+
+-- ClickHouse: one min/max per 4 granules (4 × 8,192 rows) of each part.
+ALTER TABLE events ADD INDEX ts_mm ts TYPE minmax GRANULARITY 4;
+```
+
+## Why the sort order decides everything
+
+A zone map helps only if each block covers a narrow range. That depends only on the order of the rows. If the rows are in random order, each block holds a sample of the whole domain, and its [min, max] covers almost everything.
+
+<Predict
+  id="sorted-other-column"
+  question="4,096 rows are sorted by column A and stored in 64 blocks. A query filters on column B with a range that covers 10% of B's values. How many blocks does the zone map skip?"
+  options={["About 90%, because the range covers 10% of the values", "Almost none: every block holds B values from the whole range", "About half"]}
+  answer={1}
+  explain="Sorting by A does not order B. Each block of 64 rows holds B values from almost the whole domain, so every [min B, max B] overlaps the predicate. The engine scans all 64 blocks."
+>
+<ZoneMapDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **sorted by A** and the predicate on **A**. The blocks are thin vertical strips. The zone map scans 7 of 64 blocks, and all 7 hold a match.
+2. Select **Predicate on: B**. Every strip crosses the predicate band, so all 64 blocks are scanned. The sort helps one column only.
+3. Select **unsorted**. Every box covers almost the whole square. A predicate on A or on B scans all 64 blocks.
+4. Select **Z-order (A, B)**. The boxes become small squares. A predicate on A scans 12 blocks, and on B 15 blocks. On A and B together, it scans only 4.
+5. Select **B = value** and **unsorted**, then turn on the Bloom filter. Min/max cannot skip anything, but the filter skips most blocks. The matches in skipped blocks always stay at 0.
+
+For random data, the demo shows why an unsorted zone map is useless. A block of $n$ rows can be skipped for a range $[l, h]$ only if all $n$ values fall below $l$ or above $h$:
+
+$$
+P(\text{skip}) = l^n + (1 - h)^n
+$$
+
+Here $l$ and $h$ are fractions of the domain. For $n = 64$ and a 10% range in the middle of the domain, this chance is below $10^{-18}$. Real blocks hold thousands of rows, so the chance is even smaller.
+
+## Clustering: choose the sort order for the queries
+
+Data is often sorted by time without any extra work, because new rows arrive in time order. A time-range query then skips well with no setup. For any other column, the engine must **cluster** the data: rewrite it in a chosen order.
+
+- ClickHouse sorts each part by the `ORDER BY` key of the table, and merges keep that order.
+- Snowflake tracks a **clustering depth**: how many micro-partitions overlap for a value. With a clustering key, a background service re-sorts the micro-partitions that overlap too much.
+- Delta Lake has `OPTIMIZE ... ZORDER BY (a, b)`, which rewrites the files in Z-order.
+- A PostgreSQL BRIN index works only if the heap order follows the column. `CLUSTER` sorts the heap once, but new rows do not keep that order.
+
+A sort by A makes A skip well and B not at all. The **Z-order** (Morton order) is a compromise for two or more columns. It interleaves the bits of the values, and sorts by the result:
+
+```zig
+/// Morton code of two 10-bit values: the bits alternate a9 b9 a8 b8 ... a0 b0.
+fn morton(a: u10, b: u10) u20 {
+    var z: u20 = 0;
+    var i: u5 = 10;
+    while (i > 0) {
+        i -= 1;
+        z = (z << 2) | (@as(u20, (a >> @intCast(i)) & 1) << 1) | ((b >> @intCast(i)) & 1);
+    }
+    return z;
+}
+```
+
+The rows in one block then share the high bits of both A and B. So each block covers a small square of the (A, B) plane, not a strip. A predicate on either column skips most blocks, though not as many as a sort by that column. Hilbert curves keep neighbors closer than the Z-order, at the cost of a more complex code.
+
+<PruningSweepDemo />
+
+Things to try:
+
+1. Keep **A** and 10% width. A sort by A scans 7.3 blocks on average, the Z-order 16.1 and the unsorted layout 64.0.
+2. Select **B**. The sort by A now scans 64.0 blocks, the same as no sort. The Z-order scans 19.7.
+3. Select **A and B**. The Z-order scans only 5.2 blocks, fewer than the sort by A with 7.3. Each zone map box is small in both directions.
+4. Move the width to 1% with **A**. The sort by A scans 1.6 blocks, but the Z-order still scans 10.3. Each Z-order block is wide in A, so even a narrow range hits several blocks.
+
+## Bloom filters for point predicates
+
+A min/max range cannot help a predicate like `user_id = 48213` on an unsorted column. Each block holds IDs from the whole range. A [Bloom filter](/databases/lsm/bloom-filters) per block can help. It answers "this block does not contain 48213" with no false negatives, and with a small, tunable rate of false positives.
+
+Take the unsorted layout of the demo, and average over 128 values of B. An equality on B scans 61.8 blocks with min/max only. With a Bloom filter of 10 bits per value, it scans only 4.3 blocks, close to the 3.8 blocks that really hold a match.
+
+- Parquet can store a **split block Bloom filter** per column chunk. Each block of the filter is 256 bits, so all probes of one key hit one cache line.
+- ClickHouse has the skip index types `bloom_filter`, `tokenbf_v1` (words in a string) and `ngrambf_v1` (n-grams, for `LIKE` searches).
+- PostgreSQL 14 added the `bloom` and `minmax_multi` operator classes for BRIN.
+
+A Bloom filter costs much more space than a min/max pair, and it helps only equality and `IN` predicates. Add it only for columns that queries look up by exact value.
+
+## When skipping fails
+
+- **Unsorted data.** Every block covers the whole domain, as the formula shows.
+- **Wide ranges.** A predicate that covers half the domain must scan at least half the blocks under any layout.
+- **Functions on the column.** A zone map on `ts` cannot prune `WHERE date_trunc('day', ts) = ...` unless the engine knows the function keeps the order.
+- **Too many small blocks.** Each block adds metadata to read. Many small Parquet files or row groups can make the metadata reads cost more than the skipped data.
+
+## Connect
+
+- [Column stores](/databases/olap/column-stores) introduced the Parquet footer and the ClickHouse parts that hold these statistics.
+- [Compression](/databases/olap/compression) also wants sorted data. A good sort order gives both long runs and narrow zone maps.
+- [Bloom filters](/databases/lsm/bloom-filters) covers the false-positive math and the cache-line blocked variant.
+- [Spatial indexes](/databases/indexes/spatial-indexes-r-trees) use the same bounding-box test as the zone map boxes in the demo.
+
+<Recall cards={[
+  { q: "What does a zone map store, and why can it never drop a matching row?", a: "The min and max of each column per block. A block that holds a matching value has a [min, max] range that overlaps the predicate, so it is always scanned." },
+  { q: "Why is a zone map almost useless on an unsorted column?", a: "Each block is a sample of the whole domain, so its [min, max] covers nearly everything. The chance to skip a block of n rows is l^n + (1 − h)^n, which is tiny." },
+  { q: "Rows are sorted by A. Which predicates prune well, and which do not?", a: "Predicates on A prune well, because each block covers a narrow range of A. Predicates on B do not prune, because each block holds B values from the whole domain." },
+  { q: "What does Z-ordering do, and what does it trade?", a: "It sorts by interleaved bits of several columns, so each block covers a small square. Predicates on any of the columns prune, but less than a sort by that one column." },
+  { q: "When does a Bloom filter per block help where min/max does not?", a: "For an equality or IN predicate on an unsorted, high-cardinality column. Min/max covers the whole range, but the filter can say the value is not in the block." },
+  { q: "What is a PostgreSQL BRIN index, and what is its default range?", a: "A block range index: one summary (min/max by default) per range of heap pages, 128 pages by default. It works only when the heap order follows the column." },
+]} />

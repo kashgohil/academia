@@ -1,0 +1,139 @@
+---
+summary: "How column stores shrink data: run-length, dictionary, frame-of-reference, delta and bit-packing encodings, LZ4 and Zstd on top, why sorted data compresses better, how engines run queries on compressed data, and how Parquet and DuckDB choose an encoding per column."
+---
+import { CompressionLabDemo, CompressedSumDemo, SortOrderDemo } from "@/demos/db/OlapCompressionDemos";
+
+A column holds values of one type, often with few distinct values or in sorted order. So a column compresses much better than a row, which mixes types. Compression in an analytical engine has two goals. It reduces the bytes that the disk and memory must move. It also lets the engine do less work per value, because some operators can run on the compressed form.
+
+There are two kinds of compression. A **lightweight encoding** uses the meaning of the values: runs, small ranges, repeated strings. It is fast to decode, and often the engine can skip the decode. A **general-purpose codec** such as LZ4 or Zstd sees only bytes. It finds repeated byte sequences in any data, but the engine must decompress a whole block before it can read one value.
+
+## The lightweight encodings
+
+- **Run-length encoding (RLE)** stores each run of equal values once, with its length. It needs long runs, so it works on sorted or clustered columns.
+- **Dictionary encoding** stores each distinct value once, in a dictionary. The column then holds small integer **codes**. It works when the column has few distinct values.
+- **Frame of reference (FOR)** stores, for each block, the minimum value. Each value is then stored as its small offset from that minimum.
+- **Delta encoding** stores the difference between each value and the previous value. Sorted IDs and timestamps have small, nearly equal differences.
+- **Bit-packing** stores each integer in exactly as many bits as the largest value needs, not in 32 or 64 bits. FOR, delta and dictionary codes all end in bit-packing.
+
+The bit width for values in $0 \ldots m$ is $\lceil \log_2(m + 1) \rceil$. So 8 distinct strings need 3-bit codes, and offsets up to 400 need 9 bits.
+
+<Predict
+  id="ids-encoding"
+  question="A column holds 4,096 sorted order IDs near 1,000,000. Each ID is 1 to 4 larger than the previous one. Which encoding makes it smallest?"
+  options={["Dictionary: IDs repeat a lot", "Delta: the differences fit in 2 bits", "Run-length: the column is sorted"]}
+  answer={1}
+  explain="Every ID is distinct, so a dictionary and RLE store every value again, plus overhead. The differences are 1 to 4, so delta with bit-packing needs 2 bits per value: 1,093 bytes in place of 16,386."
+>
+<CompressionLabDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **sorted IDs**. Delta wins with a ratio of 15.0. Frame of reference gets only 3.46, because the offsets inside a block of 128 values grow to 9 bits. RLE and dictionary are larger than plain.
+2. Select **timestamps**. Delta wins again with a ratio of 7.80. The deltas are about 1,000 ms, but delta subtracts the smallest delta of each block, so only the jitter is stored.
+3. Select **sorted dates**. There are only 30 runs, so RLE gets a ratio of 90.0. LZ4 also does well here, 64.3, because the bytes repeat.
+4. Select **countries**. Eight distinct strings become 3-bit codes, and the dictionary gets a ratio of 15.5. LZ4 gets only 2.45.
+5. Select **random floats**. Nothing helps much: LZ4 gets 1.14, and every lightweight encoding is as large as plain or larger. The analyzer keeps the plain form.
+
+## Why sorted data compresses better
+
+RLE and delta depend on the order of the rows. A sort brings equal values together, so runs get long and deltas get small. In a table, only one sort order exists. So the choice of the sort key decides which columns compress well.
+
+<SortOrderDemo />
+
+Things to try:
+
+1. Keep **unsorted**. The status column has only 3 values, but it still has 1,363 runs in 4,096 rows. RLE makes the table only 6% smaller.
+2. Select **region, country**. Region falls to 4 runs and country to 17. Country is sorted inside each region, and each country is in one region.
+3. Select **status, region, country, day**. The first keys have few distinct values, so each later key still gets long runs. The table under RLE is now 24% of its plain size.
+4. Select **customer, status**. Customer has 1,000 values, so its runs are short, and they break every column after it. The sort hardly helps.
+
+The rule is: sort by the low-cardinality columns first. C-Store and Vertica chose a sort order for each **projection** for this reason. ClickHouse sorts each part by the `ORDER BY` key, and its documentation also suggests low-cardinality columns first.
+
+## Running queries on compressed data
+
+An engine that decodes everything before it starts gets only the I/O saving. Abadi, Madden and Ferreira (2006) showed that operators can work on the compressed form directly:
+
+- **SUM over RLE** adds `value × length` once per run, not once per value.
+- **A predicate on a dictionary column** looks up the constant once in the dictionary. Then it compares integer codes, never strings. An order-preserving dictionary also turns `<` and `>` into code ranges.
+- **A predicate on FOR data** subtracts the block minimum from the constant once. Then it compares the small offsets.
+
+<Predict
+  id="rle-sum"
+  question="A column of 256 values has runs of about 8 equal values. How many operations does SUM need on the RLE form, compared with decode-then-add?"
+  options={["About the same: the engine must still visit every value", "About 9 times fewer", "About 2 times fewer"]}
+  answer={1}
+  explain="The column has 29 runs. SUM on runs does one multiply and one add per run: 58 operations. Decode-then-add writes 256 values and adds 256 values: 512 operations."
+>
+<CompressedSumDemo />
+</Predict>
+
+1. Press **Play**. Both workers do 2 operations per tick. The run worker finishes after 29 ticks, and the decode worker after 256 ticks. Both sums are equal.
+2. Move **Average run length** to 1. Every run has one value, so RLE does the same 512 operations, plus the run headers. RLE helps only with real runs.
+3. Move it to 64. Only 7 runs remain, so SUM needs 14 operations.
+4. Look at the country predicate. On plain strings, the engine compares 4,632 bytes to count the rows with 'FR'. With a dictionary, it compares 5 strings to find code 4, then 4,096 small integers.
+5. Select **'XX'**. It is not in the dictionary, so the engine knows the answer is 0 before it reads any code.
+
+The integer compares are also easy to vectorize. A SIMD instruction can compare many 8-bit or 16-bit codes in one step, and some engines compare bit-packed codes without unpacking them.
+
+## General-purpose codecs
+
+LZ4 replaces a byte sequence that occurred before with a short back-reference: an offset and a length. Its block format is simple, and the lab above runs a real LZ4 encoder. Zstd adds entropy coding (Huffman and FSE) on top of the same kind of matching, so it compresses more but runs slower. Snappy and LZ4 favor speed, and Zstd and gzip favor ratio.
+
+```cpp
+// Decode one LZ4 sequence: token, literals, then a back-reference into the output so far.
+auto read_len = [&](size_t len) {             // 15 means: more length bytes follow
+  if (len == 15) { uint8_t b; do { b = *ip++; len += b; } while (b == 255); }
+  return len;
+};
+uint8_t token = *ip++;
+size_t lit = read_len(token >> 4);
+std::memcpy(op, ip, lit); ip += lit; op += lit;
+if (ip == end) return op;                     // the last sequence has only literals
+uint16_t offset = ip[0] | (ip[1] << 8); ip += 2;
+size_t len = read_len(token & 15) + 4;        // the minimum match is 4 bytes
+for (size_t i = 0; i < len; i++, op++) *op = *(op - offset); // the copy may overlap
+```
+
+Engines often use both kinds of compression. Parquet first encodes a page (for example with a dictionary), then compresses it with a codec. Spark writes Snappy by default. ClickHouse compresses each column block with LZ4 by default, and a column can name a chain such as `CODEC(Delta, ZSTD)`. DuckDB relies on lightweight encodings in its own storage format, so a scan usually needs no general-purpose decompress step.
+
+**Strings** need special care, because each value has a different length. Dictionary encoding works for few distinct strings. **FSST** (fast static symbol table, Boncz, Neumann and Leis, 2020) handles the rest. It learns a table of up to 255 frequent substrings of 1 to 8 bytes, and replaces each one with a 1-byte code. Code 255 escapes a literal byte.
+
+Each string still decodes on its own, so a single value can be read without its neighbors. DuckDB uses FSST for string columns.
+
+**Floats** are hard, as the lab shows. Gorilla (Facebook, 2015) stores the XOR of each value with the previous one, which works for slowly changing metrics. ALP, which DuckDB uses, finds decimals that were stored as doubles and turns them back into integers.
+
+## Choosing per column
+
+No encoding wins for every column, so engines pick one per column and per block:
+
+- **Parquet** encodings are `PLAIN`, `RLE_DICTIONARY`, `RLE` (for booleans and levels), `DELTA_BINARY_PACKED`, `DELTA_LENGTH_BYTE_ARRAY`, `DELTA_BYTE_ARRAY` and `BYTE_STREAM_SPLIT`. Writers try a dictionary first and fall back to plain when the dictionary page gets too large.
+- **DuckDB** analyzes each column segment at checkpoint time. Every method (constant, RLE, dictionary, bit-packing with FOR and delta, FSST, ALP and others) estimates its size, and the smallest one wins.
+
+The lab marks the same choice: the smallest lightweight encoding.
+
+```ts
+function chooseEncoding(type: ColType, values: Value[]): EncodingResult {
+  return encodeAll(type, values)
+    .filter((r) => r.encoding !== "lz4")              // lightweight only, as in DuckDB storage
+    .reduce((a, b) => (b.bytes < a.bytes ? b : a));   // smallest estimate wins
+}
+```
+
+Compression has costs too. Encoded blocks cannot change in place, which is one reason for the delta stores in the [column stores lesson](/databases/olap/column-stores). A codec with a high ratio can make a fast disk wait for the CPU. And a block-level codec forces a full block decode even to read one row.
+
+## Connect
+
+- [Column stores](/databases/olap/column-stores) explains why one column is the right unit to compress.
+- [Zone maps](/databases/olap/zone-maps-and-data-skipping) also profit from a good sort order: short runs and narrow ranges go together.
+- [Memtables and SSTables](/databases/lsm/memtables-and-sstables) shows prefix compression of sorted keys, a relative of delta encoding.
+- [Durability and checksums](/databases/storage/durability-fsync-torn-writes-and-checksums) and PostgreSQL TOAST (in [pages and slotted records](/databases/storage/pages-and-slotted-records)) show compression in a row store.
+
+<Recall cards={[
+  { q: "Which encoding fits sorted IDs, which fits a sorted date column, and which fits country codes?", a: "Sorted IDs: delta with bit-packing (small differences). Sorted dates: run-length (few long runs). Country codes: dictionary (few distinct values, small codes)." },
+  { q: "How does SUM run directly on an RLE column, and what does it cost?", a: "It adds value × length once per run, so it costs two operations per run, not per value." },
+  { q: "How does an engine evaluate country = 'FR' on a dictionary column?", a: "It looks up 'FR' once in the dictionary to get its code, then compares integer codes. If the value is not in the dictionary, the answer is empty at once." },
+  { q: "Why should a table be sorted by its low-cardinality columns first?", a: "The first key then has few long runs, and each later key still has long runs inside them. A high-cardinality first key breaks the runs of every later column." },
+  { q: "What is the difference between a lightweight encoding and a general-purpose codec?", a: "A lightweight encoding uses the meaning of the values and is often usable without a decode. A codec such as LZ4 or Zstd sees only bytes and must decompress a whole block first." },
+  { q: "How does DuckDB choose the encoding of a column segment?", a: "At checkpoint time, each compression method analyzes the segment and estimates its size. The method with the smallest estimate wins." },
+]} />

@@ -1,0 +1,114 @@
+---
+summary: "When a column store should turn columns back into rows: early vs late materialization, position lists, bitmaps and selection vectors, why late wins for selective queries and loses when it must read columns again, and the invisible join."
+---
+import { PlanStepperDemo, CrossoverDemo } from "@/demos/db/OlapLateDemos";
+
+A column store keeps each column apart, but a query returns rows. So at some point the engine must **materialize** tuples: copy the values of one row from several columns into one row-shaped record. The question is when. Abadi, Myers, DeWitt and Madden studied it in "Materialization Strategies in a Column-Oriented DBMS" (ICDE 2007).
+
+- **Early materialization** builds row tuples as soon as it reads the columns. After that, the plan works like a row store.
+- **Late materialization** keeps the columns apart for as long as possible. Operators pass **positions**, the row numbers that are still alive, not values. The engine reads the output columns only at the end, and only at the surviving positions.
+
+## Positions, bitmaps and selection vectors
+
+A **position list** is a sorted array of row numbers. A filter on a column writes the positions where the predicate is true. The next operator reads its column only at those positions. Two position lists combine with a merge, which gives their intersection.
+
+A **bitmap** has one bit per row. Two predicates can scan their columns in parallel, and an AND of the bitmaps combines them, one machine word at a time. A dense result is smaller as a bitmap than as a list of 32-bit positions. A sparse result is smaller as a list.
+
+A **selection vector** is the form that vectorized engines use (see [vectorized execution](/databases/query/vectorized-execution)). DuckDB processes vectors of 2,048 values, and Velox uses the same idea. A filter does not copy the surviving values. It writes a short array of the indexes that are still active, and later operators read only those indexes.
+
+```go
+// A filter that writes a selection vector. It copies no values, only indexes.
+func filterGreater(vec []int32, sel []uint16, limit int32, out []uint16) []uint16 {
+	out = out[:0]
+	for _, i := range sel {
+		if vec[i] > limit {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+```
+
+<Predict
+  id="late-reads"
+  question="The table has 16 rows and 5 of them are in region 'EU'. The query outputs id and price where region = 'EU' and qty > 25. How many column values does the late plan read?"
+  options={["64: four columns of 16 rows, like any plan", "25: all of region, 5 values of qty, then 2 values each of id and price", "16: only the region column"]}
+  answer={1}
+  explain="Late materialization reads region fully (16 values). It reads qty only at the 5 EU positions. Two rows pass, so it reads id and price at 2 positions each. That makes 16 + 5 + 2 + 2 = 25. The early plan reads 64 values and copies all 64 into tuples."
+>
+<PlanStepperDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **late, position lists** and press **Next step** four times. The position list shrinks from 5 rows to 2 rows. The id and price columns are read only at rows 1 and 9.
+2. Select **early** and step through. Step 1 reads 64 values and copies 64 values into 16 tuples. The filters then throw away 14 of the tuples.
+3. Select **late, bitmaps**. Both predicate columns are read fully, so the plan reads 36 values. In exchange, the two scans do not wait for each other, and the AND is one word operation.
+4. Move **Threshold t** to 0. Now all 5 EU rows pass. The late plan reads more, but it still copies only 10 values.
+5. Read the table at the bottom for several thresholds. The early plan always reads 64 values and copies 64, whatever the predicate.
+
+## Why late wins, and when it loses
+
+Late materialization saves work in three ways:
+
+- **It reads less.** Columns after the first filter are read only at surviving positions. With a selective predicate, most values are never touched.
+- **It copies less.** Tuples are built only for output rows. Early materialization copies every value of every row, then throws most tuples away.
+- **It keeps the data compressed for longer.** A predicate on an RLE or dictionary column runs on the compressed form (see [compression](/databases/olap/compression)). Early materialization must decode every value to put it into a tuple.
+
+It also has costs. Each position list must be written and read. A fetch by position is a **gather**: it reads scattered values, not a sequential stream, so the hardware prefetcher helps less. If the output also needs a predicate column, the late plan reads that column a second time. This is the **re-access** problem.
+
+<CrossoverDemo />
+
+Things to try:
+
+1. Keep the defaults: 4 output columns, 1% selectivity. Late costs 1.78 units per row and early 13.5, so late is 7.6 times cheaper.
+2. Move **Selectivity** up. Late gets more expensive, and early stays flat. They cross at 76.9%.
+3. Turn on **The predicate column is also an output**. Early now reads one column fewer, and late reads that column twice. The crossover falls to 57.7%.
+4. Set **Output columns** to 1. Late is never more expensive than early, even when all rows pass.
+5. Turn on **RLE-compressed**. Late checks one run of 16 rows at a time, so the crossover moves up to 84.6%.
+
+The cost model is simple, but it follows the shape of the real result. Early materialization pays for every input row. Late materialization pays for every surviving row, at a higher price per row:
+
+<Steps>
+<div>Early: scan $k$ columns, copy $k$ values per row, check the predicate per row. The cost per input row is a constant, $C_E$.</div>
+<div>Late: scan the predicate column, write $s$ positions, gather $s$ values from each of $m$ output columns, copy $s \cdot m$ values. The cost is $C_P + s \cdot (1 + m \cdot (g + 1))$ plus cache misses.</div>
+<div>The gather price $g$ is larger than a sequential read. At $s = 1$ the late plan does all of the early work, plus the positions and the gathers.</div>
+<div>So late wins below some selectivity and loses above it. More output columns and re-access move the crossover down.</div>
+</Steps>
+
+Abadi and others measured the same pattern in C-Store. Late materialization won by a large factor for selective predicates, most of all on compressed columns. Early materialization won when most rows passed and the query output many columns. In practice, engines decide per operator. DuckDB evaluates scan filters with selection vectors, and it skips the other columns of a vector when no row in it passes. The Rust Parquet reader (arrow-rs) can take a row filter: it decodes the filter columns first, then the other columns only for the selected rows.
+
+## Joins
+
+Joins make late materialization harder. A hash join produces pairs of positions, one from each side, and these positions are not in order. A late fetch from the probe side is then a random gather over the whole column. Many engines materialize the join keys early for this reason, and keep the wide payload columns late.
+
+The **invisible join** (Abadi, Madden and Hachem, 2008) handles the common star-schema case. A fact table holds foreign keys into small dimension tables:
+
+1. Apply each dimension predicate to its dimension table, and build a hash set of the keys that pass.
+2. Scan each foreign-key column of the fact table, probe its set, and write a position list.
+3. AND the position lists. Only the fact rows that pass every dimension remain.
+4. For the output, read the dimension values. Dimension keys are often dense integers, so the key itself is the position in the dimension column.
+
+```rust
+// Step 4 of the invisible join: a dense dimension key is an array index, not a hash probe.
+fn dim_values<'a>(fk: &[u32], positions: &[u32], dim_col: &'a [&'a str]) -> Vec<&'a str> {
+    positions.iter().map(|&p| dim_col[(fk[p as usize] - 1) as usize]).collect()
+}
+```
+
+If the passing dimension keys form a contiguous range, step 2 becomes a range check on the foreign key. Abadi called this **between-predicate rewriting**. No hash table is needed at all.
+
+## Connect
+
+- [Column stores](/databases/olap/column-stores) showed the cost of rebuilding one row: one page per column.
+- [Join algorithms](/databases/query/join-algorithms) covers the hash join that produces unordered position pairs.
+- [Zone maps](/databases/olap/zone-maps-and-data-skipping) skip whole blocks before any position list exists.
+- [Prefetching](/architecture/caches/prefetching) explains why a gather costs more than a sequential scan.
+
+<Recall cards={[
+  { q: "What is the difference between early and late materialization?", a: "Early builds row tuples as soon as it reads the columns. Late passes positions between operators and reads the output columns only at the surviving positions, at the end." },
+  { q: "Name three structures that carry the surviving rows between operators.", a: "A sorted position list, a bitmap with one bit per row, and a selection vector of active indexes inside a vector of values." },
+  { q: "When does late materialization lose to early materialization?", a: "When most rows pass and the query outputs many columns. Then it does all the early work plus position lists and gathers, and it may read a predicate column twice." },
+  { q: "Why does late materialization combine well with compression?", a: "Predicates can run on RLE or dictionary data directly, and the engine decodes only the values at the surviving positions. Early materialization must decode every value." },
+  { q: "What are the steps of the invisible join?", a: "Filter each dimension into a key set. Probe the foreign-key columns of the fact table to get position lists, and AND them. Read dimension values with the dense keys as array positions." },
+]} />

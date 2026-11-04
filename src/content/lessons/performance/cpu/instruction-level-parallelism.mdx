@@ -1,0 +1,58 @@
+---
+summary: Why a CPU that can do 4 things per cycle runs your loop at 0.25 per cycle, and how independent dependency chains unlock the rest.
+---
+import { IlpDemo } from "@/demos/CpuDemos";
+
+An out-of-order core looks at a window of hundreds of upcoming instructions and starts any whose inputs are ready, several per cycle. Its speed is therefore bounded by two things:
+
+- **Throughput**: how many instructions of each kind can start per cycle (ports). Typically 2 FP adds per cycle.
+- **Latency along dependency chains**: an instruction can't start until the instructions it depends on have finished. An FP add takes about 4 cycles.
+
+A loop runs at the slower of the two limits. Most simple loops are limited by latency without anyone noticing.
+
+<Predict
+  id="sum"
+  question="for (i = 0; i < n; i++) s += a[i] on floats. The core can start 2 FP adds per cycle, and each takes 4 cycles. About how many cycles per element?"
+  options={["0.5 (2 per cycle)", "1", "4"]}
+  answer={2}
+  explain="Every add needs the previous value of s, so the adds form one chain: each starts 4 cycles after the previous one. The core's other add port, and 3 of the 4 cycles of the busy one, sit idle. Four accumulators interleaved make four independent chains, giving 1 cycle per element; eight reach the throughput limit of 0.5."
+>
+<IlpDemo />
+</Predict>
+
+1. With **1 accumulator** the schedule is a staircase: one add every 4 cycles, loads finished long before they're needed.
+2. With **2, 4, 8** accumulators the chains overlap, and cycles per element fall 4 → 2 → 1 → 0.5.
+3. With **16**: no further gain. The limit is now throughput, 2 adds per cycle.
+
+## The rule
+
+The number of independent chains needed to saturate a unit is
+
+$$\text{chains} = \text{latency} \times \text{throughput} = 4 \times 2 = 8.$$
+
+That's Little's law (the queueing lesson) applied inside the core: to keep 2 adds per cycle in flight for 4 cycles each, you need 8 in progress at once.
+
+## Where this shows up
+
+- **Reductions** (sums, dot products, min/max, hashes): split into several accumulators and combine at the end. For floats this changes rounding, which is why compilers won't do it for you without `-ffast-math` / `-fassociative-math` (the auto-vectorization lesson).
+- **Polynomials**: Horner's rule is one long chain. Estrin's scheme evaluates pairs in parallel.
+- **Linked structures**: pointer chasing is a chain of loads with about 5 cycles of latency even from L1 (90 ns from DRAM). Walking several independent lists at once overlaps them.
+- **Loop unrolling** helps mainly by allowing multiple accumulators and cutting per-iteration overhead. Unrolling a single-accumulator loop does nothing for the dependency chain.
+
+```zig
+var s0: f32 = 0; var s1: f32 = 0; var s2: f32 = 0; var s3: f32 = 0;
+var i: usize = 0;
+while (i + 4 <= a.len) : (i += 4) { s0 += a[i]; s1 += a[i + 1]; s2 += a[i + 2]; s3 += a[i + 3]; }
+var s = (s0 + s1) + (s2 + s3);
+while (i < a.len) : (i += 1) s += a[i]; // tail
+```
+
+Tools: uiCA and llvm-mca model the schedule of a loop body on a specific microarchitecture and report whether it is latency- or throughput-bound. Agner Fog's instruction tables and uops.info list latency and throughput per instruction.
+
+<Recall cards={[
+  { q: "Why does `s += a[i]` on floats run at ~4 cycles per element on a 4-wide core?", a: "Each add depends on the previous one (a loop-carried dependency), so the loop runs at the FP add latency, not the throughput." },
+  { q: "How many independent chains saturate a unit with latency L and throughput T per cycle?", a: "L × T (e.g. 4 × 2 = 8 accumulators)." },
+  { q: "Why won't the compiler split a float sum into accumulators by itself?", a: "FP addition isn't associative, so reordering changes the result; it needs -ffast-math or explicit code." },
+  { q: "What does unrolling alone (with one accumulator) do for a reduction?", a: "Little: it reduces loop overhead but the dependency chain is unchanged." },
+  { q: "Name a tool that predicts a loop's cycle count on a given CPU.", a: "llvm-mca or uiCA." },
+]} />

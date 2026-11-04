@@ -1,0 +1,60 @@
+---
+summary: When many threads update one thing, they wait for each other. This lesson shows how much each kind of lock costs, and how to avoid the wait.
+---
+import { LockScalingDemo, AmdahlDemo } from "@/demos/ConcurrencyPerfDemos";
+
+**Contention** occurs when many threads want the same lock or the same variable at the same time. Only one thread can have it. The other threads wait.
+
+Each handoff between threads moves at least one cache line, which takes about 40 ns. So a shared lock or counter has a maximum speed. More threads cannot make it faster.
+
+<Predict
+  id="atomic"
+  question="Eight threads increment one shared atomic counter with fetch_add, as fast as possible. A move of the cache line takes 40 ns. What is the maximum rate?"
+  options={["About 8 times the rate of one thread", "About 25 million updates per second, in total", "Unlimited, because fetch_add has no lock"]}
+  answer={1}
+  explain="Each update needs the cache line. The line moves for each update, so the updates occur one at a time. One update every 40 ns is 25 million updates per second. More threads only wait more."
+>
+<LockScalingDemo />
+</Predict>
+
+Do these steps:
+
+1. Look at **Atomic fetch_add**. It stops at 25 updates per µs. The cache line is the limit.
+2. Look at **Per-thread counters**. Each thread updates its own counter. The throughput increases with each thread.
+3. Compare the two spinlocks. **Test-and-set** gets slower after 4 threads. Each waiting thread writes the lock and moves the line. **Test-and-test-and-set** waits with reads, so it moves the line less.
+4. Set **Time inside the lock** to 1000 ns. Now no lock can do more than 1 update per µs. The work inside the lock is the limit.
+
+## The serial part limits everything
+
+Work inside a lock occurs one thread at a time. That part is **serial**. Amdahl's law gives the maximum speedup on n cores:
+
+$$\text{speedup} = \frac{1}{s + (1 - s)/n}$$
+
+Here, s is the serial part of the work.
+
+<AmdahlDemo />
+
+1. Set the serial part to 5%. On 64 cores, the speedup is only about 15. The limit is 20, however many cores you add.
+2. Set the serial part to 1%. The limit is 100.
+3. Turn on **Grow the problem with the core count**. This is Gustafson's law. When the problem grows with the machine, the serial part becomes small, and the speedup continues to increase.
+
+## How to decrease contention
+
+| Method | Example |
+|---|---|
+| Shard the data | per-thread or per-core counters; sum them when you read |
+| Make the critical section shorter | do the work outside the lock; lock only to publish the result |
+| Use finer locks | one lock per bucket, not one lock per table |
+| Use reader-writer locks for read-mostly data | many readers at the same time; one writer |
+| Batch the updates | add 100 items to a local list, then lock once |
+| Use a better spin | test-and-test-and-set, back off after a failure, use a pause hint |
+
+Before you change the code, measure the contention. Use `perf lock contention` on Linux. Or count the time that threads wait for the lock.
+
+<Recall cards={[
+  { q: "Why does a shared atomic counter not scale?", a: "Each update needs the cache line. The line moves for each update, so the updates occur one at a time." },
+  { q: "How do you make a hot counter scale?", a: "Shard it: give each thread or core its own counter, and add the counters when you read." },
+  { q: "Why is test-and-test-and-set better than test-and-set?", a: "Waiting threads only read the lock. Reads share the line. Test-and-set writes, and each write moves the line." },
+  { q: "State Amdahl's law.", a: "Speedup = 1 / (s + (1 − s)/n). Here s is the serial part and n is the number of cores." },
+  { q: "With a 5% serial part, what is the maximum speedup?", a: "20 (1 / 0.05), however many cores you add." },
+]} />

@@ -47,6 +47,7 @@ export function putSteps(id: RealId, o: PutOpts = PUT_DEFAULTS): PutStep[] {
       read,
       { action: "write", file: "db-journal", bytes: SQLITE_JOURNAL_SECTOR + 4 + P + 4, text: "Write the journal header (one sector) and the original leaf page with its page number and checksum" },
       { action: "fsync", file: "db-journal", bytes: 0, text: "fsync the journal" },
+      { action: "fsync", file: "directory", bytes: 0, text: "fsync the directory, so that the new journal file survives a crash" },
       { action: "write", file: "db-journal", bytes: 0, text: "Write the page count into the journal header" },
       { action: "fsync", file: "db-journal", bytes: 0, text: "fsync the journal again" },
       { action: "write", file: "db", bytes: P, text: "Overwrite the leaf page in the database file" },

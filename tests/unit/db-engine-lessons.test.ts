@@ -227,7 +227,7 @@ describe("sqlite-lmdb-and-rocksdb-compared", () => {
     expect(putSummary("rocksdb")).toMatchObject({ commitBytes: 138, commitFsyncs: 0, durableAtCommit: false });
     expect(rocksWalBytes(16, 100)).toBe(138);
     expect(putSummary("rocksdb", { ...PUT_DEFAULTS, rocksSync: true })).toMatchObject({ commitFsyncs: 1, durableAtCommit: true });
-    expect(putSummary("sqlite", { ...PUT_DEFAULTS, sqliteMode: "rollback" })).toMatchObject({ commitBytes: 8712, commitFsyncs: 3 });
+    expect(putSummary("sqlite", { ...PUT_DEFAULTS, sqliteMode: "rollback" })).toMatchObject({ commitBytes: 8712, commitFsyncs: 4 });
     expect(Math.round(putSummary("rocksdb").laterBytes)).toBe(1404);
     const h5 = putSummary("lmdb", { ...PUT_DEFAULTS, height: 5 }).commitBytes;
     expect(h5 - 20480).toBe(2 * 4096);

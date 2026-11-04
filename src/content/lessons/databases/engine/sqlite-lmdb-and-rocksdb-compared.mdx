@@ -19,7 +19,7 @@ Things to try:
 
 1. Read the defaults. SQLite in WAL mode writes 4,120 bytes and one fsync. LMDB writes 20,480 bytes and two fsyncs. RocksDB writes 138 bytes and no fsync at all, because `WriteOptions.sync` is false by default.
 2. Switch on **RocksDB WriteOptions.sync = true**. Now RocksDB pays one fsync too. Without it, a process crash keeps the commit, because the bytes are in the OS cache, but a power cut can lose it.
-3. Select **Rollback journal**. SQLite now writes 8,712 bytes and calls fsync three times: twice on the journal, once on the database. Deleting the journal is the commit.
+3. Select **Rollback journal**. SQLite now writes 8,712 bytes and calls fsync four times: twice on the journal, once on its directory, once on the database. Deleting the journal is the commit.
 4. Move **Tree height** to 5. LMDB grows by one page per level, because it copies the path. SQLite and RocksDB do not change.
 5. Look at the "written later" line. SQLite's checkpoint writes the page a second time. RocksDB's flush and compaction rewrite the entry several times, about 1,404 bytes per put in the leveled model.
 

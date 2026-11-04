@@ -88,9 +88,9 @@ const hierSchema = {
   l3: select({ label: "L3", options: [0, 131072, 262144].map((s) => ({ value: String(s), label: s ? bytes(s) : "none" })), default: "131072", segmented: true }),
 };
 
-const MODES: { id: Inclusion; label: string; color: string }[] = [
+const MODES: { id: Inclusion; label: string; color: string; dash?: string }[] = [
   { id: "inclusive", label: "Inclusive", color: "var(--c4)" },
-  { id: "nine", label: "Non-inclusive", color: "var(--c1)" },
+  { id: "nine", label: "Non-inclusive", color: "var(--c1)", dash: "5 4" },
   { id: "exclusive", label: "Exclusive", color: "var(--c3)" },
 ];
 
@@ -141,7 +141,7 @@ export function HierarchyDemo() {
         <RuleX at={total} label="sum" color="var(--c3)" />
         {curves.map((c) => (
           <g key={c.id}>
-            <Line points={c.pts} color={c.color} width={1.75} />
+            <Line points={c.pts} color={c.color} width={1.75} dash={c.dash} />
             <Dots points={c.pts} color={c.color} r={2} />
           </g>
         ))}
@@ -164,7 +164,7 @@ const KINDS: { id: PrefetchKind; label: string }[] = [
 
 const pfSchema = {
   pattern: select({ label: "Access pattern", options: PREFETCH_PATTERNS.map((p) => ({ value: p.id, label: p.label })), default: "sequential" }),
-  kind: select({ label: "Prefetcher", options: KINDS.map((k) => ({ value: k.id, label: k.label })), default: "next-line", segmented: true }),
+  kind: select({ label: "Prefetcher", options: KINDS.map((k) => ({ value: k.id, label: k.label })), default: "next-line" }),
   degree: select({ label: "Degree (lines ahead)", options: ["1", "2", "4", "8"].map((v) => ({ value: v, label: v })), default: "2", segmented: true }),
 };
 

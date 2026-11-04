@@ -21,7 +21,7 @@ One cache can't be both fast and large. Bigger arrays have longer wires and more
 
 Things to try:
 
-1. Read the staircase: a flat floor at 4 cycles while the working set fits in L1, then steps as it spills into L2, L3 and memory. Measuring real hardware with a pointer-chasing benchmark (lmbench's `lat_mem_rd`) produces the same shape.
+1. Read the staircase: a flat floor at 4 cycles while the working set fits in L1, then steps as it spills into L2, L3 and memory. Measuring real hardware with a pointer-chasing benchmark (lmbench's `lat_mem_rd`) produces the same shape. Inclusive and non-inclusive (dashed) nearly coincide here: random accesses have no hot lines for back-invalidation to hurt.
 2. Set L1 = 16 KiB and L2 = 16 KiB. Inclusive gains nothing from the L2 (it is the same size as L1), while exclusive doubles the capacity.
 3. Remove the L3 and watch the cliff to memory move left.
 4. Read the **hot set** numbers under the plot: only the inclusive hierarchy loses the hot data.

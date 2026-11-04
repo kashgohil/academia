@@ -96,3 +96,12 @@ describe("fences and happens-before", () => {
     }
   });
 });
+
+describe("CAS contention simulation", () => {
+  test("one thread never fails; contention grows retries; backoff reduces them", async () => {
+    const { simulateCas } = await import("@/demos/CasContentionDemo");
+    expect(simulateCas(1, 200, false)).toBe(1);
+    expect(simulateCas(8, 200, false)).toBeGreaterThan(1.5);
+    expect(simulateCas(8, 200, true)).toBeLessThan(simulateCas(8, 200, false));
+  });
+});

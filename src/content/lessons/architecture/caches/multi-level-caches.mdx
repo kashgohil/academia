@@ -1,0 +1,66 @@
+---
+summary: Why CPUs stack L1, L2 and L3, how to compute average access time, and what inclusive and exclusive hierarchies trade.
+---
+import { HierarchyDemo } from "@/demos/CacheHierarchyDemos";
+
+One cache can't be both fast and large. Bigger arrays have longer wires and more ways to compare, so they take more cycles. CPUs therefore stack levels: a tiny L1 that answers in about 4 cycles, a larger L2 at about 12, a shared L3 at about 40, and DRAM at a few hundred. Each level catches some of what the level above misses.
+
+<Predict
+  id="exclusive"
+  question="L1 is 8 KiB and L2 is 16 KiB, with no L3. A program accesses a 24 KiB working set at random. What fraction of accesses go to memory, inclusive vs exclusive?"
+  options={[
+    "About a third in both",
+    "About a third inclusive, under 10% exclusive",
+    "Close to 0% in both",
+  ]}
+  answer={1}
+  explain="An inclusive L2 duplicates everything in L1, so the hierarchy holds 16 KiB of distinct data. An exclusive hierarchy holds each line in only one level: 8 + 16 = 24 KiB. In the simulation inclusive sends 33% to memory and exclusive 9%; the remainder is set conflicts in 8-way caches."
+>
+<HierarchyDemo />
+</Predict>
+
+Things to try:
+
+1. Read the staircase: a flat floor at 4 cycles while the working set fits in L1, then steps as it spills into L2, L3 and memory. Measuring real hardware with a pointer-chasing benchmark (lmbench's `lat_mem_rd`) produces the same shape.
+2. Set L1 = 16 KiB and L2 = 16 KiB. Inclusive gains nothing from the L2 (it is the same size as L1), while exclusive doubles the capacity.
+3. Remove the L3 and watch the cliff to memory move left.
+4. Read the **hot set** numbers under the plot: only the inclusive hierarchy loses the hot data.
+
+## Average memory access time
+
+<Steps>
+<div>For one level: $\text{AMAT} = t_{\text{hit}} + m \cdot t_{\text{miss}}$, where $m$ is the miss rate.</div>
+<div>The miss penalty is itself the AMAT of the next level: $\text{AMAT} = t_1 + m_1\,(t_2 + m_2\,(t_3 + m_3\, t_{\text{mem}}))$.</div>
+<div>Here $m_2$ is the <b>local</b> miss rate: misses at L2 ÷ accesses that <i>reach</i> L2. The <b>global</b> miss rate is misses ÷ all accesses, $m_1 m_2$. A "bad" 50% local L2 miss rate can be fine if L1 already catches 95%.</div>
+<div>Example: $t = 4, 12, 40, 200$ and local miss rates $5\%, 40\%, 30\%$: $4 + 0.05(12 + 0.4(40 + 0.3 \cdot 200)) = 6.6$ cycles.</div>
+</Steps>
+
+## Inclusion policies
+
+| Policy | Rule | Capacity | Used by |
+|---|---|---|---|
+| Inclusive | every line in L1 is also in L2 (and L3) | the largest level | Intel L3 from Nehalem through client Skylake |
+| Non-inclusive (NINE) | no rule; levels fill and evict independently | in between | Intel Skylake-SP and later server L3 |
+| Exclusive | each line lives in exactly one level | sum of levels | AMD Zen L3 (a victim cache for L2) |
+
+Inclusion's advantage is **coherence**. If L3 includes everything, another core's request only needs to check L3 to know whether any private cache holds the line, so L3 doubles as a snoop filter. Its cost is duplicated capacity, plus a subtle pathology:
+
+<Callout kind="warn" title="Back-invalidation kills hot lines">
+L1 hits never reach L2, so L2's replacement policy doesn't see that a line is hot. A streaming scan pushes the hot line to the LRU position in L2, L2 evicts it, and inclusion forces L1 to evict it too. In the demo, a 2 KiB hot set misses L1 on 12.6% of its accesses under the inclusive policy and never under the others. Jaleel et al. (MICRO 2010) measured this on real workloads and proposed passing "temporal locality hints" down to fix it.
+</Callout>
+
+Exclusive hierarchies avoid the duplication, but every L2 hit is a *swap* between levels, and evictions from L1 must be written down. That means more traffic between levels, which is why exclusive designs are usually "mostly exclusive" victim caches.
+
+## Using this
+
+- **Know your sizes**: `lscpu`, `getconf -a | grep CACHE`, or `/sys/devices/system/cpu/cpu0/cache/`. Typical today: 32–48 KiB L1D, 1–2 MiB L2 per core, a few MiB of L3 per core, shared.
+- **Size working sets to a level**: tiles to L1 or L2, hash tables to L2 or L3. The steps in the plot are the budget you are designing against.
+- **Shared L3 means noisy neighbors**: another core's streaming job can evict your working set. Cache partitioning (Intel CAT, AMD QoS) exists for this.
+
+<Recall cards={[
+  { q: "AMAT formula for a two-level cache?", a: "t1 + m1·(t2 + m2·t_mem), with m2 the local L2 miss rate." },
+  { q: "Local vs global miss rate of L2?", a: "Local: L2 misses ÷ accesses reaching L2. Global: L2 misses ÷ all accesses = m1·m2." },
+  { q: "Effective capacity of inclusive vs exclusive L1 + L2?", a: "Inclusive: the size of L2, since L1 is duplicated. Exclusive: L1 + L2." },
+  { q: "Main advantage of an inclusive last-level cache?", a: "It acts as a snoop filter: if a line isn't in L3, no private cache has it, which simplifies coherence." },
+  { q: "Why can inclusive hierarchies evict hot L1 lines?", a: "L1 hits don't update L2's LRU state, so L2 evicts lines that look cold to it, and inclusion forces L1 to drop them too." },
+]} />

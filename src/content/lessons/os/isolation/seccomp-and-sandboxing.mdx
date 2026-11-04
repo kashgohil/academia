@@ -1,0 +1,178 @@
+---
+summary: "Why reduce the system call surface, seccomp strict mode and BPF filters, return actions, argument checks and their pointer limit, TOCTOU in supervisors, Landlock, pledge and unveil, and the Chrome and Firefox sandboxes."
+---
+import { IsolationFilterDemo, IsolationSurfaceDemo } from "@/demos/os/IsolationSeccompDemos";
+
+Namespaces and capabilities change what a call can do. They do not stop the call from running kernel code. Every [system call](/os/processes/system-calls) enters the kernel, and each one has parsing, locking and state that can contain a bug. If a program cannot make a call, a bug behind that call is out of its reach. On Linux, the tool for this is **seccomp** (secure computing). It runs a small program at system call entry, and that program decides what happens to the call.
+
+An image decoder needs `read`, `write` and memory calls. It has no reason to call `mount` or `bpf`. The decoder also parses untrusted bytes, so it is the part most likely to be taken over. A filter limits what an attacker can do after that.
+
+## Strict mode and BPF filters
+
+**Strict mode** came first, in 2005. After `prctl(PR_SET_SECCOMP, SECCOMP_MODE_STRICT)`, a thread can call only `read`, `write`, `_exit` and `sigreturn`. Any other call kills it with `SIGKILL`. Few programs can live with that.
+
+**Filter mode** came in Linux 3.5. The process gives the kernel a program in **classic BPF**, a small instruction set from packet filtering. The kernel runs it on each system call. The program reads one structure:
+
+```c
+struct seccomp_data {
+    int   nr;                    /* offset 0:  system call number */
+    __u32 arch;                  /* offset 4:  AUDIT_ARCH_X86_64 is 0xc000003e */
+    __u64 instruction_pointer;   /* offset 8 */
+    __u64 args[6];               /* offset 16: the raw register values */
+};
+```
+
+The structure has 64 bytes. Classic BPF has an accumulator `A`, an index register `X`, 16 scratch words, and jumps that go only forward. So a filter always ends, and its run time has a limit set by its length. A program has at most 4,096 instructions. All the filters on one task have at most 32,768 in total.
+
+The kernel checks the program when it is loaded. A jump must land inside the program, and the last instruction must return. A load must be aligned and inside `seccomp_data`.
+
+```c
+struct sock_filter f[] = {
+    BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, 4),                  /* A = arch */
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+    BPF_STMT(BPF_LD  | BPF_W | BPF_ABS, 0),                  /* A = nr */
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mount, 0, 1),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+};
+struct sock_fprog prog = { .len = 7, .filter = f };
+prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog);
+```
+
+The caller must set `no_new_privs` first, or have `CAP_SYS_ADMIN`. Otherwise a filter could confuse a setuid program. A filter stays for the life of the task, and `fork` and `execve` keep it. New filters stack, and all of them run. The strongest result wins.
+
+| Action | Value | Effect |
+|---|---|---|
+| `KILL_PROCESS` | `0x80000000` | the whole process dies with `SIGSYS` |
+| `KILL_THREAD` | `0x00000000` | the thread dies |
+| `TRAP` | `0x00030000` | the task gets `SIGSYS`, and a handler can emulate the call |
+| `ERRNO` | `0x00050000` | the call does not run, and it returns the error in the low 16 bits |
+| `USER_NOTIF` | `0x7fc00000` | the task waits, and a supervisor process decides |
+| `TRACE` | `0x7ff00000` | a ptrace tracer decides |
+| `LOG` | `0x7ffc0000` | the call runs, and the kernel logs it |
+| `ALLOW` | `0x7fff0000` | the call runs |
+
+<Predict
+  id="path-filter"
+  question="You want a filter that allows openat only for paths under /tmp. Can a seccomp BPF filter do this?"
+  options={["Yes, it can compare the path argument with a prefix", "No, the filter sees only the pointer value, and it cannot read user memory", "Yes, but only with the USER_NOTIF action inside the filter"]}
+  answer={1}
+  explain="args[1] of openat is an address. Classic BPF has no instruction to read through it. This is a design choice: another thread could change that memory after the check. So seccomp filters check numbers, not strings."
+>
+<IsolationFilterDemo />
+</Predict>
+
+Things to try:
+
+1. Click the `openat` row, then press **Back** to the start and **Step** through. The filter checks the arch, then the x32 range, then each rule. The program counter only moves forward.
+2. Select **Argument checks**. The two `socket` rows now get different verdicts, because `args[0]` is an integer. The same holds for the two `clone` rows.
+3. Click the last row of the trace, with the i386 arch. The first check kills it. Number 0 means `read` on x86-64 and `restart_syscall` on i386.
+4. Select **Ask a supervisor**. `openat` now returns `USER_NOTIF`.
+5. Add many rules, and watch the program grow. The run for a late rule takes more steps than for an early rule.
+
+### Details that matter
+
+- **Check the arch.** A process on x86-64 can enter through the 32-bit path, where the numbers differ. A filter that ignores `arch` compares numbers from the wrong table.
+- **Check x32.** x32 calls set bit 30 in `nr`, so a filter must reject them or list them.
+- **Check the high word.** `A` holds 32 bits, and arguments have 64. A complete check loads both words. The demo checks the low word only, to stay short.
+- **Prefer an allow list.** A deny list does not know about calls that a future kernel adds. A related trap: `clone3` takes a pointer to its flags, so a filter cannot read them. Profiles often return `ENOSYS` for `clone3`, and libc falls back to `clone`.
+- **Allow-list errors.** `ENOSYS` tells libc that a call does not exist, which often gives a clean fallback. `EPERM` can look like a real failure.
+- **Watch for side doors.** A ring such as [io_uring](/os/io/io-uring) does its work with no system call for each operation, so a filter cannot see those operations. Many container profiles now block `io_uring_setup`.
+
+Cost is small. The kernel compiles filters with a JIT compiler. Since Linux 5.11, it also keeps a bitmap of calls that always get `ALLOW`, for each architecture. So a stable allow list usually costs little per call. Do not write the program by hand in production. `libseccomp` handles the arch, x32 and high-word details.
+
+## How much surface does a profile remove?
+
+<Predict
+  id="surface"
+  question="A static file server needs 38 of the 187 calls in the table below. A Docker-style deny list removes rarely used calls. Which removes more: that list, or an allow list for this program?"
+  options={["About the same, since both block the dangerous calls", "The allow list, by far: about 80% against about 20%", "The deny list, since it was written by experts"]}
+  answer={1}
+  explain="The deny list removes 38 calls, which is 20.3% of the table. The allow list removes 149 calls, which is 79.7%. But it fails as soon as the program needs one more call, so someone must maintain it."
+>
+<IsolationSurfaceDemo />
+</Predict>
+
+1. Select **Allow list for this program**, and watch the blue squares go. Blue means open but not used. These are the calls that give an attacker room.
+2. Select **Strict mode**. Only 4 calls stay, and the red squares show what breaks: almost everything, even startup.
+3. Tick **Install the filter after startup**. The file server needs 25 calls, not 38, because startup is over. Programs that install a filter late get a tighter list. The `hello` program needs only 3.
+4. Select **Docker-style deny list**. Nothing breaks, and the Administration row is mostly gone. The Docker documentation says that its default profile disables around 44 calls of more than 300. This table holds only part of that list, plus `io_uring`, so it shows 38.
+
+## TOCTOU in supervisors
+
+`USER_NOTIF`, since Linux 5.0, lets a supervisor decide with full knowledge. It reads the target's memory, so it can look at a path. Container runtimes and tools such as Sysbox use it. This raises a classic problem: **time of check to time of use** (TOCTOU).
+
+| Time | Supervisor | Target program |
+|---|---|---|
+| 1 | | a thread calls `openat(path)` and waits |
+| 2 | reads the string at `path`: the value looks fine | |
+| 3 | | a second thread changes that memory |
+| 4 | answers `CONTINUE` | |
+| 5 | | the kernel reads the string again and uses the new value |
+
+The memory belongs to the program, so the program can change it between the check and the use. The same race affects `ptrace`-based sandboxes. So `SECCOMP_USER_NOTIF_FLAG_CONTINUE` is not safe as a security decision, and the man page says so. The safe design has the supervisor do the work itself: it opens the file, and it passes the descriptor back with `SECCOMP_IOCTL_NOTIF_ADDFD`. The target then gets a result and no second read happens. It must also check `SECCOMP_IOCTL_NOTIF_ID_VALID`, in case the target died and its PID was reused.
+
+This is also why plain BPF filters cannot follow pointers. A filter that read a path would have the same race, built into the kernel.
+
+## Landlock, pledge and unveil
+
+seccomp talks about system call numbers, which is the wrong level for many questions. "May read `/etc/ssl`" has no direct form in a seccomp filter.
+
+**Landlock**, since Linux 5.13, gives rules on file hierarchies. An unprivileged process can use it on itself. The kernel checks each rule at the object, after path resolution, so it has no string race. Linux 6.7 added rules for TCP bind and connect.
+
+```c
+int fd = syscall(SYS_landlock_create_ruleset, &attr, sizeof attr, 0);
+syscall(SYS_landlock_add_rule, fd, LANDLOCK_RULE_PATH_BENEATH, &rule, 0);
+prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+syscall(SYS_landlock_restrict_self, fd, 0);
+```
+
+OpenBSD went another way. **pledge** takes promises in words, and **unveil** hides the file system except for named paths:
+
+```c
+unveil("/etc/ssl", "r");
+unveil(NULL, NULL);                 /* no more unveil calls */
+pledge("stdio rpath inet", NULL);   /* a violation kills the process */
+```
+
+| | seccomp BPF | Landlock | pledge and unveil |
+|---|---|---|---|
+| Unit of the rule | call number and integer arguments | file hierarchy, TCP port | named groups of behavior, paths |
+| Sees paths | no | yes, after resolution | yes |
+| Who writes it | a profile author, per architecture | the program | the program, in a few lines |
+| Portability | changes with libc and kernel | stable access rights, by ABI version | OpenBSD only |
+
+The pledge design is short, because the kernel knows what `stdio` means. A seccomp list must instead track which calls libc uses today. That list can change with a libc upgrade. The usual pattern on all of them has two phases: acquire resources, then drop rights before the risky work starts.
+
+## Browser sandboxes
+
+A browser is the largest sandbox client on most machines. It splits work across processes. The renderer parses web content, so it gets almost nothing. A more trusted **broker** process does file and network work on request, over IPC.
+
+- **Chrome on Linux** has two layers. The first uses namespaces, or an older setuid helper, to remove the file system and other views. The second is a seccomp BPF filter on the renderer. A renderer must ask the broker to open a file.
+- **Firefox on Linux** uses the same tools. It has a seccomp filter for content processes, user namespaces where it can get them, and a file broker in the parent process.
+
+The same split appears on other systems with other tools. The principle is what moves: run untrusted parsing with no rights, and keep a narrow, checked channel to something with rights. A sandbox fails in known ways. An allowed call can have a kernel bug. A broker can believe a bad request. A shared service can act as a **confused deputy**, which uses its own rights for a caller that has none.
+
+<Callout title="On your Mac">
+macOS has no seccomp. Its sandbox, known as Seatbelt, is a kernel policy module, and it checks operations such as file reads and network connections. App Store apps get it through the App Sandbox and entitlements. Safari and Chrome use it for renderers. `sandbox-exec` runs a program with a profile, and Apple marks it as deprecated. `dtruss` shows system calls, and System Integrity Protection limits it.
+</Callout>
+
+## Connect
+
+- [System calls](/os/processes/system-calls) shows the entry path where the filter runs.
+- [Users, permissions and capabilities](/os/isolation/users-permissions-and-capabilities) explains `no_new_privs`.
+- [Critical sections](/os/sync/critical-sections) has the general form of the check-then-act race.
+- [ptrace and strace](/os/observability/ptrace-and-strace) shows how to see the calls that a program makes.
+- [eBPF](/os/observability/ebpf) is the extended instruction set that grew from classic BPF.
+- [Containers](/os/isolation/containers) applies a default seccomp profile.
+
+<Recall cards={[
+  { q: "What data can a seccomp BPF filter read?", a: "Only struct seccomp_data: the call number, the arch, the instruction pointer and six raw argument values. It cannot read through a pointer." },
+  { q: "Why must a seccomp filter check the arch field?", a: "System call numbers differ between ABIs on one CPU. A filter that ignores arch could compare a 32-bit call number against the 64-bit table." },
+  { q: "Why does a classic BPF filter always end?", a: "Jumps go only forward, and the kernel rejects any jump past the end. So a run takes at most as many steps as the program has instructions." },
+  { q: "Stacked filters give different results for one call. Which one wins?", a: "All of them run, and the strongest action wins. KILL_PROCESS is the strongest, and ALLOW is the weakest." },
+  { q: "Why is a CONTINUE answer from a USER_NOTIF supervisor unsafe as a security check?", a: "The target can change its memory after the supervisor reads it. The kernel reads the arguments again, so it can use different data. The supervisor should do the work and return the result with ADDFD." },
+  { q: "How does Landlock differ from seccomp?", a: "Landlock states rules on file hierarchies and ports, and the kernel checks them on the resolved object. seccomp only sees call numbers and raw integers." },
+]} />

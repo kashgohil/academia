@@ -1,0 +1,185 @@
+---
+summary: "The eight namespace types, clone, unshare and setns, PID namespaces and the special role of PID 1, user namespaces and uid_map, mount propagation, and network namespaces with veth pairs and a bridge."
+---
+import { IsolationPidNsDemo, IsolationUidMapDemo, IsolationNetNsDemo } from "@/demos/os/IsolationNsDemos";
+
+A **namespace** wraps one global kernel resource, so that a group of processes sees its own copy. A process in a new PID namespace sees its own PID 1. A process in a new network namespace sees its own interfaces. No new kernel runs, and no new memory protection appears. The kernel only changes the answer that it gives to the question "which one do you mean?".
+
+Linux has eight types:
+
+| Type | Flag | Isolates | Since |
+|---|---|---|---|
+| mnt | `CLONE_NEWNS` | the mount tree | 2.4.19 |
+| uts | `CLONE_NEWUTS` | host name and domain name | 2.6.19 |
+| ipc | `CLONE_NEWIPC` | System V IPC and POSIX queues | 2.6.19 |
+| pid | `CLONE_NEWPID` | process IDs | 2.6.24 |
+| net | `CLONE_NEWNET` | interfaces, routes, ports, firewall | 2.6.29 |
+| user | `CLONE_NEWUSER` | UIDs, GIDs and capabilities | 3.8 |
+| cgroup | `CLONE_NEWCGROUP` | the view of the cgroup tree | 4.6 |
+| time | `CLONE_NEWTIME` | offsets for `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` | 5.6 |
+
+Three system calls control them:
+
+- **`clone`** creates a child in new namespaces. A flag asks for each type.
+- **`unshare`** moves the caller to new namespaces.
+- **`setns`** joins an existing namespace, through a file descriptor.
+
+Each process has links in `/proc/<pid>/ns`. Two processes share a namespace if their links show the same inode number. In the initial PID namespace, this number is always 4026531836:
+
+```text
+$ readlink /proc/self/ns/pid
+pid:[4026531836]
+$ sudo unshare --pid --fork --mount-proc sh -c 'readlink /proc/self/ns/pid; echo $$'
+pid:[4026532514]
+1
+```
+
+The second inode number changes from run to run. A namespace lives while a process is in it, or while something holds a reference. A bind mount of one of these links keeps it alive with no process. `ip netns add` works this way. These commands run only on Linux.
+
+## PID namespaces
+
+PID namespaces nest, to a limit of 32 levels. A process has one PID in its own namespace and one in each ancestor namespace. The kernel stores all of them in `struct pid`, as an array of `struct upid`. A namespace can see its own processes and those of its descendants, and never those of an ancestor.
+
+<Predict
+  id="pid-view"
+  question="A container process has PID 1 inside its namespace. You run ps on the host. What do you see?"
+  options={["Nothing: the container hides the process from the host", "The same process with a different, ordinary PID", "PID 1: the host and the container share the number"]}
+  answer={1}
+  explain="The host namespace is an ancestor, so it sees everything. The process has PID 1 in its own namespace and another number on the host. The hiding goes in one direction only."
+>
+<IsolationPidNsDemo />
+</Predict>
+
+Things to try:
+
+1. Click **app**, and read the table below the boxes. It has PID 4 at level 0 and PID 1 at level 1. Its `getppid` returns 0, because its parent is outside.
+2. Click the level 1 box to look from there. `ps` shows 3 processes, and the host processes are hidden.
+3. With **app** selected, press **clone(CLONE_NEWPID)**. The new process has three PIDs, one per level.
+4. Select **worker-a** and press **exit**. Only that process goes away.
+5. Select **app** and press **exit**. It is PID 1 of its namespace, so the kernel kills everything inside.
+
+### The special role of PID 1
+
+The first process in a PID namespace has PID 1, and it has three duties:
+
+- **It adopts orphans.** A process whose parent exits moves to PID 1 of its namespace, which must reap it with `wait`. A server that runs as PID 1 and never calls `wait` collects zombies. This is why `docker run --init` adds a small init process.
+- **It has signal protection.** A process in the namespace can send PID 1 only the signals for which it has a handler. So `SIGTERM` does nothing to a PID 1 with no handler. An ancestor namespace can still send `SIGKILL` and `SIGSTOP`.
+- **Its death ends the namespace.** The kernel sends `SIGKILL` to every process inside. After that, a `fork` in the namespace fails with `ENOMEM`.
+
+`unshare(CLONE_NEWPID)` and `setns` on a PID namespace do not move the caller, because a process cannot change its PID. They affect only its next child. That child becomes PID 1. `/proc/<pid>/ns/pid_for_children` shows the target. `unshare(CLONE_NEWTIME)` follows the same rule.
+
+The `/proc` file system also matters here. It shows the PID namespace of the mount, not of the reader. After `unshare --pid --fork` with no new `/proc` mount, `ps` still lists the host processes. This is why the command above needs `--mount-proc`.
+
+## User namespaces
+
+A **user namespace** gives a process its own UID and GID numbers, and its own capability sets. The first process in a new one gets all capabilities there. These capabilities apply only to resources that this user namespace owns. A process can be "root" over its own network namespace and have no power over the real network card.
+
+Each user namespace has a `uid_map` and a `gid_map`. Each line has three numbers: the first ID inside, the first ID outside, and the length.
+
+```text
+$ cat /proc/$PID/uid_map
+         0     100000      65536
+```
+
+This line maps inside UIDs 0 to 65535 to host UIDs 100000 to 165535. So root in the container is UID 100000 on the host. A file that the container creates has that owner on disk.
+
+<Predict
+  id="uid-map"
+  question="The map is 0 100000 65536. Inside the container, you run ls -l on a host file that UID 0 owns on the host. Which owner do you see?"
+  options={["root, because UID 0 is root everywhere", "65534 (nobody), because host UID 0 has no mapping", "100000, because that is the mapped value"]}
+  answer={1}
+  explain="Host UID 0 is not in the range 100000 to 165535, so it has no inside ID. The kernel shows the overflow UID, 65534. The process inside has no rights as the owner of that file."
+>
+<IsolationUidMapDemo />
+</Predict>
+
+1. Move the slider to 0 with **Rootless** selected. Inside UID 0 maps to host UID 1000, the user who started the container. UID 1 maps to 100000.
+2. Select **Only my UID**, then move the slider. Every ID except 0 has no mapping.
+3. Select **No remap**. Inside 0 is host 0, and the verdict warns you. This is why a container with no user namespace depends so much on its other layers.
+4. Edit the text so that two lines overlap. The write fails with `EINVAL`, as it does in the kernel.
+
+The kernel has strict rules for these files. A map has at most 340 lines, and it can be written only once. Ranges must not overlap on either side.
+
+A process with no `CAP_SETUID` in the parent namespace can map only its own effective UID, in one line of length 1. It must also write `deny` to `/proc/<pid>/setgroups` before it writes `gid_map`. The `newuidmap` helper is a setuid program. It checks `/etc/subuid` and writes larger maps for normal users.
+
+```rust
+// Rust, Linux only: become root in a new user namespace. libc crate.
+let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWUSER) }, 0);
+std::fs::write("/proc/self/setgroups", "deny")?;
+std::fs::write("/proc/self/uid_map", format!("0 {uid} 1"))?;
+std::fs::write("/proc/self/gid_map", format!("0 {gid} 1"))?;
+assert_eq!(unsafe { libc::geteuid() }, 0); // root here, still uid on the host
+```
+
+User namespaces have a cost. They let a normal user reach kernel code that once needed root, such as mount and network configuration. Bugs in that code become reachable. So some distributions limit who can create them, and `user.max_user_namespaces` sets a count limit.
+
+## Mount namespaces and propagation
+
+A new mount namespace starts with a copy of the mount tree. A later mount in one copy can appear in the other, or not. **Propagation type** decides this for each mount:
+
+| Type | Events from the peer arrive | Own events go to the peer | Use |
+|---|---|---|---|
+| shared | yes | yes | the default on systemd machines |
+| slave | yes | no | a container that follows host mounts |
+| private | no | no | full separation |
+| unbindable | no | no | also blocks bind mounts of it |
+
+`/proc/self/mountinfo` shows `shared:N` and `master:N` for each mount. Systemd makes `/` shared, so a mount inside a new namespace could leak back to the host. So `unshare` and container runtimes first change `/` to private or slave. The command is `mount --make-rprivate /`.
+
+## Network namespaces
+
+A **network namespace** has its own interfaces, routes, firewall rules, port numbers and loopback. A new one contains only a `lo` device, and that device is down. The link to the outside is a **veth pair**: two virtual interfaces joined like a cable. A frame sent into one end comes out of the other. The ends can be in different namespaces.
+
+```bash
+sudo ip netns add red
+sudo ip link add br0 type bridge
+sudo ip addr add 10.200.0.1/24 dev br0
+sudo ip link set br0 up
+sudo ip link add veth-r type veth peer name eth0 netns red
+sudo ip link set veth-r master br0 up
+sudo ip netns exec red ip addr add 10.200.0.2/24 dev eth0
+sudo ip netns exec red ip link set eth0 up
+sudo ip netns exec red ip route add default via 10.200.0.1
+```
+
+A **bridge** is a software switch. It learns which MAC address is on which port, and it floods a frame with an unknown destination to all ports. Docker builds its default network in the same way, with a bridge that it calls `docker0`.
+
+<Predict
+  id="loopback"
+  question="A server in a container listens on 127.0.0.1:8080. You run curl 127.0.0.1:8080 on the host. What happens?"
+  options={["It connects, because 127.0.0.1 is the same machine", "The connection is refused: the host has its own loopback device, in another namespace", "It connects, but only if a veth pair exists"]}
+  answer={1}
+  explain="Each network namespace has its own lo device. So the address 127.0.0.1 means something different in each one. The server must listen on the container's eth0 address, and a port rule must forward to it."
+>
+<IsolationNetNsDemo />
+</Predict>
+
+1. Press **Send packet** with red to blue, then press **Next hop** until the end. The first packet needs ARP, so the bridge floods one frame.
+2. Press **Send packet** again. The trace has no ARP and no flood, because the tables have learned.
+3. Select **127.0.0.1** as the destination. The packet stays inside red.
+4. Select **8.8.8.8**. The packet goes up to the host stack, and NAT changes the source address to the address of the host.
+5. Clear `ip_forward` and send again. The host drops the packet. Clear only the MASQUERADE box, and a private source address leaves the machine, so replies cannot return.
+
+Docker publishes ports with DNAT rules or a small proxy. Host networking (`--network host`) skips the namespace, so it has no veth cost and no isolation.
+
+<Callout title="On your Mac">
+macOS has no namespaces, so `unshare`, `ip netns` and `/proc` do not exist there. A container on a Mac runs inside a Linux VM, and these commands work inside that VM. The [containers lesson](/os/isolation/containers) explains this.
+</Callout>
+
+## Connect
+
+- [What a process is](/os/processes/what-a-process-is) covers zombies and re-parenting.
+- [Users, permissions and capabilities](/os/isolation/users-permissions-and-capabilities) explains the capability sets that a user namespace scopes.
+- [Unix domain sockets](/os/ipc/unix-domain-sockets) can pass descriptors across namespaces, including namespace descriptors.
+- [Cgroups](/os/isolation/cgroups) limits how much a group uses, where namespaces limit what it sees.
+- [Containers](/os/isolation/containers) combines all of these.
+
+<Recall cards={[
+  { q: "Name the eight namespace types.", a: "Mount, UTS, IPC, PID, network, user, cgroup and time." },
+  { q: "Why does unshare(CLONE_NEWPID) not put the caller in the new namespace?", a: "A process cannot change its PID. The call changes the namespace for the next child, and that child becomes PID 1." },
+  { q: "What happens when PID 1 of a PID namespace exits?", a: "The kernel sends SIGKILL to all other processes in the namespace, and later fork calls there fail with ENOMEM." },
+  { q: "What does the uid_map line 0 100000 65536 mean?", a: "Inside UIDs 0 to 65535 map to host UIDs 100000 to 165535. So container root is an ordinary user on the host." },
+  { q: "Why does ps show host processes after unshare --pid --fork with no new /proc?", a: "ps reads /proc, and /proc shows the PID namespace of its mount. The old mount belongs to the host namespace." },
+  { q: "What is a veth pair, and what does a bridge add?", a: "A veth pair is a virtual cable with one end in each namespace. A bridge is a learning switch that joins many veth ends in one network." },
+]} />

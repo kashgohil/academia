@@ -1,0 +1,154 @@
+---
+summary: "cgroup v1 and the v2 unified hierarchy, the cpu, memory, io and pids controllers, how limits are enforced and what happens at each one, CFS bandwidth throttling and its latency surprise, memory reclaim, cgroup OOM and PSI."
+---
+import { IsolationCpuMaxDemo, IsolationWeightTreeDemo, IsolationMemcgDemo } from "@/demos/os/IsolationCgroupDemos";
+
+A namespace limits what a process can see. A **cgroup** (control group) limits how much it can use. A cgroup is a directory in a special file system, usually `/sys/fs/cgroup`. Processes join by a write of their PID to a file, and limits are more files. There is no special system call.
+
+```bash
+sudo mkdir /sys/fs/cgroup/demo
+echo "+cpu +memory +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+echo "50000 100000" | sudo tee /sys/fs/cgroup/demo/cpu.max     # half a CPU
+echo 512M           | sudo tee /sys/fs/cgroup/demo/memory.max
+echo 256            | sudo tee /sys/fs/cgroup/demo/pids.max
+echo $$             | sudo tee /sys/fs/cgroup/demo/cgroup.procs
+```
+
+These limits are not advice. The kernel enforces them in the scheduler, the page allocator and the fork path. The surprises are in how it enforces them.
+
+## v1 and v2
+
+**cgroup v1** gave each controller its own tree. A process could be in one group for CPU and an unrelated group for memory. So no controller could know about another. The classic failure is writeback. The memory tree and the I/O tree were different, so the kernel could not charge a dirty page write to the right I/O group.
+
+**cgroup v2** has one **unified hierarchy**. Each process is in one cgroup, and that cgroup is one node of one tree. Its main rules are these:
+
+- A parent turns on controllers for its children, in `cgroup.subtree_control`.
+- **No internal processes:** a non-root cgroup that gives controllers to its children cannot hold processes itself. Tasks live in the leaves.
+- A subtree can be **delegated** to a non-root user, with `chown` on its files. Rootless containers use this.
+
+| Controller | Main files | What happens at the limit |
+|---|---|---|
+| cpu | `cpu.weight`, `cpu.max`, `cpu.max.burst`, `cpu.stat` | The group waits for the next period. |
+| memory | `memory.low`, `memory.high`, `memory.max`, `memory.events` | Reclaim, then sleep (high) or OOM (max). |
+| io | `io.max`, `io.weight`, `io.stat` | The I/O waits in a queue. |
+| pids | `pids.max`, `pids.current` | `fork` and `clone` fail with `EAGAIN`. |
+
+## CPU: a hard limit with a surprise
+
+`cpu.max` holds two numbers: quota and period, in microseconds. The default is `max 100000`, which means no limit and a 100 ms period. A value of `100000 100000` means 100 ms of CPU time in each 100 ms. So people call it "1 CPU". This name hides a problem: the quota is CPU time, and a program can spend it on many CPUs at once.
+
+<Predict
+  id="cpu-max"
+  question="A cgroup has cpu.max = 100000 100000, which people call one CPU. It has 8 busy threads on 8 free CPUs. What does one thread see in each 100 ms period?"
+  options={["It runs at one eighth speed, smoothly, all the time", "It runs at full speed for about 12.5 ms, then all threads stop for about 87.5 ms", "It runs at full speed all the time, because 8 CPUs are free"]}
+  answer={1}
+  explain="Eight threads burn 100 ms of quota in 12.5 ms of wall time. Then the group has nothing left until the next period, so every thread stops for 87.5 ms. CFS bandwidth control limits time, not parallelism."
+>
+<IsolationCpuMaxDemo />
+</Predict>
+
+Things to try:
+
+1. Keep 8 threads at quota 1.00. The readout shows 12.5 ms of run and 87.5 ms of stall. Slices of 5 ms make some threads run a little longer than others.
+2. Set **Busy threads** to 1. The thread never stops, with the same quota. Throttling depends on the thread count.
+3. Set the quota to 0.60 with 8 threads, and read the curve. Then move it to 1.00 and 1.25. The red line falls to the "no limit" line only well above the mean use of 0.41 CPUs.
+4. At quota 0.80, move **cpu.max.burst** to 50 ms. The group saves unused quota, and p99 falls.
+5. At quota 0.80, try each period. A 10 ms period gives a quota that is smaller than one request, so most requests cross a refill.
+
+Bandwidth control works in `kernel/sched/fair.c`. Each cgroup has one global pool of runtime, in `struct cfs_bandwidth`. A timer refills the pool at each period. Each CPU takes a **slice** from the pool, 5 ms by default (`kernel.sched_cfs_bandwidth_slice_us`). When a CPU has no slice left and the pool is empty, the group is **throttled** on that CPU until the refill.
+
+The latency numbers in the demo come from a model with 25 requests per second. Each request uses 16 ms of CPU time on 8 threads. So the program uses 0.41 CPUs on average, and a request takes 2 ms when nothing stops it.
+
+| Limit | p99 latency |
+|---|---|
+| no limit | 3.8 ms |
+| 1.25 CPUs | 3.8 ms |
+| 1.00 CPUs | 4.7 ms |
+| 0.80 CPUs | 33.0 ms |
+| 0.60 CPUs | 111.8 ms |
+
+At 0.80 CPUs, the limit is about twice the mean use. Yet p99 is about 8.6 times worse than with no limit. A mean hides bursts, and a burst of requests can use a whole period's quota. The same model with one thread has a p99 of 55.4 ms with no limit, and any quota above 1 CPU changes nothing. One thread can never burn more than the period.
+
+How to work with this:
+
+- **Watch `cpu.stat`.** `nr_periods`, `nr_throttled` and `throttled_usec` show throttling directly. A low mean CPU use with a high `nr_throttled` is the sign of this problem.
+- **Match the thread count to the quota.** `nproc` reads the affinity mask, and it does not see `cpu.max`. Go 1.25 and later set `GOMAXPROCS` from the cgroup limit. Rust's `available_parallelism` reads it too. The JVM has container support. Your own thread pools must do the same.
+- **Use burst.** `cpu.max.burst` lets a group carry unused quota into the next period. In the model, 50 ms of burst brings p99 at 0.80 CPUs back to 3.8 ms.
+- **Prefer weights when you can.** A weight never makes a program wait while a CPU is idle.
+
+Older kernels also expired unused slice time on each CPU, which caused throttling at low use. Linux 5.4 removed that expiry.
+
+## CPU: weights
+
+`cpu.weight` runs from 1 to 10000, with a default of 100. It is a share and not a limit. The scheduler treats each cgroup as one entity on each CPU, so a group competes with its siblings by weight. See [CFS and EEVDF](/os/scheduling/cfs-and-eevdf) for the mechanism. Your share of the machine is the product of your local shares along the path from the root.
+
+<Predict
+  id="weights"
+  question="kubepods has weight 800, and two siblings have weight 100 each. Inside kubepods, api has weight 300 and batch has weight 100. All are busy. What share of the machine does api get?"
+  options={["75%, because 300 out of 400 is 75%", "60%, because 80% times 75% is 60%", "About 21%, because weight 300 out of a total of 1,400"]}
+  answer={1}
+  explain="kubepods gets 800 of 1,000, which is 80%. Inside it, api gets 300 of 400, which is 75%. The product is 60%. Weights only compare siblings."
+>
+<IsolationWeightTreeDemo />
+</Predict>
+
+1. Read the default tree: `api` has 60.0%, `batch` has 20.0%, and `sshd` has 5.0%.
+2. Tick **idle** on `batch`. Its share goes to `api`, because weights apply only between groups that want CPU.
+3. Give `sshd` a weight of 1000. Its share inside `system.slice` grows, but its global share stays below 10%. A group cannot escape the share of its parent.
+4. Add children to a group. Each new level divides what the parent has.
+
+## Memory: three levels
+
+The memory controller charges each page to a cgroup: anonymous pages, page cache, and some kernel memory. Each cgroup has its own LRU lists, as [page replacement](/os/memory/page-replacement) describes. Three files set three behaviors:
+
+- **`memory.low`** is best-effort protection. Pressure from outside reclaims from other groups first. `memory.min` is the hard version.
+- **`memory.high`** is the throttle. Over this line, the kernel reclaims from the group. If that is not enough, it puts the task to sleep when the task returns to user mode. One sleep lasts at most 2 s. Nothing dies.
+- **`memory.max`** is the wall. A charge that would pass it runs reclaim inside the cgroup. If reclaim cannot make room, the cgroup OOM killer runs.
+
+<Predict
+  id="memcg"
+  question="A cgroup has memory.max = 800 MiB and no swap. It has 700 MiB of page cache and 40 MiB of anonymous memory. A task touches 200 MiB of new anonymous memory. What happens?"
+  options={["The OOM killer runs, because 940 MiB is above the limit", "Reclaim drops clean page cache to make room, and no task dies", "The allocation fails, and malloc returns NULL"]}
+  answer={1}
+  explain="Clean page cache is cheap to drop, so reclaim frees it and the charge succeeds. The OOM killer runs only if reclaim cannot make room. With no swap, anonymous memory cannot be reclaimed, so it is the part that leads to a kill."
+>
+<IsolationMemcgDemo />
+</Predict>
+
+1. Press **read a 100 MiB file** many times. The page cache grows to `memory.high`, then reclaim holds it there. No task sleeps.
+2. Press **app: touch 100 MiB** until the usage passes `memory.high`. Now reclaim cannot free anonymous memory, so the task sleeps. The sleep counter climbs quickly.
+3. Keep going until `memory.max`. The cgroup OOM killer kills `app`, the largest task. The `oom_kill` counter goes up, and `sidecar` lives.
+4. Turn on `memory.oom.group` and repeat. Now one kill ends all tasks in the group, so no half-dead service stays up.
+5. Add swap with `memory.swap.max`. Anonymous memory can now move out, and the OOM comes later.
+6. Fill the page cache and press **outside pressure**. Reclaim stops at `memory.low`.
+
+A cgroup OOM is local. It can run while the machine has plenty of free memory, and it chooses only tasks in that cgroup. [The OOM killer lesson](/os/memory/swapping-and-the-oom-killer) has the score arithmetic and the Kubernetes rules, and this demo uses the same victim code. A common setup sets `memory.high` a little below `memory.max`. The program then slows down and has time to react, before it reaches the wall.
+
+## I/O, PIDs and pressure
+
+`io.max` sets bytes per second and operations per second for each device, in lines such as `8:16 rbps=1048576 wiops=120`. `io.weight` shares a disk by weight. With cgroup v2, writeback can be charged to the right group. See [the block layer](/os/io/the-block-layer-and-i-o-schedulers).
+
+`pids.max` stops a fork bomb inside one group. Without it, one group can fill the PID space of the whole machine. The system call fails with `EAGAIN`, and other groups do not notice.
+
+**PSI** (pressure stall information) measures the time that tasks lose. Each cgroup has `cpu.pressure`, `memory.pressure` and `io.pressure`. The format is the one in [the OOM lesson](/os/memory/swapping-and-the-oom-killer). `some` means that at least one task stalled, and `full` means that all non-idle tasks stalled. A process can register a trigger on these files and get a `poll` event when pressure crosses a threshold. `systemd-oomd` uses this to act before the kernel does.
+
+<Callout title="On your Mac">
+macOS has no cgroups. Its nearest tools are `taskpolicy` and quality-of-service classes, which guide scheduling but set no hard quota. To try the commands above, use a Linux VM. A file under `/sys/fs/cgroup` exists only there.
+</Callout>
+
+## Connect
+
+- [CFS and EEVDF](/os/scheduling/cfs-and-eevdf) explains the weights that groups use.
+- [Multiprocessor scheduling](/os/scheduling/multiprocessor-scheduling) covers `cpuset` and placement.
+- [Swapping and the OOM killer](/os/memory/swapping-and-the-oom-killer) has the victim score and PSI.
+- [Page replacement](/os/memory/page-replacement) shows the LRU lists that exist per cgroup.
+- [Containers](/os/isolation/containers) uses cgroups as the resource layer.
+
+<Recall cards={[
+  { q: "What problem does the unified hierarchy of cgroup v2 solve?", a: "In v1 each controller had its own tree, so controllers could not cooperate. For example, writeback could not be charged to the right I/O group. In v2 each process has one cgroup in one tree." },
+  { q: "Eight busy threads run under cpu.max = 100000 100000. How do they behave?", a: "They burn the quota in 12.5 ms, then all stop for 87.5 ms until the next refill. Quota limits CPU time, not parallelism." },
+  { q: "Which file shows that a program is being throttled, and which fields do you read?", a: "cpu.stat: nr_periods, nr_throttled and throttled_usec." },
+  { q: "How do you compute the machine share of a nested cgroup?", a: "Multiply the local shares along the path from the root. Each local share is the weight divided by the sum of weights of the siblings that want CPU." },
+  { q: "What is the difference between memory.high and memory.max?", a: "Over memory.high the kernel reclaims and makes tasks sleep, and nothing dies. At memory.max a charge that reclaim cannot satisfy starts the cgroup OOM killer." },
+  { q: "What does fork return when a cgroup reaches pids.max?", a: "It fails with EAGAIN, and other cgroups are not affected." },
+]} />

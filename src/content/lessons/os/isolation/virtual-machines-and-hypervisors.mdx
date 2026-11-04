@@ -1,0 +1,175 @@
+---
+summary: "Trap and emulate, Popek and Goldberg's requirements and why classic x86 failed them, binary translation, paravirtualization, VT-x and VM exits, EPT and the 2D walk of 24 reads, virtio, KVM and QEMU, Firecracker, gVisor, and container against VM trade-offs."
+---
+import { IsolationTrapDemo, IsolationVmExitDemo, IsolationWorkloadDemo, IsolationNestedWalkDemo } from "@/demos/os/IsolationVmDemos";
+
+A **virtual machine** (VM) gives a **guest** operating system what looks like a whole computer. A **hypervisor**, or VMM (virtual machine monitor), runs below it and keeps control. The surprising part is that most guest instructions run directly on the real CPU, at full speed. The whole design is about the few that must not.
+
+## Trap and emulate
+
+Run the guest kernel with no privilege. Most of its instructions work as usual. When it tries a privileged one, such as a write to CR3, the CPU **traps** to the hypervisor. The hypervisor then **emulates** the effect on a virtual copy of that state, and it resumes the guest. The guest cannot tell.
+
+Popek and Goldberg made this precise in 1974. A VMM must have three properties:
+
+- **Equivalence:** a program behaves as it does on the real machine.
+- **Resource control:** the VMM keeps control of the real resources.
+- **Efficiency:** most instructions run with no VMM action.
+
+They sort instructions into two groups. A **sensitive** instruction reads or changes privileged state. A **privileged** instruction traps when it runs without privilege. Their theorem says that a trap-and-emulate VMM exists if every sensitive instruction is privileged. Each sensitive instruction then traps, so none can do harm in silence.
+
+<Predict
+  id="popf"
+  question="Classic x86 runs a guest kernel in ring 3. The guest kernel executes popf to turn interrupts off. What happens?"
+  options={["It traps, and the hypervisor records that this guest has interrupts off", "Nothing visible: the CPU ignores the change to the interrupt flag, and no trap occurs", "The real CPU turns interrupts off, for every guest"]}
+  answer={1}
+  explain="popf is sensitive but not privileged. In ring 3, it silently keeps the old interrupt flag. The guest believes interrupts are off, and the hypervisor never hears about it. This breaks the theorem."
+>
+<IsolationTrapDemo />
+</Predict>
+
+Things to try:
+
+1. Click each row with **Classic x86** selected. `lgdt` and `hlt` trap, so a hypervisor can handle them. `popf`, `pushf`, `sgdt` and `smsw` give a wrong answer with no trap.
+2. Select **VT-x**. The same four instructions now work on the guest's own state.
+
+Robin and Irvine (2000) listed more than a dozen such instructions on x86. Three approaches solved this problem:
+
+| Approach | Idea | Example | Cost |
+|---|---|---|---|
+| **Binary translation** | rewrite guest kernel code at run time, and replace bad instructions | VMware, 1999 | complex, and guest kernel code runs from a cache |
+| **Paravirtualization** | change the guest kernel to call the hypervisor directly (**hypercalls**) | Xen, 2003 | needs a modified guest |
+| **Hardware support** | add a new CPU mode, so the guest runs unmodified | VT-x and AMD-V, about 2005 | each exit costs time |
+
+Hardware won for CPUs. Paravirtualization survives for devices, as virtio.
+
+## VT-x and VM exits
+
+VT-x adds two modes, each with all four rings. The hypervisor runs in **VMX root** mode, and the guest runs in **VMX non-root** mode. So the guest kernel really is in ring 0, and a guest system call needs no help. A data structure, the **VMCS** (virtual machine control structure), holds guest state and host state. It also says which events must leave non-root mode.
+
+A **VM exit** saves the guest state to the VMCS, loads the host state, and runs the hypervisor. `VMRESUME` goes back. The hardware part alone takes about 1,500 cycles in this model, before any handler code runs. On arm64, the same split is EL2 for the hypervisor and EL1 for the guest kernel.
+
+<Predict
+  id="exits"
+  question="With EPT on modern Intel hardware, which causes a VM exit: a system call, a guest page fault, a CR3 write, or CPUID?"
+  options={["All four, since they are all privileged operations", "Only CPUID: the others stay inside the guest", "System call and CPUID only"]}
+  answer={1}
+  explain="A system call stays in non-root mode. With EPT, the guest owns its page tables, so its page faults and CR3 writes need no exit. CPUID always exits on VT-x, so the hypervisor can choose what the guest sees."
+>
+<IsolationVmExitDemo />
+</Predict>
+
+1. Read the table. Only some rows exit. Plain arithmetic, a system call and a page fault do not.
+2. Select **Identify the CPU** and press **Start**, then **Step**. CPUID takes 1 µs against 30 ns with no VM, which is about 33 times slower in this model.
+3. Clear **EPT**. A CR3 write now costs 2.3 µs, because the hypervisor must maintain shadow page tables. This is why nested paging was such a large gain.
+4. Select **Notify a virtio device** and clear **ioeventfd**. The cost goes from 1 µs to 7 µs, because the exit now goes to QEMU in user space.
+5. Select **Register write, emulated device**. At 8.3 µs, this is the slowest path in the table.
+
+All these times are model inputs, chosen as round figures of the right size. They are not measurements of one CPU. To measure your machine, run the `vmexit` test in `kvm-unit-tests`.
+
+## How much do exits cost a workload?
+
+Lost time is simple arithmetic: exits per second times the cost of each exit.
+
+<Predict
+  id="exit-rate"
+  question="A guest makes 10,000 VM exits per second, and each one costs 1 µs. How much CPU time does it lose?"
+  options={["0.01%", "1%", "10%"]}
+  answer={1}
+  explain="10,000 times 1 µs is 10 ms of each second, which is 1%. A rate that sounds large can be cheap. The cost becomes serious near 100,000 exits per second, or when each exit goes to user space."
+>
+<IsolationWorkloadDemo />
+</Predict>
+
+1. Start at **Web server** with virtio. It has 4,500 exits per second, and it loses 1.4%.
+2. Select **Emulated**. Each packet now needs 4 register writes, each with a trip to QEMU. The CPU time lost reaches 100%, so the guest cannot keep up.
+3. Move the kick slider down to 1, with virtio. More kicks mean more exits. This is the value of a **batch**.
+4. Select **A loop that calls CPUID**. It loses 20% with no I/O at all. Some programs do this for timing, and it hurts in a VM.
+
+**virtio** is why devices are fast. The guest driver knows that it is in a VM. It puts buffers in shared rings of descriptors (a **virtqueue**), and it notifies the host only when it must. One notification can carry many packets. `vhost` moves the work to a kernel thread on the host, and `ioeventfd` means that the notify never reaches user space.
+
+## Memory: the 2D walk
+
+A guest has its own page tables, which map a guest virtual address to a **guest physical** address. That address is still fake. **Nested paging** adds a second set of tables that map guest physical to host physical. Intel calls them **EPT** (extended page tables), and AMD calls them **NPT**. The CPU walks both in hardware. arm64 calls this stage 2 translation.
+
+The cost is hidden in one fact: each guest page table lives at a guest physical address. So the CPU must translate that address before it can read the entry.
+
+<Predict
+  id="nested-reads"
+  question="The guest uses 4-level page tables, and so does the EPT. A TLB miss needs a full walk, with no caches helping. How many memory reads does it take?"
+  options={["8, which is 4 + 4", "16, which is 4 × 4", "24, because each guest level and the final address need a full EPT walk"]}
+  answer={2}
+  explain="Each of the 4 guest levels needs 4 EPT reads and 1 guest entry read, which gives 20. The final guest physical address needs 4 more EPT reads. The total is (4 + 1)(4 + 1) - 1 = 24."
+>
+<IsolationNestedWalkDemo />
+</Predict>
+
+1. Hover over the cells in order from 1 to 24, or tap them. Orange cells read the EPT, and blue cells read a guest table.
+2. Read the shape: 5 columns times 5 rows is 25 cells. The corner is the data itself, so it is not a walk read.
+3. Set **EPT levels** and **Guest levels** to 5. The walk needs 35 reads.
+4. Set **Host page** to 2 MiB. The count falls to 19. Set the guest page to 2 MiB as well, and it falls to 15.
+5. Set both pages to 1 GiB. The count falls to 8. This is why huge pages help more inside a VM.
+
+A native walk takes 4 reads, so the ratio is 6 times. Real CPUs rarely pay the full price. The TLB caches the final result, and paging-structure caches skip most of the steps. But a program with many TLB misses can slow down noticeably in a VM. See [the TLB](/os/vm/the-tlb) and [huge pages](/os/vm/huge-pages). Before EPT, the hypervisor kept **shadow page tables** in software, and it paid an exit on most page table changes.
+
+## KVM and QEMU
+
+On Linux, the hypervisor is split in two. **KVM** is a kernel module that drives VT-x or AMD-V, and it exposes `/dev/kvm`. **QEMU** is a normal process that holds the guest memory and acts as its device model. Each vCPU is a thread that loops on one `ioctl`:
+
+```c
+int kvm = open("/dev/kvm", O_RDWR);
+int vm = ioctl(kvm, KVM_CREATE_VM, 0);
+ioctl(vm, KVM_SET_USER_MEMORY_REGION, &region);     /* guest RAM is an mmap in this process */
+int vcpu = ioctl(vm, KVM_CREATE_VCPU, 0);
+struct kvm_run *run = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu, 0);
+for (;;) {
+    ioctl(vcpu, KVM_RUN, 0);                        /* the guest runs here */
+    switch (run->exit_reason) {
+    case KVM_EXIT_IO:   handle_port_io(run);  break;  /* a device register */
+    case KVM_EXIT_MMIO: handle_mmio(run);     break;
+    case KVM_EXIT_HLT:  return 0;
+    }
+}
+```
+
+So a guest is an ordinary Linux process to the host. `top` shows it, cgroups limit it, and the scheduler runs its vCPU threads. Most exits end inside KVM. Only some reach this loop.
+
+## MicroVMs and gVisor
+
+A general VM carries emulated hardware that a cloud workload never uses, and each device is more attack surface. A **microVM** removes it. **Firecracker** (Agache et al., NSDI 2020) keeps KVM and replaces QEMU with a small Rust program. It has very few devices: virtio network and block, a serial port and little more.
+
+The paper reports boot in about 125 ms, and less than 5 MiB of overhead per VM. AWS Lambda runs on it. Kata Containers uses a VM of this kind behind the OCI runtime interface.
+
+**gVisor** is a middle ground. Its **Sentry** is a kernel written in Go that runs in user space. It takes the system calls of the application and implements them itself, so the application rarely reaches the host kernel. Sentry itself uses only a small set of host calls, under a seccomp filter. The boundary is narrower than the Linux system call table, but a system call costs more, and some kernel features are missing.
+
+| | Container | gVisor | MicroVM | Full VM |
+|---|---|---|---|---|
+| Kernel | host, shared | a user-space kernel per sandbox | guest, per VM | guest, per VM |
+| Boundary | system calls to the host | Sentry, then few host calls | hypervisor | hypervisor and device model |
+| Start time | fast | fast | fast, but longer than a process | slowest |
+| Memory overhead | lowest | low | low | highest |
+| System call speed | native | slower | native in the guest | native in the guest |
+| I/O path | native | through Sentry | virtio | virtio or emulated |
+| Compatibility | full Linux, one kernel | most of Linux | any guest kernel | any OS |
+
+Choose by trust. For code that you wrote, a container is usually enough. For code from another tenant, use a hardware boundary. A VM has its own weak points. The device model is the largest target. A shared CPU can also leak data through side channels such as cache timing, so hosts often pin tenants to separate cores.
+
+<Callout title="On your Mac">
+Apple Silicon runs its hypervisor at EL2. **Hypervisor.framework** is the low-level interface, with `hv_vm_create` and `hv_vcpu_run`. It has the same loop as the KVM code above, and your program is the device model. **Virtualization.framework** sits above it and gives you virtio devices. Docker Desktop and many other tools use these. There is no `/dev/kvm`, no VT-x and no EPT by that name, and the guests are arm64. `lima` is an easy way to get a Linux VM.
+</Callout>
+
+## Connect
+
+- [Kernel mode and user mode](/os/processes/kernel-mode-and-user-mode) explains the rings that VT-x doubles.
+- [Paging and page tables](/os/vm/paging-and-page-tables) and [the TLB](/os/vm/the-tlb) cover one dimension of this walk.
+- [Huge pages](/os/vm/huge-pages) shows why fewer levels help so much here.
+- [DMA and the IOMMU](/os/io/dma-and-the-iommu) explains how devices are given to a guest safely.
+- [Containers](/os/isolation/containers) is the other side of the trade-off.
+
+<Recall cards={[
+  { q: "State the Popek and Goldberg theorem.", a: "A trap-and-emulate VMM can be built if every sensitive instruction is privileged, so that each sensitive instruction traps when it runs without privilege." },
+  { q: "Why did classic x86 fail that test? Give an example.", a: "Some sensitive instructions do not trap in ring 3. popf silently ignores a change to the interrupt flag, so the guest and the hypervisor disagree." },
+  { q: "Why does a guest system call need no VM exit under VT-x?", a: "The guest has its own rings in non-root mode. Moving between its ring 3 and ring 0 stays inside non-root mode." },
+  { q: "Derive the number of reads in a nested walk with 4 guest levels and 4 EPT levels.", a: "Each of 4 guest levels takes 4 EPT reads and 1 guest entry read, giving 20. The final address takes 4 more. In general: (g + 1)(h + 1) - 1 = 24." },
+  { q: "What does each part do in the split between KVM and QEMU?", a: "KVM runs in the kernel and handles the CPU, memory virtualization and fast exits. QEMU is a user process that holds guest memory and emulates devices when an exit reaches it." },
+  { q: "How does gVisor differ from a microVM?", a: "gVisor implements Linux system calls in a user-space kernel, Sentry, with no guest kernel. A microVM runs a real guest kernel behind a hypervisor with very few devices." },
+]} />

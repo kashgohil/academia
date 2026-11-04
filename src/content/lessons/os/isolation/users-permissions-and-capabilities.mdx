@@ -1,0 +1,181 @@
+---
+summary: "UIDs and GIDs (real, effective, saved), the rwx check and its one-class rule, setuid and why it is dangerous, sticky and setgid bits, ACLs, then Linux capabilities: five sets, the execve rules, file capabilities and least privilege in practice."
+---
+import { IsolationPermCheckDemo, IsolationSetuidDemo, IsolationCapExecDemo } from "@/demos/os/IsolationPermDemos";
+
+The oldest isolation in UNIX is the **user**. The kernel knows a user only as a number, the **UID** (user ID). A **GID** (group ID) names a group in the same way. Names such as `alice` live in `/etc/passwd`, and only user programs read that file. Every file has one owner UID, one GID and a set of **mode bits**.
+
+The mode has three classes of three bits: owner, group and other. Each class has read, write and execute. Most people read these as three separate grants. The kernel does not.
+
+<Predict
+  id="owner-locked-out"
+  question="Alice owns a file with mode 0077, so everyone except the owner has rwx. Alice runs cat on the file. What happens?"
+  options={["It works, because other users can read it and the owner is at least as trusted", "EACCES, because only the owner bits apply and they are empty", "It works, because an owner can always read a file that she owns"]}
+  answer={1}
+  explain="The kernel picks exactly one class. Alice matches the owner class, so the kernel reads only the owner bits. They are empty, so the read fails. Alice can still run chmod, because ownership gives that right."
+>
+<IsolationPermCheckDemo />
+</Predict>
+
+Things to try:
+
+1. Select **Owner locked out**. Press **Step** and watch the check stop at the owner class. The group and other rows say "not read".
+2. Select **Group blocks, other allows**. The mode is `0604`. Alice is in the group, so she is denied. A stranger can read the file.
+3. Select **Root, mode 000**. The read works through a capability, not through the bits. Then select **Root runs a file with no x**. Even root cannot execute a file with no execute bit at all.
+4. Clear the capability box with UID 0 selected. UID 0 with no capabilities gets no override.
+5. Select **/tmp**. Alice can write to the directory, but she cannot delete a file that bob owns.
+
+## The check
+
+`generic_permission` in `fs/namei.c` does this work for most file systems. This is the shape of it, without ACLs:
+
+```c
+int mode = inode->i_mode;
+if (uid_eq(current_fsuid(), inode->i_uid))
+    mode >>= 6;                     /* owner: use these bits and stop */
+else if (in_group_p(inode->i_gid))
+    mode >>= 3;                     /* group: use these bits and stop */
+/* otherwise the low three bits apply */
+if ((want & ~mode & (MAY_READ | MAY_WRITE | MAY_EXEC)) == 0)
+    return 0;
+/* denied by the bits: only CAP_DAC_OVERRIDE or CAP_DAC_READ_SEARCH can help */
+```
+
+The kernel runs this check at each step of a path. To open `/a/b/c`, the process needs execute on `/`, `/a` and `/a/b`, and then the access it wants on `c`. [Path lookup](/os/fs/path-lookup-and-the-vfs) shows that walk.
+
+Execute means something different on a directory:
+
+| Bit | On a file | On a directory |
+|---|---|---|
+| r | read the bytes | list the names |
+| w | change the bytes | create, delete and rename entries |
+| x | run it | use the directory in a path (search) |
+
+Delete is a write to the directory, not to the file. So the mode of a file does not decide who can delete it.
+
+## Real, effective and saved IDs
+
+A process has several UIDs, in `struct cred`:
+
+- **Real UID**: the user who started the process. Accounting uses it, and so do signal checks.
+- **Effective UID**: the identity for most permission checks. Linux copies it to a **filesystem UID** (`fsuid`), which is what the file check above reads.
+- **Saved UID**: a copy that lets a program return to an earlier effective UID.
+
+GIDs have the same three, plus a list of **supplementary groups**. The `access` call is a known trap: it checks the real UID, not the effective UID. A setuid program that calls `access` and then `open` also has a race, because the file can change between the two calls.
+
+## Setuid
+
+The **setuid** bit makes `execve` set the effective UID to the owner of the file. This is how `passwd` writes to `/etc/shadow` when a normal user runs it. The saved UID keeps the old effective UID, so the program can drop privilege and take it back.
+
+<Predict
+  id="setuid-drop"
+  question="A setuid-root program calls seteuid(1000) to drop privilege. Later, a bug lets an attacker choose what the program does. Is root gone?"
+  options={["Yes, the effective UID is 1000, so the program has no root rights", "No, the saved UID is still 0, so the program can call seteuid(0) again", "Yes, but only until the next execve"]}
+  answer={1}
+  explain="seteuid changes only the effective UID. The saved UID stays 0, and that is enough to go back. To drop for good, a privileged process calls setuid, which sets all three IDs."
+>
+<IsolationSetuidDemo />
+</Predict>
+
+1. Press **execve setuid-root file**. The real UID stays 1000, and the effective and saved UIDs become 0. The read of `/etc/shadow` now works.
+2. Press **seteuid(1000)**, and the read fails. Press **seteuid(0)**, and it works again.
+3. Press **setuid(1000)**. All three IDs change. Now **seteuid(0)** returns EPERM.
+
+Setuid is dangerous because the caller controls the environment of a program that runs with the rights of the owner. The caller sets the arguments, the environment variables, the open descriptors, the working directory, the resource limits and the signal state. The dynamic linker has a defense, the `AT_SECURE` flag, which makes it limit `LD_PRELOAD` and similar variables. Each program must still handle the rest. The 2021 `pkexec` bug (CVE-2021-4034) came from the way one such program handled its arguments.
+
+Linux has limits on this. It ignores the setuid bit on scripts. A write by an unprivileged process clears the bit. A file system mounted with `nosuid` ignores it. A process with `no_new_privs` set also ignores it, and that flag survives `execve` and cannot be cleared.
+
+## Sticky and setgid bits
+
+- **Sticky on a directory** (`/tmp`, mode `1777`): only the owner of the file or of the directory can delete an entry. `CAP_FOWNER` also allows it.
+- **Setgid on a directory**: new files get the group of the directory, not the group of the creator. Shared project folders use this.
+- **Setgid on a file**: `execve` sets the effective GID to the group of the file. This needs the group execute bit as well.
+
+**POSIX ACLs** (access control lists) add entries for named users and groups. The order is owner, then named user, then the groups, then other. A `mask` entry limits the named entries and the groups. `getfacl` and `setfacl` manage them. A `+` at the end of the `ls -l` mode shows that a file has an ACL.
+
+## Capabilities
+
+Root has two jobs on classic UNIX: it owns files, and it bypasses checks. **Capabilities** split the second job into separate rights. Linux has 41 of them, numbered 0 to 40. Binding a low port needs `CAP_NET_BIND_SERVICE`. Changing the time needs `CAP_SYS_TIME`. `CAP_SYS_ADMIN` covers so many operations that it is close to root.
+
+A process has five sets:
+
+| Set | Meaning |
+|---|---|
+| Permitted | the capabilities that the process may use or make effective |
+| Effective | the capabilities that the kernel checks now |
+| Inheritable | the capabilities that can pass through `execve`, with help from the file |
+| Bounding | a limit on what `execve` can add from a file |
+| Ambient | the capabilities that pass through `execve` to a normal program |
+
+A file can also carry capabilities, in the `security.capability` extended attribute. It has a permitted set, an inheritable set and one effective bit. `execve` combines the process and the file by these rules:
+
+```text
+P'(ambient)     = file is privileged ? 0 : P(ambient)
+P'(permitted)   = (P(inheritable) & F(inheritable)) | (F(permitted) & P(bounding)) | P'(ambient)
+P'(effective)   = F(effective) ? P'(permitted) : P'(ambient)
+P'(inheritable) = P(inheritable)
+P'(bounding)    = P(bounding)
+```
+
+A file is **privileged** if it has file capabilities or if it changes the UID or GID. Root has a special rule: a process with UID 0 acts as if the file sets were all ones. This is why root keeps its power across `execve`.
+
+<Predict
+  id="caps-lost"
+  question="A non-root process has CAP_NET_BIND_SERVICE in its permitted and effective sets, and nothing in inheritable or ambient. It runs a plain program with no file capabilities. Can that program bind port 80?"
+  options={["Yes, a child program inherits the capabilities of its parent", "No, every term of the permitted formula is empty, so the capability is lost", "Yes, but only if the bounding set has it"]}
+  answer={1}
+  explain="The inheritable set is empty, the file sets are empty, and the ambient set is empty. So the new permitted set is empty. This surprised so many people that Linux 4.3 added the ambient set."
+>
+<IsolationCapExecDemo />
+</Predict>
+
+1. Start at **setcap +ep**. The file gives the capability, and the bounding set allows it. Clear `NET_BIND_SERVICE` in column B, and the capability disappears.
+2. Select **Plain user**, then tick `NET_BIND_SERVICE` in column P and column E. After `execve`, the capability is gone.
+3. Select **Ambient**. The capability survives a plain program. Tick **has file caps**: the file is now privileged, and the ambient set is cleared.
+4. Select **Root with a cut bounding set**. Root gets only what the bounding set allows. Containers use this.
+5. Select **no_new_privs**. The file asks for a capability, and `execve` does not grant it.
+
+## Least privilege in practice
+
+A web server needs port 80 and nothing else from root. Three ways give it that right:
+
+```bash
+# 1. File capability: this binary gets one capability when it runs.
+sudo setcap 'cap_net_bind_service=+ep' ./server
+getcap ./server
+
+# 2. systemd: no root, no file attribute. The ambient set carries the capability.
+#    [Service]
+#    User=www
+#    AmbientCapabilities=CAP_NET_BIND_SERVICE
+#    CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+#    NoNewPrivileges=yes
+
+# 3. Move the port limit (default 1024) for this network namespace.
+sudo sysctl net.ipv4.ip_unprivileged_port_start=80
+```
+
+To inspect a process, run `grep Cap /proc/self/status` and decode the masks with `capsh --decode`. A program that starts as root should drop what it does not need. It should also call `setuid` to leave UID 0, which clears the permitted, effective and ambient sets. The bounding set matters most to a container runtime. Docker keeps 14 capabilities by default, and it removes the rest from the bounding set.
+
+Capabilities have limits as well. Several of them can lead to full root, directly or not. `CAP_SYS_ADMIN`, `CAP_SYS_MODULE` and `CAP_SYS_PTRACE` are the clearest cases. So a capability list is only as strong as its most powerful entry.
+
+<Callout title="On your Mac">
+macOS has UIDs, mode bits, setuid and ACLs, but it has no Linux capability sets. Root is also limited by other layers. **System Integrity Protection** (SIP) stops even root from changing protected system locations. `csrutil status` shows its state. **TCC** (Transparency, Consent and Control) asks the user before a program can read data such as the camera, contacts or protected folders. So `sudo cat` can fail on a file in a protected folder when the terminal has no consent. `getcap` and `setcap` do not exist on macOS.
+</Callout>
+
+## Connect
+
+- [System calls](/os/processes/system-calls) shows where these checks run in the kernel path.
+- [Fork and exec](/os/processes/fork-and-exec) explains what `execve` keeps and what it replaces.
+- [Path lookup and the VFS](/os/fs/path-lookup-and-the-vfs) runs the search check at each path step.
+- [Namespaces](/os/isolation/namespaces) makes UID 0 and capabilities local to a user namespace.
+- [Containers](/os/isolation/containers) uses the bounding set to limit root.
+
+<Recall cards={[
+  { q: "A process matches the owner of a file, and the owner bits deny the access while the other bits allow it. What happens?", a: "The access fails. The kernel uses exactly one class, the first that matches: owner, then group, then other." },
+  { q: "What is the job of the saved UID?", a: "It stores the effective UID from execve. A setuid program can drop to its real UID with seteuid and return later, because the saved UID still holds the old value." },
+  { q: "Why is setuid dangerous?", a: "The caller controls the arguments, environment, descriptors, limits and signal state of a program that runs with the rights of its owner. Each of these inputs can carry an attack." },
+  { q: "Write the rule for the new permitted set after execve.", a: "P'(permitted) = (P(inheritable) & F(inheritable)) | (F(permitted) & P(bounding)) | P'(ambient)." },
+  { q: "Which events clear the ambient set during execve?", a: "Running a privileged file: one with file capabilities, or one that changes the UID or GID." },
+  { q: "How can a non-root server bind port 80 without any setuid bit?", a: "Give the binary CAP_NET_BIND_SERVICE with setcap, or let systemd set it in the ambient set, or lower net.ipv4.ip_unprivileged_port_start." },
+]} />

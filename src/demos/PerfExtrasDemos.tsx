@@ -205,14 +205,18 @@ export function PipelineSlotsDemo() {
   const td = measureKernel(id).topdown;
   // Illustration: 4 slots × 60 cycles, filled in runs whose lengths match each category's typical stall.
   const cells = useMemo(() => {
-    const r = mulberry32(2);
-    const RUN = { retiring: 3, badSpeculation: 16, frontend: 2, backendMemory: 60, backendCore: 3 } as const;
+    // Deterministic fill: always extend the category that is furthest below its target share,
+    // in runs as long as that category's typical stall. Runs interleave as they do in real execution.
+    const RUN = { retiring: 2, badSpeculation: 16, frontend: 2, backendMemory: 60, backendCore: 3 } as const;
+    const emitted: Record<string, number> = {};
     const cols: string[] = [];
     while (cols.length < 60) {
-      let u = r(), cat: (typeof CATS)[number]["k"] = "retiring";
-      for (const c of CATS) { if ((u -= td[c.k]) < 0) { cat = c.k; break; } }
-      const len = cat === "retiring" ? 1 + Math.floor(r() * RUN.retiring) : RUN[cat];
-      for (let i = 0; i < len && cols.length < 60; i++) cols.push(cat);
+      let best: (typeof CATS)[number]["k"] = "retiring", gap = -Infinity;
+      for (const c of CATS) {
+        const g = td[c.k] * (cols.length + 1) - (emitted[c.k] ?? 0);
+        if (td[c.k] > 0.005 && g > gap) { gap = g; best = c.k; }
+      }
+      for (let i = 0; i < RUN[best] && cols.length < 60; i++) { cols.push(best); emitted[best] = (emitted[best] ?? 0) + 1; }
     }
     return cols;
   }, [id]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -299,7 +303,7 @@ export function HotColdDemo() {
   const loaded = rows.reduce((s, r) => s + r.lines.filter(Boolean).length, 0) * 64;
   const used = ENT * 24;
   return (
-    <Demo title="Bytes the update loop loads, for 8 entities" controls={<Param spec={select({ label: "Layout", options: [{ value: "object", label: "128-byte objects" }, { value: "split", label: "Hot fields in arrays" }], default: "object", segmented: true })} value={layout} onChange={(v) => setLayout(v as "object" | "split")} />}>
+    <Demo title="Bytes the update loop loads, for 8 entities" controls={<Param spec={select({ label: "Layout", options: [{ value: "object", label: "Objects" }, { value: "split", label: "Hot arrays" }], default: "object", segmented: true })} value={layout} onChange={(v) => setLayout(v as "object" | "split")} />}>
       <div ref={ref}>
         <svg width={w} height={rows.length * 26 + 8} style={{ display: "block" }}>
           {rows.map((r, i) => (
@@ -337,7 +341,7 @@ export function LayoutPictureDemo() {
       title="Where each field lives (16 entities, 4 fields)"
       controls={
         <>
-          <Param spec={select({ label: "Layout", options: [{ value: "aos", label: "AoS" }, { value: "soa", label: "SoA" }, { value: "aosoa", label: "AoSoA (blocks of 4)" }], default: "aos", segmented: true })} value={layout} onChange={(v) => setLayout(v as "aos" | "soa" | "aosoa")} />
+          <Param spec={select({ label: "Layout (AoSoA uses blocks of 4)", options: [{ value: "aos", label: "AoS" }, { value: "soa", label: "SoA" }, { value: "aosoa", label: "AoSoA" }], default: "aos", segmented: true })} value={layout} onChange={(v) => setLayout(v as "aos" | "soa" | "aosoa")} />
           <Param spec={range({ label: "Fields the loop reads", min: 1, max: 4, step: 1, default: 1 })} value={read} onChange={(v) => setRead(v as number)} />
         </>
       }

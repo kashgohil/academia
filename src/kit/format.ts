@@ -11,8 +11,9 @@ export function si(v: number, unit = "", digits = 3): string {
 }
 
 export function bytes(v: number): string {
-  if (v >= 1 << 20) return `${v / (1 << 20)} MiB`;
-  if (v >= 1024) return `${v / 1024} KiB`;
+  if (v >= 1 << 30) return `${+(v / (1 << 30)).toPrecision(3)} GiB`;
+  if (v >= 1 << 20) return `${+(v / (1 << 20)).toPrecision(3)} MiB`;
+  if (v >= 1024) return `${+(v / 1024).toPrecision(3)} KiB`;
   return `${v} B`;
 }
 

@@ -1,0 +1,81 @@
+---
+summary: Temporal and spatial locality made measurable with reuse distance, and why loop order changes matrix multiply's miss rate by 15×.
+---
+import { ReuseDemo, MatmulDemo } from "@/demos/LocalityDemos";
+
+Caches work because programs are predictable in two ways:
+
+- **Temporal locality**: data used now is likely to be used again soon.
+- **Spatial locality**: data *near* what's used now is likely to be used soon. Caches move whole lines (usually 64 bytes), so neighbors arrive for free.
+
+Both can be measured precisely with one number per access: the **reuse distance**.
+
+<Predict
+  id="col"
+  question="You walk a 64×64 matrix of 4-byte ints column by column (it's stored row by row). What is the smallest fully associative LRU cache with 64-byte lines that gets about 94% hits?"
+  options={["256 B", "4 KiB", "16 KiB, the whole matrix"]}
+  answer={1}
+  explain="One column touches 64 different lines (a row is 256 bytes). Each line holds 16 ints, so the next 15 columns reuse those same 64 lines, at a reuse distance of 63 distinct lines. A cache of 64 lines (4 KiB) holds them all; anything smaller misses every time."
+>
+<ReuseDemo />
+</Predict>
+
+Things to try:
+
+1. **Matrix, column-major walk** at 64 B lines: one tall bar at distance 32–63, and a hit-rate curve that jumps from 0% to 94% exactly at 4 KiB.
+2. **Sequential scan** at line sizes 4, 16, 64 and 256 B: the cold fraction falls from 100% to 1/64. That's spatial locality: bigger lines turn neighbors into hits at distance 0.
+3. **Loop over 6 KiB, one access per line**: every reuse distance is 95. Below 6 KiB the hit rate is 0%; at 8 KiB it's nearly perfect. LRU has a cliff, not a slope.
+4. **Random over 64 KiB**: a smooth curve. With no locality, the hit rate is roughly cache size ÷ footprint.
+
+## Reuse distance and the stack property
+
+The reuse distance of an access is the number of *distinct* lines touched since the last access to the same line. First touches have infinite distance.
+
+<Steps>
+<div>Keep lines in a stack ordered by recency: most recently used on top. An access to a line at depth $d$ has reuse distance $d$; move it to the top.</div>
+<div>A fully associative LRU cache of $C$ lines holds exactly the top $C$ lines of that stack.</div>
+<div>So an access hits if and only if its distance is less than $C$. This is the <b>inclusion property</b> of LRU (Mattson et al., 1970): a bigger LRU cache always contains what a smaller one does.</div>
+<div>One pass over a trace therefore gives the hit rate of <i>every</i> cache size: the cumulative histogram of distances. Real set-associative caches add conflict misses on top (Cache organization lesson).</div>
+</Steps>
+
+The **working set** is the set of lines a program phase reuses. If it fits, misses are only compulsory; if it doesn't, an LRU-like cache can thrash completely.
+
+## Loop order changes everything
+
+Matrix multiply does $n^3$ multiply-adds whatever the loop order. Only the *access pattern* changes. With row-major storage, the innermost loop should walk along rows.
+
+<Predict
+  id="loop"
+  question="C += A × B with N×N row-major double matrices that don't fit in cache. Which loop order has the fewest cache misses (i = row of C, j = column of C, k = the summed index)?"
+  options={["ijk: inner loop over k", "jki: inner loop over i", "ikj: inner loop over j"]}
+  answer={2}
+  explain="With j innermost, B[k][j] and C[i][j] both walk along rows: one miss per 8 doubles. ijk walks down a column of B (a miss every iteration); jki walks down columns of both A and C (two misses per iteration)."
+>
+<MatmulDemo />
+</Predict>
+
+| Order | Inner loop touches | Misses per inner iteration (64 B lines, large N) |
+|---|---|---|
+| ijk | A row-wise, B **column-wise** | ≈ 1/8 + 1 |
+| jki | A and C **column-wise** | ≈ 2 |
+| ikj | B and C row-wise | ≈ 1/8 + 1/8 |
+
+The demo gets about 1.04, 2.02 and 0.13. ikj does even better than the table, because one row of C (512 bytes) stays in cache across all of the k loop. This is the analysis from Bryant and O'Hallaron's *Computer Systems: A Programmer's Perspective*, and on real hardware the gap is the same order of magnitude.
+
+**Tiling** goes further. It splits the matrices into $T \times T$ blocks so that one block each of A, B and C fits in cache together, and every element loaded is reused $T$ times before eviction. With an 8 KiB cache, 8×8 tiles (3 × 512 B) cut misses to about 0.035 per iteration, 30× fewer than ijk. Choose 16×16 and the three tiles (6 KiB), plus conflict misses, no longer fit an 8 KiB 8-way cache, and the benefit disappears. Tile size is tuned to the cache, which is why BLAS libraries pick it per CPU.
+
+## Designing for locality
+
+- **Walk memory in layout order.** Row-major in C, C++, Rust, Zig, Go and Odin; column-major in Fortran, MATLAB and Julia.
+- **Keep hot data dense.** Split rarely used fields out of hot structs, and prefer arrays to linked structures.
+- **Struct of arrays** when loops touch a few fields of many objects (Performance → Data-oriented design).
+- **Tile** any nested loop that reuses data across an outer loop: matrix kernels, stencils, convolutions, image filters.
+- **Measure**: `perf stat -e cache-misses,L1-dcache-load-misses`, or `perf c2c` for sharing problems.
+
+<Recall cards={[
+  { q: "Temporal vs spatial locality?", a: "Temporal: the same data is reused soon. Spatial: nearby data is used soon, and lines bring neighbors in for free." },
+  { q: "Define reuse (stack) distance.", a: "The number of distinct lines accessed since the previous access to the same line (∞ for first touches)." },
+  { q: "How do you get the hit rate of every fully associative LRU cache size from one pass?", a: "Histogram the reuse distances: a cache of C lines hits exactly the accesses with distance < C (LRU's inclusion property)." },
+  { q: "Best loop order for C += A·B with row-major matrices, and why?", a: "ikj (j innermost): B and C are both walked along rows, so about 1/8 miss per access each with 64 B lines and doubles." },
+  { q: "How does tiling reduce misses, and how is the tile size chosen?", a: "It works on blocks small enough that a block each of A, B and C fit in cache together, so each loaded element is reused T times. T is chosen so that 3·T²·element size fits, with room for conflicts." },
+]} />

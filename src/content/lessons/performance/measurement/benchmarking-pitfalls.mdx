@@ -1,50 +1,63 @@
 ---
-summary: Why a naive micro-benchmark reports 0 ns, and the five fixes every benchmark harness applies.
+summary: Why a simple timing loop can report 0 ns for real work, and the fixes that every benchmark tool uses.
 ---
 import { BenchPitfallsDemo } from "@/demos/MeasurementDemos";
+import { QuantizationDemo } from "@/demos/PerfExtrasDemos";
 
-A micro-benchmark has one job: report how long a piece of code takes. The naive version (read the clock, call the function, read the clock again) fails in several independent ways, each of which can be off by orders of magnitude. The demo times a function that truly costs **40 ns**, with every pitfall present, and lets you apply the fixes one by one.
+A **micro-benchmark** measures how long a small piece of code takes. The simple method is to read the clock, run the code, and read the clock again. This method can be wrong by a factor of 1000 or more. This lesson shows each problem and its fix.
+
+## Problem 1: the clock is too coarse
+
+A clock reading changes only at each tick. If the code is shorter than one tick, most readings show 0.
+
+<QuantizationDemo />
+
+1. Set the true time to 300 ns and the clock tick to 1 µs. Most readings are 0. Some readings are 1000 ns.
+2. Set **Runs per measurement** to 100. Each measurement now covers many ticks. Divide by 100 to get the time of one run.
+3. Set the clock tick to 1 ns. Now one run is enough.
+
+## All the problems together
 
 <Predict
   id="naive"
-  question="You time a 40 ns function once per sample with a 1 µs clock, and the compiler can see that the function's result is never used. What does the median sample say?"
+  question="You time a 40 ns function once per measurement with a 1 µs clock. The compiler can see that the result is never used. What does the median measurement show?"
   options={["About 40 ns", "About 1 µs", "0 ns"]}
   answer={2}
-  explain="Two things zero it out. The optimizer deletes the call entirely, because its result is unused. And even with the call kept, a 40 ns interval only crosses a 1 µs clock tick about 4% of the time, so most readings are 0 and a few are 1000. Neither is the answer."
+  explain="Two problems give 0. The compiler removes the call, because nothing uses the result. And a 40 ns interval almost never crosses a 1 µs clock tick."
 >
 <BenchPitfallsDemo />
 </Predict>
 
-Apply the fixes in order and watch the median:
+Apply the fixes in this order:
 
-1. **Keep the result alive** (`black_box`): the work now happens, but the median is still 0 because of clock granularity.
-2. **1000 iterations per timing**: the measured interval is about 40 µs, so the clock's resolution no longer matters. The median reads 40 ns.
-3. **Discard warm-up samples**: the first samples run slow (cold caches, page faults, JIT tiers, frequency ramp-up). Dropping them pulls the mean down.
-4. **Thermal throttling**: turn it on and the later samples drift up 25%. A benchmark that runs long enough to heat the chip measures the thermals, not the code.
-5. The scattered high points are **interrupts and context switches**. They're why you report the median, not the mean.
+1. Turn on **Keep the result alive**. The work now runs, but the median is still 0. The clock is too coarse.
+2. Set **Iterations per timing** to 1000. The median is now 40 ns.
+3. Turn on **Discard warm-up samples**. The first samples are slow because the caches are cold. Removing them makes the mean correct.
+4. Turn on **Thermal throttling**. The later samples become about 25% slower. A long benchmark can measure the temperature of the chip, not the code.
+5. Look at the points at the top. Interrupts and context switches cause them. Report the median, not the mean.
 
-## The pitfalls, and what harnesses do about them
+## Problems and fixes
 
-| Pitfall | Symptom | Fix |
+| Problem | Symptom | Fix |
 |---|---|---|
-| Dead-code elimination | impossibly fast (often ~0) | `std::hint::black_box` (Rust), `benchmark::DoNotOptimize` (C++), `std.mem.doNotOptimizeAway` (Zig), keep results in a sink (Go: assign to a package-level var) |
-| Constant folding | same, when inputs are compile-time constants | feed inputs through `black_box` too |
-| Timer resolution and overhead | quantized readings; clock cost dominates | time many iterations per sample; use a monotonic high-resolution clock |
-| Warm-up | early samples slow | run warm-up iterations first and discard them |
-| Frequency scaling | drift up or down over the run | fix the frequency (`cpupower frequency-set -g performance`), disable turbo for comparisons, or interleave A and B |
-| Noise (interrupts, other processes) | outliers, right skew | many samples; report median and spread; pin to a quiet core (`taskset`, `isolcpus`) |
-| Unrealistic state | hot caches and perfectly predicted branches every iteration | benchmark with realistic data sizes and orders; vary inputs |
+| Dead-code elimination | impossibly fast, often 0 | `std::hint::black_box` (Rust), `benchmark::DoNotOptimize` (C++), `std.mem.doNotOptimizeAway` (Zig) |
+| Constant folding | the same, when inputs are constants | pass the inputs through `black_box` too |
+| Clock resolution | readings of 0 or of whole ticks | time many runs per measurement |
+| Warm-up | the first samples are slow | run and discard warm-up iterations |
+| Frequency changes | samples drift up or down | fix the CPU frequency, or interleave A and B |
+| Noise | outliers on the slow side | use many samples; report the median and the spread |
+| Unrealistic state | hot caches and perfect branch prediction | use realistic data sizes and inputs |
 
-The last row is the subtle one. A loop that calls the same function on the same input a million times measures the **best case**: everything in L1 and every branch predicted. Real code gets cold caches and unpredictable inputs. Use micro-benchmarks to compare alternatives, then confirm with a whole-program measurement.
+The last row is easy to forget. A loop that calls one function a million times with the same input measures the best case. Real code has cold caches and unpredictable inputs. Use micro-benchmarks to compare two versions. Then measure the full program.
 
-## Use a harness
+## Use a benchmark tool
 
-Criterion (Rust), Google Benchmark (C++), `testing.B` (Go), `std.time.Timer` with a hand-rolled loop or the `zbench` library (Zig), and JMH (Java) already handle batching, warm-up, outliers and result sinks. They exist because everyone who writes the loop by hand gets at least one of these wrong.
+Criterion (Rust), Google Benchmark (C++), `testing.B` (Go) and JMH (Java) do batching, warm-up, outlier handling and result sinks for you. For Zig, use a small loop with `std.time.Timer` and `doNotOptimizeAway`, or the zBench library.
 
 <Recall cards={[
-  { q: "Why can a naive benchmark report 0 ns?", a: "The compiler removed the unused computation (dead-code elimination), and/or the interval is shorter than one tick of the clock." },
-  { q: "How do you beat clock resolution?", a: "Time a batch of many iterations per sample and divide." },
-  { q: "Why report the median rather than the mean?", a: "Timing noise is right-skewed by interrupts and context switches; a few huge outliers drag the mean." },
-  { q: "Name three sources of warm-up effects.", a: "Cold caches and TLBs, page faults on first touch, JIT compilation tiers, and CPU frequency ramp-up." },
-  { q: "What does black_box / DoNotOptimize do?", a: "It makes a value opaque to the optimizer, so computations producing it (or depending on it) can't be deleted or constant-folded." },
+  { q: "Why can a simple benchmark report 0 ns?", a: "The compiler removes the unused work, and the code is shorter than one clock tick." },
+  { q: "How do you measure code that is shorter than one clock tick?", a: "Time many runs in one measurement, then divide by the number of runs." },
+  { q: "Why report the median and not the mean?", a: "Interrupts and context switches make a few very slow samples. They change the mean much more than the median." },
+  { q: "Name three causes of warm-up effects.", a: "Cold caches and TLBs, page faults, JIT compilation, and CPU frequency ramp-up." },
+  { q: "What does black_box do?", a: "It hides a value from the optimizer, so the compiler cannot remove or precompute the work that makes the value." },
 ]} />

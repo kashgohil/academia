@@ -1,56 +1,61 @@
 ---
-summary: Reading IPC, cache misses and branch mispredictions from the CPU's own counters, and using the top-down method to find what limits a loop.
+summary: Use the CPU's own counters to find why code is slow, with IPC and the top-down method.
 ---
 import { CountersDemo } from "@/demos/MeasurementDemos";
+import { PipelineSlotsDemo } from "@/demos/PerfExtrasDemos";
 
-Timing tells you *that* code is slow. The CPU can tell you *why*. Every modern core has **performance monitoring counters** that count events (cycles, instructions retired, cache misses, branch mispredictions, and hundreds more) with almost no overhead. `perf stat` reads them for a whole run:
+A timer tells you that code is slow. The CPU can tell you why. Each modern core has **performance counters**. They count events such as cycles, instructions, cache misses and branch mispredictions. They cost almost nothing. `perf stat` reads them:
 
 ```
-$ perf stat -e cycles,instructions,branch-misses,cache-misses ./app
+perf stat -e cycles,instructions,branch-misses,cache-misses ./app
 ```
 
-The first number to read is **IPC** (instructions per cycle). A modern core can retire 4–6 instructions per cycle. IPC below 1 means it spends most cycles waiting.
+Read **IPC** (instructions per cycle) first. A modern core can complete 4 to 6 instructions per cycle. An IPC below 1 means that the core waits during most cycles.
 
 <Predict
   id="sorted"
-  question="for each byte b in a: if b >= 128 { sum += b }. With 100,000 random bytes, and then with the same bytes sorted first (same instructions executed), how do the cycle counts compare?"
-  options={["About the same: same instructions", "Sorted is a few times faster", "Random is faster: less work"]}
+  question="A loop adds each byte that is 128 or more. It runs on 100,000 random bytes, then on the same bytes after a sort. The instructions are the same. How do the cycle counts compare?"
+  options={["About the same", "The sorted run is a few times faster", "The random run is faster"]}
   answer={1}
-  explain="On random data the branch is a coin flip: the predictor misses about a quarter of all branches (half of the data-dependent ones), and each miss throws away about 16 cycles of work. Sorted, it predicts almost perfectly. The model gives IPC 0.53 vs 3.63: 6.8× more cycles for identical instructions."
+  explain="With random data, the branch is a coin flip. The predictor misses about a quarter of all branches, and each miss wastes about 16 cycles. With sorted data, the predictor is almost always correct. The model gives an IPC of 0.53 against 3.63."
 >
 <CountersDemo />
 </Predict>
 
-1. **Branch on random data** vs **sorted data**: the top-down bar is mostly red (bad speculation) for one and green (retiring) for the other.
-2. **Pointer chase**: IPC 0.01. Every iteration waits about 100 ns for DRAM, because the next address depends on the current load. All orange: backend memory bound.
-3. **Dependent FP chain**: IPC about 0.75 with no misses at all. Each multiply-add waits for the previous result (4-cycle latency): core bound. The ILP lesson breaks such chains.
-4. **Sequential sum**: IPC near 3. Memory streams in, the prefetcher keeps up, and the branch is always predicted.
+1. Compare **Branch on random data** with **Same loop, sorted data**. One bar is mostly red (bad speculation). The other is mostly green.
+2. Select **Pointer chase**. The IPC is 0.01. Each load waits about 100 ns for DRAM.
+3. Select **Dependent FP chain**. There are no misses, but the IPC is about 0.75. Each operation waits for the result of the previous one.
 
-## Top-down analysis
+## Where the pipeline slots go
 
-Intel's **top-down microarchitecture analysis** (Yasin, 2014) accounts for every pipeline *slot*: the core's width × cycles. Each slot is classified as one of:
+The **top-down method** (Ahmad Yasin, Intel, 2014) looks at every pipeline slot. A 4-wide core has 4 slots in each cycle. Each slot gets one of five labels.
 
-| Category | Meaning | Typical fixes |
+<PipelineSlotsDemo />
+
+1. Select **Branch on random data**. Red blocks appear after each misprediction. Each block is about 16 cycles of wasted slots.
+2. Select **Pointer chase**. Almost all slots are orange. The core waits for memory.
+3. Select **Sequential sum**. Most slots are green. The core does useful work.
+
+| Label | Meaning | Typical fix |
 |---|---|---|
-| **Retiring** | useful work | fewer instructions: better algorithm, SIMD |
-| **Bad speculation** | work thrown away after mispredicted branches | predictable branches, branchless code, sorting or partitioning data |
-| **Frontend bound** | the core couldn't fetch or decode instructions fast enough | smaller hot code, fewer i-cache/iTLB misses, PGO and LTO |
-| **Backend: memory** | waiting on loads (cache and DRAM misses) | locality, prefetching, smaller data |
-| **Backend: core** | execution units or dependency chains | break dependency chains, more ILP |
+| Retiring | useful work | do fewer instructions: a better algorithm, SIMD |
+| Bad speculation | work that the CPU discards after a wrong branch prediction | make branches predictable, use branchless code, sort the data |
+| Frontend bound | the core cannot get instructions fast enough | make the hot code smaller, use PGO and LTO |
+| Backend: memory | the core waits for loads | improve locality, make the data smaller |
+| Backend: core | the core waits for execution units or dependency chains | break dependency chains |
 
-Start at the top level, then drill into the dominant category. `perf stat -M TopdownL1` (newer kernels, Intel and some AMD), `toplev` from pmu-tools, VTune and AMD uProf all report it.
+Use `perf stat -M TopdownL1`, `toplev` (pmu-tools), VTune or AMD uProf.
 
-## Practicalities
+## Practical notes
 
-- Counting (`perf stat`) is cheap and exact. Sampling on an event (`perf record -e cache-misses`) attributes events to code, with skid (see Profilers).
-- There are only a few hardware counters (4–8 general-purpose per core). Ask for more events than that and `perf` time-multiplexes them, scaling the counts: you'll see percentages in brackets.
-- Virtual machines and containers often hide or virtualize counters. Measure on bare metal when you can.
-- `perf c2c` (false sharing), `perf mem` (load latency) and `perf stat -e L1-dcache-load-misses,LLC-load-misses` connect this lesson to the cache and coherence modules.
+- There are only 4 to 8 counters per core. If you request more events, perf shares the counters over time and scales the results. Then it shows percentages in brackets.
+- Virtual machines often hide the counters. Measure on real hardware when possible.
+- `perf c2c` finds false sharing. `perf mem` measures load latency.
 
 <Recall cards={[
-  { q: "What does an IPC well below 1 tell you?", a: "The core spends most cycles stalled (memory, mispredictions or dependencies) rather than retiring instructions." },
-  { q: "The four top-level top-down categories?", a: "Retiring, bad speculation, frontend bound, backend bound (split into memory and core)." },
-  { q: "Why does sorting the data speed up `if (x >= 128)` over random bytes?", a: "Sorted data makes the branch predictable, removing mispredictions that each cost about 15–20 cycles." },
-  { q: "Why is a pointer chase memory bound with IPC near zero?", a: "Each load's address depends on the previous load, so DRAM latencies can't overlap." },
-  { q: "What does perf do when you request more events than there are counters?", a: "It time-multiplexes the counters and scales the counts, showing the fraction of time each was counted." },
+  { q: "What does an IPC far below 1 tell you?", a: "The core waits during most cycles: for memory, after mispredictions, or for dependency chains." },
+  { q: "Name the top-level labels of the top-down method.", a: "Retiring, bad speculation, frontend bound, and backend bound (memory and core)." },
+  { q: "Why does sorting the data make `if (x >= 128)` faster?", a: "With sorted data, the branch changes only once, so the predictor is almost always correct." },
+  { q: "Why does a pointer chase have an IPC near zero?", a: "Each load needs the result of the previous load, so the DRAM waits cannot overlap." },
+  { q: "What does perf do when you request more events than there are counters?", a: "It shares the counters over time and scales the counts." },
 ]} />

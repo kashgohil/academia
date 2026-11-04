@@ -1,55 +1,63 @@
 ---
-summary: Reading a flame graph correctly, what its axes mean and don't mean, and the variants that answer different questions.
+summary: How a flame graph is built from stack samples, how to read it, and what its axes do not mean.
 ---
 import { FlameGraphDemo } from "@/demos/MeasurementDemos";
+import { StacksToFlameDemo } from "@/demos/PerfExtrasDemos";
 
-A sampling profiler collects thousands of stacks. Brendan Gregg's **flame graph** (2011) draws them all at once:
+A sampling profiler records thousands of stacks. A **flame graph** (Brendan Gregg, 2011) shows all of them in one picture:
 
-- each box is a function in a stack,
-- its **width** is the share of samples in which that stack prefix appeared (inclusive time),
-- frames are stacked by call depth, callers below callees,
-- functions with nothing above them, the *top edge*, are where the CPU actually was (self time).
+- Each box is a function in a stack.
+- The **width** of a box is the share of samples that have this stack. Wide boxes take much time.
+- Callers are below and callees are above.
+- The top edge of each box shows where the CPU really was (self time).
+
+## Build one, sample by sample
+
+<StacksToFlameDemo />
+
+1. Click **Take 1 sample** a few times. Each sample is one stack, from `main` to the running function.
+2. Each sample adds 1 to the width of every frame on its stack. Stacks with the same start share their lower boxes.
+3. Click **Take 500**. The shape is now stable. The widths are the time shares.
+
+## Read one
 
 <Predict
   id="axis"
-  question="In a standard flame graph, what does the horizontal position of a box (left vs right) tell you?"
-  options={["When during the run the function executed", "Nothing about time: siblings are sorted alphabetically", "Which thread ran it"]}
+  question="In a normal flame graph, what does the left-to-right position of a box tell you?"
+  options={["When the function ran during the program", "Nothing about time: the boxes are sorted by name", "Which thread ran the function"]}
   answer={1}
-  explain="Samples with the same stack are merged, and siblings are sorted alphabetically so identical stacks line up. The x axis is not time, and left-to-right order means nothing. Only width matters. A time-ordered view is a different chart: a flame chart."
+  explain="The flame graph merges samples with the same stack and sorts the boxes by name. The x-axis is not time. Only the width has a meaning. A chart with a time axis is a different chart: a flame chart."
 >
 <FlameGraphDemo />
 </Predict>
 
-1. Find the widest **plateau**: a wide box with little stacked on top of it is self time. Here, `socket_read` under `db_query`.
-2. Type **alloc** into the highlight box. `alloc_string` appears under both `parse_json` and `decode_rows`: total allocation cost is the sum of separate towers. Profiler UIs offer a merged "by function" view for exactly this.
-3. Click **render_template** to zoom in: `hash_key` and `escape_html` are its children. Click a frame below it to zoom out.
-4. Switch to **icicle** (root at the top), the layout Chrome DevTools and speedscope's left-heavy view use. Same data, flipped.
+1. Find the widest box with little above it. That is self time: `socket_read` under `db_query`.
+2. Type **alloc** in the highlight box. `alloc_string` is in two different towers. Its total cost is the sum of both.
+3. Click **render_template** to zoom in. Click a lower box to zoom out.
+4. Click **Icicle**. The root is now at the top. The data is the same.
 
-## Reading strategy
+## A method to read flame graphs
 
 <Steps>
-<div>Look at the top edge for wide boxes: they're where cycles are spent.</div>
-<div>Follow a wide tower down to see <i>why</i> it's called: which caller path is responsible. Often the fix is in the caller (call it less), not the leaf (make it faster).</div>
-<div>Look for the same function in several towers. Spread-out costs like allocation, locking or logging hide in flame graphs, so use search, or a function-merged view.</div>
-<div>Ignore colors in classic flame graphs: they are random warm hues, chosen to separate neighbors. Some tools color by meaning instead (kernel vs user, language, or the change in a differential graph).</div>
+<div>Look at the top edge for wide boxes. The CPU spends its time there.</div>
+<div>Follow a wide tower down to find the caller. Often the best fix is to call the function less.</div>
+<div>Search for functions that appear in many towers, such as allocation, locks or logging. Their cost is spread out.</div>
+<div>Do not read meaning into the colors of a classic flame graph. They are random warm colors.</div>
 </Steps>
 
-## Variants
-
-| Chart | x axis | Answers |
+| Chart | x-axis | Answers |
 |---|---|---|
-| Flame graph | merged samples, sorted | where CPU time goes overall |
-| Flame chart (DevTools, Tracy, Perfetto) | time | what happened when; latency of one request |
-| Off-CPU flame graph | merged blocked time | where threads wait (I/O, locks) |
-| Differential flame graph | merged, colored by change | what got slower between two profiles |
-| Memory flame graph | merged allocation sizes | who allocates |
+| Flame graph | merged samples, sorted | where CPU time goes |
+| Flame chart | time | what happened when, for one request |
+| Off-CPU flame graph | merged waiting time | where threads wait |
+| Differential flame graph | merged, colored by change | what got slower |
 
-Getting one: `perf record -g ./app` then `perf script | stackcollapse-perf.pl | flamegraph.pl > out.svg`, or `cargo flamegraph`, `samply record`, `go tool pprof -http=:8080`, or load a profile into speedscope.
+To make one: `perf record -g ./app`, then `perf script | stackcollapse-perf.pl | flamegraph.pl > out.svg`. You can also use `cargo flamegraph`, `samply record` or `go tool pprof -http=:8080`.
 
 <Recall cards={[
-  { q: "What does the width of a flame-graph box mean?", a: "The fraction of samples whose stack included that frame at that position: inclusive time." },
-  { q: "What does the x position mean in a flame graph?", a: "Nothing about time: identical stacks are merged and siblings sorted alphabetically." },
-  { q: "Where is self time in a flame graph?", a: "On the top edge: the parts of a box with nothing stacked above them." },
-  { q: "Flame graph vs flame chart?", a: "A flame graph merges samples and has no time axis; a flame chart plots stacks along a real time axis." },
-  { q: "Why can allocation cost be hard to see in a flame graph?", a: "It is split across many separate towers, one per caller path. Search or a function-merged view adds them up." },
+  { q: "What does the width of a flame-graph box show?", a: "The share of samples whose stack includes that frame: the inclusive time." },
+  { q: "What does the x position show in a flame graph?", a: "Nothing about time. The boxes are merged and sorted by name." },
+  { q: "Where is self time in a flame graph?", a: "On the top edge of the boxes, where nothing is above them." },
+  { q: "What is the difference between a flame graph and a flame chart?", a: "A flame graph merges samples and has no time axis. A flame chart shows stacks along a time axis." },
+  { q: "Why is allocation cost hard to see in a flame graph?", a: "It is split into many towers, one for each caller. Search or a merged view adds them." },
 ]} />

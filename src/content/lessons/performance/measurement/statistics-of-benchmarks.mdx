@@ -1,44 +1,57 @@
 ---
-summary: "Deciding whether a change really made code faster: skewed noise, medians, bootstrap confidence intervals, and how many samples a small speedup needs."
+summary: "How to decide if a change made code faster: use medians, confidence intervals, and enough samples."
 ---
 import { BenchCompareDemo } from "@/demos/MeasurementDemos";
+import { MeanMedianDemo } from "@/demos/PerfExtrasDemos";
 
-"I made it 3% faster" is a statistical claim. Two runs of identical code differ by a few percent, so you need to know whether the difference you measured is bigger than that noise. Timing noise is also not normal: it is skewed right, with occasional large outliers. Both points change how you should compare.
+Two runs of the same code take different times. The difference is often a few percent. So "my change made it 3% faster" is a statistical claim. You must show that the difference is larger than the noise.
+
+## The noise is not symmetric
+
+Timing noise has a long slow tail. Interrupts, page faults and context switches make some runs much slower. They never make a run faster than the code allows.
+
+<MeanMedianDemo />
+
+1. Set the interrupt share to 0%. The mean and the median are almost equal.
+2. Set the share to 5% and the slowdown to 20×. The mean moves far to the right. The median stays near 100 ns.
+3. So compare medians, not means.
+
+## How many samples do you need?
 
 <Predict
   id="n"
-  question="Version B is truly 3% faster than A. Each timing has about 8% noise plus occasional outliers. You collect 30 timings of each and compute a 95% confidence interval for the speedup. How often will the interval show that B is faster?"
+  question="Version B is 3% faster than A. Each timing has about 8% noise. You take 30 timings of each version. How often does a 95% confidence interval show that B is faster?"
   options={["Almost always", "About half the time", "About one time in five"]}
   answer={2}
-  explain="With 30 samples, a 3% effect is mostly buried in the noise: the simulation detects it in 19% of experiments. It takes about 100 samples per version to detect it half the time, and about 500 to detect it nearly always."
+  explain="With 30 samples, the 3% difference is mostly hidden in the noise. The simulation detects it in 19% of experiments. You need about 100 samples for 50%, and about 500 for almost 100%."
 >
 <BenchCompareDemo />
 </Predict>
 
-1. Click **Run a new experiment** several times at 30 samples. The verdict flips between "faster" and "can't tell", from identical code and an identical true speedup.
-2. Set the speedup to **0%**. Now any "faster" verdict is a false positive. It shows up only a few percent of the time (at most 2.5% for this one-sided check), which is what a 95% interval promises.
-3. Set the speedup to **1%**. Even 1,000 samples per version only catch it some of the time. A 1% change is below what an unaided micro-benchmark can resolve in this noise.
+1. Click **Run a new experiment** several times with 30 samples. The verdict changes, but the code and the true speedup do not change.
+2. Set the speedup to **0%**. Now each "faster" verdict is a false positive. It occurs in only a few percent of experiments.
+3. Set the speedup to **1%**. Even 1000 samples find it only sometimes.
 
-## Doing it right
+## How to compare two versions
 
 <Steps>
-<div><b>Use robust statistics.</b> Compare medians (or trimmed means), not means: one context switch can move a mean by more than your optimization.</div>
-<div><b>Quantify uncertainty with a bootstrap.</b> Resample each version's timings with replacement many times, compute the median ratio each time, and take the 2.5th and 97.5th percentiles. This works for skewed distributions without assuming normality.</div>
-<div><b>Decide on the sample size by effect size.</b> Halving the detectable effect needs about 4× the samples (the √n law from the CLT lesson).</div>
-<div><b>Interleave A and B</b> (ABABAB…) rather than running all of A then all of B, so drift (thermals, background load) affects both equally.</div>
-<div><b>Report the interval</b>, not just the point estimate: "B/A = 0.97 [0.95, 0.99]" says what you know; "3% faster" doesn't.</div>
+<div>Compare medians, not means.</div>
+<div>Calculate a confidence interval with a bootstrap. Resample each set of timings many times. Calculate the ratio of the medians each time. Use the middle 95% of the ratios.</div>
+<div>Choose the number of samples for the effect that you want to see. Half the effect needs about 4 times the samples.</div>
+<div>Run A and B in turns (A, B, A, B), not all of A and then all of B. Then slow changes in the machine affect both versions equally.</div>
+<div>Report the interval, for example "B/A = 0.97 [0.95, 0.99]".</div>
 </Steps>
 
-Tools: Criterion.rs reports a bootstrap confidence interval and a change estimate against the previous run. `hyperfine` does the same for whole commands. Go's `benchstat` compares two sets of benchmark runs with a Mann-Whitney U test and reports `~` when the difference isn't significant. Statistics → Hypothesis testing covers the general theory.
+Tools: Criterion.rs reports a bootstrap interval. `hyperfine` does the same for full commands. Go's `benchstat` uses a Mann-Whitney U test and shows `~` when a difference is not significant.
 
-<Callout kind="warn" title="Comparing many benchmarks">
-With 40 benchmarks at a 5% false-positive rate each, you should expect about 2 "significant" changes from pure noise. Treat isolated small wins and regressions with suspicion, and correct for multiple comparisons when gating CI on performance.
+<Callout kind="warn" title="Many benchmarks, many false results">
+With 40 benchmarks and a 5% false-positive rate, you can expect about 2 false "changes". Be careful with one small win or loss in a large set of benchmarks.
 </Callout>
 
 <Recall cards={[
-  { q: "Why compare medians rather than means for timings?", a: "Timing distributions are right-skewed with outliers, which move the mean much more than the median." },
-  { q: "How does a bootstrap confidence interval for a speedup work?", a: "Resample each set of timings with replacement many times, recompute the median ratio each time, and take the middle 95% of those ratios." },
-  { q: "How many more samples to detect an effect half as large?", a: "About 4×, because the standard error shrinks like 1/√n." },
-  { q: "Why interleave runs of A and B?", a: "So slow drift (thermals, background load, frequency) affects both versions equally instead of biasing one." },
-  { q: "40 benchmarks, 5% false-positive rate each: expected spurious 'changes'?", a: "About 2." },
+  { q: "Why compare medians and not means for timings?", a: "Timing noise has a long slow tail. A few slow outliers move the mean much more than the median." },
+  { q: "How does a bootstrap interval for a speedup work?", a: "Resample both sets of timings many times, calculate the median ratio each time, and use the middle 95% of the ratios." },
+  { q: "How many more samples do you need to see half the effect?", a: "About 4 times as many, because the error decreases as 1/√n." },
+  { q: "Why run A and B in turns?", a: "Slow changes in the machine (temperature, background load) then affect both versions equally." },
+  { q: "40 benchmarks with a 5% false-positive rate: how many false changes?", a: "About 2." },
 ]} />

@@ -1,52 +1,59 @@
 ---
-summary: How sampling profilers estimate where time goes, how accurate they are, and why instrumenting every call distorts the answer.
+summary: How a sampling profiler finds where time goes, how accurate it is, and why timing every function call gives wrong answers.
 ---
 import { ProfilerDemo } from "@/demos/MeasurementDemos";
+import { SamplingAnimationDemo } from "@/demos/PerfExtrasDemos";
 
-A profiler answers "where does the time go?". There are two ways to ask:
+A **profiler** shows where a program spends its time. There are two types:
 
-- **Sampling**: interrupt the program at regular intervals (or every N hardware events), record the current stack, and count. A function's share of samples estimates its share of time. `perf`, Instruments, VTune, `pprof`, py-spy and samply all work this way.
-- **Instrumentation**: insert timing code at every function entry and exit and add up exact durations. Valgrind's callgrind, compiler `-pg` / gprof and tracing frameworks work this way.
+- A **sampling profiler** stops the program at regular intervals and records the function that runs. A function that runs 20% of the time appears in about 20% of the samples. Examples are perf, Instruments, VTune, pprof and samply.
+- An **instrumenting profiler** adds timing code at the start and end of each function. Examples are gprof (`-pg`) and Valgrind's callgrind.
 
-Instrumentation sounds more accurate. For finding hotspots, it usually isn't.
+## How sampling works
+
+<SamplingAnimationDemo />
+
+1. Watch the black line. It is the current time. Each sample records the function under the line.
+2. Look at the bars. They show the share of samples for each function. The black marks show the true share of time.
+3. Set more samples per time unit. The bars get close to the marks faster.
+
+## Sampling against instrumentation
 
 <Predict
   id="instr"
-  question="A request handler spends 25% of its time in socket_read (6,000 calls) and 4% in hash_key (600,000 tiny calls). An instrumenting profiler adds about 300 ns to every call it times. Which function does it report as the bigger cost?"
-  options={["socket_read, by a lot", "About equal", "hash_key"]}
+  question="A program spends 25% of its time in socket_read (6,000 calls) and 4% in hash_key (600,000 short calls). An instrumenting profiler adds about 300 ns to each call. Which function does it show as more expensive?"
+  options={["socket_read, by a lot", "Both are about equal", "hash_key"]}
   answer={2}
-  explain="600,000 calls × 300 ns adds 180 ms to hash_key, ten times its real 18 ms, while socket_read's few long calls barely change. The instrumented profile shows hash_key at 29% and socket_read at 16%: the ranking is inverted, and the program ran 55% slower."
+  explain="600,000 calls × 300 ns adds 180 ms to hash_key. That is ten times its real 18 ms. socket_read has few calls, so it changes little. The profiler shows hash_key at 29% and socket_read at 16%. The order is wrong."
 >
 <ProfilerDemo />
 </Predict>
 
-1. At **100 Hz**, a 445 ms run gives only about 45 samples. Small functions get 0 samples or wildly wrong shares, as the ± column shows.
-2. At **10 kHz** (about 4,450 samples) every estimate is within about a percentage point.
-3. Raise the **instrumentation cost** and watch the functions with the most calls (`hash_key`, `alloc_string`, `escape_html`) inflate.
+1. Set **100 Hz**. The run gives only about 45 samples. Small functions get 0 samples, or very wrong shares.
+2. Set **10 kHz**. About 4,450 samples give each share within about 1 percentage point.
+3. Increase the instrumentation cost. Functions with many calls (`hash_key`, `alloc_string`) get larger.
 
 ## How accurate is sampling?
 
-Each sample is an independent draw, so a function that truly takes fraction $p$ of the time gets a sample share with standard error
+Each sample is independent. A function that takes a fraction p of the time gets a share of samples with this standard error:
 
-$$\text{SE} = \sqrt{\frac{p(1-p)}{n}}.$$
+$$\text{SE} = \sqrt{\frac{p(1-p)}{n}}$$
 
-With $n = 1000$ samples, a 25% function is measured within about ±2.7 points (95%), and a 4% function within ±1.2. Most profilers default to around 1–4 kHz. Profile long enough to collect a few thousand samples in the code you care about, and ignore functions with a handful of samples.
+With 1000 samples, a 25% function is correct within about ±2.7 points. Collect a few thousand samples in the code that you study. Ignore functions with only a few samples.
 
-## What sampling gets wrong
+## Limits of sampling
 
-- **Skid**: the reported instruction is often a few instructions after the one that caused the event. Use precise events (Intel PEBS, AMD IBS: `perf record -e cycles:pp`) when you look at individual instructions.
-- **Inlining**: inlined functions don't have frames. Build with debug info so the profiler can recover inline frames from DWARF.
-- **Missing stacks**: frame-pointer-less builds break stack walking. Compile with `-fno-omit-frame-pointer` (or Rust `-C force-frame-pointers=yes`), or use DWARF or LBR unwinding (`perf record --call-graph dwarf|lbr`).
-- **Off-CPU time**: a CPU sampler doesn't see time spent *blocked* (I/O, locks, sleep). Use off-CPU profiling (`perf sched`, eBPF `offcputime`) or wall-clock sampling for latency questions.
+- **Skid**: the profiler can report an instruction that is a few instructions after the real one. Use precise events: `perf record -e cycles:pp`.
+- **Inlined functions**: they have no stack frame. Build with debug information, so the profiler can show them.
+- **Missing stacks**: without frame pointers, stack walks fail. Compile with `-fno-omit-frame-pointer` (Rust: `-C force-frame-pointers=yes`), or use `perf record --call-graph dwarf`.
+- **Waiting time**: a CPU profiler does not see time that a thread waits for I/O or locks. Use an off-CPU profiler for that.
 
-## Instrumentation's place
-
-Instrumentation gives exact **call counts** and full traces, which samplers can't. Use it for "how many times is this called?", for causal traces of a single request (OpenTelemetry spans, Tracy, `tracing` in Rust), and on coarse boundaries where the overhead is negligible. Don't use per-function instrumentation for hotspot ranking.
+Instrumentation is good for exact call counts and for traces of one request (OpenTelemetry, Tracy). Do not use it to find hotspots.
 
 <Recall cards={[
-  { q: "How does a sampling profiler estimate a function's cost?", a: "By the fraction of periodic stack samples in which the function is executing (self) or on the stack (inclusive)." },
-  { q: "Standard error of a sampled share p with n samples?", a: "√(p(1−p)/n)." },
-  { q: "Why does instrumentation distort hotspot rankings?", a: "It adds fixed overhead per call, so small, frequently called functions are inflated relative to long, rarely called ones." },
-  { q: "What is skid, and how do you reduce it?", a: "The sampled instruction is a few instructions past the culprit. Precise sampling (PEBS/IBS, e.g. cycles:pp) reduces it." },
-  { q: "What does a CPU sampling profiler miss?", a: "Off-CPU time: blocking on I/O, locks or sleep. Use off-CPU or wall-clock profiling for that." },
+  { q: "How does a sampling profiler estimate the time of a function?", a: "It counts the share of periodic samples in which that function runs." },
+  { q: "What is the standard error of a sampled share p with n samples?", a: "√(p(1 − p) / n)." },
+  { q: "Why does instrumentation give the wrong order of hotspots?", a: "It adds a fixed cost to each call. Short functions with many calls look much more expensive than they are." },
+  { q: "What is skid?", a: "The profiler reports an instruction a little after the real one. Precise events (cycles:pp) decrease it." },
+  { q: "What does a CPU sampling profiler not show?", a: "Time that a thread waits for I/O, locks or sleep (off-CPU time)." },
 ]} />

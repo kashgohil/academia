@@ -1,51 +1,72 @@
 ---
-summary: Bump allocation that grows in chunks, scoped temporary memory, and designing around lifetimes.
+summary: Bump allocation that grows in chunks, scoped temporary memory, and design around lifetimes.
 ---
 import { ArenaDemo } from "@/demos/AllocatorDemos";
+import { ArenaLifetimesDemo, ChunkWasteDemo } from "@/demos/AllocExtrasA";
 
-A bump allocator over a fixed buffer runs out. An **arena** fixes that by bump-allocating inside *chunks* it obtains from a backing allocator (the OS, `malloc`, or a parent arena). When the current chunk can't fit a request, the arena abandons its tail and opens a new chunk. Freeing the arena returns every chunk at once. Zig's `std.heap.ArenaAllocator`, Odin's `mem.Arena` and its `context.temp_allocator`, Rust's `bumpalo`, and C++'s `std::pmr::monotonic_buffer_resource` all work like this.
+A bump allocator over a fixed buffer runs out of memory. An **arena** solves this problem. It bump-allocates inside **chunks**: large blocks that it gets from a **backing allocator**. The backing allocator can be the operating system, `malloc`, or a parent arena.
+
+When the current chunk cannot hold a request, the arena leaves the rest of that chunk unused and opens a new chunk. A free of the arena gives back all chunks in one step. Zig's `std.heap.ArenaAllocator`, Odin's `mem.Arena` and `context.temp_allocator`, Rust's `bumpalo`, and C++'s `std::pmr::monotonic_buffer_resource` all work in this way.
 
 <Predict
   id="chunks"
-  question="Chunks are 256 bytes, and each chunk starts with a 16-byte header. You allocate 100 bytes three times (byte alignment). What happens?"
+  question="Chunks are 256 bytes, and each chunk starts with a 16-byte header. You allocate 100 bytes three times, with byte alignment. What happens?"
   options={[
-    "Everything fits in one chunk",
-    "A second chunk opens, and 40 bytes at the end of the first are abandoned",
-    "Three chunks, one per allocation",
+    "All three fit in one chunk",
+    "A second chunk opens, and 40 bytes at the end of the first chunk are never used",
+    "Three chunks open, one for each allocation",
   ]}
   answer={1}
-  explain="The first chunk has 240 usable bytes. Two allocations use 200, leaving 40. The third needs 100, so the arena opens a new chunk and the 40-byte tail becomes slack that is never used."
+  explain="The first chunk has 240 usable bytes. Two allocations use 200 bytes, so 40 bytes are left. The third allocation needs 100 bytes, so the arena opens a new chunk. The 40-byte tail is slack: memory that the arena holds but never uses."
 >
 <ArenaDemo />
 </Predict>
 
 Things to try:
 
-1. Run **3 × 100 B** with 128, 256 and 512 B chunks. Small chunks waste more on headers and abandoned tails; big chunks hold memory you may never use.
-2. Request **500 B** with 256 B chunks. Oversized requests get a dedicated chunk rounded up to whole chunk sizes.
-3. Run **Frame loop**: each frame begins a scope, allocates temporaries and ends the scope. The same memory is reused every frame with zero bookkeeping.
-4. Free individual blocks: they turn grey. An arena only gives memory back when it is reset or a scope ends.
+1. Run **3 × 100 B** with 128 B, 256 B and 512 B chunks. Small chunks lose more memory to headers and unused tails. Large chunks hold memory that you possibly never use.
+2. Request **500 B** with 256 B chunks. A request that is too large for one chunk gets its own chunk. Its size is rounded up to whole chunk sizes, here 768 B.
+3. Run **Frame loop**. Each frame begins a scope, allocates temporary data and ends the scope. Each frame uses the same memory again, with no bookkeeping.
+4. Click blocks to free them. They become grey. An arena gives memory back only at a reset or at the end of a scope.
 
 ## The cost model
 
-For a typical allocation size $s$ and chunk size $C$:
+Let $s$ be the typical allocation size, $C$ the chunk size and $h$ the header size. Then:
 
-- **Header overhead** is $h/C$ per chunk.
-- **Abandoned tails** average about $s/2$ per chunk, so the fraction wasted is roughly $\frac{s}{2C}$. Chunks should be large compared with typical allocations.
-- **Backing calls** happen once per chunk. Many arenas *grow* chunk sizes geometrically, so a long-lived arena makes $O(\log n)$ backing calls.
+- **Header overhead** is $h/C$ of each chunk.
+- **Unused tails** are about $s/2$ for each chunk, on average. So the wasted part of a chunk is about $(h + s/2)/C$. Make chunks large compared with typical allocations.
+- **Backing calls** happen once for each chunk. Many arenas make each new chunk larger than the last, by a constant factor. Then a long-lived arena makes only $O(\log n)$ backing calls.
 
-Allocation stays a bump in the common case. The arena's real cost is its **high-water mark**: it holds its peak usage until reset.
+<ChunkWasteDemo />
 
-## Designing with lifetimes
+Things to try:
 
-The arena's power is architectural. Instead of tracking each object, you tie groups of objects to an event:
+1. Keep $s$ at 64 B. With 4 KiB chunks, the measured waste is 1.4% and the estimate is 1.2%. With 256 B chunks, the waste is 22%.
+2. Move $s$ to 256 B or more. The waste goes up for all small chunks. When $s$ is near $C$, the estimate is not accurate, because large requests get their own chunks.
+3. Move $s$ to 8 B. Now the headers are most of the waste, and the two lines are almost the same.
+
+Allocation is a bump in the common case. The real memory cost of an arena is its **high-water mark**: the largest amount of memory it held at one time. The arena keeps that memory until a reset.
+
+## Design with lifetimes
+
+The power of an arena is in the program design. You do not track each object. You connect a group of objects to an event, and one reset frees the full group.
+
+<ArenaLifetimesDemo />
+
+Things to try:
+
+1. Click **Play** with **Every frame**. The arena holds 2 chunks (2 KiB) and makes 2 backing calls in total. After 16 frames, `malloc` would need 320 calls to `free`. The arena needs 16 resets.
+2. Select **Never**. The held memory goes up in each frame, to 18 KiB after 16 frames. This is a memory leak.
+3. Select **Every 4 frames**. The used memory has a sawtooth shape. The arena now holds 5 KiB, not 2 KiB, because the data of 4 frames is alive at the same time.
+4. Select **Every frame** and clear **Keep the chunks after a reset**. Now the arena gives its chunks back at each reset and gets new ones again. It makes 26 backing calls in 16 frames, not 2.
+5. Move **Temporary objects per frame**. More objects need more chunks, but with a reset in each frame the count stops growing.
 
 | Lifetime | Arena | Reset when |
 |---|---|---|
-| Frame (games, UIs) | per-frame scratch, often double-buffered | frame ends |
-| Request (servers) | per-request arena | response sent |
-| Pass (compilers) | per-phase arena: tokens, AST, IR | phase output is consumed |
-| Call (any code) | scratch scope with mark/restore | function returns |
+| Frame (games, UIs) | scratch memory for each frame, often two buffers that alternate | the frame ends |
+| Request (servers) | one arena for each request | the response is sent |
+| Pass (compilers) | one arena for each phase: tokens, syntax tree, IR | the next phase has used the output |
+| Call (any code) | scratch scope with mark and restore | the function returns |
 
 ```zig
 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -62,14 +83,15 @@ process :: proc(input: string) {
 }
 ```
 
-<Callout kind="warn" title="The failure mode: silent dangling pointers">
-After a reset, old pointers still point at valid, mapped memory, which is now being reused. Reading through them doesn't crash; it returns someone else's data. Never let an arena pointer escape into something that outlives the arena. Debug builds can poison memory on reset (fill it with a pattern such as `0xAA`) to make such bugs visible.
+<Callout kind="warn" title="The failure mode: dangling pointers that do not crash">
+After a reset, old pointers still point at valid, mapped memory. The arena now uses that memory for new data. A read through an old pointer does not crash. It returns data that belongs to a different object. Never let an arena pointer go into a structure that lives longer than the arena. Debug builds can **poison** memory on reset: they fill it with a pattern such as `0xAA`, so that these bugs are easy to see.
 </Callout>
 
 <Recall cards={[
-  { q: "How does an arena differ from a plain bump allocator?", a: "It bump-allocates inside chunks obtained from a backing allocator, so it can grow. Freeing it releases all chunks at once." },
-  { q: "Roughly what fraction of a chunk is wasted on abandoned tails, for allocations of typical size s and chunk size C?", a: "About s / (2C) per chunk: on average half an allocation is left at the end." },
-  { q: "What is the main memory cost of an arena?", a: "Its high-water mark: it keeps peak usage until reset." },
-  { q: "Name three natural arena lifetimes.", a: "Per frame, per request, per compiler pass (or per function call with scratch scopes)." },
-  { q: "Why is use-after-reset dangerous with arenas specifically?", a: "The memory stays mapped and gets reused, so stale pointers read other live data instead of crashing." },
+  { q: "How is an arena different from a plain bump allocator?", a: "It bump-allocates inside chunks from a backing allocator, so it can grow. A free of the arena releases all chunks in one step." },
+  { q: "About what part of a chunk is wasted, for typical allocation size s, header size h and chunk size C?", a: "About (h + s/2) / C. On average, half of one allocation is left unused at the end of each chunk." },
+  { q: "What is the main memory cost of an arena?", a: "Its high-water mark. It keeps its largest usage until a reset." },
+  { q: "Why should a frame arena keep its chunks after a reset?", a: "Then the next frame uses the same chunks, and the arena makes no new backing calls after the first frames." },
+  { q: "Name three natural arena lifetimes.", a: "One frame, one request, one compiler pass. A function call with a scratch scope is a fourth." },
+  { q: "Why is use after reset dangerous with arenas specifically?", a: "The memory stays mapped and the arena uses it again. So an old pointer reads other live data and does not crash." },
 ]} />

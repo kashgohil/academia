@@ -1,35 +1,48 @@
 ---
-summary: Fixed-size slots, a free list stored inside the free memory itself, and handles that catch stale references.
+summary: Fixed-size slots, a free list stored inside the free memory, and handles that find old references.
 ---
 import { PoolDemo } from "@/demos/AllocatorDemos";
+import { PoolFreeListDemo, SafeLinkingDemo } from "@/demos/AllocExtrasA";
 
-When every object has the same size (particles, network packets, tree nodes, kernel inodes), you don't need a general allocator. Cut a buffer into equal **slots**, and keep the free ones on a linked list. The trick: a free slot isn't being used for anything, so **the slot itself stores the "next" pointer**. That gives zero metadata, O(1) allocate and free, and no external fragmentation for that size.
+Sometimes all objects have the same size: particles, network packets, tree nodes or kernel inodes. Then you do not need a general allocator. A **pool allocator** cuts a buffer into equal **slots** and keeps the free slots on a linked list.
+
+The important idea is this: a free slot holds no data. So **the free slot itself stores the "next" pointer** of the list. A list that is stored inside the items in this way is an **intrusive list**. The result is zero metadata, O(1) allocate and free, and no external fragmentation for that size.
 
 <Predict
   id="lifo"
-  question="You allocate A, B and C (in that order) from an empty pool, then free A, then free C. Which slot does the next allocation return?"
-  options={["A's slot", "C's slot", "The slot after C", "B's slot"]}
+  question="You allocate A, B and C, in that order, from an empty pool. Then you free A, and then you free C. Which slot does the next allocation return?"
+  options={["The slot of A", "The slot of C", "The slot after C", "The slot of B"]}
   answer={1}
-  explain="Freed slots are pushed onto the head of the list and allocations pop from the head: last in, first out. C was freed last, so it comes back first. That's also the slot most likely to still be in cache."
+  explain="A free pushes the slot onto the head of the list. An allocation takes the slot at the head. This order is last in, first out (LIFO). C was freed last, so it comes back first. C is also the slot most likely to still be in the cache."
 >
 <PoolDemo />
 </Predict>
 
 Things to try:
 
-1. Run **A, B, C · free A · free C**. The numbers on free slots show the free-list order: **1** is the head.
-2. Set the slot size to **48 B**: 1024 / 48 = 21 slots, and the 16 bytes left over are unusable. Now request **align 32**: it fails, because 48-byte slots are only guaranteed 16-byte alignment.
-3. Request 10 B from 64 B slots. The other 54 B are slack: pools trade internal waste for speed. Real systems keep several pools, one per size.
-4. **Churn**, then look at the free-list order. After a while it is scrambled, so consecutive allocations land far apart. That matters for cache locality (see Computer Architecture → Caches).
+1. Run **A, B, C · free A · free C**. The numbers on the free slots show the free-list order. Number **1** is the head.
+2. Set the slot size to **48 B**. A 1 KiB pool then has 21 slots, and the last 16 bytes cannot be used. Now request **align 32**. The request fails, because 48-byte slots are only guaranteed 16-byte alignment.
+3. Request 10 B from 64 B slots. The other 54 B are **slack**: allocated memory that holds no data. A pool accepts this waste to get speed. Real systems keep many pools, one for each size.
+4. Click **Churn**, then look at the free-list order. After some time the order is mixed. Then two allocations in sequence are often far apart in memory. This is bad for cache locality (see Computer Architecture → Caches).
 
 ## The intrusive free list
 
 <Steps>
-<div>Initialize: slot $i$ holds the address of slot $i+1$; the last holds null; `head` is slot 0.</div>
-<div>Allocate: `p = head; head = *p;` (one load and one store).</div>
-<div>Free: `*p = head; head = p;` (one store and one assignment).</div>
-<div>The minimum slot size is a pointer (8 bytes on 64-bit), because a free slot has to hold one. Slot alignment is the largest power of two dividing the slot size.</div>
+<div>Initialize: slot $i$ holds the address of slot $i+1$. The last slot holds null. The head is slot 0.</div>
+<div>Allocate: `p = head; head = *p;`. That is one load and one store.</div>
+<div>Free: `*p = head; head = p;`. That is one store and one assignment.</div>
+<div>A free slot must hold a pointer, so the minimum slot size is 8 bytes on a 64-bit machine. The alignment of a slot is the largest power of two that divides the slot size.</div>
 </Steps>
+
+<PoolFreeListDemo />
+
+Things to try:
+
+1. Click **Allocate** three times. A, B and C go into slots 0, 1 and 2. Each free slot shows its **next** value: the free slot that comes after it in the list.
+2. Click **A** to free it, and then click **C**. The head is now slot 2, then slot 0, then slot 3. The arrows show this order.
+3. Click **Allocate**. You get slot 2 again, as the new object D. Now click the handle **C (2, 0)**. The pool rejects it, because slot 2 is now at generation 1.
+4. Click **Free one** and **Allocate** many times. The arrows jump across the pool, because the list order follows the order of the frees.
+5. Move **Slots**. Every new pool starts with the list in address order.
 
 ```rust
 struct Pool { buf: Vec<u8>, slot: usize, head: Option<usize> }
@@ -49,22 +62,34 @@ impl Pool {
 
 ## Handles instead of pointers
 
-A pool slot is reused immediately, so a stale pointer silently aliases a *new* object. The robust fix, used in most game engines and ECS libraries, is a **generational handle**:
+A pool uses a free slot again immediately. So an old pointer silently points at a *new* object. A safer design is a **generational handle**. Most game engines and ECS libraries use it:
 
-- Each slot keeps a generation counter that increments on every free.
-- A handle is `(index, generation)`.
-- Dereferencing checks that the generation matches. A stale handle is detected instead of aliasing the new object.
+- Each slot keeps a **generation** counter. The counter increases at each free of the slot.
+- A handle is the pair `(index, generation)`.
+- Before each access, the pool checks that the generation in the handle is equal to the generation of the slot. So the pool finds an old handle and does not give access to the new object.
 
-Handles are also smaller than pointers (two `u32`s, or one), they survive the pool being relocated, and they serialize trivially.
+Handles are also smaller than pointers: two `u32` values, or one. They stay valid when the pool moves to a different address. They are also easy to write to a file or send over a network.
 
-<Callout kind="warn" title="Free-list corruption">
-A use-after-free write, or a double free, overwrites the next pointer. The next allocation can then return an arbitrary address, which is a classic exploitation primitive. glibc's tcache "safe-linking" stores `next ^ (slot_address >> 12)` so that a forged pointer is unlikely to decode to something useful. Debug pools add canaries or keep freed slots out of circulation for a while.
-</Callout>
+## Free-list corruption
+
+A write after a free, or a double free, changes the next pointer in a free slot. Then the next allocation can return any address that the attacker selects. Attackers often use this method. The tcache of glibc uses **safe-linking** to make this more difficult. It stores `next ^ (slot_address >> 12)`, not the plain pointer.
+
+<SafeLinkingDemo />
+
+Things to try:
+
+1. Select **Nothing**. The stored value looks random, but the decoded value is the real next slot.
+2. Select **Target address**. The attacker writes a plain address. It decodes to a different value that is not 16-byte aligned, so glibc stops the program.
+3. Look at the number under the table. Over random heap addresses, a plain forged pointer passes the alignment check only about 1 time in 16.
+4. Select **Target, encoded with a leak**. If the attacker knows a heap address, the attacker can encode the target correctly, and the attack works. Safe-linking makes an attack more difficult, but it does not make it impossible.
+
+Debug pools add **canaries**: known values next to each slot, which the pool checks for changes. Debug pools also keep freed slots out of use for some time, so that a use after free is easier to find.
 
 <Recall cards={[
-  { q: "Where does a pool allocator store its free list?", a: "Inside the free slots themselves: each free slot holds the pointer/index of the next free slot (an intrusive list)." },
-  { q: "Order in which a LIFO pool returns freed slots, and why that's good?", a: "Most recently freed first. That slot is likely still in cache." },
-  { q: "Minimum slot size for an intrusive free list on 64-bit?", a: "8 bytes: a free slot must hold a pointer (or 4 bytes if it stores a 32-bit index)." },
-  { q: "What problem do generational handles solve?", a: "Stale references: a (index, generation) handle is rejected once the slot has been freed and reused." },
-  { q: "What does glibc's safe-linking do?", a: "It stores free-list pointers XOR-ed with (slot address >> 12), so corrupted or forged pointers rarely decode to useful addresses." },
+  { q: "Where does a pool allocator store its free list?", a: "Inside the free slots. Each free slot holds the pointer or index of the next free slot. This is an intrusive list." },
+  { q: "In which order does a LIFO pool return freed slots, and why is that good?", a: "The most recently freed slot comes first. That slot is probably still in the cache." },
+  { q: "What is the minimum slot size for an intrusive free list on a 64-bit machine?", a: "8 bytes, because a free slot must hold a pointer. It is 4 bytes if the slot stores a 32-bit index." },
+  { q: "What alignment does a 48-byte slot get?", a: "16 bytes: the largest power of two that divides 48. A request for 32-byte alignment fails." },
+  { q: "What problem do generational handles solve?", a: "Old references. The pool rejects an (index, generation) handle after the slot is freed and used again." },
+  { q: "What does glibc safe-linking do?", a: "It stores free-list pointers XOR-ed with (slot address >> 12). A corrupted or forged pointer then rarely decodes to an aligned, useful address." },
 ]} />

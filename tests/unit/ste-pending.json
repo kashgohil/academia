@@ -21,12 +21,8 @@
  "deep-learning/optimization/gradient-descent-on-loss-surfaces",
  "electronics/transients/rc-charging-and-discharging",
  "statistics/limit-theorems/central-limit-theorem",
- "systems/allocators/arena-allocators",
  "systems/allocators/buddy-allocator",
- "systems/allocators/bump-allocators",
  "systems/allocators/fragmentation",
- "systems/allocators/free-lists",
  "systems/allocators/general-purpose-allocators",
- "systems/allocators/pool-allocators",
  "systems/allocators/slab-allocator"
 ]

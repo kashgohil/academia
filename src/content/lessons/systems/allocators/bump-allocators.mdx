@@ -1,36 +1,55 @@
 ---
-summary: The fastest allocator there is, what alignment costs, and why "free" is mostly a no-op.
+summary: The fastest allocator, what alignment costs, and why most frees do nothing.
 ---
 import { BumpDemo } from "@/demos/AllocatorDemos";
+import { BumpStepperDemo, StructLayoutDemo } from "@/demos/AllocExtrasA";
 
-A bump allocator owns a buffer and one integer, `top`. To allocate, round `top` up to the requested alignment, check the end, and advance it. That's the whole fast path: a few instructions, no metadata and no searching. Compilers use it for AST nodes, games for per-frame data, and it sits underneath Zig's `FixedBufferAllocator`, Odin's temp allocator and Rust's `bumpalo`.
+A **bump allocator** owns a buffer and one integer, `top`. The integer `top` is the offset of the first free byte. To allocate, the allocator rounds `top` up to the requested alignment. Then it checks the end of the buffer and moves `top` forward. That is the full fast path: a few instructions, no metadata and no search.
+
+**Alignment** is a rule that a value must start at an address that is a multiple of a number. Usually that number is the size of the value. Hardware requires aligned access, or runs it faster.
+
+Compilers use bump allocators for syntax tree nodes. Games use them for data that lives for one frame. Zig's `FixedBufferAllocator`, Odin's temp allocator and Rust's `bumpalo` use one inside.
+
+## Watch the pointer move
+
+<BumpStepperDemo />
+
+Things to try:
+
+1. Look at the start state: blocks `a`, `b`, `c` and `d` with sizes 1, 8, 1 and 8. The striped bytes are padding. There are 14 of them.
+2. Click **Free last**. The block goes away and `top` moves back. A bump allocator can free only the newest block in this way.
+3. Click **Reset** and move **Top starts at byte** to 1. Allocate 8 B with alignment 8. The block starts at byte 8, so 7 bytes are padding.
+4. Select alignment 1 and allocate some blocks. With alignment 1 there is never padding.
+5. Read the arithmetic under the grid after each step. The next section explains it.
+
+## Field order changes the size
 
 <Predict
   id="struct"
-  question="On a bump allocator starting at address 0, you allocate the fields of struct { char a; double b; char c; double d; } in order, each at its natural alignment (1, 8, 1, 8). How many bytes does that consume?"
+  question="A bump allocator starts at address 0. You allocate the fields of struct { char a; double b; char c; double d; } in order, each at its natural alignment (1, 8, 1, 8). How many bytes does that use?"
   options={["18", "24", "32", "40"]}
   answer={2}
-  explain="a at 0; b must start at a multiple of 8, so 7 bytes of padding, b at 8–15; c at 16; 7 more padding bytes; d at 24–31. That is 32 bytes for 18 bytes of data, and it is exactly how a C compiler lays out that struct."
+  explain="Field a is at byte 0. Field b must start at a multiple of 8, so 7 bytes of padding come first, and b uses bytes 8 to 15. Field c is at byte 16. Then 7 more bytes of padding come before d at bytes 24 to 31. That is 32 bytes for 18 bytes of data. A C compiler makes the same layout for this struct."
 >
 <BumpDemo />
 </Predict>
 
 Things to try:
 
-1. Click **char, double, char, double** and then **double, double, char, char**. That's the same data with 14 bytes of padding vs 0.
-2. Allocate a few blocks and free the **last** one by clicking it. `top` rolls back. Now free one in the **middle**: it turns grey (freed, but not reclaimed).
-3. Free the top block again. The rollback continues through the grey block underneath, because it is dead too.
-4. **Begin scope**, allocate several blocks, then **End scope**. Everything allocated in the scope disappears in O(1).
+1. Click **char, double, char, double** and then **double, double, char, char**. The data is the same. The first order has 14 bytes of padding and the second has 0.
+2. Allocate some blocks. Then click the **last** block to free it, and `top` moves back. Now free a block in the **middle**. It becomes grey: it is free, but the allocator cannot use it yet.
+3. Free the top block again. The rollback continues through the grey block below it, because that block is also free.
+4. Click **Begin scope**, allocate some blocks, then click **End scope**. All blocks from the scope go away in one step.
 
 ## Alignment arithmetic
 
-Hardware requires (or strongly prefers) that a value of size 8 sits at an address divisible by 8. Alignments are powers of two, which makes rounding up a bit trick:
+Alignments are powers of two. Because of this, rounding up is a bit operation:
 
 <Steps>
-<div>We want the smallest multiple of $a$ that is $\ge x$. Adding $a-1$ pushes $x$ past the next multiple, unless it's already on one.</div>
-<div>For $a = 2^k$, "round down to a multiple of $a$" means "clear the low $k$ bits": AND with $\lnot(a-1)$.</div>
-<div>Together: $\text{align\_up}(x, a) = (x + a - 1)\ \&\ \lnot(a - 1)$. For $x = 17, a = 8$: $(24)\ \&\ \lnot 7 = 24$.</div>
-<div>The padding wasted is $\text{align\_up}(x, a) - x$, between $0$ and $a - 1$ bytes.</div>
+<div>We want the smallest multiple of $a$ that is $\ge x$. Add $a-1$ to $x$. This moves $x$ past the next multiple, unless $x$ is already on a multiple.</div>
+<div>For $a = 2^k$, rounding down to a multiple of $a$ clears the low $k$ bits. That is an AND with $\lnot(a-1)$.</div>
+<div>Put the two steps together: $\text{align\_up}(x, a) = (x + a - 1)\ \&\ \lnot(a - 1)$. For $x = 17$ and $a = 8$: $(24)\ \&\ \lnot 7 = 24$.</div>
+<div>The padding is $\text{align\_up}(x, a) - x$. It is between $0$ and $a - 1$ bytes.</div>
 </Steps>
 
 ```zig
@@ -49,36 +68,48 @@ const Bump = struct {
 
 ## Struct layout is the same problem
 
-A compiler laying out a struct is a bump allocator running over its fields. Different languages handle this differently:
+A compiler that lays out a struct does the work of a bump allocator over the fields. The demo shows the same fields in two orders.
 
-- **C, C++, Zig `extern struct`** keep declaration order, so field order decides padding. Sorting fields by decreasing alignment minimizes it.
-- **Rust** (default `repr(Rust)`) and **Zig** (plain `struct`) may reorder fields to reduce padding. Use `#[repr(C)]` / `extern struct` when the layout must be fixed (FFI, file formats).
-- **Odin** keeps declaration order by default; `#packed` removes padding, at the cost of unaligned access.
+<StructLayoutDemo />
 
-The total size is also rounded up to the struct's alignment, so that arrays of it stay aligned. `{double; char}` is 16 bytes, not 9.
+Things to try:
+
+1. Click **char, double, char, double**. Declaration order needs 32 bytes. Sorted order needs 24 bytes: 18 bytes of data and 6 bytes of tail padding.
+2. Click **double, char**. The struct is 16 bytes, not 9. The tail padding keeps the next element of an array aligned.
+3. Click **char, int, char, short, ptr**. Declaration order needs 24 bytes. Sorted order needs 16 bytes.
+4. Build your own struct with the **Add a field** buttons. Sorted order is never larger than declaration order.
+
+Languages treat field order in different ways:
+
+- **C, C++ and Zig `extern struct`** keep declaration order. So the field order decides the padding. Sort the fields by decreasing alignment to get the least padding.
+- **Rust** (default `repr(Rust)`) and **Zig** (plain `struct`) can change the field order to make less padding. Use `#[repr(C)]` or `extern struct` when the layout must not change, for example for FFI or file formats.
+- **Odin** keeps declaration order by default. The `#packed` attribute removes all padding, but then the fields can be unaligned.
+
+The compiler rounds the total size up to the alignment of the struct. The alignment of the struct is the largest alignment of its fields.
 
 ## What "free" means here
 
-A bump allocator can only reclaim memory at the top. In practice it supports:
+A bump allocator can get memory back only at the top. In practice it supports three operations:
 
-- **LIFO frees**: freeing the most recent allocation rolls `top` back (a stack allocator).
-- **Reset**: drop everything at once.
-- **Mark / restore**: save `top`, do temporary work, restore it. This is a scoped stack, which is what *Begin scope / End scope* do.
+- **LIFO free**: LIFO means "last in, first out". A free of the newest allocation moves `top` back. This makes the allocator a stack allocator.
+- **Reset**: free all allocations in one step.
+- **Mark and restore**: save `top`, do temporary work, then put `top` back to the saved value. This is a scoped stack. The **Begin scope** and **End scope** buttons do this.
 
-Any other free just leaks until the next reset. That's not a defect: it is the design. **Bump allocation works when lifetimes are grouped**, so that many objects die at the same moment. When they aren't, use a pool or a general-purpose allocator.
+All other frees do nothing until the next reset. This is not a defect. It is the design. **Bump allocation works when lifetimes are grouped**, so that many objects become unused at the same time. When they do not, use a pool or a general-purpose allocator.
 
 | Property | Bump |
 |---|---|
-| alloc | O(1), ~3 instructions |
-| free | O(1) at the top; otherwise a no-op |
+| alloc | O(1), about 3 instructions |
+| free | O(1) at the top; otherwise it does nothing |
 | metadata per allocation | none |
-| locality | perfect: allocations are contiguous in program order |
-| fragmentation | none until you need individual frees |
+| locality | very good: allocations are next to each other, in program order |
+| fragmentation | none, until you need individual frees |
 
 <Recall cards={[
-  { q: "Formula to round x up to a multiple of a power-of-two alignment a?", a: "(x + a − 1) & ~(a − 1)" },
-  { q: "struct { char; double; char; double } in C: size and padding?", a: "32 bytes, 14 of them padding. Reordered as { double; double; char; char } it needs 18 bytes of data plus 6 bytes of tail padding (size 24), so arrays stay 8-aligned." },
-  { q: "Which frees can a bump allocator actually reclaim?", a: "Only frees at the top (LIFO), a reset of everything, or a restore to a saved mark." },
-  { q: "Which languages may reorder struct fields by default?", a: "Rust (repr(Rust)) and Zig (plain struct). C, C++, Zig extern struct and Odin keep declaration order." },
-  { q: "When is a bump allocator the right choice?", a: "When many allocations share one lifetime and die together: per frame, per request, per compiler pass." },
+  { q: "What is the formula to round x up to a multiple of a power-of-two alignment a?", a: "(x + a − 1) & ~(a − 1)" },
+  { q: "In C, what is the size of struct { char; double; char; double }, and how much is padding?", a: "32 bytes, and 14 bytes are padding. In the order { double; double; char; char } it is 18 bytes of data plus 6 bytes of tail padding, so the size is 24." },
+  { q: "Which frees can a bump allocator really use again?", a: "Only a free of the newest block (LIFO), a reset of all blocks, or a restore to a saved mark." },
+  { q: "Which languages can change the order of struct fields by default?", a: "Rust (repr(Rust)) and Zig (plain struct). C, C++, Zig extern struct and Odin keep declaration order." },
+  { q: "Why is struct { double; char } 16 bytes and not 9?", a: "The size is rounded up to the alignment of the struct, 8. Then each element of an array of the struct starts aligned." },
+  { q: "When is a bump allocator the correct choice?", a: "When many allocations have the same lifetime and become unused together: per frame, per request, or per compiler pass." },
 ]} />

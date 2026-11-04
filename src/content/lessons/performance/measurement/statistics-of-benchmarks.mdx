@@ -1,0 +1,44 @@
+---
+summary: "Deciding whether a change really made code faster: skewed noise, medians, bootstrap confidence intervals, and how many samples a small speedup needs."
+---
+import { BenchCompareDemo } from "@/demos/MeasurementDemos";
+
+"I made it 3% faster" is a statistical claim. Two runs of identical code differ by a few percent, so you need to know whether the difference you measured is bigger than that noise. Timing noise is also not normal: it is skewed right, with occasional large outliers. Both points change how you should compare.
+
+<Predict
+  id="n"
+  question="Version B is truly 3% faster than A. Each timing has about 8% noise plus occasional outliers. You collect 30 timings of each and compute a 95% confidence interval for the speedup. How often will the interval show that B is faster?"
+  options={["Almost always", "About half the time", "About one time in five"]}
+  answer={2}
+  explain="With 30 samples, a 3% effect is mostly buried in the noise: the simulation detects it in 19% of experiments. It takes about 100 samples per version to detect it half the time, and about 500 to detect it nearly always."
+>
+<BenchCompareDemo />
+</Predict>
+
+1. Click **Run a new experiment** several times at 30 samples. The verdict flips between "faster" and "can't tell", from identical code and an identical true speedup.
+2. Set the speedup to **0%**. Now any "faster" verdict is a false positive. It shows up only a few percent of the time (at most 2.5% for this one-sided check), which is what a 95% interval promises.
+3. Set the speedup to **1%**. Even 1,000 samples per version only catch it some of the time. A 1% change is below what an unaided micro-benchmark can resolve in this noise.
+
+## Doing it right
+
+<Steps>
+<div><b>Use robust statistics.</b> Compare medians (or trimmed means), not means: one context switch can move a mean by more than your optimization.</div>
+<div><b>Quantify uncertainty with a bootstrap.</b> Resample each version's timings with replacement many times, compute the median ratio each time, and take the 2.5th and 97.5th percentiles. This works for skewed distributions without assuming normality.</div>
+<div><b>Decide on the sample size by effect size.</b> Halving the detectable effect needs about 4× the samples (the √n law from the CLT lesson).</div>
+<div><b>Interleave A and B</b> (ABABAB…) rather than running all of A then all of B, so drift (thermals, background load) affects both equally.</div>
+<div><b>Report the interval</b>, not just the point estimate: "B/A = 0.97 [0.95, 0.99]" says what you know; "3% faster" doesn't.</div>
+</Steps>
+
+Tools: Criterion.rs reports a bootstrap confidence interval and a change estimate against the previous run. `hyperfine` does the same for whole commands. Go's `benchstat` compares two sets of benchmark runs with a Mann-Whitney U test and reports `~` when the difference isn't significant. Statistics → Hypothesis testing covers the general theory.
+
+<Callout kind="warn" title="Comparing many benchmarks">
+With 40 benchmarks at a 5% false-positive rate each, you should expect about 2 "significant" changes from pure noise. Treat isolated small wins and regressions with suspicion, and correct for multiple comparisons when gating CI on performance.
+</Callout>
+
+<Recall cards={[
+  { q: "Why compare medians rather than means for timings?", a: "Timing distributions are right-skewed with outliers, which move the mean much more than the median." },
+  { q: "How does a bootstrap confidence interval for a speedup work?", a: "Resample each set of timings with replacement many times, recompute the median ratio each time, and take the middle 95% of those ratios." },
+  { q: "How many more samples to detect an effect half as large?", a: "About 4×, because the standard error shrinks like 1/√n." },
+  { q: "Why interleave runs of A and B?", a: "So slow drift (thermals, background load, frequency) affects both versions equally instead of biasing one." },
+  { q: "40 benchmarks, 5% false-positive rate each: expected spurious 'changes'?", a: "About 2." },
+]} />

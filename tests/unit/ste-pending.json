@@ -1,6 +1,1 @@
-[
- "architecture/multicore/cache-coherence-mesi",
- "architecture/multicore/interconnects",
- "architecture/multicore/memory-consistency-models",
- "architecture/multicore/numa"
-]
+[]

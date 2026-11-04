@@ -1,34 +1,63 @@
 ---
-summary: Coherence orders writes to one address; consistency orders everything else. How store buffers break sequential consistency, and what x86, ARM and RISC-V promise.
+summary: Coherence orders the writes to one address; consistency orders everything else. How store buffers break sequential consistency, and what x86, ARM and RISC-V promise.
 ---
 import { StoreBufferDemo } from "@/demos/MulticoreDemos";
 import { LitmusDemo } from "@/demos/LitmusDemo";
+import { StoreBufferTimelineDemo, ScheduleCountDemo } from "@/demos/MulticoreExtrasDemos";
 import { LESSON_PRESETS } from "@/sims/memmodel/presets";
 
-Coherence (previous lesson) guarantees that all cores agree on the order of writes to **one** address. It says nothing about how accesses to **different** addresses appear to interleave. That's the job of the **memory consistency model**: the hardware's contract about which reorderings other cores can observe. Lamport's *sequential consistency* (1979) is the intuitive one: results as if all operations ran in some single interleaving, each core in program order. No mainstream CPU implements it, because it would forbid the most important optimization of all: the store buffer.
+Coherence (the previous lesson) makes all cores agree on the order of the writes to **one** address. It says nothing about accesses to **different** addresses. The **memory consistency model** covers these. It is the contract of the hardware: it tells which reorderings other cores can see.
+
+Lamport defined **sequential consistency** (SC) in 1979. Under SC, the result is the same as if all operations ran in one interleaving, and each core kept its program order. No mainstream CPU uses SC, because SC forbids the most important optimization: the **store buffer**. A store buffer is a small queue in each core. It holds the stores that the core has run but that have not reached the cache yet.
 
 <Predict
   id="tso"
-  question="Core 0: x = 1; r0 = y. Core 1: y = 1; r1 = x. Each core has a FIFO store buffer and loads read from memory (or from their own buffer). Can both cores read 0?"
-  options={["No: each store happens before its core's load", "Yes: both stores can sit in their buffers while both loads read memory"]}
+  question="Core 0 runs x = 1, then r0 = y. Core 1 runs y = 1, then r1 = x. Each core has a FIFO store buffer. A load reads memory, or a store in the buffer of its own core. Can both cores read 0?"
+  options={["No: each store happens before the load of its core", "Yes: both stores can wait in their buffers while both loads read memory"]}
   answer={1}
-  explain="A store enters the buffer immediately, and the core moves on without waiting for it to reach the cache. Both loads then read memory, where neither store has arrived yet. Every x86 CPU allows this outcome. Try it: execute both stores, execute both loads, then drain."
+  explain="A store goes into the buffer at once. The core continues, and does not wait for the store to reach the cache. Both loads then read memory, where neither store has arrived. Every x86 CPU permits this result. Try it: execute both stores, execute both loads, then drain the buffers."
 >
 <StoreBufferDemo />
 </Predict>
 
-1. **Store buffering** on TSO: execute all four instructions *before* draining anything, then drain. The outcome is marked impossible under SC.
-2. Same program, store buffer **None (SC)**: the outcome can't be reached.
-3. **Message passing, relaxed** on TSO: no order of drains shows stale data, because the FIFO buffer keeps stores in order. Switch to **PSO** and drain `flag` before `data`: the reader sees the flag with old data.
-4. **Message passing, release fence only** on PSO: the fence keeps `flag` behind `data` in the buffer.
-5. **Store buffering with seq_cst fences**: the fence blocks until the buffer is empty. That's x86's `MFENCE`, and why it costs tens of cycles.
+1. Select **Store buffering** with **FIFO (TSO)**. Execute all four instructions *before* you drain a store. Then drain the buffers. The demo marks the result as impossible under SC.
+2. Select **None (SC)** with the same program. You cannot get this result.
+3. Select **Message passing, relaxed** with TSO. No order of drains shows old data, because the FIFO buffer keeps the stores in order. Select **PSO** and drain `flag` before `data`. The reader sees the flag, but old data.
+4. Select **Message passing, release fence only** with PSO. The fence keeps `flag` behind `data` in the buffer.
+5. Select **Store buffering with seq_cst fences**. The fence blocks until the buffer is empty. This is the x86 `MFENCE`, and it is why `MFENCE` costs tens of cycles.
+
+## See it on a timeline
+
+A store buffer delays the time when a store becomes visible to other cores. The demo shows one schedule of the same program. Core 0 runs `x = 1`, then `r0 = y`. Core 1 runs `y = 1`, then `r1 = x`.
+
+<StoreBufferTimelineDemo />
+
+1. Start with the default values. Each store needs 8 cycles to reach memory, and core 1 starts 2 cycles later. Both loads read 0.
+2. Move the store time down to 3 cycles. The store of core 0 now reaches memory in time for the load of core 1, so r1 = 1.
+3. Move the store time to 0. This is a machine without a store buffer. No start delay gives r0 = r1 = 0.
+4. Set the store time back to 8 and turn on the fence. Each load now waits until the store of its own core reaches memory. The result r0 = r1 = 0 disappears, but each load waits 7 cycles.
+
+In this model, both loads read 0 when a store needs more cycles to reach memory than the start delay plus 1.
+
+## Count every schedule
+
+A **litmus test** is a small program that shows if a reordering can occur. The machine can take its steps in many orders. A step runs the next instruction of a core, or writes a permitted store from a buffer to memory. The demo counts all the schedules and groups them by result.
+
+<ScheduleCountDemo />
+
+1. Select **Store buffering, relaxed** with **None (SC)**. There are 6 schedules, and none of them gives r0=0 r1=0.
+2. Select **FIFO (TSO)**. There are now 80 schedules, and 18 of them give r0=0 r1=0. Click that result to see one of the schedules.
+3. Select **Message passing, relaxed** with TSO. No schedule gives r0=1 r1=0. Select **PSO**: 1 schedule of 45 gives it.
+4. Select **Store buffering with seq_cst fences** with TSO. None of the 70 schedules gives r0=0 r1=0.
+
+A count of schedules is not a probability. But it shows that a weak result often needs one specific timing. So a weak result can be rare in tests and still occur in production.
 
 ## Why hardware reorders
 
-- **Store buffers**: a store missing the cache would stall the core for hundreds of cycles. Buffering it, and letting later loads go ahead, hides that. This creates store → load reordering.
-- **Out-of-order loads**: loads execute as soon as their address is known. x86 keeps them *looking* ordered by squashing and replaying if a line is invalidated in between. Weaker architectures don't bother.
-- **Non-FIFO draining and invalidation queues**: letting stores to different lines complete out of order, or acknowledging invalidations before applying them, gives store → store and load → load reordering.
-- **Shared store buffers or non-atomic write propagation** between hardware threads can let different cores see two writes in different orders (IRIW).
+- **Store buffers**: a store that misses the cache would stop the core for hundreds of cycles. The buffer hides this delay, because later loads can go first. This gives store → load reordering.
+- **Out-of-order loads**: a load runs as soon as its address is known. x86 keeps the loads *apparently* in order. If a line is invalidated between two loads, the core discards the later load and runs it again. Weaker architectures do not do this.
+- **Stores that drain out of order, and invalidation queues**: stores to different lines can complete out of order. A cache can also acknowledge an invalidation before it applies it. These give store → store and load → load reordering.
+- **Shared store buffers, or writes that do not reach all cores at the same time**: different cores can see two writes in different orders. The litmus test for this is IRIW (independent reads of independent writes).
 
 ## The major models
 
@@ -40,18 +69,26 @@ Coherence (previous lesson) guarantees that all cores agree on the order of writ
 | **ARMv8 / RVWMO** | all four reorderings unless ordered by dependencies or barriers; multi-copy atomic | ARMv8+, RISC-V default |
 | **POWER** | all of the above, and not multi-copy atomic (IRIW observable) | IBM POWER |
 
-Barriers per architecture: x86 `MFENCE` (or any `LOCK`ed instruction); ARM `DMB ISH`, plus `LDAR`/`STLR` for acquire/release; RISC-V `fence rw,rw`. Compilers map C++ and Rust atomics onto these (Atomics → Memory orderings).
+A model is **multi-copy atomic** when a write becomes visible to all other cores at the same time. A **barrier** (or fence) is an instruction that stops the reorderings across it. The barriers are:
+
+- x86: `MFENCE`, or any instruction with a `LOCK` prefix.
+- ARM: `DMB ISH`, and `LDAR` and `STLR` for acquire and release.
+- RISC-V: `fence rw,rw`.
+
+Compilers map C++ and Rust atomics to these instructions (see Atomics → Memory orderings). The demo below runs litmus tests under SC, x86-TSO and the C++ model.
 
 <LitmusDemo presets={LESSON_PRESETS.orderings} />
 
 ## The contract you program against
 
-Nobody writes portable code against a hardware model directly. Languages define their own model (C++, Rust, Java, Go), and compilers insert the barriers each architecture needs. The core promise is **SC for data-race-free programs**: synchronize correctly (locks, or atomics with proper orderings) and you can reason as if the hardware were sequentially consistent. The hardware models matter when you write those synchronization primitives, read compiler output, or debug a race that "only happens on ARM".
+Portable code does not target a hardware model directly. Each language defines its own model, for example C++, Rust, Java and Go. The compiler inserts the barriers that each architecture needs. The main promise is **SC for data-race-free programs**. Synchronize correctly, with locks or with atomics and correct orderings. Then you can think as if the hardware were SC.
+
+The hardware models are important when you write synchronization primitives or read compiler output. They are also important when you debug a race that occurs "only on ARM".
 
 <Recall cards={[
-  { q: "Coherence vs consistency?", a: "Coherence: agreement on the order of writes to a single location. Consistency: which orderings of accesses to different locations other cores can observe." },
-  { q: "What single reordering does TSO allow?", a: "A store followed by a load to a different address: the store waits in the store buffer while the load proceeds." },
-  { q: "Why does message passing work on x86 without fences?", a: "TSO's FIFO store buffer keeps stores in order, and loads are kept in order, so seeing the flag implies seeing the earlier data write." },
-  { q: "What does 'multi-copy atomic' mean, and who isn't?", a: "A write becomes visible to all other cores at the same time. POWER is not, so readers can disagree on the order of independent writes (IRIW)." },
-  { q: "What does an x86 MFENCE do in store-buffer terms?", a: "It waits until the core's store buffer has drained before later loads execute." },
+  { q: "What is the difference between coherence and consistency?", a: "Coherence: all cores agree on the order of the writes to one location. Consistency: which orders of accesses to different locations other cores can see." },
+  { q: "Which single reordering does TSO permit?", a: "A store followed by a load to a different address. The store waits in the store buffer while the load runs." },
+  { q: "Why does message passing work on x86 without fences?", a: "The FIFO store buffer of TSO keeps the stores in order, and the loads stay in order. So a core that sees the flag also sees the earlier data write." },
+  { q: "What does multi-copy atomic mean, and which architecture is not?", a: "A write becomes visible to all other cores at the same time. POWER is not, so readers can disagree on the order of independent writes (IRIW)." },
+  { q: "What does an x86 MFENCE do to the store buffer?", a: "It waits until the store buffer of the core is empty before later loads run." },
 ]} />

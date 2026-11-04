@@ -1,33 +1,44 @@
 ---
-summary: How private caches agree on one value per address, what the M, E, S and I states buy, and why false sharing is so expensive.
+summary: How private caches agree on one value for each address, what the M, E, S and I states give, and why false sharing is so expensive.
 ---
 import { CoherenceDemo, CoherenceWorkloadsDemo } from "@/demos/CoherenceDemos";
+import { MesiStateMachineDemo, FalseSharingDemo } from "@/demos/MulticoreExtrasDemos";
 
-Each core has its own L1 and L2. If two cores cache the same line and one writes it, the other's copy is stale. A **coherence protocol** keeps that from being observable. It maintains two invariants (Sorin, Hill and Wood's *Primer on Memory Consistency and Cache Coherence*):
+Each core has its own L1 and L2 caches. Two cores can keep copies of the same **cache line**, the 64-byte block that caches move. If one core writes its copy, the other copy becomes **stale**: it holds an old value. A **coherence protocol** makes sure that no program can see a stale copy. It keeps two rules, called **invariants** (Sorin, Hill and Wood, *A Primer on Memory Consistency and Cache Coherence*):
 
-- **Single writer, multiple readers (SWMR)**: at any moment, a line is either writable by exactly one core, or readable by any number of cores, never both.
-- **Data value**: a read returns the value of the last write to that line.
+- **Single writer, multiple readers (SWMR)**: at any time, one core can write a line, or any number of cores can read it. These two cases never occur together.
+- **Data value**: a read gets the value of the last write to that line.
 
-Every cache line carries a state, and cores keep the invariants by broadcasting requests on a shared bus that every other cache **snoops**.
+Each line in each cache has a **state**. In the simplest design, all caches share a **bus**: one set of wires on which each request goes to every cache, in the same order. Each cache **snoops**: it watches the bus and looks up each request in its own cache.
 
 <Predict
   id="mesi"
-  question="A core reads a line that no other core has, then writes it. How many bus transactions does that take under MSI, and under MESI?"
+  question="A core reads a line that no other core has. Then it writes the line. How many bus transactions does this take under MSI, and under MESI?"
   options={["2 and 2", "2 and 1", "1 and 1"]}
   answer={1}
-  explain="MSI loads the line as Shared, so the write needs a second transaction to invalidate other copies, even though none exist. MESI loads it as Exclusive when nobody else has it, and the write upgrades E → M silently. Most data is private, so this saving is everywhere."
+  explain="MSI loads the line as Shared. So the write needs a second transaction to invalidate other copies, although no other copies exist. MESI loads the line as Exclusive when no other cache has it. The write then changes E to M with no bus transaction. Most data is private, so this saving occurs everywhere."
 >
 <CoherenceDemo />
 </Predict>
 
 Things to try:
 
-1. **Read, then write (one core)** under MSI vs MESI: 2 bus transactions vs 1.
-2. **Producer → consumer ×2** under MESI vs MOESI. MESI writes the dirty line back to memory every time a consumer reads it; MOESI keeps it dirty in the producer as **Owned** and supplies it cache-to-cache. Watch the memory row: "stale" means memory is out of date, which is allowed while some cache owns the line.
-3. **Everyone reads, one writes**: the write invalidates every other copy at once.
-4. **Ping-pong writes**: each write by a different core moves the line and invalidates the other copy. This is what a contended atomic or a shared counter costs.
+1. Select **Read, then write (one core)**. Compare MSI and MESI: 2 bus transactions against 1.
+2. Select **Producer → consumer ×2**, and compare MESI and MOESI. MESI writes the dirty line back to memory each time the consumer reads it. MOESI keeps the dirty line in the producer as **Owned** and sends it directly to the other cache.
+3. Look at the memory row. "Stale" means that memory holds an old value. This is permitted while a cache owns the line.
+4. Select **Everyone reads, one writes**. The write invalidates all the other copies at the same time.
+5. Select **Ping-pong writes**. Each write by a different core moves the line and invalidates the other copy. A contended atomic or a shared counter has this cost.
 
 ## The states
+
+Look at one line in one cache. Its state changes when this core reads or writes the line. It also changes when another core reads or writes the line.
+
+<MesiStateMachineDemo />
+
+1. Click **This core reads**, then **This core writes**. Under MESI, the line goes from I to E to M with one bus transaction. Under MSI, it goes from I to S to M with two.
+2. Click **Other core reads**. Under MESI, M changes to S, and the dirty data goes back to memory. Under MOESI, M changes to O, and memory stays stale.
+3. Click **Other core writes**. The copy in this core becomes I, from any state.
+4. Select **MOESI** and get the line into O. Then click **This core writes**. The core must invalidate the other copy with a BusUpgr before it can write.
 
 | State | Meaning | Can read | Can write | Memory up to date |
 |---|---|---|---|---|
@@ -37,19 +48,43 @@ Things to try:
 | **S**hared | one of possibly many clean copies | yes | needs upgrade | yes (or an O holds it) |
 | **I**nvalid | not present | no | no | — |
 
-The transactions: **BusRd** (read miss: get a shared copy), **BusRdX** (write miss: get the line and invalidate everyone), **BusUpgr** (write hit in S: invalidate the others, no data needed), and **writebacks** of dirty lines. Real CPUs add variants: Intel's **MESIF** designates one sharer as the **F**orwarder that answers requests; AMD's MOESI shares dirty data without writing it back.
+A line is **dirty** when the cache has changed it and memory has the old value. A line is **clean** when memory has the same value. The bus transactions are:
+
+- **BusRd**: a read miss. The cache gets a shared copy.
+- **BusRdX**: a write miss. The cache gets the line and invalidates all other copies.
+- **BusUpgr**: a write hit in S. The cache invalidates the other copies. It does not need the data.
+- **Writeback**: a dirty line goes back to memory.
+
+Real CPUs add variants. In Intel **MESIF**, one sharer is the **Forwarder** (F), which answers the requests for the line. AMD uses MOESI, so it can share dirty data without a writeback to memory.
 
 ## Protocols on real workloads
 
 <CoherenceWorkloadsDemo />
 
-- **Private read-then-write**: MESI halves the bus traffic.
-- **Producer → consumers**: MOESI cuts memory writes from 8 to 0.
-- **False sharing** vs **padded counters**: 63 vs 4 bus transactions, and about 3.6× the cycles for the same work.
+- **Private read-then-write**, 4 cores: MESI needs 16 bus transactions, and MSI needs 32.
+- **Producer → consumers**: MOESI cuts the memory writes from 8 to 0.
+- **False sharing** against **padded counters**: 63 against 4 bus transactions, and about 3.6 times the cycles for the same work.
 
 ## False sharing
 
-Coherence works on whole lines, not variables. Two threads updating *different* variables that share a 64-byte line make that line ping-pong between cores, exactly like a contended shared variable. Typical sources: per-thread counters in an array, a lock next to the data it protects, or fields of one struct written by different threads.
+Coherence works on whole lines, not on variables. Two threads can write *different* variables that are in the same line. Then the line moves between the two cores, as if they shared one variable. This is **false sharing**. Typical causes are per-thread counters in an array, a lock next to the data that it protects, and struct fields that different threads write.
+
+<Predict
+  id="false-sharing"
+  question="Two cores each increment their own 8-byte counter 8 times. The counters are 8 bytes apart. Compared with counters 64 bytes apart, how long does the work take?"
+  options={["About the same time", "About 1.5 times as long", "About 3.6 times as long"]}
+  answer={2}
+  explain="The two counters are in one 64-byte line. So each increment must take the line from the other core: 31 bus transactions against 2. In this model, the work takes 1,154 cycles against 320."
+>
+<FalseSharingDemo />
+</Predict>
+
+1. Start at **8 bytes**. Almost every access is a red bus transaction. The line moves to the other core at each increment.
+2. Move the distance to **56 bytes**. The counters are still in the same line, so nothing changes.
+3. Move the distance to **64 bytes**. Counter B is now in line 1. After the first miss of each core, every access is a hit.
+4. Compare the cycles: 1,154 against 320. False sharing makes the same work about 3.6 times slower.
+
+The fix is to give each variable its own line, with padding or alignment. Many libraries use 128 bytes. On x86-64, the adjacent-line prefetcher fetches lines in pairs, so two neighbor lines can also interfere.
 
 ```rust
 #[repr(align(128))]   // crossbeam's CachePadded uses 128 on x86-64: adjacent-line prefetch pairs lines
@@ -60,12 +95,12 @@ struct PerThread { count: AtomicU64 }
 const PerThread = struct { count: std.atomic.Value(u64) align(std.atomic.cache_line) };
 ```
 
-C++17 has `std::hardware_destructive_interference_size` for this. `perf c2c` on Linux finds false sharing by reporting cache lines with heavy cross-core "HITM" (hit-modified) traffic.
+C++17 has `std::hardware_destructive_interference_size` for this. On Linux, `perf c2c` finds false sharing. It reports the cache lines with much cross-core "HITM" traffic: loads that hit a line in the Modified state in another core.
 
 <Recall cards={[
-  { q: "The two coherence invariants?", a: "Single-writer/multiple-reader per line, and every read returns the last written value." },
-  { q: "What does MESI's E state save over MSI?", a: "A private line loaded as E can be written silently (E → M) with no upgrade transaction." },
-  { q: "What does MOESI's O state save?", a: "Dirty lines can be shared cache-to-cache without writing them back to memory first." },
-  { q: "BusRd vs BusRdX vs BusUpgr?", a: "BusRd: read miss, get a shared copy. BusRdX: write miss, get data and invalidate others. BusUpgr: write hit in S, invalidate others without fetching data." },
-  { q: "What is false sharing, and the fix?", a: "Different variables written by different cores share a cache line, which ping-pongs between them. Fix: pad or align each to its own line (often 128 bytes)." },
+  { q: "What are the two coherence invariants?", a: "Single writer or multiple readers for each line, and each read gets the value of the last write." },
+  { q: "What does the E state of MESI save, compared with MSI?", a: "A private line that is loaded as E can be written with no bus transaction: E changes to M silently." },
+  { q: "What does the O state of MOESI save?", a: "Caches can share a dirty line directly, without a writeback to memory first." },
+  { q: "What do BusRd, BusRdX and BusUpgr do?", a: "BusRd: a read miss gets a shared copy. BusRdX: a write miss gets the data and invalidates the other copies. BusUpgr: a write hit in S invalidates the other copies, with no data transfer." },
+  { q: "What is false sharing, and what is the fix?", a: "Different cores write different variables in the same cache line, so the line moves between them. The fix: pad or align each variable to its own line, often 128 bytes." },
 ]} />

@@ -1,59 +1,69 @@
 ---
-summary: What the compiler can vectorize on its own, the four things that stop it, and how to check and coax it.
+summary: What the compiler can turn into SIMD code without help, the four things that stop it, and how to check the result.
 ---
 import { VectorizeDemo } from "@/demos/CpuDemos";
+import { LoopDependencyDemo } from "@/demos/CpuExtrasDemos";
 
-At `-O2` / `-O3` (Rust `--release`), LLVM and GCC try to rewrite simple loops into SIMD code automatically. When it works, you get the previous lesson's speedups for free. When it doesn't, nothing tells you unless you ask: the loop just runs scalar. Knowing what blocks vectorization lets you write loops the compiler can handle.
+At `-O2` and `-O3` (or a Rust release build), LLVM and GCC try to change simple loops into SIMD code. When this works, you get the speedups of the previous lesson without extra work. When it does not work, the compiler does not tell you. The loop just stays scalar.
+
+## When iterations can share a vector
+
+A vector instruction runs several iterations at the same time. This is safe only if no iteration needs a result from another iteration in the same vector.
+
+<LoopDependencyDemo />
+
+1. Select **c[i] = a[i] + b[i]**. The iterations are independent. Each vector group is safe.
+2. Select **a[i] = a[i-1] * k**. Each iteration needs the one before it. There are red arcs inside each group.
+3. Select **a[i+2] = a[i] + 1**. With 4 lanes, the arcs are inside the groups. Set the lanes to 2: the arcs go between groups, and the loop is safe.
+4. Select **a[i+8] = a[i] + 1**. With 8 lanes or fewer, it is safe.
+
+## What the compiler does
 
 <Predict
   id="fsum"
-  question="for (i = 0; i < n; i++) s += a[i]; with float a and s, compiled with -O3 -march=native (no -ffast-math). Does it vectorize?"
-  options={["Yes: it's the simplest loop there is", "No: the compiler isn't allowed to reorder float additions", "Only with restrict"]}
+  question="The loop is s += a[i] with float values, compiled with -O3 -march=native and without -ffast-math. Does the compiler vectorize it?"
+  options={["Yes: it is a very simple loop", "No: the compiler may not change the order of float additions", "Only with restrict"]}
   answer={1}
-  explain="Vectorizing a sum means keeping 8 partial sums and adding them at the end, a different order of additions. With floats that can change the rounded result, and the compiler must preserve your program's exact semantics. With int, or with -ffast-math (or -fassociative-math), it vectorizes."
+  explain="A vector sum keeps 8 partial sums and adds them at the end. That is a different order of additions. With floats, the rounded result can change, and the compiler must keep the exact result of your program. With int, or with -ffast-math, it vectorizes."
 >
 <VectorizeDemo />
 </Predict>
 
-Go through the loops with the toggles:
+1. Select **c[i] = a[i] + b[i]** without the no-overlap option. The compiler adds a runtime check for overlapping arrays. Rust slices and C `restrict` remove the check.
+2. Select the sum and the conditional sum. Floats need permission to change the order. Integers do not.
+3. Select the recurrence. It never vectorizes.
+4. Select the gather, the early exit and the function call. These stop the vectorizer, or make it less useful.
 
-1. **c[i] = a[i] + b[i]** without the no-overlap guarantee: vectorized with a runtime overlap check and a scalar fallback. Rust slices and C `restrict` remove the check.
-2. **Sum** and **conditional sum**: float needs permission to reassociate; int doesn't.
-3. **Recurrence** `a[i] = a[i-1]*k + b[i]`: never. A loop-carried dependency can't be computed in parallel lanes as written.
-4. **Gather**, **early exit**, **opaque call**: the usual partial or complete blockers.
+## The four things that stop the vectorizer
 
-## The four blockers
-
-| Blocker | Example | Fix |
+| Problem | Example | Fix |
 |---|---|---|
-| Possible aliasing | `void f(float *c, float *a)` | `restrict`; Rust `&mut` / `&` already guarantee no overlap; copy to locals |
-| Loop-carried dependency | prefix sums, recurrences, `x = f(x)` | change the algorithm (parallel scan, blocking), or accept scalar |
-| Floating-point semantics | reductions, reordered expressions | `-fassociative-math` (narrower than `-ffast-math`), explicit multiple accumulators, or `@reduce` / SIMD types |
-| Unknown control flow | calls, early exits, complex branches, exceptions | inline the callee, hoist conditions, split search loops, use library routines |
+| Arrays can overlap | `void f(float *c, float *a)` | `restrict`; Rust references already guarantee no overlap |
+| Dependency between iterations | prefix sums, `x = f(x)` | change the algorithm (parallel scan, blocking) |
+| Float rules | reductions | `-fassociative-math`, several accumulators, or vector types |
+| Unknown control flow | function calls, early exits | inline the function, move the condition, split search loops |
 
-Others: non-contiguous or indirect access (strides, gathers), mixed element widths, and loops the cost model deems too short to be worth it.
+## How to check
 
-## Checking
+- Clang and Rust: `-Rpass=loop-vectorize -Rpass-missed=loop-vectorize`. In Rust, use `RUSTFLAGS="-C remark=loop-vectorize -C debuginfo=1"`.
+- GCC: `-fopt-info-vec-optimized` and `-fopt-info-vec-missed`.
+- Read the assembly, for example on Compiler Explorer. `ymm` or `zmm` registers and `ps` instructions show vector code. `ss` instructions show scalar code.
+- Set the target CPU: `-march=native` or `-C target-cpu=native`. The default x86-64 target allows only SSE2, so the compiler cannot use AVX2.
 
-- Clang (and Rust: `RUSTFLAGS="-C remark=loop-vectorize -C debuginfo=1"` or `-Cllvm-args=-pass-remarks=loop-vectorize`): `-Rpass=loop-vectorize -Rpass-missed=loop-vectorize -Rpass-analysis=loop-vectorize` explains each decision.
-- GCC: `-fopt-info-vec-optimized` / `-fopt-info-vec-missed`.
-- Look at the assembly (Compiler Explorer): `ymm` / `zmm` registers and `ps` / `pd` packed instructions mean vector code; `ss` / `sd` means scalar.
-- Target the CPU you run on: `-march=native` or `-C target-cpu=native`. The default x86-64 target only guarantees SSE2, so the compiler can't use AVX2 at all.
-
-## Writing vectorizable loops
+## Write loops that the compiler can vectorize
 
 <Steps>
-<div>Iterate over contiguous arrays with a simple counted loop; iterators over slices in Rust and Zig are fine.</div>
-<div>Keep the body free of calls that can't be inlined, and of early exits.</div>
-<div>Make independent iterations obvious: no writes that a later iteration reads.</div>
-<div>For reductions over floats, either opt in to reassociation, or write the multiple accumulators or vector types yourself.</div>
-<div>Lay data out as struct-of-arrays, so each field is contiguous.</div>
+<div>Use simple counted loops over contiguous arrays. Slice iterators in Rust and Zig are fine.</div>
+<div>Keep function calls that cannot be inlined, and early exits, out of the loop body.</div>
+<div>Make sure that no iteration reads a value that a later iteration writes.</div>
+<div>For float reductions, allow a different order, or write the accumulators yourself.</div>
+<div>Store each field in its own array (struct of arrays).</div>
 </Steps>
 
 <Recall cards={[
-  { q: "Why doesn't a float sum auto-vectorize at plain -O3?", a: "Vectorizing reorders the additions, which can change the rounded result; the compiler needs permission (-fassociative-math / -ffast-math)." },
-  { q: "How do compilers handle possible aliasing between arrays?", a: "They vectorize with a runtime overlap check and keep a scalar fallback, unless restrict or language guarantees (Rust references) rule out overlap." },
-  { q: "Why can't `a[i] = a[i-1] * k + b[i]` be vectorized directly?", a: "Each iteration depends on the previous one: a loop-carried dependency." },
-  { q: "How do you see why Clang didn't vectorize a loop?", a: "-Rpass-missed=loop-vectorize (and -Rpass-analysis=loop-vectorize)." },
-  { q: "Why does -march=native matter for vectorization?", a: "The default x86-64 target only allows SSE2; the compiler can't use AVX2 or AVX-512 unless the target says they exist." },
+  { q: "Why does a float sum not vectorize at -O3?", a: "Vectorizing changes the order of the additions, which can change the rounded result. The compiler needs permission (-fassociative-math or -ffast-math)." },
+  { q: "What does the compiler do when arrays can overlap?", a: "It adds a runtime overlap check and keeps a scalar loop for the overlap case." },
+  { q: "Why can `a[i] = a[i-1] * k + b[i]` not be vectorized?", a: "Each iteration needs the result of the previous iteration." },
+  { q: "When is a dependency of distance d safe for a vector of n lanes?", a: "When d is n or more, because then the dependency goes between vector groups." },
+  { q: "Why does -march=native matter?", a: "The default x86-64 target allows only SSE2. The compiler can use AVX2 only when the target has it." },
 ]} />

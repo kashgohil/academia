@@ -46,7 +46,7 @@ Available in MDX without importing: `<Predict>`, `<Recall>`, `<Callout>`, `<Step
 - **Connect**: point to related modules in other tracks.
 - **Recall**: 4–6 cards. Questions should need recall, not recognition.
 
-Style: short sentences, no filler, no emoji.
+Style: ASD-STE100 (Simplified Technical English). At most 25 words per sentence, at most 6 sentences per paragraph, no contractions, no filler, no emoji. `tests/unit/style.test.ts` checks this; `STE_CHECK=track/module/lesson npx vitest run tests/unit/style.test.ts` checks one lesson.
 
 ## 5. Check
 

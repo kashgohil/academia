@@ -4,6 +4,7 @@
  * - a paragraph has at most 6 sentences,
  * - no contractions.
  * Lessons written before this standard are listed in ste-pending.json until they are rewritten.
+ * STE_CHECK=a/b/c,d/e/f checks only the named lessons, even if they are pending.
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
@@ -45,7 +46,8 @@ export const sentences = (p: string) => p.split(/(?<=[.!?])\s+(?=[A-Z0-9"(“])/
 export const words = (s: string) => s.split(/\s+/).filter((w) => /[A-Za-z0-9]/.test(w)).length;
 
 describe("ASD-STE100 style", () => {
-  const done = files(root).filter((f) => !(pending as string[]).includes(f));
+  const only = process.env.STE_CHECK?.split(",").map((x) => x.trim()).filter(Boolean);
+  const done = only ?? files(root).filter((f) => !(pending as string[]).includes(f));
   test("pending list only names real lessons", () => {
     for (const f of pending as string[]) expect(files(root), f).toContain(f);
   });

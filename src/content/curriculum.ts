@@ -36,6 +36,7 @@ export const LIVE = new Set<string>([
   "statistics/limit-theorems/central-limit-theorem",
   "deep-learning/optimization/gradient-descent-on-loss-surfaces",
   "architecture/caches/locality",
+  "os/memory/copy-on-write os/memory/kernel-memory-allocators os/memory/mmap os/memory/page-replacement os/memory/swapping-and-the-oom-killer ",
   "databases/engine/a-tiny-key-value-store-end-to-end",
   "databases/engine/architecture-of-an-embedded-engine",
   "databases/engine/crash-testing-the-engine",

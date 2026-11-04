@@ -1,0 +1,146 @@
+---
+summary: "mmap maps a file or anonymous memory into an address space. MAP_SHARED and MAP_PRIVATE, msync, madvise and the page cache; when mmap beats read and when it does not; SIGBUS on truncate; the case against mmap in databases and LMDB's answer; and TLB shootdowns."
+---
+import { MappingStepperDemo, ReadVsMmapDemo, TruncateDemo } from "@/demos/os/MemoryMmapDemos";
+
+`mmap` tells the kernel to make a range of addresses stand for a file, or for zeroed memory. It does no I/O. It only records a **VMA** (virtual memory area). The pages arrive later, through [page faults](/os/vm/page-faults-and-demand-paging). This one system call provides `malloc`'s large allocations, shared libraries, program text and shared memory.
+
+```c
+int fd = open("data.bin", O_RDWR);
+char *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+p[100] = 'x';                  // a store, not a system call
+msync(p, len, MS_SYNC);        // wait until the dirty pages are on disk
+munmap(p, len);
+```
+
+| Flags | Backed by | A store goes to | Typical use |
+|---|---|---|---|
+| file, `MAP_SHARED` | page cache | the page cache, then the file | file I/O, shared data |
+| file, `MAP_PRIVATE` | page cache, then a private copy | a private anonymous copy | program text and data |
+| `MAP_ANONYMOUS`, `MAP_PRIVATE` | zero page, then anonymous pages | this process only | large `malloc`, stacks |
+| `MAP_ANONYMOUS`, `MAP_SHARED` | shmem | shared with `fork` children | [shared memory](/os/ipc/shared-memory) |
+
+The key fact is that there is one **page cache** per file. `read()`, `write()` and each `MAP_SHARED` mapping use the same physical page. A `MAP_PRIVATE` mapping also maps that page, until it writes. This is why all processes that use `libc.so` share one copy of its code.
+
+<Predict
+  id="private-snapshot"
+  question="Process A maps a file with MAP_PRIVATE and reads page 0. Process B maps the same file with MAP_SHARED and writes to page 0. A reads page 0 again. What does A see on Linux?"
+  options={["The old value: MAP_PRIVATE is a snapshot", "B's new value: A still maps the page cache page", "It depends on msync: only then does the change spread"]}
+  answer={1}
+  explain="A's entry still points at the page cache page, so A sees B's store at once. MAP_PRIVATE only protects the file from A's writes. POSIX leaves this case unspecified. A's view of a page freezes only when A writes to that page and gets a private copy."
+>
+<MappingStepperDemo />
+</Predict>
+
+Things to try:
+
+1. With **Private is not a snapshot**, press **Next step** six times. After step 4, A owns a private copy, and B's later store does not reach A.
+2. Select **Two shared mappings**. A's store appears in B before any `msync`. The dirty page reaches the disk only at the last step. `msync` is about durability. It is not about visibility.
+3. Select **Private writes never reach the disk**. `msync` changes nothing on disk, and process B still sees the file's data.
+4. Select **Eviction and a major fault**. The eviction writes the dirty page and removes it from both page tables. The next read goes to disk. The eviction shoots down two entries, which is the cost that this lesson returns to later.
+5. Build your own case with the buttons. Try **write()** with a mapping that has no copy of that page, then with one that has a copy.
+
+## msync, writeback and the write fault
+
+A store to a clean page in a shared mapping faults, even though the data is in memory. The kernel keeps these entries read-only so that it can track dirty pages. The fault calls the file system's `page_mkwrite` handler, which may allocate blocks, and then it marks the page dirty.
+
+Writeback later writes the page and makes the entries read-only again (`folio_mkclean`), so the next store faults once more. So stores are not free, and [writeback](/os/fs/the-page-cache-and-writeback) runs on its own schedule, even with no `msync`.
+
+- `msync(MS_SYNC)` waits until the range is written. It works like `fsync` for that range. `fsync(fd)` also covers dirty mapped pages.
+- `msync(MS_ASYNC)` does nothing useful on current Linux, because the kernel already tracks dirty pages.
+- The kernel can write a dirty page at any time. This is the first database problem below.
+
+## madvise
+
+`madvise` gives the kernel hints about a range:
+
+| Advice | Effect |
+|---|---|
+| `MADV_SEQUENTIAL` | read ahead more, and free pages behind the reader sooner |
+| `MADV_RANDOM` | stop read-ahead |
+| `MADV_WILLNEED` | start reading the range now |
+| `MADV_DONTNEED` | drop the pages now; the next access gets zeros (anonymous) or file data |
+| `MADV_FREE` | anonymous pages may go if memory is short, and a new store keeps them |
+| `MADV_PAGEOUT`, `MADV_COLD` | reclaim the pages now, or make them first in line |
+| `MADV_POPULATE_READ` | fault the range in now, and report errors as a return value |
+| `MADV_HUGEPAGE` | prefer [huge pages](/os/vm/huge-pages) here |
+
+`MAP_POPULATE` in the `mmap` call faults a range in at the start. Allocators use `MADV_DONTNEED` and `MADV_FREE` to return memory.
+
+## read or mmap?
+
+`read()` enters the kernel on each call and copies bytes. `mmap` has no copy and no system call on a hit, but a first touch costs a fault, and eviction costs more. Which one is cheaper depends on the access pattern.
+
+<ReadVsMmapDemo />
+
+All costs here are model inputs, listed under the demo. They are round numbers for scale. Each `read()` gets one page.
+
+Things to try:
+
+1. Keep **100%** cached and **Random**, with one touch per page. `read()` costs 550 ns, and `mmap` costs 630 ns. A fault costs more than a copy, so `read()` wins by a little.
+2. Move **Touches per page** to 2. `mmap` falls to 330 ns, and at 10 touches it is 90 ns. `read()` stays at 550 ns, because it pays on each access. This is where `mmap` shines.
+3. Set touches back to 1 and select **Sequential** at 100%. `mmap` costs 78 ns, because fault-around maps 16 pages in one fault. `read()` still pays 550 ns.
+4. Move **Cores** to 64, select **Random**, and set **cached** to 90%. `read()` costs 8,550 ns and `mmap` costs 13,770 ns. Shootdowns make the gap.
+5. Select **Sequential** at 50% cached with 64 cores. `read()` costs 1,800 ns, and `mmap` costs 27,028 ns. A scan larger than memory is the worst case for `mmap`, because each new page evicts a mapped page.
+
+## TLB shootdowns
+
+To evict a mapped page, the kernel must remove its page table entries and also remove stale translations from each core's [TLB](/os/vm/the-tlb). On x86-64, it sends an inter-processor interrupt (IPI) to each core that runs a thread of the process, and it waits. The model charges 1,000 ns plus 800 ns per other core, which is 51.4 µs at 64 cores. Reclaim batches these flushes (`try_to_unmap_flush`), and this helps, but the cost still grows with the number of cores.
+
+`read()` avoids this cost. Its page cache page is not in any page table, so its eviction needs no IPI.
+
+The arm64 architecture differs here. It can broadcast an invalidation in hardware (`TLBI` with the inner-shareable option), so it needs no IPI. The broadcast still has a cost, and the CPU waits for its completion with a `DSB`.
+
+## SIGBUS
+
+A `read()` past the end of a file returns 0. A load past the end of a mapped file has no return value, so the kernel must send a signal.
+
+<Predict
+  id="sigbus"
+  question="A process maps 12 KiB of a file that has 5,120 bytes, with 4 KiB pages. It loads the byte at offset 8,960. What happens?"
+  options={["The load returns 0: past EOF reads as zero", "SIGBUS: the mapping covers the address, and the file has no page there", "SIGSEGV: the address is past the end of the file"]}
+  answer={1}
+  explain="Offset 8,960 is in page 2. The file ends in page 1, so page 2 has no file data. The fault handler has nothing to map and sends SIGBUS. Zeros appear only in the rest of the last file page, up to offset 8,192."
+>
+<TruncateDemo />
+</Predict>
+
+Things to try:
+
+1. Move **Offset** to about 6,000. It is past EOF, but in the last file page, so it reads zero.
+2. Move **Offset** past 12,288. No mapping covers this address, so the signal is `SIGSEGV`.
+3. Move the offset to about 500 and shrink **File size** to 0. An offset that was valid now raises `SIGBUS`. Another process can do this at any moment with `ftruncate`.
+
+`SIGBUS` also reports a disk read error, and a store to a hole when the disk is full. Each of these would be a normal error return with `read()` or `write()`. In Rust, `memmap2::Mmap::map` is `unsafe` for this reason: another process can change the bytes, or remove them. Go programs can use `debug.SetPanicOnFault` to turn such a fault into a panic that they can recover from.
+
+## The database argument
+
+Crotty, Leis and Pavlo (CIDR 2022) argue that a database should not use `mmap` as its buffer pool. The [buffer pool lesson](/databases/storage/buffer-pools) gives their list. The kernel can write a page before its log record is durable. A miss blocks the thread. Errors arrive as signals. Shootdowns limit scaling, as the demo above shows.
+
+[LMDB](/databases/btrees/copy-on-write-b-trees) is the usual counter-example, and it shows which conditions make `mmap` safe:
+
+- **No write-order problem.** Its copy-on-write B-tree never changes a live page. An early write of a new page harms nothing, because no root points to it yet. By default it writes with `pwrite` and reads through a read-only map.
+- **Few shootdowns.** It works best when the database fits in RAM. Then evictions are rare, and readers pay no system call and no copy.
+- **One writer.** Writers are serial, so the design needs no latch on pages.
+
+LMDB still blocks on a miss and still gets `SIGBUS` on a disk error. So the argument is about a workload, not about `mmap` itself. `mmap` suits read-mostly data that fits in memory. It does not suit a write-heavy engine with data larger than RAM and many cores.
+
+<Callout title="On your Mac">
+`mmap` works on macOS, with `MAP_ANON` as the spelling for anonymous memory. Apple Silicon uses 16 KiB pages, so use `getpagesize()`, and do not assume 4 KiB. `MAP_POPULATE` does not exist. `MADV_DONTNEED` is only a hint: the data can stay. Use `MADV_FREE_REUSABLE` to release pages. `SIGBUS` on truncate also happens on macOS.
+</Callout>
+
+## Connect
+
+- [Copy-on-write](/os/memory/copy-on-write) explains the fault that `MAP_PRIVATE` uses.
+- [The page cache and writeback](/os/fs/the-page-cache-and-writeback) explains when dirty pages reach the disk.
+- [The TLB](/os/vm/the-tlb) explains what a shootdown must remove.
+- [Buffer pools](/databases/storage/buffer-pools) and [copy-on-write B-trees](/databases/btrees/copy-on-write-b-trees) give both sides of the database argument.
+
+<Recall cards={[
+  { q: "What does a store through MAP_SHARED change, and what does a store through MAP_PRIVATE change?", a: "MAP_SHARED changes the page cache page, so all mappers and read() see it, and writeback sends it to the file. MAP_PRIVATE copies the page and changes only the copy. It never reaches the file." },
+  { q: "Is MAP_PRIVATE a snapshot of the file?", a: "No. Until the process writes to a page, it maps the page cache page, and it can see later changes on Linux." },
+  { q: "What is msync for, if other mappers see a store at once?", a: "Durability. Stores are visible at once through the page cache. msync(MS_SYNC) waits until they are on disk." },
+  { q: "When does an access to a mapped file give SIGBUS, and when does it give zeros?", a: "Bytes past EOF in the last file page read as zero. A whole page past EOF, inside the mapping, gives SIGBUS. Past the mapping, the signal is SIGSEGV." },
+  { q: "Why does a scan larger than memory hurt mmap more than read?", a: "Each new page evicts a mapped page, and each eviction needs a TLB shootdown on all cores that run the process. Page cache pages that read uses are not mapped, so they need no IPI." },
+  { q: "Why is LMDB safe with mmap?", a: "Its copy-on-write tree never changes a live page, so the kernel cannot write a page too early. It has one writer, and it works best when the data fits in RAM, so evictions are rare." },
+]} />

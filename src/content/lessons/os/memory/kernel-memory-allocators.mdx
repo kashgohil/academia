@@ -1,0 +1,183 @@
+---
+summary: "How the Linux kernel allocates its own memory: zones, the buddy allocator, per-CPU page lists, SLUB and the kmalloc size classes, vmalloc, and GFP flags, which say what an allocation may do in its calling context."
+---
+import { SlubPathDemo, GfpExplorerDemo, BuddyinfoDemo } from "@/demos/os/MemoryAllocDemos";
+
+The kernel has no `malloc` underneath it. It must allocate its own memory, and it does so under rules that a user program never meets. It may hold a spinlock. It may run in an interrupt handler. It may be the code that must free memory for everyone else.
+
+The general designs are in other lessons: the [buddy allocator](/systems/allocators/buddy-allocator) and the [slab allocator](/systems/allocators/slab-allocator). This lesson shows what the kernel adds to them. The stack has four layers, and each one exists to avoid the next one:
+
+| Layer | Gives | Shared state |
+|---|---|---|
+| `kmalloc`, `kmem_cache_alloc` (SLUB) | objects | per-CPU freelist, no lock in the fast path |
+| per-CPU page lists (pcp) | single pages and small blocks | per-CPU list |
+| buddy allocator | blocks of 4 KiB to 4 MiB | `zone->lock` |
+| reclaim and the OOM killer | free pages, at a high cost | everything |
+
+<Predict
+  id="producer"
+  question="CPU 0 allocates 256-byte objects with kmalloc, and CPU 1 frees them, one after the other, with a short queue between them. Which allocations and frees stay on the lockless fast path?"
+  options={["Neither: objects move between CPUs, so all of it takes locks", "Most allocations do, and no frees do", "All of them: SLUB is per-CPU, so both sides are fast"]}
+  answer={1}
+  explain="In this run, 95.8% of allocations stay on the fast path, because CPU 0 owns the current slab. No free does, because the object is not in CPU 1's slab. The frees use a cmpxchg on the slab's own freelist, which takes no lock but shares a cache line."
+>
+<SlubPathDemo />
+</Predict>
+
+Things to try:
+
+1. Press **Alloc** twice. The first request takes the slowest path, a new slab from the page allocator. The second pops from `c->freelist`.
+2. Press **Alloc 16** three times. The 32 objects of the slab run out, and a new slab appears. Between those events, each allocation is on the fast path.
+3. Press **Free 16 on the other CPU**, then **Alloc 16**. The objects went to the slab's own freelist. When `c->freelist` is empty, the CPU takes that list in one step. The counter for `c->slab` freelist goes up.
+4. Read the three workloads at the bottom. One CPU: 100% fast, at 10.1 ns per allocation in this model. Bursts of 500 on one CPU: 97.0% of allocations are fast, but only 4.0% of frees are. The mean is 51.4 ns, because slabs go back and forth.
+5. Move **kmalloc(size)** above 8 KiB. The slab layers disappear. kmalloc asks the page allocator directly.
+
+## Zones and the page allocator
+
+Physical memory is split per NUMA node into **zones**, because some hardware cannot reach all addresses:
+
+- `ZONE_DMA`: the first 16 MiB on x86-64, for old devices.
+- `ZONE_DMA32`: the first 4 GiB, for devices with 32-bit DMA.
+- `ZONE_NORMAL`: the rest.
+- `ZONE_MOVABLE`: an optional zone that holds only pages that the kernel can move.
+
+An allocation lists the zones that it accepts, in order, in a **zonelist**. A normal allocation that finds `ZONE_NORMAL` empty can fall back to `ZONE_DMA32`. `vm.lowmem_reserve_ratio` keeps part of the lower zones for callers that have no other choice. The sizes of the DMA zones differ on arm64, because they depend on the platform.
+
+Each zone has its own [watermarks](/os/memory/swapping-and-the-oom-killer) and its own buddy lists, with free blocks of order 0 to 10. The kernel adds one more split to the classic buddy design. Inside each order, free lists are also grouped by **migration type**: unmovable, reclaimable and movable. A page block (order 9 on x86-64) holds one type if possible. So one unmovable kernel object does not pin a large region full of user pages. `kcompactd` then moves movable pages to build large blocks.
+
+## Per-CPU page lists
+
+`zone->lock` is a single lock, and all CPUs would fight over it on each page. So each CPU keeps a small **per-CPU page list** (`struct per_cpu_pages`), mainly for orders up to 3. An allocation pops from this list with no shared lock. When the list is empty, `rmqueue_bulk` takes the zone lock once and moves a whole **batch** of blocks. When the list grows past **high**, a batch goes back. `/proc/zoneinfo` prints `high` and `batch` for each CPU.
+
+`/proc/buddyinfo` shows what is left in the buddy lists. It does not count pages on the per-CPU lists.
+
+<BuddyinfoDemo />
+
+Things to try:
+
+1. At **30%** free, the row is `854 145 9 0 ...`. That is 4.61 MiB free of 16 MiB, but the largest block is order 2 (16 KiB). An order-3 request fails the check, even though memory is free.
+2. Move the slider to **70%**. Most pages are free, and still the largest block is order 3. A few random used pages stop all merges above that order.
+3. Turn on **Run compaction**. The same free memory now forms large blocks. Real compaction can move only movable pages, so unmovable pages limit it. So large `kmalloc` calls can fail on a server that has run for a long time. A driver should allocate large buffers at boot.
+
+The watermark check in `__zone_watermark_ok` needs both conditions: enough free pages in total, and one free block of the requested order or larger.
+
+## SLUB
+
+Linux has had three slab allocators. SLOB was removed in Linux 6.4, and SLAB was removed in 6.8. **SLUB** is the only one left.
+
+SLUB keeps its metadata out of the way. It has no per-slab descriptor array. The free pointer usually lives inside each free object, and the `struct slab` shares the memory of `struct page`. In normal operation, it has no list of full slabs. The layers of one `struct kmem_cache` are:
+
+```c
+struct kmem_cache_cpu {        // one per CPU, per cache
+    void **freelist;           // next free object in the current slab
+    unsigned long tid;         // transaction id: detects migration and races
+    struct slab *slab;         // the current slab
+    struct slab *partial;      // a short list of partial slabs
+};
+struct kmem_cache_node {       // one per NUMA node
+    spinlock_t list_lock;
+    unsigned long nr_partial;
+    struct list_head partial;
+};
+```
+
+The fast path takes no lock and does not disable interrupts. It reads `c->freelist` and `c->tid`, then swaps them with a per-CPU double-word `cmpxchg`. If the task moved to another CPU or an interrupt ran, the `tid` differs, and the code retries. No other CPU normally touches this data, so the cache line stays local.
+
+```text
+kmalloc(256, GFP_KERNEL)
+  kmalloc_slab             → choose the cache kmalloc-256
+  slab_alloc_node          → c->freelist                  (fast path)
+  ___slab_alloc            → c->slab->freelist            (remote frees)
+                           → c->partial                   (this CPU's list)
+  get_partial              → n->partial under list_lock   (shared)
+  new_slab → alloc_pages   → pcp list, then zone->lock    (page allocator)
+```
+
+Recent kernels add a per-CPU layer called sheaves for some caches, so the details are moving. The layers above show the classic path, as the demo does.
+
+**A free** is fast only if the object belongs to this CPU's current slab. Otherwise, `__slab_free` pushes it on the slab's own freelist with a `cmpxchg`. If the slab was full, this CPU adopts it on `c->partial`. A slab that becomes empty goes back to the page allocator if the node already has enough partial slabs (`min_partial`, between 5 and 10).
+
+## kmalloc size classes
+
+`kmalloc` is a set of ordinary slab caches with names like `kmalloc-64`. On x86-64 with 4 KiB pages, the classes are 8, 16, 32, 64, 96, 128, 192, 256, 512, 1k, 2k, 4k and 8k. A request above 8 KiB goes straight to the page allocator. A 100-byte request uses `kmalloc-128`, which wastes 21.9% of the object. So code that allocates many objects of one type makes its own cache with `kmem_cache_create`. On arm64, the small classes can be larger, because some devices need DMA buffers aligned to a cache line.
+
+`calculate_order()` chooses the slab size. It takes the smallest order that holds enough objects (20 on a machine with 8 CPUs) and wastes at most 1/16 of the slab:
+
+| Cache | Order | Objects per slab | Bytes wasted |
+|---|---|---|---|
+| `kmalloc-64` | 0 | 64 | 0 |
+| `kmalloc-96` | 0 | 42 | 64 |
+| `kmalloc-256` | 1 | 32 | 0 |
+| `kmalloc-1k` | 3 | 32 | 0 |
+| `kmalloc-8k` | 3 | 4 | 0 |
+
+`/proc/slabinfo` (root only) lists `objperslab` and `pagesperslab` for each cache, and `slabtop` shows them live. You may also see `kmalloc-cg-*`, for memory that is charged to a cgroup, and `dma-kmalloc-*`. Caches with the same size and flags can merge, so a named cache may not appear.
+
+## vmalloc
+
+`kmalloc` memory is physically contiguous and comes from the **direct map**, a large linear mapping of all RAM. It needs no page table change. `vmalloc` is different:
+
+| | `kmalloc` | `vmalloc` |
+|---|---|---|
+| Physical pages | contiguous | any pages |
+| Virtual range | direct map | a separate kernel range |
+| Page tables | none to change | new entries for each page |
+| Can sleep | depends on the flags | yes, in practice |
+| Large sizes | fails as memory fragments | works |
+| TLB | direct map, usually huge pages | usually 4 KiB entries, flush on free |
+| DMA | yes | not as one contiguous buffer |
+
+Kernel stacks use `vmalloc` space (`CONFIG_VMAP_STACK`), so that an overflow hits a guard page. `kvmalloc` tries `kmalloc` first, then falls back to `vmalloc`.
+
+## GFP flags
+
+Each allocation passes a **GFP mask**. It says what the allocator may do to get memory. The mask does not describe the memory so much as the caller's situation. The core question is whether the caller may sleep, because reclaim can wait for disk I/O.
+
+<Predict
+  id="gfp"
+  question="A driver holds a spinlock and calls kmalloc(64, GFP_KERNEL). Memory is plentiful, so the call returns at once. Is the code correct?"
+  options={["Yes: it did not sleep, so no harm was done", "No: the flag allows sleep, and this context must not sleep", "Yes: spinlocks stop preemption, so the allocator cannot sleep"]}
+  answer={1}
+  explain="GFP_KERNEL may enter direct reclaim, which can sleep. The bug appears only under memory pressure, when it can deadlock. CONFIG_DEBUG_ATOMIC_SLEEP catches it early, because kmalloc checks might_sleep on each call. Use GFP_ATOMIC or allocate before you take the lock."
+>
+<GfpExplorerDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **Holding a spinlock** and select `GFP_ATOMIC`. It is correct now. It cannot reclaim, so it may return NULL, and it may use 62.5% of the min reserve.
+2. Select **Block driver, in the I/O path** with `GFP_KERNEL`. Reclaim may wait for I/O through this driver, and this driver waits for the allocation. Select `GFP_NOIO`.
+3. Select **File system, in a transaction** with `GFP_NOIO`, then `GFP_NOFS`. Both are safe. `GFP_NOFS` still allows reclaim to start I/O. Note that it may not call the OOM killer.
+4. Select **Process context** and `GFP_KERNEL`, then raise **Order** from 3 to 4. Up to order 3, the call does not return NULL: it loops, and it may call the OOM killer. Above order 3, it may fail. This rule is sometimes called "too small to fail".
+5. Add `__GFP_NOFAIL` to `GFP_ATOMIC`. The kernel warns: it cannot keep that promise without reclaim.
+
+| Flag | Composition | Use |
+|---|---|---|
+| `GFP_KERNEL` | reclaim, I/O, FS | process context, the default |
+| `GFP_NOFS` | reclaim, I/O | inside a file system |
+| `GFP_NOIO` | reclaim | in the block I/O path |
+| `GFP_ATOMIC` | high, kswapd | cannot sleep; use the reserve |
+| `GFP_NOWAIT` | kswapd | cannot sleep; fail fast |
+| `GFP_HIGHUSER_MOVABLE` | reclaim, I/O, FS, movable | user pages |
+
+In recent kernels, a caller that cannot sleep may use 25% of the min watermark, and `__GFP_HIGH` raises this to 62.5%. New code should prefer the scoped API, `memalloc_nofs_save()` and `memalloc_noio_save()`, over passing flags through many layers. The block layer also uses a `mempool_t`, a small private reserve, so that I/O can always make progress and free memory.
+
+<Callout title="On your Mac">
+XNU has a similar design with different names: `kalloc` with zones (`zalloc`) on top of the page allocator. `zprint` lists the zones, like `/proc/slabinfo`. Linux tools such as `slabtop` do not work on macOS. A Linux VM is the simplest way to try the commands in this lesson.
+</Callout>
+
+## Connect
+
+- [Buddy allocator](/systems/allocators/buddy-allocator) and [slab allocator](/systems/allocators/slab-allocator) give the general designs.
+- [Swapping and the OOM killer](/os/memory/swapping-and-the-oom-killer) explains the reclaim that GFP flags allow.
+- [Locks and spinlocks](/os/sync/locks-and-spinlocks) explains why a spinlock holder must not sleep.
+- [A simple allocator](/os/kernel/a-simple-allocator) builds a small page and object allocator from zero.
+
+<Recall cards={[
+  { q: "List the layers that a kmalloc passes through, from fastest to slowest.", a: "c->freelist, the current slab's freelist, c->partial, n->partial under list_lock, then the page allocator: per-CPU page list, then the buddy lists under zone->lock." },
+  { q: "When is a SLUB free fast, and what happens otherwise?", a: "It is fast if the object is in this CPU's current slab. Otherwise a cmpxchg pushes it on that slab's own freelist. If the slab was full, this CPU adopts it on its partial list." },
+  { q: "What does the kernel add to the classic buddy allocator?", a: "Zones, per-CPU page lists for small orders, watermarks, and migration types with compaction, so that large blocks can form." },
+  { q: "Why does GFP_ATOMIC exist, and what is the cost of using it?", a: "Some code cannot sleep, so it cannot reclaim. GFP_ATOMIC does not sleep and may use the reserve below the min watermark. It can fail, and the caller must handle NULL." },
+  { q: "Why does a block driver use GFP_NOIO?", a: "Reclaim may wait for I/O through the same driver, while the driver waits for this allocation. That is a deadlock." },
+  { q: "When do you use vmalloc and not kmalloc?", a: "For a large buffer that does not need contiguous physical pages. It needs page table entries and TLB flushes, and it cannot serve as one contiguous DMA buffer." },
+]} />

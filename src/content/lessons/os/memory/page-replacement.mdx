@@ -1,0 +1,166 @@
+---
+summary: "When memory is full, which page goes? Belady's MIN as the limit, FIFO and its anomaly, LRU and why nobody runs it exactly, Clock and the accessed bit, working sets and thrashing, and the Linux lists, MGLRU and refaults."
+---
+import { ReplacementStepperDemo, FaultCurveDemo, WorkingSetDemo, ThrashingDemo } from "@/demos/os/MemoryReplacementDemos";
+
+Physical memory is a cache for the pages of all programs. When it is full and a program faults, the kernel must remove a page. A **page replacement policy** chooses this victim. The wrong choice costs a disk read, which takes far longer than the fault itself. This lesson starts from [demand paging](/os/vm/page-faults-and-demand-paging).
+
+We study a policy on a **reference string**: the list of pages that a program touches, in order. A reference to a page that is not in memory is a **fault**.
+
+<Predict
+  id="belady"
+  question="FIFO evicts the page that was loaded first. On the string 1 2 3 4 1 2 5 1 2 3 4 5 it takes 9 faults with 3 frames. How many faults does it take with 4 frames?"
+  options={["8: more memory means fewer faults", "9: the extra frame does not help", "10: more memory gives more faults"]}
+  answer={2}
+  explain="FIFO takes 10 faults with 4 frames. This is Belady's anomaly. The larger memory does not always hold what the smaller memory holds, so a larger memory can be worse. LRU and MIN do not have this problem."
+>
+<ReplacementStepperDemo />
+</Predict>
+
+Things to try:
+
+1. Press **Belady's anomaly**. Read the table under the grids: FIFO goes from 9 faults to 10 when you add a frame. Clock does the same on this string. Move **Frames** between 3 and 4.
+2. Select **Textbook** with 3 frames. MIN takes 9 faults, LRU 12, Clock 14 and FIFO 15. MIN is the limit. No other policy can beat it.
+3. Move **Reference number** slowly with MIN. At each red cell, look ahead along the string. MIN evicts the page whose next use is furthest away.
+4. Select **Loop**: a loop over 4 pages with 3 frames. LRU and FIFO fault on all 12 references. MIN takes 6. LRU always evicts the page that the loop needs next.
+
+## MIN: the limit that no kernel can reach
+
+Belady's **MIN** (1966) evicts the page whose next use is furthest in the future. An exchange argument shows that it is optimal. Suppose another policy evicts page A, and MIN evicts page B, which is used later than A. Swap the two choices. The result has the same or fewer faults, because the next use of B comes later.
+
+MIN reads the future, so no kernel can run it. It is still useful. Run it on a recorded trace, and it tells you how much better any policy could be. The tests for this lesson check MIN against an exhaustive search of all eviction choices.
+
+## FIFO and the anomaly
+
+FIFO needs only a queue, but age is a poor signal. It evicts a hot page as soon as that page gets old. Worse, it can break the rule that more memory helps.
+
+The reason is the **inclusion property**. A policy has this property if the pages in memory with $m$ frames are always a subset of the pages in memory with $m+1$ frames. Then any hit with $m$ frames is also a hit with $m+1$ frames, so the fault count cannot rise. Mattson and others (1970) call such policies **stack algorithms**.
+
+LRU and MIN are stack algorithms. The $m$ most recently used pages are always part of the $m+1$ most recently used pages. FIFO and Clock are not stack algorithms, because their choice depends on when pages were loaded.
+
+The inclusion property also gives a tool. One pass over a trace gives the LRU fault count for every memory size at once:
+
+```rust
+/// Mattson's stack algorithm. faults[m] is the LRU fault count with m frames.
+fn lru_curve(refs: &[u32], max: usize) -> Vec<u64> {
+    let mut stack: Vec<u32> = Vec::new();        // index 0 = most recently used
+    let mut hits_at = vec![0u64; max];
+    for &r in refs {
+        if let Some(d) = stack.iter().position(|&p| p == r) {
+            stack.remove(d);
+            if d < max { hits_at[d] += 1; }      // a hit for every m > d
+        }
+        stack.insert(0, r);
+    }
+    let mut hits = 0;
+    let mut faults = vec![refs.len() as u64; max + 1];
+    for m in 1..=max { hits += hits_at[m - 1]; faults[m] -= hits; }
+    faults
+}
+```
+
+## LRU, and why exact LRU is too costly
+
+**LRU** evicts the page that was used longest ago. It assumes that the recent past predicts the near future. Programs have **locality**, so this assumption is usually correct.
+
+A database [buffer pool](/databases/storage/buffer-pools) can run LRU, because each access calls the pool. A kernel cannot do this. A program touches memory with ordinary loads and stores, and the kernel does not see them. Exact LRU would need a list update on every memory access. Only a trap on every access could give the kernel that information, and a trap costs far more than the access.
+
+## Clock: one bit from the hardware
+
+The hardware gives the kernel one useful bit. On x86-64, the CPU sets the **accessed bit** (A, bit 5) in a page table entry when it walks the page table for that page. On arm64, the equivalent is the access flag (AF). Hardware can set it on recent cores. Otherwise, a fault lets the kernel set it.
+
+**Clock**, also called **second chance**, uses this bit. The frames form a ring with a hand. To find a victim:
+
+1. Look at the frame under the hand.
+2. If its accessed bit is 1, clear the bit, move the hand, and go to step 1. The page gets a second chance.
+3. If its accessed bit is 0, evict this page.
+
+A page that is in use sets its bit again before the hand returns. So the hand finds pages that were not touched in the last full turn. The bit is only one bit of history, so Clock is an approximation of LRU, and a coarse one.
+
+<FaultCurveDemo />
+
+Things to try:
+
+1. Select **Loop** at 40 frames. MIN has 17.6% faults, and all the others have 100%. The loop is larger than memory, so they always evict the page that the loop needs next.
+2. Select **Uniform** at 32 frames. LRU, FIFO and Clock all have about 50%, and MIN has 21.7%. With no locality, recent use says nothing, and only the future helps.
+3. Select **Phases**. The LRU curve falls almost in a straight line, then stops at 24 frames, at 1.6%. The locality fits, so more memory adds nothing. The rest of the faults are first touches.
+4. Select **Hot + scan** at 32 frames. FIFO has 48.1%, Clock 43.0%, LRU 39.0%, Two lists 32.9% and MIN 24.5%. Scan pages push hot pages out of LRU. The two-list model protects the hot pages. The [buffer pool lesson](/databases/storage/buffer-pools) calls this sequential flooding.
+
+## Working sets
+
+Denning (1968) gave locality a precise form. The **working set** $W(t, \tau)$ is the set of distinct pages that a program touched in the last $\tau$ references. A program runs well if its working set is in memory.
+
+<WorkingSetDemo />
+
+Things to try:
+
+1. Set $\tau$ to 200. The curve stays near 24, and it jumps at each phase change, while the old and new sets are both in the window.
+2. Set $\tau$ to 10. The mean falls to 8.3 pages, so the window is too short to see the locality.
+3. Set $\tau$ to 3000. The mean rises to 53.5 pages. The window now covers more than one phase. So $\tau$ must be longer than the time between uses of a hot page, and shorter than a phase.
+
+## Thrashing
+
+Multiprogramming helps while programs wait for I/O: another program can use the CPU. But each new program takes frames from the others. When a program has fewer frames than its working set, it faults at once and blocks. The kernel gives its frames to others, and they fault in turn. This is **thrashing**. The CPU is idle, and the paging device is saturated.
+
+<Predict
+  id="thrash"
+  question="256 frames serve processes that each have a working set of 24 pages. CPU utilization is 99.8% with 10 processes. What is it with 12 processes?"
+  options={["About 100%: more work is ready to run", "About 90%: it falls a little", "About 20%: it collapses"]}
+  answer={2}
+  explain="With 12 processes, each has 21 frames, 3 fewer than it needs. The fault rate rises from 0.6% to 12.9% per reference. The paging device is at 100%, and CPU utilization falls to 19.4%."
+>
+<ThrashingDemo />
+</Predict>
+
+The curve comes from a queueing model. The processes move between one CPU, one paging device and file I/O, and the model solves this network exactly by mean value analysis. The fault rate is not assumed: an exact LRU run on a locality trace gives it. The fault service time (2 ms) and the other timings are model inputs.
+
+Things to try:
+
+1. Move **Processes** from 1 to 10. CPU utilization climbs from 23.6% to 99.8%, because each process waits for I/O most of the time.
+2. Move to 11, 12 and 13. Utilization falls to 55.3%, 19.4% and 11.8%. The drop is sudden, because total demand has just passed the physical memory.
+3. Select a fault time of **100 µs**, like a fast SSD. At 40 processes, utilization is still 66.4%. A faster device moves the cliff, but it does not remove the cause.
+4. Look at the dashed **load control** line. If the kernel admits only the processes that fit, utilization stays high. The other processes wait outside memory.
+
+Old systems suspended whole processes to do load control. Linux does not. It reclaims until a [memory pressure](/os/memory/swapping-and-the-oom-killer) signal or the OOM killer stops the problem. On a server, the usual fix is a memory limit and fewer processes.
+
+## What Linux does
+
+Linux keeps lists per memory cgroup and per NUMA node, in a `struct lruvec`. The classic design has an **active** and an **inactive** list, for anonymous pages and for file pages.
+
+- New pages usually enter the inactive list. The first touch of a file page marks it as referenced, and a second touch moves it to the active list (`folio_mark_accessed`).
+- Reclaim takes pages from the tail of the inactive list (`shrink_folio_list`). It reads the accessed bits through the reverse map (`folio_referenced`). A page that was used recently goes back or is promoted.
+- When the active list is too large, its tail moves to the inactive list.
+
+A scan touches each page once, so scan pages die on the inactive list. This is the same idea as midpoint insertion in InnoDB.
+
+**Refaults** give the kernel a signal that hardware does not. When the kernel evicts a page cache page, it leaves a small **shadow entry** in the page's slot in the cache. The entry records a clock of evictions.
+
+If the page faults back in, the **refault distance** says how many other pages were evicted in the meantime. If that distance fits within the active list, the page would have stayed in memory with a little more space. So the kernel puts it straight on the active list (`mm/workingset.c`). The counters are in `/proc/vmstat`:
+
+```text
+workingset_refault_file   pages that came back after eviction
+workingset_activate_file  of these, pages that went straight to the active list
+workingset_refault_anon   the same for swapped anonymous pages
+```
+
+The **multi-generational LRU** (MGLRU, in Linux 6.1, `CONFIG_LRU_GEN`) replaces the two lists with up to four generations of pages. **Aging** walks page tables, in place of one reverse-map lookup per page, and moves pages with the accessed bit set to the newest generation. **Eviction** takes pages from the oldest generation. A page table walk is cheap when many pages in a region are used, so the CPU cost of scanning falls. `min_ttl_ms` in `/sys/kernel/mm/lru_gen/` tells the kernel to protect a working set of that age, and to use the OOM killer if it cannot.
+
+<Callout title="On your Mac">
+XNU also keeps pages on queues, with active, inactive and speculative pages. Run `vm_stat` to see the page counts, page-ins and page-outs. Linux files such as `/proc/vmstat` do not exist on macOS.
+</Callout>
+
+## Connect
+
+- [Buffer pools](/databases/storage/buffer-pools) apply LRU-K, 2Q and clock sweep where the program sees every access.
+- [Page faults and demand paging](/os/vm/page-faults-and-demand-paging) explains what a fault costs.
+- [Swapping and the OOM killer](/os/memory/swapping-and-the-oom-killer) continues with what happens to the victim.
+- [Cgroups](/os/isolation/cgroups) give each group of programs its own lists and limits.
+
+<Recall cards={[
+  { q: "What does Belady's MIN evict, and why can no kernel run it?", a: "It evicts the page whose next use is furthest in the future. A kernel does not know the future. MIN is useful as a limit on a recorded trace." },
+  { q: "What is Belady's anomaly, and which property prevents it?", a: "More frames can give more faults, as with FIFO. The inclusion property prevents it: the pages held with m frames are a subset of those held with m + 1 frames. LRU and MIN have this property." },
+  { q: "Why can a kernel not run exact LRU, when a buffer pool can?", a: "Programs touch memory with ordinary loads and stores, and the kernel does not see them. A buffer pool sees every access, because each access is a call." },
+  { q: "How does Clock use the accessed bit?", a: "The hand looks at each frame. A set bit is cleared and the page gets a second chance. The first frame with a clear bit is the victim." },
+  { q: "What causes thrashing, and what does it look like?", a: "Total working sets are larger than physical memory, so processes fault as soon as they run. CPU utilization collapses, and the paging device is saturated." },
+  { q: "What is a refault distance, and what does Linux do with it?", a: "It is the number of evictions between a page's eviction and its return, read from a shadow entry. If it fits within the active list, the page goes straight to the active list." },
+]} />

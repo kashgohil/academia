@@ -1,0 +1,139 @@
+---
+summary: "How Linux finds free memory: anonymous and file-backed reclaim, watermarks, kswapd and direct reclaim, swappiness, zswap and PSI, overcommit accounting, and how the OOM killer chooses a victim on a node or in a pod."
+---
+import { PressureDemo, OvercommitDemo, OomPickerDemo } from "@/demos/os/MemoryReclaimDemos";
+
+[Page replacement](/os/memory/page-replacement) chooses a victim. This lesson asks what happens to that victim, when the kernel starts to look for one, and what it does when no victim is left.
+
+Linux has two kinds of pages. A **file-backed** page has a copy in a file, or it can get one. If it is clean, the kernel drops it at once. If it is dirty, the kernel writes it first.
+
+An **anonymous** page holds a heap or a stack. It has no file, so the kernel must write it to **swap** space first. Without swap, an anonymous page cannot leave memory.
+
+<Predict
+  id="reclaim-stall"
+  question="A workload grows on a machine with 8 GiB of RAM and 2 GiB of swap. Free memory reaches the low watermark after 7.8 s. What does the workload feel at that moment?"
+  options={["It stalls: the kernel must stop it to free memory", "Nothing: a kernel thread frees memory in the background", "The OOM killer runs: memory is almost full"]}
+  answer={1}
+  explain="kswapd wakes at the low watermark and reclaims in the background. The workload does not stall until much later, when it allocates faster than kswapd can free. In this model the first direct reclaim comes at 31.8 s."
+>
+<PressureDemo />
+</Predict>
+
+Things to try:
+
+1. Press **Play**, or drag **Time**. Up to 7.8 s, only free memory falls. Then kswapd holds free memory between the watermarks, and cold file cache shrinks.
+2. Watch 14 s to 30 s. The cold cache is gone, so kswapd takes hot file pages and swaps anonymous pages. Refaults start, and the stall meter climbs.
+3. At 31.8 s, swap is almost full, and the workload enters direct reclaim. At 33.8 s, the OOM killer ends the workload. Free memory comes back at once.
+4. Set **vm.swappiness** to 200. Direct reclaim starts at 14.2 s, because swap writes are slow and kswapd falls behind. File refaults fall from 7,982 MiB to 3,975 MiB. Set it to 0: refaults rise to 9,537 MiB.
+5. Set **Swap** to **None**. Anonymous pages cannot leave, and the OOM kill comes at 19.8 s.
+6. Turn on **zswap** with 2 GiB of swap. Peak stall falls from 66% to 51%, with no disk writes. But the pool takes RAM, so the OOM kill comes earlier, at 27.1 s. With 8 GiB of swap and zswap, this run has no direct reclaim at all.
+
+The throughputs in this demo are model inputs, and the demo widens the watermarks so that you can see them.
+
+## Watermarks, kswapd and direct reclaim
+
+Each memory zone has three watermarks: **min**, **low** and **high**. The kernel computes them from two sysctls. `vm.min_free_kbytes` defaults to $\sqrt{16 \cdot \text{lowmem\_kB}}$, and it sets min. `vm.watermark_scale_factor` (default 10, which means 0.1% of memory) sets the gaps:
+
+$$\text{gap} = \max\left(\frac{\text{min}}{4},\ \frac{\text{managed} \times \text{scale}}{10000}\right), \quad \text{low} = \text{min} + \text{gap}, \quad \text{high} = \text{min} + 2\,\text{gap}$$
+
+On a 16 GiB machine with one zone, min is 16,384 kB, low is 33,161 kB and high is 49,938 kB. The whole band is about 0.3% of memory. Read the real values in `/proc/zoneinfo`.
+
+- **Above low.** An allocation takes pages and does nothing else.
+- **Below low.** The allocator wakes **kswapd**, one kernel thread per NUMA node. It reclaims in the background until free memory passes high. The allocating task does not wait.
+- **At min.** An ordinary allocation cannot pass min, so the task enters **direct reclaim** (`__alloc_pages_direct_reclaim`). The task itself scans lists and may wait for I/O. This is the latency spike that you see on a loaded server. The reserve below min serves atomic allocations and tasks that are doing reclaim.
+
+Direct reclaim is not an error. It is backpressure: the allocator slows the task to the speed of reclaim. If direct reclaim makes no progress after several tries, the kernel calls the OOM killer.
+
+## Swappiness
+
+`get_scan_count()` in `mm/vmscan.c` decides how much to scan from each list. If the inactive file list is large, it scans only file pages. Otherwise, it splits the work using `vm.swappiness` (default 60, range 0 to 200):
+
+$$\text{anon share} : \text{file share} = \text{swappiness} : (200 - \text{swappiness})$$
+
+The kernel also weights this split by the recent cost of refaults. A value of 100 means that a swap I/O costs the same as a file I/O. A value of 0 does not disable swap: if the file cache is tiny, the kernel still swaps. A fast SSD or zswap makes a higher value sensible. Swap is useful even on a large machine, because it lets idle anonymous pages leave, and this leaves more room for file cache.
+
+**zswap** keeps pages that are on their way to swap in a compressed pool in RAM. The pool may use up to 20% of RAM by default (`max_pool_percent`). A later swap-in only needs decompression. Each entry also holds a slot on a real swap device, so swap size still sets the limit. The **zram** driver is a different tool: a compressed block device in RAM that you use as swap.
+
+<Callout title="On your Mac">
+macOS compresses memory by default. The compressor keeps inactive anonymous pages in a compressed region of RAM, and it swaps segments to disk later. Run `memory_pressure` and `vm_stat` to see it. In Activity Monitor, look at "Compressed". macOS sends memory pressure notifications to apps, which can then free caches. The memorystatus subsystem in XNU, called Jetsam on iOS, ends processes under pressure.
+</Callout>
+
+## Pressure stall information
+
+Free memory says little: a healthy Linux machine has almost none, because the page cache uses it. **PSI** (pressure stall information) measures what matters, which is time lost:
+
+```text
+$ cat /proc/pressure/memory
+some avg10=12.31 avg60=4.20 avg300=1.07 total=8123456
+full avg10=3.02 avg60=0.91 avg300=0.22 total=1934821
+```
+
+These numbers only show the format. `some` is the share of time in which at least one task stalled on memory. `full` is the share in which all non-idle tasks stalled. The values are averages over 10, 60 and 300 s. The stall meter in the demo has the same shape as `some avg10`. Refaults and direct reclaim both count. A cgroup has its own `memory.pressure` file. systemd-oomd reads PSI and kills earlier than the kernel, because the kernel can stay in a slow state for a long time.
+
+## Overcommit
+
+`malloc` usually returns memory that does not exist yet. `mmap` only records a range, and a page arrives at the first touch. So the kernel must decide how much to promise. `vm.overcommit_memory` chooses the rule.
+
+<OvercommitDemo />
+
+Things to try:
+
+1. In mode **0**, request 20 GiB, then 21 GiB. The heuristic refuses only one request that is larger than RAM + swap. Many requests can pass together.
+2. Select mode **1** and request 40 GiB. It passes. Touch all of it, and the OOM killer runs. The failure moved from a clean `ENOMEM` to a `SIGKILL` at an unrelated moment.
+3. Select mode **2** with a ratio of 50%. CommitLimit is 12 GiB: 4 GiB of swap plus half of the 16 GiB of RAM. Requests stop there, even if RAM is free. Programs that reserve large sparse ranges fail in this mode.
+
+Compare `Committed_AS` and `CommitLimit` in `/proc/meminfo`. Mode 1 suits sparse arrays. Redis asks for it, because `fork` for a snapshot charges the whole heap again, and a stricter rule can refuse that `fork`. Mode 2 gives clean errors, but it needs tuning.
+
+## The OOM killer
+
+`out_of_memory()` picks a task with `oom_badness()` and sends `SIGKILL`:
+
+```c
+points = get_mm_rss(mm) + get_mm_counter(mm, MM_SWAPENTS)
+       + mm_pgtables_bytes(mm) / PAGE_SIZE;
+adj    = p->signal->oom_score_adj;      /* -1000 .. 1000 */
+points += adj * (totalpages / 1000);    /* -1000 means: never */
+```
+
+The score counts pages that a kill would free. The adjustment is a share of all memory, so an `oom_score_adj` of 500 counts as half of memory. Read the result in `/proc/<pid>/oom_score`. In recent kernels, it is 1000 + badness × 1000 / totalpages.
+
+<Predict
+  id="victim"
+  question="A 16 GiB node has three processes. A database has 8 GiB of RSS and oom_score_adj = -900. A pod process has 3.5 GiB and adj = 0. A batch job has 2 GiB and adj = 500. Who dies?"
+  options={["The database: it frees the most memory", "The pod process: it has the largest score without an adjustment", "The batch job: its adjustment counts as half of memory"]}
+  answer={2}
+  explain="The batch job has 525,288 pages of RSS and page tables, plus 500 × 4,194 pages from its adjustment. That gives a badness of 2,622,288 pages, and an oom_score of 1625. The database scores 603, and the pod process scores 1219."
+>
+<OomPickerDemo />
+</Predict>
+
+Things to try:
+
+1. Drag the adj of **batch job** to 0. Now **java** is the victim, with a score of 1219.
+2. Drag the adj of **postgres** to 0. The largest process is the victim. This is why databases set a low adj.
+3. Press **Kill the victim** a few times. The killer picks again if memory is still short. It never picks **sshd**, because -1000 means never.
+4. Select **Pod at its 4 GiB limit**. The score now uses the cgroup limit as total memory. Only the two processes in the pod are candidates. The database cannot die for this pod's problem.
+
+## Why Kubernetes pods die
+
+A container's memory limit is `memory.max` in its [cgroup](/os/isolation/cgroups). The cgroup counts anonymous memory, page cache, and some kernel memory. When a charge would pass the limit, the kernel reclaims inside the cgroup. If that fails, it runs a **cgroup OOM**. It chooses only inside that cgroup, even if the node has free memory. The kubelet then reports `OOMKilled`, with exit code 137 (128 + 9, for `SIGKILL`).
+
+Recent kubelets on cgroup v2 set `memory.oom.group`, so one kill ends the whole container. The kubelet sets `oom_score_adj` by **QoS class**: Guaranteed gets -997, and BestEffort gets 1000. Burstable gets $1000 - 1000 \cdot \text{request} / \text{capacity}$, clamped to 2 to 999. So a 1 GiB request on a 16 GiB node gives 938. A node can also run short of memory. The kubelet then evicts pods in a controlled way, and the kernel OOM killer is the last resort.
+
+Page cache rarely causes an OOM on its own, because clean cache is cheap to drop. A pod with a large page cache can still stall in direct reclaim. `memory.high` makes a softer limit: it throttles the cgroup and does not kill.
+
+## Connect
+
+- [Page replacement](/os/memory/page-replacement) explains how reclaim chooses pages on each list.
+- [Copy-on-write](/os/memory/copy-on-write) explains why `fork` needs a commit charge.
+- [The page cache and writeback](/os/fs/the-page-cache-and-writeback) covers dirty pages, which reclaim must write first.
+- [Cgroups](/os/isolation/cgroups) gives the limits that cause a cgroup OOM.
+
+<Recall cards={[
+  { q: "What happens at each watermark?", a: "Below low, kswapd wakes and reclaims in the background until free memory passes high. At min, the allocating task enters direct reclaim and stalls." },
+  { q: "Why can an anonymous page not simply be dropped, as a clean file page can?", a: "It has no copy anywhere else. The kernel must write it to swap first, so without swap it stays in memory." },
+  { q: "Name the meaning of each vm.overcommit_memory mode.", a: "0: a heuristic that refuses only a single request larger than RAM + swap. 1: never refuse. 2: refuse when Committed_AS would pass CommitLimit, which is swap + RAM × overcommit_ratio / 100." },
+  { q: "How does oom_badness compute a score?", a: "RSS + swap entries + page table pages, plus oom_score_adj × totalpages / 1000. A value of -1000 means that the task is never chosen." },
+  { q: "How does a cgroup OOM differ from a global OOM?", a: "It chooses only from tasks in that cgroup. It uses the cgroup limit as total memory. It can happen while the node has free memory." },
+  { q: "What does PSI some avg10 measure?", a: "The share of the last 10 seconds in which at least one task stalled on memory. Direct reclaim and waits for refaults both count." },
+]} />

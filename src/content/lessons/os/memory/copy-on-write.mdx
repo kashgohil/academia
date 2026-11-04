@@ -1,0 +1,120 @@
+---
+summary: "Sharing pages after fork: the write fault path, reference counts, what the first write costs, why a Redis snapshot grows memory, KSM, how file systems use the same idea, and the Dirty COW class of bug."
+---
+import { CowStepperDemo, SnapshotDemo } from "@/demos/os/MemoryCowDemos";
+
+A process with 16 GiB of memory calls [fork](/os/processes/fork-and-exec). If `fork` copied all of it, the call would take seconds. Most children call `exec` soon after, so that copy would be wasted. **Copy-on-write** (COW) shares the pages instead. It copies a page only when a process writes to it.
+
+The trick has three parts. Both page tables map the same frame. Both entries are read-only, even for writable memory. A **reference count** on the frame says how many mappers it has. The first write faults, and the kernel decides what to do.
+
+<Predict
+  id="reuse"
+  question="A parent forks. The child writes page 0, and then the parent writes page 0. How many page copies did the two writes cause?"
+  options={["0: the pages are shared", "1: only the first write copies", "2: each write copies"]}
+  answer={1}
+  explain="The child's write copies the page and drops the count on the original frame to 1. The parent's write still faults, because its entry is read-only. But the count is 1, so the kernel reuses the frame and only sets the write bit."
+>
+<CowStepperDemo />
+</Predict>
+
+Things to try:
+
+1. Press **fork()**. No frame is added, and "frames in use" stays at 4. The sum of the two RSS values is 8, so RSS counts shared pages twice. Use `Pss` in `/proc/<pid>/smaps` for a fair number.
+2. Press **Child writes page 0**. The frame splits. Now press **Parent writes page 0**. The stat for reuses goes up, and the copies stat does not.
+3. Write to page 1 from the child twice. The first write faults and copies. The second write has no fault, because the entry is writable now.
+4. Press **Child exits**. Each frame that the child shared loses a reference. The parent's entries stay read-only. Its next write takes a fault, and that fault reuses the frame.
+5. Turn on **Write equal bytes**. Write page 0 in the child and page 1 in the parent, then press **Run KSM**. The two frames with equal contents merge into one frame, read-only, with two references.
+
+## The write fault path
+
+A write to a read-only page raises a page fault with the write bit set in the error code. On x86-64, the path starts at `exc_page_fault` and goes through `handle_mm_fault`. The first check is the [VMA](/os/vm/page-faults-and-demand-paging). If the VMA does not allow writes, the kernel sends `SIGSEGV`. If it does allow writes, the read-only entry means COW, and `do_wp_page` runs.
+
+```c
+// Outline of do_wp_page, in spirit. Real code handles many more cases.
+if (page_is_exclusive_to_this_mm(page)) {     // count == 1 for anonymous pages
+    set_pte_writable(pte);                    // reuse: no copy
+    return;
+}
+new = alloc_page();                           // may enter direct reclaim
+copy_page(new, old);
+ptep_clear_flush(pte);                        // remove the old entry from the TLB
+set_pte(pte, mk_writable(new));
+put_page(old);                                // drop one reference
+```
+
+The order of the last steps matters. The kernel must flush the old translation before other threads of the process can store to the new page. Otherwise, one thread could keep writing to the old, shared frame through a stale [TLB](/os/vm/the-tlb) entry. On arm64, `set_pte` needs a break-before-make sequence for the same reason.
+
+The reference count alone is not the whole check. A kernel subsystem can pin a page for direct I/O, and the pin adds a count. Recent kernels track whether an anonymous page is exclusive to one process with a flag (`PageAnonExclusive`). A process that does direct I/O while it forks should use `MADV_DONTFORK` on the buffer.
+
+## What the first write costs
+
+The cost of COW moves from `fork` to the writes after it. It has three parts:
+
+- **`fork` copies page tables.** There is one 8-byte entry for each 4 KiB page, so that is 2 MiB of entries per GiB. A 16 GiB process copies 32 MiB of entries and read-only marks them all. Redis reports this time as `latest_fork_usec`.
+- **Every write after `fork` faults once per page.** With a model input of 1,000 ns for a fault and 10 GiB/s for the copy, one fault costs 1,381 ns. A plain store costs about 1 ns.
+- **Huge pages make it worse.** A [2 MiB page](/os/vm/huge-pages) takes about 196 µs to copy in the same model. The copy is 512 times larger, and one small write pays for all of it.
+
+## Why Redis BGSAVE memory grows
+
+Redis uses this behaviour on purpose. `BGSAVE` forks a child. The child writes a frozen view of the data to disk, and the parent keeps serving writes. The child needs no locks, and it sees a consistent snapshot, because the page tables froze its view. But each parent write to a shared page makes a copy, so memory grows while the snapshot runs.
+
+Let $D$ be the number of pages and $w$ the writes during the snapshot, and assume that each write hits a random page. The expected number of copied pages is
+
+$$D\left(1 - \left(1 - \tfrac{1}{D}\right)^{w}\right) \approx D\left(1 - e^{-w/D}\right)$$
+
+<SnapshotDemo />
+
+Things to try:
+
+1. Start with 16 GiB, at a model input of 200 MiB/s for the snapshot. It takes 81.9 s. At 10,000 writes per second, 819,200 writes copy 744,164 pages. That is 2.84 GiB, or 17.7% of the dataset.
+2. Move to 100,000 writes per second. The copy grows to 85.8%, or 13.7 GiB. A machine must have room for this, or the [OOM killer](/os/memory/swapping-and-the-oom-killer) ends the snapshot or the server.
+3. Look at the dashed line. At 10,000 writes per second, skew helps: if 90% of writes go to 10% of the pages, only 10.2% is copied. Writes to a page already copied cost nothing more.
+4. Select **2 MiB (THP)**. At 1,000 writes per second, the whole dataset is copied. With 4 KiB pages, the same load copies only 1.9%. So Redis logs a warning when transparent huge pages are on.
+
+The same effect hits other programs. CPython stores a reference count inside each object, so a child that only reads objects still dirties their pages. A pre-fork web server with a garbage collector loses sharing in the same way, when a GC marks objects in place.
+
+## KSM
+
+**Kernel same-page merging** applies COW in the other direction. The thread `ksmd` scans memory that a program marked with `madvise(MADV_MERGEABLE)`. It hashes pages, finds pages with equal contents, and maps them all to one read-only frame. A later write faults and splits the page as usual. Virtual machines with the same guest OS gain the most.
+
+KSM costs CPU for scanning. Control it through `/sys/kernel/mm/ksm/` (`run`, `pages_to_scan`, `sleep_millisecs`). It also has a security cost: a write to a merged page takes longer, and so another tenant can learn what memory holds. So operators often keep it off between tenants.
+
+## COW in file systems
+
+[Btrfs and ZFS](/os/fs/log-structured-and-copy-on-write-filesystems) use the same words for a different level. A write to a block goes to a new location, and the tree above is updated up to a new root. The old root is a snapshot. [LMDB](/databases/btrees/copy-on-write-b-trees) does the same inside one file.
+
+| | Process COW | File system COW |
+|---|---|---|
+| Unit | a page frame | a block or extent |
+| Trigger | a write fault on a read-only PTE | every write |
+| Reference count | on the frame | on the block, or implied by the tree |
+| Goal | cheap `fork`, cheap sharing | snapshots, crash safety, no overwrites |
+| Main cost | faults and copies after `fork` | fragmentation and metadata writes |
+
+## The Dirty COW class of bug
+
+COW is a security boundary. A private mapping of a read-only file must never change the file. **Dirty COW** (CVE-2016-5195) broke this.
+
+It was a race in the kernel's own access path (`get_user_pages`). A kernel write through a COW mapping could, under the race, reach the page cache page and not the private copy. So an unprivileged user could change a file that they could only read. The fix made the kernel track that a COW had already happened, and it did not retry the write on the original page.
+
+The general lesson is simple. Any kernel path that reaches user pages by its own route must follow the same COW rules as a CPU store. CVE-2020-29374 was another bug in this area, also about the way `get_user_pages` handled COW pages. These bugs led to the simpler reuse rule and the exclusive flag that you saw above.
+
+<Callout title="On your Mac">
+XNU also uses COW for `fork`, through Mach VM objects and shadow objects: a chain of objects holds the private changes. `vmmap <pid>` marks these regions as SM=COW, and `vm_stat` prints a count of copy-on-write faults. Darwin has no KSM, and `/proc` does not exist.
+</Callout>
+
+## Connect
+
+- [Fork and exec](/os/processes/fork-and-exec) shows the system calls that start all of this.
+- [mmap](/os/memory/mmap) uses the same COW path for `MAP_PRIVATE`.
+- [Huge pages](/os/vm/huge-pages) explains the 2 MiB mappings that make the copy so large.
+- [Log-structured and copy-on-write file systems](/os/fs/log-structured-and-copy-on-write-filesystems) applies COW to blocks.
+
+<Recall cards={[
+  { q: "What does fork do to a writable private page?", a: "It maps the same frame in both page tables, marks both entries read-only, and increments the frame's reference count. It copies no data." },
+  { q: "What does the write fault handler do when the count is 1?", a: "It reuses the frame. It sets the write bit and copies nothing, because no other process maps the frame." },
+  { q: "Why does a Redis snapshot use extra memory?", a: "The child holds a frozen view through COW. Each parent write to a page that is still shared makes a copy, for the whole time of the snapshot." },
+  { q: "Why do transparent huge pages make a snapshot worse?", a: "One small write copies 2 MiB. So the whole dataset is copied at a much lower write rate, and each fault takes far longer." },
+  { q: "What does KSM do, and what does it cost?", a: "ksmd merges pages with equal contents into one read-only COW frame. It costs CPU for scanning, and write timing can reveal what memory holds." },
+  { q: "What invariant did Dirty COW break?", a: "A write through a private mapping must never reach the page cache page. A race in the kernel's own access path let this happen." },
+]} />

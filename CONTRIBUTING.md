@@ -58,4 +58,4 @@ pnpm typecheck && pnpm test
 pnpm build && pnpm test:e2e
 ```
 
-The e2e test clicks through every live lesson in both themes and at phone width, fails on console errors, and saves screenshots to `tests/e2e/shots/`. Add new live lesson paths to `LIVE` in `tests/e2e/smoke.mjs`.
+The e2e test clicks through every live lesson in both themes and at phone width, fails on console errors, and saves screenshots to `tests/e2e/shots/`.

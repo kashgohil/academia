@@ -83,6 +83,7 @@ export function PoolDemo() {
       controls={<Controls params={params} />}
       bytesPerRow={128}
       links
+      hideFrag
       scenarios={scenarios}
       defaultSize={Math.min(40, slot)}
       maxSize={160}
@@ -214,7 +215,7 @@ export function SlabDemo() {
   ];
   return (
     <HeapPlayground
-      title="Slab allocator · 4 KiB · 512 B pages · caches 16/32/64/128/256 B"
+      title="Slab allocator · 4 KiB · 512 B pages"
       config={{ kind: "slab", cap: 4096, a: 512, b: keep ? 1 : 0 }}
       controls={<Controls params={params} />}
       bytesPerRow={512}

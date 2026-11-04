@@ -24,6 +24,8 @@ export interface HeapPlaygroundProps {
   randomSize?: (rng: Rng) => number;
   bytesPerRow?: number;
   links?: boolean;
+  /** Hide external fragmentation (meaningless when every block is the same size). */
+  hideFrag?: boolean;
   /** Extra readouts computed from the heap. */
   extraStats?: (h: Heap, s: HeapStats) => { label: string; value: ReactNode }[];
   children?: ReactNode;
@@ -150,8 +152,10 @@ export function HeapPlayground(p: HeapPlaygroundProps) {
           { label: "live", value: `${s.live} B` },
           { label: "overhead", value: `${overhead(s)} B` },
           { label: "free", value: `${s.free} B` },
-          { label: "largest free block", value: `${s.largestFree} B` },
-          { label: "external fragmentation", value: pct(extFrag(s), 0) },
+          ...(p.hideFrag ? [] : [
+            { label: "largest free block", value: `${s.largestFree} B` },
+            { label: "external fragmentation", value: pct(extFrag(s), 0) },
+          ]),
           ...(p.extraStats?.(heap, s) ?? []),
         ]}
       />

@@ -2,7 +2,7 @@
 // live lesson, unlocks demos, moves a slider, fails on any console error. Saves screenshots.
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 
 const require = createRequire(import.meta.url);
 const { chromium } = require("playwright");
@@ -20,12 +20,10 @@ await new Promise((res, rej) => {
   setTimeout(() => rej(new Error("preview did not start")), 15000);
 });
 
-const LIVE = [
-  "electronics/transients/rc-charging-and-discharging",
-  "statistics/limit-theorems/central-limit-theorem",
-  "deep-learning/optimization/gradient-descent-on-loss-surfaces",
-  "architecture/caches/cache-organization-and-access-patterns",
-];
+// Live lessons, read from the curriculum registry.
+const curriculum = readFileSync(new URL("../../src/content/curriculum.ts", import.meta.url), "utf8");
+const liveBlock = curriculum.slice(curriculum.indexOf("export const LIVE"), curriculum.indexOf("]);", curriculum.indexOf("export const LIVE")));
+const LIVE = [...liveBlock.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
 
 const browser = await chromium.launch();
 const failures = [];

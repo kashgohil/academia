@@ -1,0 +1,131 @@
+---
+summary: "The layers of a storage engine, from the API down to fsync; the life of a put() and a get() through each layer; embedded vs client/server; and the five design choices that decide what an engine is good at."
+---
+import { ArchitectureDemo, DesignExplorerDemo } from "@/demos/db/EngineArchDemos";
+
+The earlier modules built the parts of a database one at a time: [pages](/databases/storage/pages-and-slotted-records), a [buffer pool](/databases/storage/buffer-pools), [B+ trees](/databases/btrees/b-trees), [LSM trees](/databases/lsm/memtables-and-sstables), [MVCC](/databases/transactions/mvcc) and [ARIES](/databases/recovery/aries). A **storage engine** is these parts joined into one program that stores keys and values and keeps them safe. This module joins them. This lesson shows the layers and the choices. The next lesson builds a working engine, and the third lesson tries to break it.
+
+An **embedded engine** is a library that runs inside the process of the application. SQLite, LMDB, RocksDB and LevelDB are embedded. A call to `put()` is a function call, and the data files belong to the application. A **client/server** database such as PostgreSQL or MySQL runs as its own process. Clients send queries over a socket.
+
+## The layers
+
+Every engine in this track has the same seven layers, from top to bottom:
+
+| Layer | Job | In this track |
+|---|---|---|
+| API | `begin`, `get`, `put`, `delete`, `commit`, `abort` | [ACID](/databases/transactions/acid) |
+| Transaction manager | snapshots, visibility, write conflicts, commit order | [MVCC](/databases/transactions/mvcc), [SSI](/databases/transactions/serializable-snapshot-isolation) |
+| Access method | find the key in a B+ tree, an LSM tree or a hash table | [B+ trees](/databases/btrees/b-trees), [compaction](/databases/lsm/compaction-leveled-vs-tiered) |
+| Buffer pool | cache pages in frames, pin them, write back dirty pages | [buffer pools](/databases/storage/buffer-pools) |
+| Page and file layer | page numbers to file offsets, checksums | [slotted pages](/databases/storage/pages-and-slotted-records), [checksums](/databases/storage/durability-fsync-torn-writes-and-checksums) |
+| Write-ahead log | log records, LSNs, the WAL rule, group commit | [WAL](/databases/recovery/write-ahead-logging), [group commit](/databases/recovery/group-commit) |
+| OS and device | `pread`, `write`, `fsync` | [disks vs SSDs](/databases/storage/disks-vs-ssds) |
+
+Each layer talks only to the layer below it, with one exception. The buffer pool must ask the log before it writes a page, because of the WAL rule.
+
+<Predict
+  id="put-writes"
+  question="The tree is in the buffer pool. You call put() on an existing key and then commit. How many data pages does the engine write to the data file before commit returns?"
+  options={[
+    "One: the leaf page that holds the key",
+    "None: commit writes and fsyncs only the log",
+    "Two: the leaf page and its parent",
+  ]}
+  answer={1}
+  explain="Commit forces the log, not the pages. The changed leaf stays dirty in the buffer pool and goes to disk later, at an eviction or a checkpoint. This is NO-FORCE: one sequential log write is cheaper than random page writes."
+>
+<ArchitectureDemo />
+</Predict>
+
+Things to try:
+
+1. Keep 24 keys and 8 frames, and click **put + commit** for k005. The tree visits 3 pages, all hits. The log gets 4 records and 4,244 bytes, with one write and one fsync. The data file gets no write.
+2. Click **put + commit** again. Now the log gets only 3 records and 130 bytes. The first change to a page after a checkpoint logs a full image of the page; the second change does not.
+3. Set the key to k019 and click **get**. The read visits 3 pages and touches no lower layer: no log record, no I/O.
+4. Set the key to k030 and click **put + commit**. The key is new and its leaf is full, so the leaf splits. The split record holds the images of 4 pages, and the operation logs 16,524 bytes.
+5. Click **checkpoint**. Now the dirty pages go to disk: 5 page writes, one fsync of the data file and one of the log.
+6. Set 60 keys. Then click **put (no commit)** for k005, k025, k045 and k015. The fourth put has no commit, but it writes a page and fsyncs the log. The pool needs a frame, the victim is dirty, and the WAL rule forces the log first.
+
+## The life of a put()
+
+A `put(k, v)` inside a transaction goes down the layers like this:
+
+1. **API.** The engine checks that the transaction is open.
+2. **Transaction manager.** It looks at the newest version of `k`. If another open transaction wrote it, or a transaction committed it after our snapshot, this is a write conflict.
+3. **Access method.** It descends from the root to the leaf. Each page comes from the buffer pool and stays pinned while it is in use. A full leaf splits first.
+4. **Write-ahead log.** It appends a record with the old and the new value. The record gets the next LSN. The page header gets that LSN as its pageLSN.
+5. **Buffer pool.** The leaf is now dirty. Its recLSN, the first LSN that dirtied it, goes into the dirty page table.
+
+Nothing has touched the device yet. At commit, the log layer appends a commit record and calls `write()` and `fsync()`. Only then does the client hear "committed". The page goes to disk much later. Before that write, the buffer pool forces the log up to the pageLSN.
+
+## The life of a get()
+
+A `get(k)` stops much higher. The transaction manager gives it a snapshot. The access method descends to the leaf through the buffer pool, and the transaction manager picks the newest version that the snapshot can see. A get writes nothing, with one exception: a cache miss can evict a dirty page. Then the read pays for a page write and a log flush, as step 6 shows.
+
+## Embedded vs client/server
+
+| | Embedded (SQLite, LMDB, RocksDB) | Client/server (PostgreSQL, MySQL) |
+|---|---|---|
+| A call costs | a function call | a round trip over a socket, and a context switch |
+| Concurrency | threads of one process; LMDB and SQLite also share files between processes with locks | many connections, one server process per connection (PostgreSQL) or a thread pool |
+| Who owns the files | the application | the server |
+| Crash of the application | can be a crash of the engine | the server keeps running |
+| Typical use | phones, browsers, devices, the storage layer of a larger system | shared databases for many applications |
+
+Many servers use an embedded engine inside. MySQL runs InnoDB, MongoDB runs WiredTiger, and CockroachDB runs Pebble, an LSM engine in Go that follows the design of RocksDB.
+
+## Five choices
+
+An engine is mostly the sum of five choices. Each choice moves cost from one place to another.
+
+<DesignExplorerDemo />
+
+1. Read the default: B+ tree, in place, undo + redo log, many writers, own buffer pool. This is InnoDB. A 100-byte update writes about 42 bytes for each byte: one log record and one 4 KiB page.
+2. Select **Copy-on-write** and **Shadow paging**. Write amplification grows to about 246, because each update copies the whole path from leaf to root. In exchange, recovery has no work to do.
+3. Select **LSM tree**. The page writes are gone, and write amplification falls to 24. A point read now costs 1.03 I/O and a range of 100 records costs 7 I/Os instead of 4.
+4. Select **Hash + log**. Writes cost about 5 bytes for each byte, but a range of 100 records costs 100 I/Os. The hash keeps no key order.
+5. Select **B+ tree**, **In place**, and **OS page cache / mmap**. The explorer refuses. With a writable memory map, the OS can write a page before its log record is durable.
+
+### B+ tree or LSM tree
+
+A B+ tree keeps one copy of each key in a sorted page. Reads and ranges are cheap, but each update rewrites a page. An LSM tree buffers writes in memory and writes sorted runs. It writes fewer bytes, but a read may probe several runs, and compaction uses bandwidth in the background. The [tuning lesson](/databases/lsm/tuning-an-lsm-tree) finds the crossover for one workload.
+
+### In place, copy-on-write or log-structured
+
+An **in-place** engine overwrites a page at its own address. It needs a log for crash safety, and it needs protection against torn pages. A **copy-on-write** engine writes changed pages to new addresses and then switches one root pointer. Old pages stay valid, so readers need no locks. A **log-structured** engine never changes a file after it writes it. Space comes back only when compaction or cleaning rewrites live data.
+
+### Undo, redo or shadow paging
+
+The log design follows from the buffer pool policy, as the [WAL lesson](/databases/recovery/write-ahead-logging) explains. STEAL needs undo information, and NO-FORCE needs redo information. ARIES logs both. PostgreSQL logs only redo, because MVCC keeps old row versions in the table. SQLite in rollback mode logs only undo: it copies the original pages to a journal and forces the new pages at commit. Shadow paging logs nothing, because the old tree is still on disk.
+
+### One writer or many
+
+LMDB and SQLite allow one write transaction at a time. There are no write-write conflicts, no deadlocks and no latches between writers. The cost is write throughput. Each commit waits for its own fsync, and nothing can share it. InnoDB, PostgreSQL and RocksDB allow many writers. They need locks or optimistic checks, latch crabbing in the tree, and group commit to share log flushes.
+
+### Own buffer pool or mmap
+
+With `mmap`, the OS page cache is the buffer pool. The code is small, and reads cost no copy. But the OS chooses the victims and the time of each write-back, and an I/O error arrives as a `SIGBUS` signal. Crotty, Leis and Pavlo measured these problems in a CIDR 2022 paper: "Are You Sure You Want to Use MMAP in Your Database Management System?". LMDB maps its file read-only and writes with `pwrite`, so copy-on-write keeps it safe. Engines that update in place keep their own pool and often use `O_DIRECT`.
+
+| Choice | Option A | Option B | Engines |
+|---|---|---|---|
+| Access method | B+ tree: cheap reads and ranges | LSM: cheap writes, more read probes | SQLite, InnoDB vs RocksDB, Cassandra |
+| Updates | in place: small files, needs a log | copy-on-write: lock-free readers, path copies | InnoDB vs LMDB, WiredTiger |
+| Crash safety | log (ARIES, redo-only) | shadow paging: no recovery work | PostgreSQL vs LMDB |
+| Writers | one: simple, fsync-bound | many: locks, latches, group commit | SQLite, LMDB vs InnoDB, RocksDB |
+| Caching | own pool: control | mmap: small code, little control | InnoDB vs LMDB |
+
+## Connect
+
+- The next lesson builds this engine from the parts: [a tiny key-value store, end to end](/databases/engine/a-tiny-key-value-store-end-to-end).
+- The numbers of the explorer come from [read, write and space amplification](/databases/storage/read-write-and-space-amplification).
+- [Latency vs throughput](/performance/systems/latency-vs-throughput) explains why a single writer is bound by fsync latency.
+- [Write policies](/architecture/caches/write-policies) of CPU caches make the same choice as NO-FORCE: write back later.
+
+<Recall cards={[
+  { q: "Which layer must the buffer pool consult before it writes a dirty page, and why?", a: "The write-ahead log. The WAL rule says the log must be durable up to the pageLSN of the page before the page is written." },
+  { q: "What does commit write to the device in an engine with STEAL and NO-FORCE?", a: "Only the log: a commit record, then write() and fsync(). The dirty pages go to disk later, at evictions or checkpoints." },
+  { q: "How can a get() cause a page write and a log fsync?", a: "A cache miss needs a frame. If the victim is dirty, the pool writes it back, and the WAL rule first forces the log up to its pageLSN." },
+  { q: "Why does shadow paging need no recovery work after a crash?", a: "It never overwrites a committed page. The old root and all its pages are still valid until the new root pointer is written." },
+  { q: "What do single-writer engines such as LMDB and SQLite gain and lose?", a: "They gain simplicity: no write conflicts, no deadlocks, no latches between writers. They lose write throughput, because each commit pays its own fsync." },
+  { q: "Why is a writable mmap unsafe for an engine that updates pages in place?", a: "The OS can write a changed page to disk at any time, before the log record that describes the change is durable." },
+]} />

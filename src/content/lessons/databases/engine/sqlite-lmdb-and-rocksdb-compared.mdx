@@ -1,0 +1,101 @@
+---
+summary: "Three embedded engines, three answers to the same questions. SQLite (B-tree pages, rollback journal or WAL, one writer, file locks), LMDB (copy-on-write B+ tree on mmap, lock-free readers, no log) and RocksDB (LSM tree, WAL, column families, many writers), plus InnoDB and WiredTiger; what one put() writes, and which workload fits which engine."
+---
+import { PutRaceDemo, WorkloadFitDemo } from "@/demos/db/EngineCompareDemos";
+
+The [first lesson](/databases/engine/architecture-of-an-embedded-engine) of this module named five design choices. SQLite, LMDB and RocksDB are three embedded engines that chose differently on almost every axis, and each is excellent at something. This lesson puts them side by side. It starts with the smallest unit of work: one `put()` of a 100-byte value, with each engine's durable defaults.
+
+<Predict
+  id="put-bytes"
+  question="One put() of a 100-byte value into a tree of height 3, with the default durable settings. Which engine writes the most bytes before the commit returns?"
+  options={["SQLite in WAL mode", "LMDB", "RocksDB with sync = true"]}
+  answer={1}
+  explain="LMDB copies the whole path from leaf to root, writes those pages and a free-list page, then a meta page: 20,480 bytes with two fsyncs. SQLite appends one 4 KiB page to its WAL. RocksDB appends 138 bytes to its log."
+>
+<PutRaceDemo />
+</Predict>
+
+Things to try:
+
+1. Read the defaults. SQLite in WAL mode writes 4,120 bytes and one fsync. LMDB writes 20,480 bytes and two fsyncs. RocksDB writes 138 bytes and no fsync at all, because `WriteOptions.sync` is false by default.
+2. Switch on **RocksDB WriteOptions.sync = true**. Now RocksDB pays one fsync too. Without it, a process crash keeps the commit, because the bytes are in the OS cache, but a power cut can lose it.
+3. Select **Rollback journal**. SQLite now writes 8,712 bytes and calls fsync three times: twice on the journal, once on the database. Deleting the journal is the commit.
+4. Move **Tree height** to 5. LMDB grows by one page per level, because it copies the path. SQLite and RocksDB do not change.
+5. Look at the "written later" line. SQLite's checkpoint writes the page a second time. RocksDB's flush and compaction rewrite the entry several times, about 1,404 bytes per put in the leveled model.
+
+## SQLite
+
+SQLite stores a whole database in one file of fixed-size pages, 4,096 bytes by default. Each table is a B-tree keyed by a 64-bit rowid, with the rows in the leaves. Each index is a separate B-tree. It has two ways to make a commit atomic:
+
+- **Rollback journal** (`journal_mode = DELETE`, the default). Before a page changes, SQLite copies the original page into the `-journal` file and syncs it. Then it overwrites the page in the database file and syncs that. Deleting the journal is the commit. After a crash, a journal that still exists is "hot": the next opener copies the old pages back. This is undo logging with FORCE.
+- **WAL mode** (`journal_mode = WAL`). A commit appends the new versions of the changed pages to the `-wal` file as frames, each with a 24-byte header. The last frame marks the commit. Readers find the newest version of a page through the wal-index, a hash table in the `-shm` shared-memory file. A **checkpoint** copies the pages back into the database file, by default when the WAL reaches 1,000 pages. This is redo logging of whole pages.
+
+SQLite allows **one writer** at a time. In rollback mode, a lock on the file stops readers during the final write. The locks go from SHARED to RESERVED, PENDING and EXCLUSIVE. In WAL mode, readers and the writer do not block each other. Each reader sees the WAL up to the last commit that existed when it started. A long reader can stop a checkpoint at its end mark, and then the WAL grows.
+
+`PRAGMA synchronous = FULL` syncs at every commit. In WAL mode, `NORMAL` syncs only at checkpoints. The database stays consistent, but the last commits before a power cut can be lost.
+
+## LMDB
+
+LMDB is a [copy-on-write B+ tree](/databases/btrees/copy-on-write-b-trees) in one file that it maps into memory read-only. Readers read pages directly from the map, with no copy and no lock. A write transaction copies every page on its path to new page numbers and writes them with `pwrite`. Then it syncs, writes the new root into the older of two **meta pages**, and syncs again. The flags `MDB_NOMETASYNC` and `MDB_NOSYNC` drop the second sync or both.
+
+There is **no log and no recovery**. At startup, LMDB reads both meta pages and uses the newer valid one. Only one writer runs at a time, under a mutex in the lock file.
+
+Each reader takes a slot in the **reader table** of that file and writes its snapshot's transaction id there. A writer reuses a freed page only when no reader slot is older than the transaction that freed it. A reader that stays open for a long time stops all page reuse. The file then grows until it reaches the map size and fails with `MDB_MAP_FULL`.
+
+## RocksDB
+
+RocksDB started at Facebook in 2012 as a fork of LevelDB. It is an [LSM tree](/databases/lsm/memtables-and-sstables). A write goes to the WAL and into a memtable, a skip list. Full memtables are flushed to L0 SSTables, and [leveled compaction](/databases/lsm/compaction-leveled-vs-tiered) merges them into deeper levels. The `MANIFEST` file records which SSTables form the current version.
+
+**Column families** are separate key spaces in one database. Each has its own memtables, SSTables and options, and all of them share one WAL. So one write batch can change several column families atomically.
+
+Many threads can write at the same time. Concurrent writers join a **write group**. A leader writes the WAL records of the whole group, and then the writers insert into the memtable in parallel. With `sync = true`, the leader's one fsync covers the whole group. Reads use sequence numbers as snapshots, a block cache for data blocks, and a Bloom filter for each SSTable. Transactions come from `TransactionDB` (locks) or `OptimisticTransactionDB` (checks at commit).
+
+## The three designs side by side
+
+| | SQLite | LMDB | RocksDB |
+|---|---|---|---|
+| Structure | B-tree pages updated in place | copy-on-write B+ tree | LSM tree of sorted runs |
+| Write path | journal or WAL frame, then the page | path copy, then a meta page | WAL record, then the memtable |
+| Read path | page cache, then the file (or the WAL) | the memory map, no copy | memtable, then each level, with filters |
+| Commit durability | journal deleted, or WAL frame synced | meta page synced | WAL record (synced if `sync = true`) |
+| Recovery | roll back a hot journal, or replay the WAL | none | replay the WAL into a memtable |
+| Writers | one | one | many, grouped |
+| Readers | locks (rollback) or WAL snapshots | lock-free snapshots | sequence-number snapshots |
+
+## Which workload fits which engine
+
+<WorkloadFitDemo />
+
+1. Read the default: 20% writes, 8 clients, every commit durable, 1 ms fsync. RocksDB scores 33,656 operations per second, SQLite 4,846 and LMDB 2,433. The single-writer engines pay one or two fsyncs per commit, and nothing shares them.
+2. Move **Client threads** to 1. RocksDB falls to 4,885, close to SQLite. Its advantage here was group commit, not the LSM tree.
+3. Move **Share of writes** to 0 and **Reads that are range scans** to 100%. Now SQLite and LMDB lead with 63,634 against 47,375. A B+ tree reads a range from a few adjacent leaves; an LSM tree must merge one run per level.
+4. Set 90% writes and switch off **Every commit durable**. SQLite reaches 89,197, LMDB 31,306 and RocksDB 280,710. Without fsyncs, write amplification decides: 66.3, 198.2 and 12.3 bytes per byte.
+5. Move **Updates per transaction** to 100 with durable commits on. LMDB's write amplification falls from 198.2 to 93.1, because 100 updates share the upper pages of their paths.
+
+| Choose | When |
+|---|---|
+| SQLite | one application file, SQL, small to medium data, few writers, portability; WAL mode for concurrent readers |
+| LMDB | read-heavy work, many reader threads or processes, fast restarts, data that fits the map size; short read transactions |
+| RocksDB | write-heavy or ingest work, many writers, large data on SSDs, tunable trade-offs; the storage layer under another system |
+
+## Two more designs
+
+**InnoDB**, the default engine of MySQL, is a B+ tree with 16 KiB pages updated in place. Each table is a clustered index: the rows live in the leaves of the primary-key tree. It logs physiological redo records in its redo log and keeps old row versions in undo logs, which serve both rollback and MVCC reads. Its doublewrite buffer protects pages against torn writes. Many writers run with row locks.
+
+**WiredTiger**, the engine of MongoDB, keeps B+ tree pages in memory with update chains for changed records. It never overwrites a page on disk. When it evicts or checkpoints a page, it writes a new image to a new block, so a checkpoint is a consistent copy-on-write snapshot. MongoDB takes a checkpoint every 60 seconds and uses a redo journal between checkpoints. Writers run concurrently with snapshot isolation; a write conflict makes the transaction retry.
+
+## Connect
+
+- The same put() through all layers of one engine: [architecture of an embedded engine](/databases/engine/architecture-of-an-embedded-engine).
+- The B+ tree and LSM read and write costs come from [tuning an LSM tree](/databases/lsm/tuning-an-lsm-tree) and [read, write and space amplification](/databases/storage/read-write-and-space-amplification).
+- Why one fsync per commit limits a single writer: [group commit](/databases/recovery/group-commit) and [latency vs throughput](/performance/systems/latency-vs-throughput).
+- LMDB's reader table and page reuse: [copy-on-write B-trees](/databases/btrees/copy-on-write-b-trees).
+
+<Recall cards={[
+  { q: "What is the commit point of SQLite in rollback-journal mode, and in WAL mode?", a: "Rollback mode: deleting the journal, after the new pages are synced. WAL mode: the synced WAL frame that carries the commit mark." },
+  { q: "Why does LMDB need no recovery after a crash?", a: "It never overwrites a page that a committed version uses. At startup it picks the newer valid of its two meta pages, and that root names a complete tree." },
+  { q: "How does a long LMDB read transaction make the file grow?", a: "Its reader slot keeps an old transaction id, so no page freed after it started can be reused. Every update then takes new pages." },
+  { q: "What does RocksDB's default WriteOptions.sync = false risk?", a: "The WAL record is in the OS cache, not on the device. A process crash keeps it, but a power cut can lose acknowledged writes." },
+  { q: "How do many RocksDB writers share one fsync?", a: "They join a write group. The leader writes the WAL records of the whole group and makes one sync for all of them." },
+  { q: "Where do InnoDB and PostgreSQL keep the old row versions that MVCC readers need?", a: "InnoDB keeps them in undo logs. PostgreSQL keeps them in the table itself as older tuple versions." },
+]} />

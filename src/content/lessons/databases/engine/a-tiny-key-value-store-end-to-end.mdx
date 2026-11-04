@@ -1,0 +1,183 @@
+---
+summary: "TinyKv: a working key-value engine built from the parts of this track. A paged B+ tree over the buffer pool, CRC-32C pages, an ARIES log with full-page images, snapshot isolation with version chains, group commit, checkpoints, crash and recovery; then the same workload in B+ tree mode and in LSM mode."
+---
+import { KvPlaygroundDemo, WorkloadRunnerDemo } from "@/demos/db/EngineKvDemos";
+
+This lesson builds **TinyKv**, a small engine that you can run, crash and inspect. Its code is in `src/sims/db/engine/kv.ts`. It reuses the parts of the earlier modules where they fit. It adds the glue that a real engine needs: page numbers, checksums, full-page images and a recovery that knows the tree.
+
+| Part | Comes from | What TinyKv does with it |
+|---|---|---|
+| Buffer pool | `storage/BufferPool`: frames, pins, dirty bits, LRU or Clock | TinyKv plugs in its own page I/O. The write callback enforces the WAL rule. |
+| Checksums | `storage/crc32c` | Every page write stores a CRC-32C, and every page read checks it. |
+| B+ tree | the split and separator rules of [B+ trees](/databases/btrees/b-trees) | Nodes are numbered pages in the pool. Page 0 is a meta page with the root. |
+| Log and recovery | the [ARIES](/databases/recovery/aries) design: LSNs, prevLSN chains, CLRs, ATT, DPT, master record | Records change one key in one leaf. Splits log page images. |
+| Transactions | [MVCC](/databases/transactions/mvcc) snapshots and first-updater-wins | Each key in a leaf holds a short chain of versions. |
+| Group commit | the [group commit](/databases/recovery/group-commit) lesson | `groupCommit` commits share one write and one fsync. |
+| LSM mode | `lsm/LsmTree` | `LsmKv` puts it behind the same interface. |
+
+## The interface and the core loop
+
+Both engines implement one interface:
+
+```ts
+interface KvLike {
+  begin(readOnly?: boolean): number;
+  get(txn: number | null, key: string): string | undefined;
+  put(txn: number, key: string, value: string): void;
+  del(txn: number, key: string): void;
+  commit(txn: number): { durable: boolean; ts: number };
+  abort(txn: number): void;
+}
+```
+
+The write path is the heart of the engine. Here it is as a Rust sketch, with the same steps as the TypeScript code:
+
+```rust
+fn put(&mut self, t: TxnId, key: &[u8], val: &[u8]) -> Result<(), Error> {
+    let leaf = self.tree.find_leaf(&mut self.pool, key)?;          // pins root..leaf
+    let chain = self.pool.page(leaf).chain(key);                    // versions, newest first
+    if let Some(head) = chain.first() {
+        if head.txn != t && !self.txns.visible_committed(head.txn, self.txns[t].snap) {
+            self.abort(t)?;                                         // first updater wins
+            return Err(Error::Conflict);
+        }
+    }
+    let leaf = if chain.is_empty() && self.pool.page(leaf).is_full() {
+        self.tree.split_down(&mut self.pool, &mut self.log, key)?   // logs one SMO record
+    } else { leaf };
+    if !self.pool.is_dirty(leaf) { self.log_full_page_image(leaf); } // first change this cycle
+    let after = self.prune(Version::new(t, val), &chain);
+    let lsn = self.log.append(Rec::Cell { txn: t, prev: self.txns[t].last, page: leaf,
+                                          key, before: chain, after: after.clone() });
+    self.pool.page_mut(leaf).set_cell(key, after, lsn);            // pageLSN = lsn, dirty
+    self.txns[t].last = lsn;
+    Ok(())
+}
+```
+
+<Predict
+  id="steal-undo"
+  question="T2 puts k05 and does not commit. A checkpoint writes the leaf with T2's version to the data file. Then the power fails. After recovery, what does get(k05) return?"
+  options={[
+    "T2's value: it is on disk now",
+    "The old committed value",
+    "Nothing: recovery stops at the uncommitted page",
+  ]}
+  answer={1}
+  explain="The checkpoint stole the page, but the WAL rule forced T2's log record to disk first. Analysis finds T2 without a commit record, so T2 is a loser. Undo finds k05 again, puts back its old chain and writes a CLR."
+>
+<KvPlaygroundDemo />
+</Predict>
+
+Things to try:
+
+1. Click **begin**, then **put k05**. The log tail gets a full image of the leaf and a cell record. Both dots are hollow: the records are only in memory. Click **commit**, and both dots fill.
+2. Click **begin read-only**. Then **begin** again, **put k05** and **commit**. The leaf now shows two versions of k05. Select the read-only transaction in the table and click **get k05**. It still sees the old value, because the old version is in its snapshot.
+3. Click **begin**, **put k07**, and **checkpoint**. The leaf with the uncommitted version is now on disk. Click **crash** and **recover**. Recovery finds one loser, undoes it with a CLR, and k07 is absent again.
+4. Select **3 commits per fsync**. Begin, put and commit once. The console says the client is not told yet. Crash and recover: the commit is gone, but no client heard "committed", so nothing broke.
+5. Put new keys, such as k21 to k29, in one transaction. Watch leaves split and the root grow. A split logs one record with the images of every page it changed.
+
+## Pages and version chains
+
+A leaf holds up to `leafCap` keys. Each key has a **version chain**: a list of versions, newest first, and each version names the transaction that wrote it. A delete is a version with no value, a **tombstone**. A reader walks the chain and takes the first version that it may see. That is its own version, or a version of a transaction that committed at or before its snapshot timestamp.
+
+A write checks only the head of the chain. If the head belongs to an open transaction, or to a transaction that committed after the writer's snapshot, the writer aborts. This is **snapshot isolation** with first-updater-wins, as PostgreSQL does it at `REPEATABLE READ`. When a write adds a version, it also drops the versions that no open snapshot can see. This is a small, local form of [garbage collection](/databases/transactions/mvcc-garbage-collection).
+
+## Splits are not undone
+
+A split changes three or four pages: the full page, a new right page, the parent (or a new root), and the meta page. TinyKv splits full pages on the way down, top-down, so the parent always has room. It logs the split as one **structure modification record** (SMO) with the new images of all those pages. Redo installs the images. Undo never touches them, even when the transaction that caused the split aborts.
+
+So undo must be **logical**. To undo a change of key `k`, TinyKv descends the tree again, because a later split may have moved `k` to another leaf. It restores the old chain and writes a CLR for the page where it found the key. ARIES calls a split that survives its transaction a *nested top action*. InnoDB does the same with mini-transactions.
+
+## Torn pages and full-page images
+
+A page write can tear: the first half is new and the second half is old. The checksum finds the torn page, but it cannot repair it.
+
+So TinyKv follows PostgreSQL's `full_page_writes`. The first change to a page after a checkpoint logs a full image of the page. If the page gets dirty again in the same checkpoint cycle, its recLSN points back to that image. Redo starts at the smallest recLSN, so it always meets an image before the first change that it needs. It installs the image over a torn page and then replays the later records.
+
+## Checkpoints, crash and recovery
+
+A checkpoint has six steps. It writes a begin record, writes every dirty page and fsyncs the data file. Then it writes an end record with the open transactions, flushes the log, and updates the **master record**. The master record is small and is written in one piece. The order matters: the master may name the checkpoint only after the data fsync. Before that fsync, the OS can still lose the page writes.
+
+The crash model is strict. Each unsynced page write survives with probability 1/2, in any order. Of the log records that were written but not synced, a random prefix survives.
+
+Recovery then runs the three ARIES passes. Analysis starts at the master record, redo repairs every page in the dirty page table, and undo rolls back the losers with CLRs. It ends with a checkpoint, so a crash during recovery starts from the same place again. Here is the redo loop as a Zig sketch:
+
+```zig
+fn redo(db: *Db, dpt: *const Dpt, from: Lsn) !void {
+    var lsn = from;
+    while (lsn <= db.log.last()) : (lsn += 1) {
+        const rec = db.log.get(lsn);
+        for (rec.pages()) |change| {
+            const rec_lsn = dpt.get(change.page) orelse continue; // page was clean
+            if (lsn < rec_lsn) continue;                          // already on disk
+            const page = try db.pool.fetchUnchecked(change.page); // may be torn
+            if (change.image) |img| {
+                if (!page.checksum_ok or page.lsn < lsn) page.install(img, lsn);
+            } else if (page.checksum_ok and page.lsn < lsn) {
+                page.setCell(change.key, change.chain, lsn);
+            }
+        }
+    }
+    for (dpt.pages()) |p| if (!(try db.pool.fetchUnchecked(p)).checksum_ok)
+        return error.TornPageWithoutImage;                        // fail-stop, never guess
+}
+```
+
+## Group commit
+
+With `groupCommit = n`, a commit appends its record and returns at once with `durable = false`. The n-th commit flushes the log. That one write and one fsync make all n commits durable, and only then does each client hear "committed". This Go sketch shows the same rule with many client goroutines:
+
+```go
+func (l *Log) Commit(rec Record) error {
+	l.mu.Lock()
+	lsn := l.append(rec)
+	for l.flushed < lsn {
+		if !l.flushing { // become the leader of the next group
+			upTo := l.end
+			l.flushing = true
+			l.mu.Unlock()
+			err := l.file.WriteAndSync(l.buffer(l.flushed, upTo))
+			l.mu.Lock()
+			l.flushing, l.flushed = false, upTo
+			l.cond.Broadcast()
+			if err != nil { l.mu.Unlock(); return err }
+		} else {
+			l.cond.Wait() // a follower: the leader's fsync covers us
+		}
+	}
+	l.mu.Unlock()
+	return nil
+}
+```
+
+## B+ tree mode vs LSM mode
+
+`LsmKv` wraps the LSM tree of the [LSM module](/databases/lsm/memtables-and-sstables). A transaction buffers its writes in a write batch and reads at an LSM snapshot, a sequence number. At commit it checks each written key for a newer version than the snapshot, as RocksDB's `OptimisticTransactionDB` does. Then it appends the batch to the WAL and inserts it into the memtable.
+
+<WorkloadRunnerDemo />
+
+1. Keep 50% writes. The B+ tree writes about 54 bytes for each byte that the user writes: 1,084 log bytes and 1,901 page bytes per operation. The LSM tree writes about 4.6 bytes for each byte.
+2. Look at the B+ tree log bytes. Full-page images are 81% of them: each page that a checkpoint cycle touches logs 4 KiB once. A longer checkpoint interval logs fewer images, but recovery then reads more log.
+3. Move to 0% writes. Both engines read about one page or block per lookup, and the throughput is almost equal: 225,476 against 219,238 operations per second in the model.
+4. Select **128 frames**. The B+ tree now finds most leaves in the pool: 0.063 page reads per operation in place of 0.874. Its page writes also fall, because one write-back carries more updates.
+5. Select **SSD, 1 ms**. At 50% writes, both engines fall to about 4,100 operations per second: 4,140 and 4,239. One client that waits for each fsync is limited by fsync latency, not by the tree.
+6. Select **8 per fsync** with 16 frames. The LSM tree jumps, but the B+ tree gets slower: 0.442 fsyncs per operation in place of 0.235. Each dirty eviction now forces its own log flush, because the log lags behind.
+
+The last point is a real coupling. The WAL rule ties page writes to log flushes. Engines with small pools keep a background writer that flushes the log and writes dirty pages before the pool needs a frame. PostgreSQL has a WAL writer and a background writer for this reason.
+
+## Connect
+
+- The next lesson attacks this engine with a fuzzer: [crash testing the engine](/databases/engine/crash-testing-the-engine).
+- The redo and undo passes are those of [ARIES](/databases/recovery/aries); the images are those of [torn writes](/databases/storage/durability-fsync-torn-writes-and-checksums).
+- The pool is the one from [buffer pools](/databases/storage/buffer-pools), and its eviction cost is the [write-back](/architecture/caches/write-policies) cost of a CPU cache.
+- [I/O performance](/performance/systems/i-o-performance) explains why random page writes and fsyncs dominate the model.
+
+<Recall cards={[
+  { q: "Why does TinyKv undo a change by descending the tree again instead of going to the page in the log record?", a: "A later split may have moved the key to another leaf. Splits are never undone, so undo must find the key logically and log a CLR for the page where it is now." },
+  { q: "How does TinyKv repair a torn page?", a: "The first change to a page after a checkpoint logs a full image. Redo starts at or before that image, installs it over the torn page, and replays the later records." },
+  { q: "Why must the checkpoint fsync the data file before it updates the master record?", a: "Unsynced page writes can be lost in a crash. If the master names the checkpoint first, redo starts too late for pages whose writes were lost." },
+  { q: "What does a writer check under first-updater-wins snapshot isolation?", a: "The head of the version chain. If an open transaction wrote it, or it committed after the writer's snapshot, the writer aborts." },
+  { q: "With group commit, when does a client hear 'committed'?", a: "Only after the log flush that covers its commit record. The commit call itself can return earlier with durable = false." },
+  { q: "Why can group commit make a B+ tree engine with a small pool slower?", a: "The log lags behind, so evicting a dirty page forces a log flush first. Each eviction then pays its own fsync." },
+]} />

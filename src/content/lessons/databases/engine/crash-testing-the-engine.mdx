@@ -1,0 +1,111 @@
+---
+summary: "How engines are tested for crash safety: crash points at every write and fsync, an oracle that knows which commits must survive, torn writes, bit flips and lying fsyncs, coverage of crash points, and shrinking a failure to a minimal trace. With SQLite's crash VFS, ALICE, FoundationDB's simulator and Jepsen."
+---
+import { CrashFuzzerDemo, BugReplayDemo } from "@/demos/db/EngineCrashDemos";
+
+A recovery bug is quiet. The engine passes every normal test, because normal tests never lose power. The bug shows only when a crash hits one exact moment, for example between a page write and a log flush. So crash safety needs its own kind of test. That test runs the engine, cuts the power at chosen points, recovers, and compares the result with what the clients were promised.
+
+This lesson builds such a tester for TinyKv, the engine of the [previous lesson](/databases/engine/a-tiny-key-value-store-end-to-end). It has three parts. A **workload generator** makes random transactions from up to three clients. A **crash injector** stops the engine at an I/O point. An **oracle** decides if the state after recovery is correct.
+
+<Predict
+  id="clr-crash"
+  question="One bug makes undo skip its compensation log records (CLRs). What must the fuzzer do to expose it?"
+  options={[
+    "Cut the power in the middle of an undo",
+    "Nothing special: an abort, then any later power cut",
+    "Crash twice, once during recovery",
+  ]}
+  answer={1}
+  explain="An abort undoes the change in memory and writes an end record, but no CLR. After any later crash, redo repeats history and puts the aborted change back. The end record says the transaction is finished, so undo skips it. The aborted value is now visible."
+>
+<CrashFuzzerDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Run** with no bug. Watch the counters: thousands of power cuts, also inside recovery, and no violation. The heatmap fills as the crash points spread.
+2. Click **Reset** and switch on **Bug: skip the log fsync**. The first run fails: a commit that a client heard about is gone. The shrinker then cuts the trace to a few operations.
+3. Try **Bug: drop CLRs**. The minimal trace has no crash point at all. A write conflict aborts one client, and the final power cut is enough.
+4. Try **Bug: disable checksums**. It takes more runs, because a torn page does harm only when its two halves differ in a key that matters.
+5. Switch off the bugs and switch on **Fault: fsync that lies**. The correct engine now fails too. No engine can keep a commit that the device threw away.
+
+## The oracle
+
+The oracle must know what "correct" means after a crash. Every commit has three possible states for a client:
+
+- **Acknowledged**: commit returned, so the client was told. It must survive.
+- **In flight**: the commit record was written, but the flush had not returned. It may survive or not.
+- **Never attempted**: it must not appear.
+
+The log is a sequence, so the commits that survive are always a prefix of the commit order. The oracle replays the write sets of the first *j* commits for each *j* from the acknowledged count to the attempted count. The recovered state must equal one of them exactly. A state that matches a shorter prefix means a lost acknowledged commit. A state that matches no prefix means uncommitted or corrupt data.
+
+Three more checks run after each recovery:
+
+| Check | It catches |
+|---|---|
+| No page on disk has a pageLSN past the durable end of the log | a broken WAL rule, even when the data happens to look right |
+| The B+ tree invariants hold: sorted keys, separator bounds, equal leaf depth | half-done splits and torn inner pages |
+| Every `get()` returned the value of its snapshot plus its own writes | broken visibility and pruning of versions that a reader still needs |
+
+A `CorruptPageError` is a different outcome. The engine found a page with a bad checksum and no image to repair it, so it stopped. That is **fail-stop**: the database is down, but it did not return wrong data. The fuzzer counts it apart from silent violations.
+
+## Where to crash
+
+A crash point is a place where the state on the device can change. There are five kinds: `write()` and `fsync()` of the log, a page write, the `fsync()` of the data file, and the master record. A power cut keeps every synced byte. It also keeps a random prefix of the log records that were written but not synced. Each unsynced page write survives with probability 1/2, in any order. With **torn page writes** on, the page that was being written keeps its new first half and its old second half.
+
+The generator first runs a trace without crashes to list its I/O points. Then it picks one or more of them. Sometimes it adds a second crash point a little later, inside the recovery that follows. The heatmap shows where the power cuts landed: the kind of I/O against what the engine was doing.
+
+Some cells stay empty, and that is information too. A data-file fsync and a master write happen only in checkpoints and at the end of recovery. Redo never writes the log, because it only repeats records that are already durable. Rare cells, such as a page write during undo, need many runs. **Coverage-guided** selection gives a cell a weight of 1 / (1 + crashes there)², so rare cells get more crashes.
+
+In the tests, 2,000 guided runs with 2 crash points each inject 7,417 power cuts. 1,136 of them hit recovery itself, and there is no violation.
+
+## Faults the engine must survive, and one it cannot
+
+| Fault | TinyKv's defense | Result in 1,000 runs |
+|---|---|---|
+| Torn page write | CRC-32C finds it, a full-page image repairs it | no violation |
+| Bit flip in a page at rest | CRC-32C finds it; no image exists, so the engine stops | 239 fail-stops, 0 silent |
+| The same bit flips with checksums disabled | none | 385 silent violations |
+| fsync returns success but keeps nothing | none is possible | 227 violations, 58 fail-stops |
+
+In these runs, a bit flip hits one durable leaf at 30% of the power cuts. A lying fsync drops each sync with probability 0.2.
+
+The last row is the [fsyncgate](/databases/storage/durability-fsync-torn-writes-and-checksums) lesson in numbers. If the device or the OS loses data after it reported success, no recovery algorithm can bring it back. The defenses are outside the engine: drives with power-loss protection, and engines that stop on the first fsync error instead of retrying it.
+
+## Shrinking a failure
+
+A failing run of 60 random operations is hard to read. **Delta debugging** (Zeller, 1999) makes it small. The shrinker first tries to drop each crash point. Then it removes chunks of operations: halves, then quarters, down to single operations. It keeps every cut after which the run still fails in the same way. Crash points are attached to an operation and an I/O index inside it, so they stay in place while other operations disappear.
+
+<BugReplayDemo />
+
+1. Keep **Write the page before the log**. The fuzzer found it in run 3, and the trace went from 54 to 8 operations. Step to the checkpoint. It writes the dirty pages, then the power fails during the log write. The disk holds uncommitted values, and the log holds nothing to undo them.
+2. Select **Skip the log fsync**. Four operations are enough: an early power cut, begin, put and commit. Then the final power cut loses the commit. The right column shows the correct engine on the same trace.
+3. Select **Drop CLRs**. A write conflict aborts client A. At the final power cut, redo repeats A's put, and A's end record stops undo.
+4. Select **Skip full-page images**. A checkpoint tears page 1. The checksum finds it, but the log has no image, so recovery stops. This is fail-stop, not silent corruption.
+5. Select **Disable checksums**. Here the shrinker keeps 13 operations and two crash points, one of them inside recovery. Some bugs need a long story.
+
+## How real engines are tested
+
+- **SQLite** has several independent test harnesses. The TH3 harness reaches 100% branch coverage (MC/DC) of the core. Crash tests run SQLite on a special VFS (the OS interface layer) that simulates power loss. Unsynced writes are lost, reordered or garbled, and then the test checks that the database is intact. Other tests inject I/O errors and out-of-memory errors at every possible point.
+- **ALICE** (Pillai et al., OSDI 2014) records the system calls of an application's update protocol. Then it builds every crash state that the file system's persistence rules allow, runs the application's recovery and checks it. It found 60 crash vulnerabilities in 11 widely used applications, LevelDB, SQLite and Git among them. Many came from wrong assumptions about the order in which a file system persists writes.
+- **RocksDB** runs `db_stress` under `db_crashtest.py`. The black-box mode kills the process at random times. The white-box mode kills it at chosen points in the code. A fault-injection file system drops unsynced data to model power loss.
+- **FoundationDB** runs the whole cluster in one thread in a **deterministic simulation**. The network, the disks and the clock are simulated, and `BUGGIFY` points in the code inject faults. A seed makes every failure repeatable. TigerBeetle, written in Zig, does the same with its VOPR simulator.
+- **Jepsen** tests distributed databases from the outside. Clients run operations while a "nemesis" partitions the network, pauses processes and skews clocks. Checkers then analyze the history: Knossos for linearizability and Elle for transactional anomalies.
+
+TinyKv's fuzzer is a small deterministic simulation: the device and the crash are part of the program, and a seed replays any run.
+
+## Connect
+
+- The broken rules are those of [write-ahead logging](/databases/recovery/write-ahead-logging), [ARIES](/databases/recovery/aries) and [torn writes](/databases/storage/durability-fsync-torn-writes-and-checksums).
+- The read check tests the snapshot rules of [MVCC](/databases/transactions/mvcc).
+- A fuzzer finds bugs as [epoch-based reclamation](/concurrency/lock-free/epoch-based-reclamation) testing finds use-after-free: by forcing the rare interleaving.
+- The next lesson compares three engines that each solved crash safety differently: [SQLite, LMDB and RocksDB](/databases/engine/sqlite-lmdb-and-rocksdb-compared).
+
+<Recall cards={[
+  { q: "After a crash, which states may the recovered database be in?", a: "The result of the first j commits, for some j between the number of acknowledged commits and the number of attempted commits. In-flight commits may survive or not, but always as a prefix." },
+  { q: "Why does the oracle also check that no page on disk is newer than the durable log?", a: "A broken WAL rule can leave a state that looks right by chance. The invariant catches the bug before it causes visible damage." },
+  { q: "What is the difference between a fail-stop and a silent violation?", a: "Fail-stop: the engine finds a bad page and refuses to continue. Silent: it returns wrong data as if it were correct. Checksums turn silent corruption into fail-stop." },
+  { q: "Which fault can no engine survive, and what helps against it?", a: "An fsync that reports success but keeps nothing. Only hardware with power-loss protection and engines that stop on fsync errors help." },
+  { q: "How does a shrinker keep a crash point valid while it removes operations?", a: "The crash point is tied to one operation and an I/O index inside it. Removing other operations does not move it." },
+  { q: "What does a deterministic simulation such as FoundationDB's give a tester?", a: "Every source of randomness, including the network, disks and clock, comes from one seed, so any failure can be replayed exactly." },
+]} />

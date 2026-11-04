@@ -11,7 +11,7 @@ const KIND_LABEL: Record<string, string> = { "log.write": "log write", "log.fsyn
 export function Heatmap({ cells }: { cells: Map<string, number> }) {
   const max = Math.max(1, ...cells.values());
   return (
-    <div style={{ display: "grid", gridTemplateColumns: `52px repeat(${IO_KINDS.length}, minmax(0, 1fr))`, gap: 2, fontSize: 10.5 }}>
+    <div style={{ display: "grid", gridTemplateColumns: `64px repeat(${IO_KINDS.length}, minmax(0, 1fr))`, gap: 2, fontSize: 10.5 }}>
       <span />
       {IO_KINDS.map((k) => <span key={k} className="muted" style={{ textAlign: "center", lineHeight: 1.15 }}>{KIND_LABEL[k]}</span>)}
       {IO_CTXS.map((c) => (

@@ -1,0 +1,70 @@
+---
+summary: Fixed-size slots, a free list stored inside the free memory itself, and handles that catch stale references.
+---
+import { PoolDemo } from "@/demos/AllocatorDemos";
+
+When every object has the same size (particles, network packets, tree nodes, kernel inodes), you don't need a general allocator. Cut a buffer into equal **slots**, and keep the free ones on a linked list. The trick: a free slot isn't being used for anything, so **the slot itself stores the "next" pointer**. That gives zero metadata, O(1) allocate and free, and no external fragmentation for that size.
+
+<Predict
+  id="lifo"
+  question="You allocate A, B and C (in that order) from an empty pool, then free A, then free C. Which slot does the next allocation return?"
+  options={["A's slot", "C's slot", "The slot after C", "B's slot"]}
+  answer={1}
+  explain="Freed slots are pushed onto the head of the list and allocations pop from the head: last in, first out. C was freed last, so it comes back first. That's also the slot most likely to still be in cache."
+>
+<PoolDemo />
+</Predict>
+
+Things to try:
+
+1. Run **A, B, C · free A · free C**. The numbers on free slots show the free-list order: **1** is the head.
+2. Set the slot size to **48 B**: 1024 / 48 = 21 slots, and the 16 bytes left over are unusable. Now request **align 32**: it fails, because 48-byte slots are only guaranteed 16-byte alignment.
+3. Request 10 B from 64 B slots. The other 54 B are slack: pools trade internal waste for speed. Real systems keep several pools, one per size.
+4. **Churn**, then look at the free-list order. After a while it is scrambled, so consecutive allocations land far apart. That matters for cache locality (see Computer Architecture → Caches).
+
+## The intrusive free list
+
+<Steps>
+<div>Initialize: slot $i$ holds the address of slot $i+1$; the last holds null; `head` is slot 0.</div>
+<div>Allocate: `p = head; head = *p;` (one load and one store).</div>
+<div>Free: `*p = head; head = p;` (one store and one assignment).</div>
+<div>The minimum slot size is a pointer (8 bytes on 64-bit), because a free slot has to hold one. Slot alignment is the largest power of two dividing the slot size.</div>
+</Steps>
+
+```rust
+struct Pool { buf: Vec<u8>, slot: usize, head: Option<usize> }
+
+impl Pool {
+    fn alloc(&mut self) -> Option<usize> {
+        let i = self.head?;
+        self.head = self.read_next(i); // next index stored in the free slot's bytes
+        Some(i)
+    }
+    fn free(&mut self, i: usize) {
+        self.write_next(i, self.head);
+        self.head = Some(i);
+    }
+}
+```
+
+## Handles instead of pointers
+
+A pool slot is reused immediately, so a stale pointer silently aliases a *new* object. The robust fix, used in most game engines and ECS libraries, is a **generational handle**:
+
+- Each slot keeps a generation counter that increments on every free.
+- A handle is `(index, generation)`.
+- Dereferencing checks that the generation matches. A stale handle is detected instead of aliasing the new object.
+
+Handles are also smaller than pointers (two `u32`s, or one), they survive the pool being relocated, and they serialize trivially.
+
+<Callout kind="warn" title="Free-list corruption">
+A use-after-free write, or a double free, overwrites the next pointer. The next allocation can then return an arbitrary address, which is a classic exploitation primitive. glibc's tcache "safe-linking" stores `next ^ (slot_address >> 12)` so that a forged pointer is unlikely to decode to something useful. Debug pools add canaries or keep freed slots out of circulation for a while.
+</Callout>
+
+<Recall cards={[
+  { q: "Where does a pool allocator store its free list?", a: "Inside the free slots themselves: each free slot holds the pointer/index of the next free slot (an intrusive list)." },
+  { q: "Order in which a LIFO pool returns freed slots, and why that's good?", a: "Most recently freed first. That slot is likely still in cache." },
+  { q: "Minimum slot size for an intrusive free list on 64-bit?", a: "8 bytes: a free slot must hold a pointer (or 4 bytes if it stores a 32-bit index)." },
+  { q: "What problem do generational handles solve?", a: "Stale references: a (index, generation) handle is rejected once the slot has been freed and reused." },
+  { q: "What does glibc's safe-linking do?", a: "It stores free-list pointers XOR-ed with (slot address >> 12), so corrupted or forged pointers rarely decode to useful addresses." },
+]} />

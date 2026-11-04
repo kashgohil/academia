@@ -1,0 +1,133 @@
+---
+summary: "One append needs three block writes, and a crash can keep any subset. The classic outcomes, why fsck does not scale, the journal protocol with commit blocks and checkpoints, and what the three ext4 modes guarantee, checked at every crash point."
+---
+import { FsCrashExplorerDemo, FsJournalCostDemo } from "@/demos/os/FsJournalDemos";
+
+An append of one block to a file looks like one operation. On disk it is three writes in three places:
+
+- **D**: the new data block.
+- **I**: the inode, with the new size and a pointer to the block.
+- **B**: the block bitmap, with the new block marked as used.
+
+The disk completes writes in any order it likes, and a power cut can come at any moment. So any subset of the three can survive. This is the **crash consistency problem**. Three writes give 8 subsets, and only 3 of them are safe.
+
+| On disk after the crash | Result |
+|---|---|
+| Nothing | Old file. The append is lost, and that is acceptable. |
+| D | Old file. The data is in a block that nothing points to. |
+| I | The inode points at old bytes, and the bitmap says that the block is free. A second file can get the block. |
+| I and D | The data is right, but the bitmap says that the block is free. The same danger. |
+| B | The bitmap says used, and no inode owns it. The space leaks. |
+| B and D | The same leak. |
+| I and B | The metadata agrees, but the file holds old bytes. Maybe another user's deleted data. |
+| I, B and D | New file, complete. |
+
+Of the 8 states, 4 break the file system's rules, and 1 more shows wrong data to the reader.
+
+## fsck, and why it does not scale
+
+The first answer was to let the damage happen and repair it at boot. `fsck` scans every inode and every directory, counts all references, and rebuilds the bitmaps and link counts. It can restore consistency. It cannot know which data is right, so the "I and B" state passes every check.
+
+The real problem is time. The first pass alone must read the inode tables, which are 1.5625% of the disk. On a 10 TB disk that is about 156 GB, or about 13 minutes at the 200 MB/s of the disk model. Later passes add seeks, and the `uninit_bg` feature skips unused tables, so the true time varies. A log of a fixed size replays in seconds: a 1 GiB journal, a model input, takes about 5.4 s. The repair time should depend on what was in progress, not on the size of the disk.
+
+## The journal
+
+A **journal** is a small fixed area where a file system first writes what it intends to do. This is [write-ahead logging](/databases/recovery/write-ahead-logging) for file system blocks. On ext4 the journal layer is **jbd2**, and it logs whole blocks.
+
+The protocol has four steps:
+
+1. **Journal write.** Write a descriptor block (TxB) and copies of the blocks, then flush.
+2. **Commit.** Write the commit block (TxE), then flush. The transaction exists only when this block is durable.
+3. **Checkpoint.** Write the blocks to their home locations.
+4. **Free.** Update the journal superblock, so the space can be reused.
+
+The flush between steps 1 and 2 is the key to the design. Without it, the disk can make the commit block durable before the blocks that it covers. Recovery then trusts a transaction that is not there.
+
+Recovery reads the journal from its start. It copies each complete transaction home and ignores anything without a commit block. Replay is safe to repeat, because it only copies whole blocks. So a crash during recovery needs nothing special.
+
+jbd2 groups many operations into one running transaction, and it commits at least every 5 seconds by default, or at `fsync`. A block that many operations change appears once, and this is a large part of the saving.
+
+<Predict
+  id="writeback-garbage"
+  question="ext4 in data=writeback mode. An append's transaction commits and the data block has not reached the disk. Then the power fails, and replay runs. What does a reader of the file find?"
+  options={["The old file, because replay notices that the data is missing", "A longer file whose new block holds old bytes from the disk", "A consistent file with zeros in the new block"]}
+  answer={1}
+  explain="Writeback mode does not order data against the journal. Replay restores the inode and the bitmap, which are consistent. The new block holds whatever was there before, perhaps from a deleted file. Ordered mode prevents this."
+>
+<FsCrashExplorerDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **data=ordered** and **Append one block**. Move the crash slider from left to right. Press **Another disk order** and do it again. The result is always old or new. All 21 crash states agree: 16 old and 5 new.
+2. Select **No journal**. There are 8 states, as in the table: 2 old, 1 new, 1 garbage, 2 leaks and 2 dangling.
+3. Select **data=writeback**. There are 26 states, because the data has no order at all, and 5 of them are garbage. Click **garbage** and open one.
+4. Select **data=journal**. There are 25 states: 16 old and 9 new. Data and metadata move together.
+5. Select **Overwrite two blocks** with **data=ordered**. The file system stays fine, but 8 of 19 states hold a mix of old and new. Ordered mode does not make an overwrite atomic. With **data=journal**, no state is mixed.
+6. Go back to **data=ordered** and **Append one block**, and select **No flush**. Of 36 states, 6 replay junk over real blocks. Select **No flush, checksum**. The corrupt states disappear, but 1 garbage state stays, because the checksum covers only journal blocks.
+
+## The three modes of ext4
+
+The modes differ in what goes in the journal and when the data goes to its home.
+
+| `data=` | Journal holds | Data order | After a crash |
+|---|---|---|---|
+| `journal` | Metadata and data | Data goes to the journal first | Metadata consistent. Appends and overwrites are all or nothing, up to the last commit. |
+| `ordered` (default) | Metadata | Data reaches home before the commit | Metadata consistent. An append cannot expose old bytes. An overwrite can be mixed. |
+| `writeback` | Metadata | No order | Metadata consistent. A file can expose old bytes from other files. |
+
+None of them promises that recent writes survive. A write that has not reached a commit is lost in each mode, and only `fsync` closes that gap, as the [durability lesson](/databases/storage/durability-fsync-torn-writes-and-checksums) explains.
+
+The demo orders overwrite data in `data=ordered`, and so it shows the kindest case. Real ext4 orders mainly newly allocated blocks, so an overwrite is tied even less to the commit.
+
+Other designs reach the same goals in other ways. XFS logs only metadata, and it allocates **unwritten extents** first. It converts them after the data is on disk, so a crash shows zeros and not old bytes. With delayed allocation, ext4 also shrinks the ordered list, because blocks with no allocation yet are not in the transaction. `data=journal` turns delayed allocation off.
+
+`journal_async_commit` skips the flush before the commit block, and it relies on a checksum in the commit block. Newer ext4 also has `fast_commit`, which logs a small description of the change for `fsync`, and not whole blocks.
+
+## What each mode costs
+
+<FsJournalCostDemo />
+
+The model counts blocks for one `fsync`. All device values are labelled model inputs.
+
+1. Keep 4 KiB per `fsync` on the disk. Ordered mode writes 5.25 blocks per data block, and journal mode writes 6.25. The metadata dominates a small `fsync`, so both are much larger than 1.
+2. Read the times. Ordered mode takes 27.0 ms and journal mode takes 14.0 ms. Journal mode needs one seek, since all its bytes go to the journal in sequence. This is the surprise of `data=journal`: small synchronous writes can be faster.
+3. Move **Data per fsync** to 10 MiB. Ordered mode falls to 1.00 times the data, and journal mode rises to 2.01 times. Every byte is written twice, and this is why it is not the default.
+4. Set **Commits between checkpoints** to 1. Each commit now pays for its own metadata at home, so absorption is what makes the journal cheap.
+5. Set **Dirty data of other files** to 100 MiB. Writeback stays at 27.0 ms, and ordered rises to 564 ms. A commit must wait for all data in the transaction, so a small `fsync` waits for someone else's large write.
+
+Step 5 is **fsync entanglement**. It stalled desktop programs that called `fsync` often on ext3. Delayed allocation helps a lot, because dirty data with no blocks yet is not in the transaction.
+
+Select **NVMe SSD** and repeat steps 1 and 2. The times are now close. A seek no longer costs much, so the write amplification is what remains.
+
+Here is the rule for a program that wants its data safe, in any mode:
+
+```zig
+// Atomic replace: fsync the file, rename it, then fsync the directory.
+const f = try dir.createFile("config.tmp", .{});
+defer f.close();
+try f.writeAll(bytes);
+try f.sync();                                   // data and inode durable
+try dir.rename("config.tmp", "config");         // one transaction
+try std.posix.fsync(dir.fd);                    // the new name durable
+```
+
+<Callout title="On your Mac">
+APFS has no journal. It uses copy-on-write metadata, as the [next lesson](/os/fs/log-structured-and-copy-on-write-filesystems) explains. HFS+ had a metadata journal. The data modes here apply only to ext4 on Linux, and `fsync` on macOS does not flush the drive cache without `F_FULLFSYNC`.
+</Callout>
+
+## Connect
+
+- [Write-ahead logging](/databases/recovery/write-ahead-logging) is the same rule for database pages.
+- [fsync and torn writes](/databases/storage/durability-fsync-torn-writes-and-checksums) explains the flush that each barrier here depends on.
+- [Group commit](/databases/recovery/group-commit) is the database form of a shared transaction.
+- [The page cache](/os/fs/the-page-cache-and-writeback) holds the dirty data that a commit may wait for.
+
+<Recall cards={[
+  { q: "Which three writes does an append need, and how many crash subsets do they give?", a: "The data block, the inode and the block bitmap. They give 8 subsets. Only 3 are safe: none, data alone, and all three." },
+  { q: "Why does fsck not scale, and what can it not fix?", a: "It must read metadata in proportion to the disk size. It cannot tell correct data from old data, so an inode that points at old bytes passes." },
+  { q: "List the four steps of the journal protocol.", a: "Write the descriptor and block copies and flush. Write the commit block and flush. Checkpoint the blocks to their homes. Free the journal space." },
+  { q: "What goes in the journal in each ext4 mode, and which is the default?", a: "data=journal logs metadata and data. data=ordered logs metadata and writes data first. data=writeback logs metadata with no data order. Ordered is the default." },
+  { q: "What can a reader see after a crash in writeback mode that ordered mode prevents?", a: "A grown file whose new block holds old bytes, perhaps from a deleted file. Ordered mode writes the data before the commit." },
+  { q: "What is fsync entanglement?", a: "A commit in ordered mode waits for all data in the transaction. So a small fsync can wait for a large write by another program." },
+]} />

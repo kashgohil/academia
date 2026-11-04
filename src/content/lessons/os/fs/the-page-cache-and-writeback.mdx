@@ -1,0 +1,146 @@
+---
+summary: "The page cache as the one file cache: read-ahead, dirty pages, the flusher threads, dirty_ratio and its relatives, write throttling in balance_dirty_pages, O_DIRECT, fsync across the layers, drop_caches, and how to read free."
+---
+import { FsWriteBurstDemo, FsReadaheadDemo } from "@/demos/os/FsCacheDemos";
+
+Disks are slow and RAM is fast, so Linux keeps recently used file data in memory. This is the **page cache**. It is one cache for all uses: `read`, `write` and [mmap](/os/memory/mmap) all see the same physical pages. So a store through a shared mapping is visible to `read` at once, with no copying between caches. Linux merged its older separate buffer cache into this design in the 2.4 series.
+
+Each inode has an `address_space`, whose `i_pages` tree maps a file offset to a folio. A **folio** is a group of one or more contiguous pages. `read` goes through `filemap_read`: it finds the folio, copies the bytes to the user, and it reads from the disk only on a miss.
+
+Cached pages are not lost memory. The kernel reclaims clean pages at any time, as [page replacement](/os/memory/page-replacement) explains. A **dirty** page is harder. It holds changes that the disk does not have, so it must be written before it can be freed. The rest of this lesson is about how many dirty pages to allow.
+
+<Predict
+  id="burst"
+  question="A program writes 8 GiB at 2,000 MiB/s. The disk takes 200 MiB/s, and the machine has 16 GiB of dirtyable memory with default settings. How long until the last write returns?"
+  options={["About 4 s: writes only copy into RAM", "About 41 s: each write waits for the disk", "About 28 s: fast until the dirty limits, and then near disk speed"]}
+  answer={2}
+  explain="The first gigabytes go at memory speed. Above a threshold, the kernel slows the writer until it matches the disk. So part of the burst is free, and the rest pays disk speed. The model gives 27.8 s."
+>
+<FsWriteBurstDemo />
+</Predict>
+
+Things to try:
+
+1. Keep the defaults, and move the **Time cursor**. The flusher starts at 0.8 s, when dirty memory passes the background line. The writer slows at 1.3 s, at the free-run line. The burst is accepted at about 27.8 s, a mean of about 295 MiB/s.
+2. Read **fsync at end of burst**. It is about 14 s, because about 2.7 GiB is still dirty. The write returned long ago, and the wait comes later.
+3. Move **Burst size** down near 1 GiB. Dirty memory never reaches the background line, so nothing happens for 30 s. Then the expiry rule starts the flusher, and all data is on disk at about 35 s.
+4. Set **vm.dirty_ratio** to 2 and **vm.dirty_background_ratio** to 1. The burst is accepted later, at about 39.6 s, but an `fsync` at the end now takes about 1.5 s. Small limits trade burst speed for short stalls.
+5. Move **Disk speed** to the maximum. The flusher keeps up, so the writer never slows.
+6. Set the background ratio above the dirty ratio. The kernel ignores that and uses half of the limit.
+
+## The knobs
+
+| `/proc/sys/vm/` | Default | Meaning |
+|---|---|---|
+| `dirty_background_ratio` | 10 | Above this share, flusher threads start to write. Writers do not slow yet. |
+| `dirty_ratio` | 20 | The hard limit. Writers stop at this share. |
+| `dirty_expire_centisecs` | 3000 | Data older than 30 s is due for writing. |
+| `dirty_writeback_centisecs` | 500 | The flusher wakes every 5 s to look for old data. |
+
+`dirty_background_bytes` and `dirty_bytes` set the same limits in bytes. Writing one form clears the other. The ratios are shares of **dirtyable memory**, which is free pages plus file pages, and not of total RAM. So a machine full of anonymous memory has lower limits than its RAM suggests.
+
+Percentages suit small machines badly at large RAM sizes. On a machine with 1 TiB of RAM, 20% can take many minutes to write. So large servers often set the byte limits.
+
+The flusher runs as a kernel worker per backing device (`wb_workfn`), and it appears in `top` as `kworker/u…+flush-…`. `grep -E 'Dirty|Writeback' /proc/meminfo` shows the current amounts on Linux.
+
+## balance_dirty_pages
+
+Every buffered write path calls `balance_dirty_pages_ratelimited`. This is how the kernel slows a writer: the writer itself sleeps inside its own `write` call, for a short pause each time. No write fails, and the writer sees only a slower system call.
+
+Modern Linux does not stop writers at a wall. It aims to keep dirty memory near a **setpoint**, with four levels derived from the limits:
+
+$$
+\text{freerun} = \frac{\text{bg} + \text{limit}}{2}, \qquad \text{setpoint} = \frac{\text{freerun} + \text{limit}}{2}
+$$
+
+Below the free-run level, the writer runs free. Above it, the kernel computes the writer's rate from the device's measured write speed and a **position ratio**, which is cubic:
+
+$$
+r = 1 + \left( \frac{\text{setpoint} - \text{dirty}}{\text{limit} - \text{setpoint}} \right)^3
+$$
+
+The ratio $r$ is 2 at the free-run side, 1 at the setpoint and 0 at the limit. So the writer matches the disk speed at the setpoint, and it stops only at the limit. The feedback holds dirty memory steady and keeps pauses short. With 16 GiB of dirtyable memory, the levels are 1,638 MiB (background), 2,458 MiB (free run), 2,867 MiB (setpoint) and 3,277 MiB (limit).
+
+The real kernel also splits the limit among devices by their recent write speed, so a slow USB stick cannot take all the dirty memory. With [cgroup v2](/os/isolation/cgroups), it tracks dirty pages for each group too.
+
+## Read-ahead
+
+A sequential reader wants the next page, and the kernel can see this coming. So it reads ahead, in growing windows. A program then almost never waits.
+
+<FsReadaheadDemo />
+
+1. Press **Read next page**. Page 0 misses, and the reader waits. The kernel reads 4 pages at once, and it puts a **marker** on page 1.
+2. Press it again. Page 1 is a hit, and it carries the marker. So the next window of 8 pages starts in the background, and the reader does not wait.
+3. Press **Read 16** a few times. The windows go 4, 8, 16, 32, and they stay at 32. That is the maximum at the default of 128 KiB. In a read of 100 pages, only 1 read waits for the disk.
+4. Press **Jump**. A read far from the last one fetches one page and starts no window. Press **Read next page**. The kernel sees a sequence again, but it starts over from a window of 4.
+5. Select **1024**. The windows go 4, 16, 32, 64, 128 and 256.
+
+The state lives in `struct file_ra_state`, one for each open file description, so two readers with separate opens do not confuse each other. The windows come from `get_init_ra_size` and `get_next_ra_size`. The marker is the page flag `PG_readahead`.
+
+You can tune this per device in `/sys/block/<dev>/queue/read_ahead_kb`. A program can state its intent with `posix_fadvise`: `POSIX_FADV_SEQUENTIAL` doubles the window on Linux, `POSIX_FADV_RANDOM` turns read-ahead off, and `POSIX_FADV_DONTNEED` drops clean pages. For mapped files, `madvise` does the same, as the [mmap lesson](/os/memory/mmap) shows.
+
+## O_DIRECT
+
+`O_DIRECT` skips the page cache. The kernel moves bytes straight between the device and the user's buffer. The buffer, the file offset and the length must all be aligned, usually to the logical block size. Databases use it, because they keep their own [buffer pool](/databases/storage/buffer-pools) and do not want a second copy.
+
+```c
+void *buf;
+posix_memalign(&buf, 4096, 1 << 20);
+int fd = open("data.db", O_RDWR | O_DIRECT);
+pread(fd, buf, 1 << 20, 0);    // no copy into the page cache, and the read waits for the device
+```
+
+`O_DIRECT` loses read-ahead, write-behind and merging, so a naive program gets much slower. It also says nothing about durability. A completed direct write may still be in the drive's cache, and file metadata may not be committed. It does not replace `fsync`.
+
+## fsync across the layers
+
+`fsync` must push data through every layer, and it waits for each of them.
+
+| Layer | What happens | ext4 path |
+|---|---|---|
+| Page cache | Dirty pages of this file go to the block layer, and `fsync` waits | `file_write_and_wait_range` |
+| File system | The journal commits the transaction that holds the inode | `ext4_sync_file`, then jbd2 |
+| Block layer | Requests reach the device queue | [the block layer](/os/io/the-block-layer-and-i-o-schedulers) |
+| Device | A FLUSH or FUA empties the volatile cache | the device, unless it lies |
+
+The [durability lesson](/databases/storage/durability-fsync-torn-writes-and-checksums) follows this path with a crash at each step. It also covers the failure mode of 2018: Linux marks a failed page clean, so a retried `fsync` can report success. Linux tracks these errors with `errseq_t`, so each open file description sees an error once.
+
+## drop_caches, and reading free
+
+`echo 3 > /proc/sys/vm/drop_caches` frees clean page cache (1), dentries and inodes (2), or both (3). It frees only what is clean and unused, so run `sync` first. It is for tests that need a cold cache. It does not fix anything on a live system, since the next reads must fetch the same data again.
+
+`free` confuses people, because a healthy machine shows little free memory. Here is one imagined machine, with model inputs in MiB:
+
+```text
+       total   used   free  shared  buff/cache  available
+Mem:   16000   5950    600     200       10000      10050
+```
+
+- **free** is memory that holds nothing: 600 MiB. Low is normal, and it means that RAM is doing work.
+- **buff/cache** is page cache, block device buffers and reclaimable slab: 10,000 MiB. Most of it can go.
+- **shared** is mostly tmpfs and shared memory. It counts in the page cache, but it cannot be dropped without swap.
+- **available** is the number to read. It is the kernel's estimate (`si_mem_available`) of what a new program can get without swapping: 10,050 MiB here.
+- **used** depends on the version. Recent `free` prints total minus available, 5,950 MiB. Older versions print total minus free minus buff/cache, which would be 5,400 MiB.
+
+The estimate starts with free pages minus the reserves. It adds the file cache and the reclaimable slab, and it keeps back a part of each that reclaim needs. When **available** falls near zero, the machine is near [swap and the OOM killer](/os/memory/swapping-and-the-oom-killer). A low **free** value alone means nothing.
+
+<Callout title="On your Mac">
+macOS has a similar **unified buffer cache**, but it has no `dirty_ratio` sysctl and no `drop_caches`. `purge` empties the disk cache, and `vm_stat` shows page counts. `fcntl(fd, F_NOCACHE, 1)` is the nearest thing to `O_DIRECT`, and it needs no alignment. `fsync` on macOS does not flush the drive cache, so durable writes need `F_FULLFSYNC`.
+</Callout>
+
+## Connect
+
+- [mmap](/os/memory/mmap) maps these same pages into an address space.
+- [Page replacement](/os/memory/page-replacement) decides which cached pages to drop.
+- [fsync and torn writes](/databases/storage/durability-fsync-torn-writes-and-checksums) follows the path below the page cache.
+- [Buffer pools](/databases/storage/buffer-pools) are the same idea inside a database, with a different policy.
+- [The block layer](/os/io/the-block-layer-and-i-o-schedulers) receives what the flusher writes.
+
+<Recall cards={[
+  { q: "What do dirty_background_ratio and dirty_ratio each do, and what are the defaults?", a: "Above the background ratio, 10%, flusher threads start to write. At the dirty ratio, 20%, writers stop. Both are shares of dirtyable memory." },
+  { q: "How does the kernel slow a writer, and what does the writer see?", a: "balance_dirty_pages makes the writer sleep inside its own write call. No write fails, and the writer sees a slow system call." },
+  { q: "State the position ratio, and its value at the setpoint and at the limit.", a: "1 plus the cube of (setpoint minus dirty) over (limit minus setpoint). It is 1 at the setpoint and 0 at the limit." },
+  { q: "What is the PG_readahead marker for?", a: "It marks a page inside the window. When a reader reaches it, the kernel starts the next window in the background, so the reader does not wait." },
+  { q: "What does O_DIRECT skip, and what does it not promise?", a: "It skips the page cache. It does not promise durability: the drive cache and file metadata may still need fsync." },
+  { q: "Which column of free shows the memory that a new program can get?", a: "available. It estimates free pages plus reclaimable cache and slab. A low free column alone is normal." },
+]} />

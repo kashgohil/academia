@@ -1,0 +1,144 @@
+---
+summary: "Never overwrite in place. LFS with its inode map, segments and cleaner, the write cost formula and hot and cold data, F2FS, then copy-on-write trees in ZFS and btrfs, atomic root updates, snapshots, clones, reference counts, checksums and scrubbing."
+---
+import { FsLfsDemo, FsCowDemo } from "@/demos/os/FsLogDemos";
+
+A journal writes data twice to keep overwrites safe. Another family of file systems asks a simple question: why overwrite at all? If new data always goes to free space, the old version stays whole until the new one is ready. Two designs follow from this: the log, and the copy-on-write tree.
+
+## LFS: the disk is a log
+
+Rosenblum and Ousterhout's **Log-structured File System (LFS, 1992)** started from two facts. Memory caches absorb most reads, so the disk mostly sees writes. Disks are fast in sequence and slow at seeks. So LFS buffers all changes in memory, and it writes them in one long sequential stream.
+
+The disk is divided into large **segments**. A segment holds new data blocks, new inodes and all other new metadata, side by side. An overwrite never touches the old copy. It writes a new copy at the head of the log, and the old one becomes **dead**.
+
+This moves inodes, so an inode can no longer live at a fixed place. The **inode map (imap)** records where each inode is now, and it is also written to the log. A **checkpoint region** at a fixed place points at the pieces of the imap. To read a file, LFS goes from the checkpoint to the imap, to the inode, and then to the data. After a crash, it starts at the last checkpoint and rolls forward through the log.
+
+The log needs empty segments, and dead blocks are scattered among live ones. The **cleaner** picks segments, copies their live blocks to the head of the log, and frees them. A **segment summary** in each segment says which file and offset each block belongs to, so the cleaner can test whether a block is live. The cleaner is the whole price of this design.
+
+## Write cost
+
+A segment with a fraction $u$ of live blocks yields $1-u$ of a segment of free space. To clean $N$ blocks of segment, the cleaner reads $N$ blocks, writes back $Nu$ live blocks, and then the system can write $N(1-u)$ new blocks:
+
+$$
+\text{write cost} = \frac{N + Nu + N(1-u)}{N(1-u)} = \frac{2}{1-u}
+$$
+
+At $u = 0.5$ the cost is 4. At $u = 0.8$ the cost is 10. The paper estimated a write cost of 10 for the Unix FFS of its day, and 4 for an improved FFS. So LFS wins only if it cleans segments below these levels. On flash, a read is cheap, so the cost is closer to $1/(1-u)$. This is the write amplification of [an SSD's FTL](/databases/storage/disks-vs-ssds).
+
+The $u$ in the formula is for cleaned segments, not for the whole disk. The cleaner picks the emptiest segments, so it can do better than the disk's average.
+
+<Predict
+  id="clean-u"
+  question="An LFS disk is 75% full. Overwrites are uniform and random, and the cleaner always picks the emptiest segments. Using 2/(1-u), what is the write cost in steady state?"
+  options={["About 8, because u is 0.75", "About 5, because cleaned segments are emptier than the disk's average", "About 2, because the cleaner finds nearly empty segments"]}
+  answer={1}
+  explain="Segments vary, and the cleaner takes the emptiest. In this model, cleaned segments have u of about 0.61. The formula at 0.61 gives about 5, and the simulation agrees."
+>
+<FsLfsDemo />
+</Predict>
+
+Things to try:
+
+1. Press **Play**. Blocks die across the grid, and the log head moves right. When free segments run low, the cleaner frees some segments and copies their live blocks.
+2. Select **Uniform** at 70%, and watch the live share in each segment. All segments decay at the same rate, and they look alike.
+3. Select **Hot and cold**. Hot blocks die fast, and cold blocks stay. Segments slowly separate.
+4. Read the plot at 75% with uniform greedy. The write cost is about 5.06, and the mean cleaned $u$ is about 0.61. The dashed curve for the whole disk says 8.
+5. Compare at 80%. Uniform greedy costs 6.52, hot and cold greedy 5.72, and hot and cold cost-benefit 4.92.
+
+### Hot and cold data
+
+Greedy cleaning has a flaw. A cold segment holds blocks that rarely die, so it can sit just above the cleaning line for a long time. It locks up free space. A hot segment fills with dead blocks soon anyway, so cleaning it early wastes effort.
+
+The paper's answer is **cost-benefit** cleaning. Free space in a cold segment is worth more, because it stays free longer. So the cleaner picks the segment with the highest score, where age is the time since the newest write in the segment:
+
+$$
+\frac{\text{benefit}}{\text{cost}} = \frac{(1-u) \cdot \text{age}}{1+u}
+$$
+
+The paper reports that with hot and cold data, greedy can do worse than uniform data, and that cost-benefit fixes this. This model agrees only in part. At 40%, hot and cold greedy costs 2.42 and uniform greedy costs 2.27. At 80% it is the other way round. Cost-benefit beats greedy from 50% to 85% here, but at 90% it costs 15.2 and greedy costs 11.3. A real choice of cleaner needs a test on the real workload.
+
+### F2FS
+
+**F2FS** applies these ideas to flash, and Android phones use it widely. Its design answers the known problems of a log:
+
+- **Wandering trees.** In LFS, moving a data block changes its inode, which changes the imap, and so on up. F2FS adds a **node address table (NAT)** at a fixed place, so a moved node changes one entry there.
+- **Hot and cold.** It keeps 6 logs at once: hot, warm and cold, for both nodes and data. Separation happens at write time, and the cleaner has less to do.
+- **Segments for the device.** A segment is 2 MiB (512 blocks of 4 KiB). Segments group into sections and zones, to match the erase units of flash.
+- **Cleaning policy.** Foreground cleaning is greedy, and background cleaning uses cost-benefit. When free space is very low, it writes into dirty segments' holes and does not clean first.
+
+## Copy-on-write trees
+
+ZFS and btrfs apply the same rule to a tree. All data and metadata hang from one root, and a block never changes after it is written. To change a leaf, the file system writes a new leaf. It then writes a new parent that points to it, and so on to a new root.
+
+Commit is one small write: the pointer to the new root. Until that write, the old tree is whole. After it, the new tree is whole. No log and no replay are needed for consistency. [LMDB's B-tree](/databases/btrees/copy-on-write-b-trees) works in the same way.
+
+<Predict
+  id="snap-cost"
+  question="A tree has 8 leaves and 15 blocks in all, with fanout 2. You take a snapshot, and then you change one leaf. How many blocks does each of the two steps write?"
+  options={["15 for the snapshot and 1 for the change", "0 for the snapshot and 4 for the change", "0 for the snapshot and 1 for the change"]}
+  answer={1}
+  explain="A snapshot is a second pointer to the same root, so it copies nothing. The change copies the path from leaf to root: one block at each of the 4 levels. Unchanged subtrees are shared by both trees."
+>
+<FsCowDemo />
+</Predict>
+
+Press **Next** to follow the tour:
+
+1. **Update leaf 2** writes 4 blocks and frees 4. With no snapshot, the old path is garbage at once. The tree stays at 15 blocks.
+2. **Snapshot s1** writes nothing. It adds one pointer and one count.
+3. **Update leaf 2** writes 4 blocks and frees none, because s1 still needs the old path. Blocks in use grow to 19.
+4. **Update leaf 2 again** writes 4 and frees 4. The blocks from the last step belong to no snapshot.
+5. **Update leaf 5** writes 4 and frees only 1, the old root. The other old blocks on that path belong to s1. Now 22 blocks are in use, and snapshots alone pin 7.
+6. **Clone**, then **delete the clone**. Neither step writes or frees a block.
+7. **Delete snapshot s1**. The 7 pinned blocks go free, and the tree is back to 15.
+
+Then click a leaf of the live tree to update it yourself. Try **Flip a bit** and **Scrub**.
+
+### Reference counts and dead lists
+
+A block can be freed only when no tree can reach it. The btrfs design keeps a reference count for each extent in its **extent tree**, and this demo works in the same way. A count rule is simple: a block goes free at zero, and a snapshot's deletion cascades down.
+
+ZFS does not count per block. Each block pointer stores the **birth time** (the transaction number) of the block. A block born after a snapshot is not in that snapshot, so it can be freed at once. Otherwise it goes on the **dead list** of the dataset, and that list is processed when a snapshot goes away. This makes snapshots cheap to create and delete, and it does not need updates to shared counts.
+
+A snapshot is read-only. A **clone** is a writable tree that starts at a snapshot. Both cost nothing to create. They cost space only as they diverge. On Linux, `zfs snapshot` and `zfs clone` and `btrfs subvolume snapshot` make them.
+
+### Atomic commit
+
+A crash during a commit is harmless, if the order is right.
+
+- With a flush before the root pointer, one 4-block update has 17 crash states. In 16 the old tree is read, and in 1 the new tree is read. None is wrong.
+- With no flush, there are 32 states. In 15 of them, the new root is durable and a block under it is not. The result is damage, and only the parent's checksum detects it.
+
+ZFS writes the root pointer in the **uberblock**, in a ring of slots, and it picks the newest valid one at import. Btrfs writes a superblock with its checksum, in several places. ZFS groups changes into a **transaction group**, which closes at least every 5 seconds by default.
+
+Grouping is essential. A thousand updates to one leaf cost 4,000 block writes one at a time, or 4 in one group. For `fsync`, waiting for a whole group would be too slow. So ZFS has the **ZIL (ZFS intent log)**, and btrfs has a **log tree**. Each is a short log that holds synchronous writes until the next commit.
+
+### Checksums and scrubbing
+
+A block cannot vouch for itself, because a misdirected write brings along a valid checksum for the wrong block. So each parent stores the checksum of each child, and the tree forms a **Merkle tree**. A read checks each block against its parent, so it catches bit rot and lost or misplaced writes.
+
+Detection needs a second copy before it can repair. With a mirror or RAID-Z, ZFS reads the other copy and rewrites the bad one. Metadata also gets extra copies by default. A **scrub** (`zpool scrub`, `btrfs scrub start`) reads everything and checks it, and it finds errors in data that nobody reads. ZFS uses fletcher4 by default, and btrfs uses CRC-32C.
+
+### The price
+
+Copy-on-write fragments on random overwrites, because each change moves the block. A database file on a disk suffers the most. Each small change also rewrites a path of metadata. So databases on ZFS set `recordsize` to match the page size. On btrfs, `chattr +C` turns off copy-on-write for a file, and it also turns off checksums for that file.
+
+<Callout title="APFS on your Mac">
+APFS is a copy-on-write file system with snapshots and clones. Time Machine uses snapshots, and `tmutil listlocalsnapshots /` lists them. `cp -c` makes a clone. APFS checksums its metadata, but not user data, so it cannot detect bit rot in a file. It relies on the device for that.
+</Callout>
+
+## Connect
+
+- [Journaling](/os/fs/journaling) is the other answer to the same crash problem.
+- [Copy-on-write B-trees](/databases/btrees/copy-on-write-b-trees) use the same path copying in a database.
+- [Copy-on-write in memory](/os/memory/copy-on-write) shares pages after `fork` with the same reference idea.
+- [Read, write and space amplification](/databases/storage/read-write-and-space-amplification) gives the general trade-off, and LSM trees also have a cleaner, called compaction.
+
+<Recall cards={[
+  { q: "Derive the LFS write cost for cleaned segments at utilization u.", a: "Read N blocks, write back Nu live blocks, then write N(1-u) new blocks. Total I/O over new data is 2N over N(1-u), which is 2/(1-u)." },
+  { q: "Why is the imap needed in LFS?", a: "Inodes move with every write, so a fixed location no longer works. The imap records where each inode is now, and a fixed checkpoint region finds the imap." },
+  { q: "What score does cost-benefit cleaning use, and why does age appear?", a: "(1-u) times age, over (1+u). Free space from a cold segment stays free longer, so it is worth more." },
+  { q: "How many blocks does an update write in a copy-on-write tree of depth d, and what commits it?", a: "d plus 1 blocks, one for each level. One write of the root pointer commits it." },
+  { q: "Why does a snapshot cost nothing at creation, and when does it start to cost space?", a: "It is one more pointer to the existing root. It costs space as updates copy paths and the old blocks stay pinned." },
+  { q: "Why is a checksum stored in the parent and not in the block?", a: "A misplaced or lost write can leave a block with a valid checksum for the wrong data. The parent says what the block should be." },
+]} />

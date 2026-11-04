@@ -1,0 +1,141 @@
+---
+summary: "How open turns a path into an inode: the four VFS objects and their operation tables, the walk component by component, the dcache and negative dentries, RCU-walk and ref-walk, mount points, symlink limits and permission checks."
+---
+import { FsPathWalkDemo, FsStatCostDemo } from "@/demos/os/FsVfsDemos";
+
+Linux runs ext4, XFS, btrfs, tmpfs, NFS and `/proc` behind one set of system calls. The layer that makes this possible is the **virtual file system (VFS)**. It is an interface with four kinds of objects, and each file system fills in the operations.
+
+| Object | Stands for | Lives | Operations table |
+|---|---|---|---|
+| `struct super_block` | One mounted file system | In memory, loaded from disk | `super_operations` |
+| `struct inode` | One file | In memory, loaded from disk | `inode_operations`, `file_operations` |
+| `struct dentry` | One name in one directory | In memory only | `dentry_operations` |
+| `struct file` | One open file description | In memory only | `file_operations` |
+
+An operations table is a struct of function pointers. It is the same idea as a Rust `dyn Trait` vtable or a Go interface, written by hand:
+
+```c
+const struct inode_operations ext4_dir_inode_operations = {
+    .create  = ext4_create,
+    .lookup  = ext4_lookup,
+    .link    = ext4_link,
+    .unlink  = ext4_unlink,
+    .mkdir   = ext4_mkdir,
+    .rename  = ext4_rename2,
+    /* ... */
+};
+```
+
+The VFS does all the common work: path walking, permission checks and caching. It calls the file system only when it must. `.lookup` is the call that a path walk tries hardest to avoid, because it can read the disk.
+
+A **dentry** (directory entry) links a parent, a name and an inode. It exists only in memory, and the kernel builds it during a lookup. The cache of all dentries is the **dcache**: a hash table keyed by the parent dentry and the hash of the name.
+
+<Predict
+  id="negative"
+  question="A program calls stat on /home/kash/missing, and the file does not exist. It then calls stat on the same path again. What does the second call ask the file system?"
+  options={["It searches the directory again, because the kernel caches only files that exist", "Nothing: a cached entry records that the name does not exist", "It reads only the inode of the directory, to check that nothing changed"]}
+  answer={1}
+  explain="The first lookup leaves a negative dentry: a dentry with no inode. The second lookup finds it in the dcache and returns ENOENT with no call to the file system. Local file systems keep it correct, because a create replaces it."
+>
+<FsPathWalkDemo />
+</Predict>
+
+Things to try:
+
+1. Keep `/home/kash/notes.txt`, press **Walk**, and press **Step** until the end. A cold walk makes 3 permission checks and 3 file system lookups. The first miss moves it to ref-walk.
+2. Press **Walk** again and then **Finish**. It makes 3 dcache hits and no file system lookup, and it stays in RCU-walk from start to end.
+3. Select `/home/kash/missing` and walk twice. The second walk ends at a negative hit.
+4. Select `/root/secret`. As kash, the check on `/root` fails on the "other" bit, so the walk stops with `EACCES`. It never learns whether `secret` exists. Then select **root**.
+5. Select `/home/kash/data/etc/passwd`. One symlink leads to a mount of another file system. A second symlink uses `..` to climb back out through the mount point.
+6. Select `/loop/a`. Two symlinks point at each other. The walk follows 40 and then fails with `ELOOP`.
+
+## The walk
+
+`open` and `stat` call `path_lookupat`, and that calls `link_path_walk`. For each component, the kernel does this:
+
+1. **Check permission.** `may_lookup` needs search permission (the `x` bit) on the current directory.
+2. **Look in the dcache.** `lookup_fast` searches for the pair of parent and name.
+3. **Ask the file system on a miss.** `lookup_slow` takes the directory's inode lock and calls `.lookup`, which can read the disk. The result becomes a new dentry.
+4. **Cross a mount.** If the dentry is a mount point, the walk moves to the root of the mounted file system.
+5. **Follow a symlink.** If the dentry is a symlink, its target goes in front of the rest of the path.
+
+The kernel limits each name to `NAME_MAX`, which is 255 bytes, and each path to `PATH_MAX`, which is 4,096 bytes. A longer path can still exist, and a program reaches it in steps with `openat`.
+
+### Permission checks
+
+The check runs on every directory on the path, and only the first matching class applies. A class is the owner, the group or other. So an owner with no `x` bit is denied, even if "other" has it. `stat` needs no permission on the final file, only on the directories above it. `open` then checks the file against the access that it asks for.
+
+The check is `inode_permission`. It covers the mode bits, ACLs and security modules through `security_inode_permission`. See [users, permissions and capabilities](/os/isolation/users-permissions-and-capabilities) for the full rules, including `CAP_DAC_READ_SEARCH`, which lets root pass these checks.
+
+## RCU-walk and ref-walk
+
+The simple way to walk is to take a reference on each dentry and drop the previous one. That is **ref-walk**. Each reference is an atomic write. Every path starts at `/`, and many share `/usr`. So those dentries' cache lines bounce between all cores, and reads stop scaling, as in [read-copy-update](/os/sync/read-copy-update).
+
+**RCU-walk** takes no references and no locks. The kernel enters an RCU read section, and each step reads the dentry and checks a sequence count (`d_seq`). If the count changed, a rename or a delete may have run, so the data cannot be trusted. Nothing was written, so cores do not interfere.
+
+An RCU reader cannot sleep, so it must leave RCU-walk before anything that can block. A dcache miss is such a case. `try_to_unlazy` takes real references, and it checks that everything it saw is still valid. If that check fails, the whole walk restarts.
+
+`filename_lookup` tries in this order:
+
+1. With `LOOKUP_RCU`, the fast walk.
+2. If that returns `ECHILD`, an ordinary ref-walk from the start.
+3. If that returns `ESTALE`, a ref-walk with `LOOKUP_REVAL`, which tells network file systems to check their cached data again.
+
+## Mounts and symlinks
+
+A mount puts the root of one file system over a directory of another. The old contents stay, but the walk does not see them. A dentry flag (`DCACHE_MOUNTED`) makes the common case cheap. `__lookup_mnt` then finds the mount in a hash table keyed by the parent mount and the dentry. Because the key includes the mount, one directory can show different trees in different [mount namespaces](/os/isolation/namespaces).
+
+`..` needs care at a mount. At the root of a mount, `follow_dotdot` first steps back to the mount point, and then to its parent. `/proc/self/mountinfo` lists the mounts of a process.
+
+The kernel allows 40 symlinks in one lookup (`MAXSYMLINKS`), and the 41st gives `ELOOP`. A relative target starts from the directory that holds the link, and an absolute target restarts at the root.
+
+A path is a sequence of checks, and each can change between two calls. So code that checks a path and then opens it has a race. `openat2` closes this for a sandbox. `RESOLVE_NO_SYMLINKS` refuses all symlinks, and `RESOLVE_BENEATH` refuses any path that leaves the starting directory.
+
+```go
+// Open relative to a directory that you already hold, so nobody can swap the parents.
+dir, err := unix.Open("/srv/data", unix.O_PATH|unix.O_DIRECTORY, 0)
+if err != nil {
+	return err
+}
+how := unix.OpenHow{Flags: unix.O_RDONLY, Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS}
+fd, err := unix.Openat2(dir, "logs/app.log", &how)
+```
+
+## Why the dcache matters
+
+A build or a language runtime makes huge numbers of `stat` and `open` calls that fail. A compiler probes each include directory, and the dynamic linker probes each library path. So negative dentries are as useful as positive ones. They can also grow to fill memory, and the kernel shrinks them under memory pressure. `/proc/sys/fs/dentry-state` shows the counts on Linux.
+
+<FsStatCostDemo />
+
+Every input of this model is labelled under the demo. These are not measurements.
+
+1. Keep depth 5, 99% hits and NVMe. One `stat` costs about 539 ns with the dcache and 14,264 ns without it, 26.5 times more. One core can do about 1.86 million calls per second.
+2. Select the **7,200 rpm disk**. Without the dcache, the cost grows to about 658 µs, and the ratio to 94.3 times. The 1% of directory searches that reach the disk dominate.
+3. Move the hit rate to 50%. The ratio falls to 1.9 times. The benefit comes almost entirely from the last few percent of hits, so look at the right plot.
+4. Move the depth. Both curves grow in a straight line with depth, so a deep path costs in proportion to its length, whatever the hit rate.
+
+The formula is short. With hit rate $h$, depth $d$, hit cost $H$, search cost $S$, block miss rate $p$ and device read time $R$:
+
+$$
+T = T_{\text{syscall}} + d \cdot \bigl(h H + (1-h)(S + p R)\bigr)
+$$
+
+<Callout title="On your Mac">
+XNU has a VFS from BSD. Its objects are `struct vnode` and `struct mount`, and it has a name cache that also stores negative entries. `sudo fs_usage -f pathname` shows path lookups as they happen. `openat2` does not exist on macOS.
+</Callout>
+
+## Connect
+
+- [Files, inodes and directories](/os/fs/files-inodes-and-directories) describes what the walk finds on disk.
+- [Read-copy-update](/os/sync/read-copy-update) explains why RCU-walk scales.
+- [Namespaces](/os/isolation/namespaces) give each container its own mount tree.
+- [The page cache](/os/fs/the-page-cache-and-writeback) holds the directory blocks that a search reads.
+
+<Recall cards={[
+  { q: "Name the four VFS objects and say which of them exist only in memory.", a: "Superblock, inode, dentry and file. Dentries and files exist only in memory. Superblocks and inodes are loaded from disk." },
+  { q: "What is a negative dentry, and why is it useful?", a: "A dcache entry with no inode, which records that a name does not exist. Repeated failed lookups, such as include paths, then need no file system call." },
+  { q: "What does may_lookup check, and on which objects?", a: "Search permission, the x bit, on each directory along the path. stat needs no permission on the final file." },
+  { q: "Why does RCU-walk scale better than ref-walk?", a: "Ref-walk writes an atomic count on each dentry, so shared dentries such as the root bounce between cores. RCU-walk only reads and checks sequence counts." },
+  { q: "When must a walk leave RCU-walk?", a: "When it may block, such as on a dcache miss that reads a directory, or when a sequence check fails. try_to_unlazy then takes real references." },
+  { q: "What is the symlink limit in one lookup, and what is the error past it?", a: "40 symlinks in total, then ELOOP." },
+]} />

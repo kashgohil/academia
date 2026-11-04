@@ -1,0 +1,170 @@
+---
+summary: "A file is an inode, and a name is only a directory entry that points at it. Inode fields and stat, the ext4 layout, hard links and symlinks, atomic rename, unlink of an open file, sparse files, and the three tables behind a file descriptor."
+---
+import { FsInodeTreeDemo, FsThreeTablesDemo } from "@/demos/os/FsFilesDemos";
+
+A **file** is a sequence of bytes that has a size and survives a reboot. The kernel gives the bytes no structure. Records, lines and pages are ideas of the program that reads them.
+
+The object that holds a file is an **inode** (index node): a small fixed-size record. It holds the file's attributes and the map of its data blocks. An inode has a number and no name. A **directory** is a file whose contents map names to inode numbers. So a name is only a pointer, and one inode can have several names.
+
+`stat` prints the inode:
+
+```text
+$ stat notes.txt
+  File: notes.txt
+  Size: 6000        Blocks: 16         IO Block: 4096   regular file
+Device: 8,1         Inode: 1837234     Links: 1
+Access: (0644/-rw-r--r--)  Uid: ( 1000/ kash)   Gid: ( 1000/ kash)
+```
+
+| Field | `struct stat` | Meaning |
+|---|---|---|
+| Inode number | `st_ino` | The index in the inode table. It is unique in one file system. |
+| Type and mode | `st_mode` | File, directory or symlink, and the permission bits. |
+| Link count | `st_nlink` | The number of directory entries that point here. |
+| Owner | `st_uid`, `st_gid` | The user and group for permission checks. |
+| Size | `st_size` | The logical length in bytes. |
+| Allocated space | `st_blocks` | Space on disk, always in units of 512 bytes. |
+| Times | `st_atime`, `st_mtime`, `st_ctime` | Last read, last data change, last inode change. |
+
+The name is not in this table, because the name is not in the inode. A size of 6,000 bytes needs two 4 KiB blocks, so `st_blocks` is 16. A file with one byte still takes one block, so it shows 8.
+
+<Predict
+  id="unlink-open"
+  question="A process holds a 1 GiB log file open. Another process deletes its only name with rm. What does df report for free space, while the first process runs?"
+  options={["1 GiB more free space, because rm freed the blocks", "No change, because the open file still holds the inode and its blocks", "rm fails with EBUSY, because the file is open"]}
+  answer={1}
+  explain="rm calls unlink, which removes one name and drops the link count to zero. The inode also has an open reference, so the kernel keeps it and its blocks. The space comes back at the last close."
+>
+<FsInodeTreeDemo />
+</Predict>
+
+Things to try:
+
+1. Select **notes.txt** and click **Hard link**. Inode 3 now has 2 links and two names. Free blocks stay at 43, because no data moved.
+2. Click **unlink** on one name. The other name still works, and no block comes back. Unlink the last name, and 2 blocks come back.
+3. Reset. Select **notes.txt**, click **Open**, and click **unlink**. The inode row turns red with 0 links and 1 open reference, and it is an orphan. Click **Close**, and only now do the blocks return.
+4. Reset. Click **Write past the end**. The size jumps by 40 blocks, and the file gains only 1 block. The rest is a hole.
+5. Select **plan.txt**, click **Rename onto**, and click **notes.txt**. The old `notes.txt` inode loses its link, and its blocks return in that one step.
+6. Make a **Symlink** to a file and then unlink the file. The symlink stays, and it now points at nothing.
+
+## The layout of ext4 on disk
+
+ext4 divides the disk into **block groups**. One group holds its own bitmaps, inodes and data, so a file's inode and data can stay close together.
+
+| Region | Holds |
+|---|---|
+| Superblock | Global facts: sizes, counts, features. Backup copies live in some groups. |
+| Group descriptors | The location of each group's bitmaps and inode table. |
+| Block bitmap | One bit per block in this group: free or used. |
+| Inode bitmap | One bit per inode in this group. |
+| Inode table | The inodes themselves, 256 bytes each by default. |
+| Data blocks | File contents, directories and extent tree blocks. |
+
+The numbers follow from one rule. One 4 KiB bitmap block has 32,768 bits, so a group has 32,768 blocks, which is 128 MiB. The default of one inode per 16 KiB gives 8,192 inodes per group. These fill 512 blocks, or 2 MiB, so inode tables take 1.5625% of the disk.
+
+`mkfs` fixes the inode count. So a disk can report `ENOSPC` with free blocks, when millions of tiny files use up all the inodes. `df -i` shows this case. On Linux, `dumpe2fs` and `debugfs` print these structures. The root directory is always inode 2 on ext4.
+
+## Directories and link counts
+
+A directory block holds a list of entries (`struct ext4_dir_entry_2`): inode number, record length, name length, file type and name. Large directories add a hashed index (`dir_index`), so a lookup does not scan every entry.
+
+A file starts with one link. A new directory starts with 2: its name in the parent, and its own `.` entry. Each subdirectory adds 1 to its parent, through its `..` entry. So on ext4, `ls -ld` shows the number of subdirectories plus 2.
+
+| | Hard link | Symbolic link |
+|---|---|---|
+| What it is | Another directory entry for the same inode | A new inode that stores a path |
+| Link count of the target | Grows by 1 | Does not change |
+| After the target's name goes | Still works | Dangles, and open gives `ENOENT` |
+| Across file systems | No (`EXDEV`) | Yes |
+| To a directory | No (`EPERM`) | Yes |
+| Space | One directory entry | One inode. A target under 60 bytes fits in the inode. |
+
+The kernel forbids hard links to directories because they could make a cycle. A cycle would break `..` and every tool that walks a tree. Symlinks do not have this problem, because a walker can see them and the kernel limits how many it follows.
+
+## Why rename is atomic
+
+`rename(from, to)` changes directory entries and touches no data. The kernel holds the locks of both parent directories, so another process finds either the old inode or the new inode at `to`. It never finds nothing. If `to` existed, its inode loses one link, as with `unlink`.
+
+Crash atomicity is a separate promise. The [journal](/os/fs/journaling) puts both entry changes in one transaction, so a crash leaves all of it or none of it. It does not make the change durable by itself. For the full recipe with `fsync`, see [the write-durability lesson](/databases/storage/durability-fsync-torn-writes-and-checksums).
+
+`renameat2` on Linux adds `RENAME_NOREPLACE`, which fails if the target exists, and `RENAME_EXCHANGE`, which swaps two names in one step. On macOS, `renamex_np` has the same features, with `RENAME_EXCL` and `RENAME_SWAP`.
+
+## Unlink with an open file
+
+The kernel frees an inode when two counts are both zero: the link count on disk, and the open references in memory. This has useful results:
+
+- A program can open a temporary file and unlink it at once. The space returns at exit, even after a `SIGKILL`. `O_TMPFILE` on Linux skips the name altogether.
+- `df` can report a full disk when `du` finds little. A deleted log that a daemon holds open is the usual cause, and `lsof +L1` lists such files.
+- A crash must not leak these blocks. So ext4 keeps an **orphan list**, which starts in the superblock at `s_last_orphan`. It frees those inodes at the next mount.
+
+## Sparse files
+
+A write allocates blocks only for the bytes that it touches. A range that nobody wrote is a **hole**. A read of a hole returns zeros and does no I/O.
+
+```rust
+use std::fs::File;
+use std::os::unix::fs::MetadataExt;
+
+fn main() -> std::io::Result<()> {
+    let f = File::create("sparse.img")?;
+    f.set_len(1 << 40)?;                     // ftruncate to 1 TiB
+    let m = f.metadata()?;
+    println!("size {} blocks {} links {} ino {}", m.size(), m.blocks(), m.nlink(), m.ino());
+    Ok(())
+}
+```
+
+On ext4 this file reports a size of 1 TiB and 0 blocks, and `ls -l` and `du` disagree. `lseek` with `SEEK_DATA` and `SEEK_HOLE` finds the parts that exist, and `cp --sparse` uses this. Virtual machine images and core dumps depend on holes. Check for free space first, because a later write into a hole can fail with `ENOSPC`.
+
+## Three tables
+
+A file descriptor is not a file. Three tables stand between the two, and the [fork lesson](/os/processes/fork-and-exec) uses them too.
+
+<Predict
+  id="two-opens"
+  question="A process calls open twice on one empty file and gets fd 3 and fd 4. It writes 100 bytes to fd 3 and then 100 bytes to fd 4. What is the size of the file?"
+  options={["200 bytes, because the kernel tracks the end of the file", "100 bytes, because each open has its own offset at 0", "It fails, because the file is already open for writing"]}
+  answer={1}
+  explain="Each open makes a new open file description with its own offset. Both writes start at offset 0, so the second overwrites the first. O_APPEND or dup gives the 200-byte result."
+>
+<FsThreeTablesDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **Two opens** and press **Next** four times. Two descriptions point at one inode. Both writes land at offset 0.
+2. Select **dup**. Two descriptors share one description, so the writes land at 0 and 100.
+3. Select **fork**. The child gets a copy of the table with the same descriptions, and the writes land at 0, 100 and 200. After the child closes its descriptor, the description stays with one reference.
+4. Select **fork, then open**. Each process opens the file on its own, so the writes overwrite each other.
+5. Select **Two opens, O_APPEND**. The offsets are separate, but each write first moves to the end, so the writes land at 0 and 100.
+
+| Table | Kernel structure | Holds | Scope |
+|---|---|---|---|
+| File descriptor table | `files_struct`, `fdtable` | Small integers, each with a pointer and the close-on-exec flag | One process, or threads that share it through `CLONE_FILES` |
+| Open file table | `struct file` | Offset (`f_pos`), status flags such as `O_APPEND`, a reference count | System wide |
+| Inode table | `struct inode` | Size, link count, mode, and the page cache of the file | System wide, one per file |
+
+This is what happens in a shell. In `cmd > out 2>&1`, the shell uses `dup2`, so both streams share one offset and their output interleaves. In `cmd > out 2> out`, the shell opens the file twice, so the streams overwrite each other.
+
+`pread` and `pwrite` take an explicit offset and do not move the shared one, so threads can use one descriptor safely. On Linux, `/proc/self/fdinfo/3` shows the offset and flags of a descriptor.
+
+<Callout title="On your Mac">
+APFS has no fixed inode table, so it does not run out of inodes the way ext4 can. Use `stat -x file` for a Linux-like listing. `cp -c` calls `clonefile`, which makes a new inode that shares its data blocks until one side writes. So a clone is not a hard link: each clone has its own inode and its own future. Linux has the same idea in `cp --reflink` on btrfs and XFS, but not on ext4. macOS has no `/proc`, so use `lsof -p` to see the descriptors of a process.
+</Callout>
+
+## Connect
+
+- [Path lookup and the VFS](/os/fs/path-lookup-and-the-vfs) turns a name into an inode, one component at a time.
+- [Block allocation and extents](/os/fs/block-allocation-and-extents) explains the map from file offset to disk block.
+- [Journaling](/os/fs/journaling) keeps inodes, bitmaps and directories consistent across a crash.
+- [Threads](/os/processes/threads) share one descriptor table, and so they share every offset.
+
+<Recall cards={[
+  { q: "Where is the name of a file stored, and where is its size?", a: "The name is in a directory entry, which holds a name and an inode number. The size is in the inode. One inode can have many names." },
+  { q: "When does the kernel free a file's blocks?", a: "When the link count is zero and no open reference remains. An unlinked file that a process holds open keeps its blocks until the last close." },
+  { q: "Why does a new directory have a link count of 2, and what raises it?", a: "Its name in the parent is one link, and its own dot entry is the other. Each subdirectory adds one through its dot-dot entry." },
+  { q: "Give two differences between a hard link and a symlink.", a: "A hard link is another entry for the same inode and cannot cross file systems. A symlink is a new inode that stores a path, and it can dangle." },
+  { q: "Which of dup, fork and a second open share an offset?", a: "dup and fork share one open file description, so they share the offset. A second open makes a new description with its own offset." },
+  { q: "Why can a sparse file report 1 TiB of size and 0 blocks?", a: "Blocks are allocated only for bytes that were written. st_size is the logical length, st_blocks is the allocated space, and a hole reads as zeros." },
+]} />

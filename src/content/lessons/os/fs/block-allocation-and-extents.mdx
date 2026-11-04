@@ -1,0 +1,132 @@
+---
+summary: "How a file system finds free blocks and records them: bitmaps, the ext2 indirect tree and its size limits, ext4 extents, block groups, delayed allocation, fragmentation on disks and SSDs, and fallocate."
+---
+import { FsAllocGridDemo, FsMaxSizeDemo } from "@/demos/os/FsAllocDemos";
+
+A file system must answer two questions. Which blocks are free? Which block holds byte N of this file? The first needs a **free-space map**, and the second needs a **file map**. Both are metadata, so their size and their read cost matter.
+
+The classic free-space map is a **bitmap**: one bit per block. It costs little space, and a search for a run of free blocks is a scan for zero bits. The goal is to place each file in one adjacent run of blocks. A file in many separate runs is **fragmented**.
+
+<Predict
+  id="interleave"
+  question="Three programs append to three files at the same time, 2 blocks at a time. The file system allocates at each write and always tries the block after the file's last block. What layout do you expect?"
+  options={["Three clean runs, because each file asks for its next block", "Interleaved runs: each file's next block is often taken by another file", "One run per write, spread evenly over the whole disk"]}
+  answer={1}
+  explain="The goal block is often taken already by another writer, so the file jumps forward. The files interleave. Delayed allocation avoids this, because it allocates many blocks of one file together at writeback."
+>
+<FsAllocGridDemo />
+</Predict>
+
+Things to try:
+
+1. Keep the defaults, at round 120 with **Allocate at write**. Files average 11.3 pieces. They need 204 extents and 68 KiB of extent tree, which is more than the 60 KiB of indirect blocks.
+2. Select **Delayed allocation**. The same writes give 2.3 pieces per file, 41 extents, and no extent tree blocks at all. All extents fit in the inodes.
+3. Select **fallocate first**. Each file is in 1 piece, but it reserves space at creation.
+4. Set **Files growing at once** to 1 with **Allocate at write**. With no other writer, files stay in 1 piece. The problem is concurrency, and not the allocator's search.
+5. Read the slowdown columns at the defaults. Eleven pieces cost about 11 times more on the disk model, and about 8.6 times more on the SSD model, because these files are small.
+
+## The indirect tree
+
+ext2 keeps 15 pointers in the inode. The first 12 point at data blocks. The next three point at a **single**, a **double** and a **triple indirect block**, which are blocks full of pointers.
+
+<Steps>
+<div>A 4 KiB block holds 1,024 pointers of 4 bytes.</div>
+<div>The tree reaches 12 + 1,024 + 1,024² + 1,024³ blocks. That is 1,074,791,436 blocks.</div>
+<div>At 4 KiB per block, the tree reaches about 4 TiB.</div>
+<div>The real limit is lower. `i_blocks` counts 512-byte units in 32 bits, so it stops at 2 TiB.</div>
+</Steps>
+
+At a 1 KiB block size the tree reaches only about 16 GiB, and the size of the pointer table is the limit. A small block loses twice: fewer pointers per block, and fewer bytes per pointer.
+
+The tree has two costs. It stores one pointer per block, even when all the blocks are adjacent. A 1 GiB file needs 257 indirect blocks, about 1 MiB, or 0.098% of the file. A random read deep in the tree also needs up to 3 metadata reads, if those blocks are not cached.
+
+## Extents
+
+An **extent** is one run: a logical block, a physical block and a length. An adjacent file needs one extent however large it is. ext4 stores extents as 12-byte records in a shallow tree that starts in the inode.
+
+| Item | Value at 4 KiB blocks |
+|---|---|
+| Extents in the inode (60 bytes minus a 12-byte header) | 4 |
+| Entries per tree block | 340 |
+| Longest extent, with a 15-bit length | 32,768 blocks, or 128 MiB |
+| Largest file, with 32-bit logical block numbers | 16 TiB |
+| Largest volume, with 48-bit physical block numbers | 1 EiB |
+| Extents at tree depth 1 | 1,360 |
+
+The same 1 GiB file, if it is adjacent, takes 8 extents. That is more than the inode's 4, so it needs one tree block of 4 KiB. The overhead falls from about 1 MiB to 4 KiB, a factor of 257. In 1,000 pieces, it needs 1,000 extents and 3 tree blocks, which is still only 12 KiB.
+
+Extents have a worst case, as step 1 above showed. A file with one extent per block costs 12 bytes per block, while the indirect tree costs about 4. So extents depend on a good allocator.
+
+<FsMaxSizeDemo />
+
+1. Keep the defaults and read the table. Each level multiplies the reach by 1,024.
+2. Select **1 KiB** blocks. The maximum falls to about 16 GiB.
+3. Select **8 bytes** per pointer at 4 KiB. A block now holds 512 pointers. 64-bit pointers cost much of the reach, which is one reason that extents won.
+4. Move **File size** and read the plot. Indirect overhead settles near 0.1%. Extent overhead falls as files grow.
+5. Turn on **Fragment the file**. The extent line rises, but it stays below the indirect line unless the pieces are very small.
+
+## Groups and the allocator
+
+ext4 divides the disk into [block groups](/os/fs/files-inodes-and-directories), and XFS has a similar idea called **allocation groups**. A group keeps a file's inode, its data and its directory close together, so a disk seeks less. Groups also split locks, so several CPUs can allocate at once. XFS leans on this, and it keeps free space in B+ trees per group.
+
+The **Orlov allocator** of ext4 spreads top-level directories across groups, and it keeps a file in the group of its parent. `flex_bg` packs the metadata of 16 groups together, so large extents can cross group boundaries.
+
+The ext4 block allocator is **mballoc** (`ext4_mb_new_blocks`). It keeps buddy data in memory, so it finds a free run of a given size quickly. It serves large files from per-inode preallocations, and it groups small files in per-CPU locality groups so they sit together.
+
+## Delayed allocation
+
+A `write` to ext4 does not pick a block. It only reserves the space and dirties the page. The file system allocates later, at [writeback](/os/fs/the-page-cache-and-writeback). This has three benefits:
+
+- The allocator sees many blocks of one file at once, so it can find one run.
+- A short-lived file may be deleted before writeback, so it never uses a block.
+- Repeated small appends make one allocation and not many.
+
+The price showed up in 2009. Programs replaced files by writing a new file and renaming it, without `fsync`. With delayed allocation, a crash could leave the new name with zero bytes, because the data had no blocks yet. The answer in ext4 is `auto_da_alloc`, which forces the allocation on such a rename or truncate. The real fix is to call `fsync`.
+
+## What fragmentation costs
+
+The cost depends on the device. Details of both devices are in [disks and SSDs](/databases/storage/disks-vs-ssds).
+
+| Read of a 1 GiB file | 1 piece | 1,000 pieces | Slowdown |
+|---|---|---|---|
+| 7,200 rpm disk model | 5.38 s | 18.3 s | 3.4 times |
+| NVMe SSD model | 336 ms | 417 ms | 1.24 times |
+
+Each piece on a disk costs one seek and half a turn, 12.9 ms in the model. This is a worst case, because the model charges a full random seek for each piece. On an SSD, each piece costs one more request, about 81 µs. So fragmentation matters much less on an SSD, but it does not go away. It still costs requests, and a small file in pieces can be many times slower, as the grid demo shows.
+
+Free-space fragmentation is the slow form of the same disease. When a disk is nearly full, only small runs remain, so new files fragment too. `filefrag -v file` prints the extents of a file on Linux, and `e4defrag` rewrites a file into fewer extents.
+
+## Preallocation with fallocate
+
+A program that knows the final size can reserve it:
+
+```c
+int fd = open("db.wal", O_CREAT | O_WRONLY, 0644);
+fallocate(fd, 0, 0, 64 << 20);                         // reserve 64 MiB now
+fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+          off, len);                                   // later: free a range, keep the size
+```
+
+`fallocate` writes no data. It records **unwritten extents**: blocks that belong to the file, and that read as zeros until a write converts them. In ext4, the top bit of the extent length is this flag, so an unwritten extent holds at most 32,767 blocks.
+
+The call gives adjacent space, and it means that a later write cannot fail with `ENOSPC`. Databases use it for log files. The first write to each range still has a metadata cost, so some engines also write zeros in advance. `posix_fallocate` is the portable form, and it may write zeros if the file system has no such feature.
+
+<Callout title="On your Mac">
+APFS also stores extents in a tree. `fallocate` and `filefrag` do not exist on macOS. Use `fcntl(fd, F_PREALLOCATE, &store)` to reserve space.
+</Callout>
+
+## Connect
+
+- [Journaling](/os/fs/journaling) protects the bitmap and the extent tree across a crash.
+- [Log-structured file systems](/os/fs/log-structured-and-copy-on-write-filesystems) give up on choosing places, and they write everything to a log.
+- [The buddy allocator](/os/memory/kernel-memory-allocators) uses the same idea as mballoc, for memory.
+- [Disks and SSDs](/databases/storage/disks-vs-ssds) give the device models behind the read costs.
+
+<Recall cards={[
+  { q: "How many blocks does the ext2 tree reach at 4 KiB, and why is the real limit lower?", a: "12 plus 1,024 plus 1,024 squared plus 1,024 cubed, about 4 TiB. i_blocks counts 512-byte units in 32 bits, so the limit is 2 TiB." },
+  { q: "What does an ext4 extent store, and what is its maximum length at 4 KiB?", a: "A logical block, a physical block and a length. A length of 32,768 blocks is 128 MiB." },
+  { q: "How many extents fit in an ext4 inode, and how many in a tree block?", a: "4 in the inode, and 340 in a 4 KiB tree block." },
+  { q: "When do extents cost more than indirect pointers?", a: "When a file is badly fragmented. An extent is 12 bytes and a pointer is 4, so one extent per block costs three times more." },
+  { q: "Give two benefits of delayed allocation, and the problem that it caused.", a: "Better runs because it sees many blocks at once, and no allocation for short-lived files. A crash could leave a renamed file with zero bytes." },
+  { q: "What does fallocate record, and what does a read of that range return?", a: "Unwritten extents: blocks that the file owns but has not written. A read returns zeros." },
+]} />

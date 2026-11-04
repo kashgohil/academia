@@ -25,7 +25,7 @@ export function TwoBitStepperDemo() {
     history.push({ taken, hit: predict === taken });
     if (i < step.current) state = taken ? Math.min(3, state + 1) : Math.max(0, state - 1);
   }
-  const misses = history.slice(0, -1).filter((h) => !h.hit).length;
+  const misses = history.filter((h) => !h.hit).length;
   const cur = history.at(-1)!;
   const xs = [60, 190, 320, 450];
   return (
@@ -51,7 +51,7 @@ export function TwoBitStepperDemo() {
           <div key={i} title={h.hit ? "predicted correctly" : "mispredicted"} style={{ width: 18, height: 24, borderRadius: 3, display: "grid", placeItems: "center", fontSize: 11, color: "#fff", background: h.hit ? "var(--c3)" : "var(--c4)", outline: i === arr.length - 1 ? "2px solid var(--fg)" : undefined }}>{h.taken ? "T" : "N"}</div>
         ))}
       </div>
-      <Stats items={[{ label: "this branch", value: cur.taken ? "taken" : "not taken" }, { label: "prediction", value: cur.hit ? "correct" : "wrong" }, { label: "mispredictions so far", value: `${misses} of ${step.current}` }]} />
+      <Stats items={[{ label: "this branch", value: cur.taken ? "taken" : "not taken" }, { label: "prediction", value: cur.hit ? "correct" : "wrong" }, { label: "mispredictions so far", value: `${misses} of ${step.current + 1}` }]} />
     </Demo>
   );
 }

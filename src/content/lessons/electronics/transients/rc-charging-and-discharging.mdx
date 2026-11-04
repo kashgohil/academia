@@ -1,0 +1,90 @@
+---
+summary: Why a capacitor charges exponentially, what τ = RC means, and why simulating it naively can blow up.
+---
+import { RcDemo, RcEulerDemo } from "@/demos/RcDemo";
+
+A resistor and a capacitor in series is the simplest circuit with *memory*: what it does now depends on what happened before. It appears everywhere: switch debouncing, power-on reset, timing, filtering, sample-and-hold, and the parasitic delay of every wire on a chip.
+
+<Predict
+  id="double-r"
+  question="With the switch flipped to the source, the capacitor charges toward Vs. If you double R, the time to reach 63% of Vs…"
+  options={["halves", "stays the same", "doubles", "quadruples"]}
+  answer={2}
+  explain="Only the product RC sets the timescale. Doubling R halves the initial current, so charge accumulates half as fast at every voltage level."
+>
+<RcDemo />
+</Predict>
+
+Things to try:
+
+- Turn on **Time axis in units of τ**. Every combination of R, C and Vs now produces the *same* curve shape. The circuit has one intrinsic timescale.
+- Switch to **Discharge**. The capacitor becomes the source and the current reverses sign.
+- Watch the current plot: at t = 0 the current jumps straight to Vs/R. A discharged capacitor initially behaves like a **short circuit**; a fully charged one behaves like an **open circuit**.
+
+## The differential equation
+
+<Steps>
+<div>Kirchhoff's voltage law around the loop: $V_s = v_R + v_C = iR + v_C$.</div>
+<div>The capacitor relation $q = Cv_C$ differentiated gives $i = C\,\dfrac{dv_C}{dt}$.</div>
+<div>Substitute: $RC\,\dfrac{dv_C}{dt} + v_C = V_s$. This is a first-order linear ODE with time constant $\tau = RC$.</div>
+<div>Let $e = V_s - v_C$ be the *remaining distance*. Then $\dfrac{de}{dt} = -\dfrac{e}{\tau}$: the remaining distance shrinks at a rate proportional to itself.</div>
+<div>Hence $e(t) = e(0)\,e^{-t/\tau}$, and with $v_C(0) = 0$: $$v_C(t) = V_s\left(1 - e^{-t/\tau}\right), \qquad i(t) = \frac{V_s}{R}e^{-t/\tau}$$</div>
+</Steps>
+
+The key idea is in step 4. *Anything* whose rate of change is proportional to the distance from equilibrium decays exponentially: Newton's law of cooling, radioactive decay, a first-order low-pass filter, an exponential moving average. Once you recognise this structure, you already know the answer.
+
+| Elapsed | Charged to | Remaining |
+|---|---|---|
+| 1τ | 63.2% | 36.8% |
+| 2τ | 86.5% | 13.5% |
+| 3τ | 95.0% | 5.0% |
+| 5τ | 99.3% | 0.7% |
+
+Engineers treat **5τ as "done"**. Mathematically the capacitor never finishes charging.
+
+<Callout title="Units check">
+Ω × F = (V/A) × (C/V) = C/A = s. A 10 kΩ resistor with 100 µF gives τ = 1 s; the same resistor with 100 pF gives 1 µs.
+</Callout>
+
+## Where the energy goes
+
+The source delivers charge $Q = CV_s$ at constant voltage $V_s$, so it supplies energy $QV_s = CV_s^2$. The capacitor ends up storing $\tfrac12 CV_s^2$. **Exactly half the energy is burned in the resistor, whatever its value.** A smaller R gives a bigger current for a shorter time, and the total heat is the same. This is why charging capacitive loads from a hard voltage source is fundamentally lossy. It is also one reason CMOS dynamic power is $P \approx \alpha C V^2 f$: every switching event pays that $\tfrac12 CV^2$ loss.
+
+## The same circuit as a filter
+
+Drive the RC with a sinusoid instead of a step and take the output across C. Low frequencies pass and high frequencies are attenuated, with the corner at $f_c = \dfrac{1}{2\pi RC}$. The step response you just played with and the frequency response are two views of the same system. The AC module develops this view in the lessons on impedance and passive filters.
+
+## Simulating it: where numerical methods bite
+
+A simulator replaces the derivative with a finite step. Explicit (forward) Euler does $v_{k+1} = v_k + \frac{\Delta t}{\tau}(V_s - v_k)$.
+
+<Predict
+  id="euler"
+  question="You simulate this circuit with explicit Euler using a time step Δt = 2.2τ. What does the simulated voltage do?"
+  options={["Converges to Vs, just less accurately", "Converges, but overshoots and rings first", "Oscillates with growing amplitude and blows up", "Gets stuck at 0"]}
+  answer={2}
+  explain="The error is multiplied by (1 − Δt/τ) every step. For Δt > 2τ that factor has magnitude above 1, so the error grows without bound, even though the real circuit is perfectly stable."
+>
+<RcEulerDemo />
+</Predict>
+
+Write the error as $e_k = V_s - v_k$. Then $e_{k+1} = (1 - \Delta t/\tau)\,e_k$, which gives three regimes:
+
+- $\Delta t < \tau$: the factor is in (0, 1), so the error decays monotonically, just like the real circuit.
+- $\tau < \Delta t < 2\tau$: the factor is in (−1, 0), so the error alternates sign and the solution rings, which the real circuit never does.
+- $\Delta t > 2\tau$: the error grows. This is **numerical instability**.
+
+In a large circuit, the *fastest* time constant (some tiny parasitic capacitance) limits the step size, even if you only care about slow behavior. That is called **stiffness**, and it is why SPICE uses implicit integrators. The Numerical methods module and the Physics track's integrators module go deeper.
+
+<Callout kind="warn" title="Real components">
+Electrolytic capacitors have ±20% tolerance, leakage current and equivalent series resistance (ESR); ceramics lose capacitance under DC bias. Never design a precise timer that relies on a nominal RC value.
+</Callout>
+
+<Recall cards={[
+  { q: "What single quantity sets the timescale of an RC circuit, and what are its units?", a: "τ = RC, in seconds (Ω·F = s)." },
+  { q: "After one time constant, what fraction of the final voltage has a charging capacitor reached?", a: "1 − 1/e ≈ 63.2%. After 5τ it is about 99.3%." },
+  { q: "How does a discharged capacitor behave the instant a voltage step is applied? And at steady state?", a: "Like a short circuit at t = 0 (i = Vs/R); like an open circuit at steady state (i = 0)." },
+  { q: "Charging a capacitor from a fixed voltage through a resistor: what fraction of the source's energy ends up stored?", a: "Half. The other half is dissipated in the resistor, regardless of R." },
+  { q: "For explicit Euler on dv/dt = −v/τ, what step size makes the simulation unstable?", a: "Δt > 2τ, because the per-step error factor |1 − Δt/τ| exceeds 1." },
+  { q: "Cutoff frequency of an RC low-pass filter?", a: "f_c = 1 / (2πRC)." },
+]} />

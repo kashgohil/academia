@@ -183,3 +183,16 @@ fn sizeclass_rounding_waste() {
     assert_eq!(slack_of_object(&pow2), 64 - 33);
     assert_eq!(slack_of_object(&fine), 48 - 33);
 }
+
+#[test]
+fn slab_fills_partial_before_empty() {
+    let mut s = slab::Slab::new(4096, 512, true);
+    // Two slabs of 64 B objects: (512 - 32) / 64 = 7 per slab.
+    let xs: Vec<u32> = (0..8).map(|_| s.alloc(64, 8).unwrap()).collect();
+    // Empty the first slab entirely (kept, because keep_empty), leave one object in the second.
+    for &x in &xs[..7] {
+        s.free(x);
+    }
+    let next = s.alloc(64, 8).unwrap();
+    assert!(next >= 512, "should fill the partial slab at 512, got {next}");
+}

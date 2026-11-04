@@ -34,8 +34,14 @@ impl Slab {
 impl Allocator for Slab {
     fn alloc(&mut self, size: u32, align: u32) -> Option<u32> {
         let c = CLASSES.iter().position(|&o| o >= size && align <= o.min(SLAB_HEADER))?;
-        // Prefer a partially used slab of this cache (lowest address).
-        let found = self.pages.iter().position(|p| p.as_ref().is_some_and(|p| p.class == c && p.used.iter().any(|&u| u == 0)));
+        // Partial slabs first (so empty ones can drain back to the page pool), then empty ones.
+        let has_free = |p: &Page| p.class == c && p.used.iter().any(|&u| u == 0);
+        let has_live = |p: &Page| p.used.iter().any(|&u| u != 0);
+        let found = self
+            .pages
+            .iter()
+            .position(|p| p.as_ref().is_some_and(|p| has_free(p) && has_live(p)))
+            .or_else(|| self.pages.iter().position(|p| p.as_ref().is_some_and(has_free)));
         let pi = match found {
             Some(i) => i,
             None => {

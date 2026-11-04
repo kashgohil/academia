@@ -31,7 +31,7 @@ The operating system pauses threads for many reasons: the time slice ends, an in
 <PreemptionDemo />
 
 1. Set the chance to **0%**. The mutex and the lock-free queue have almost the same throughput.
-2. Set the chance to **1%**. The mutex drops from about 10 to about 1.2 updates per µs. The lock-free queue does not change.
+2. Set the chance to **1%**. The mutex drops from about 10 to about 1.4 updates per µs. The lock-free queue does not change.
 
 ## Without pauses, the difference is small
 

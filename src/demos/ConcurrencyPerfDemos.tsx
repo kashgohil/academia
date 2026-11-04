@@ -43,7 +43,7 @@ export function PingPongDemo() {
       }
     >
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 340px) 1fr", gap: 16, alignItems: "center" }}>
-        <svg viewBox="0 0 340 240" style={{ width: "100%", maxWidth: 340 }}>
+        <svg viewBox="0 0 340 262" style={{ width: "100%", maxWidth: 340 }}>
           {Array.from({ length: cores }, (_, i) => {
             const [x, y] = pos(i);
             return (
@@ -61,7 +61,7 @@ export function PingPongDemo() {
               {Array.from({ length: cores }, (_, i) => <rect key={i} x={4 + i * (72 / cores)} y={4} width={72 / cores - 2} height={12} rx={2} fill={TC[i]} />)}
             </g>
           )}
-          <text x={cx} y={232} textAnchor="middle" fontSize={11} fill="var(--muted)">{padded ? "each core keeps its own line: no transfers" : "one 64-byte line holds every counter"}</text>
+          <text x={cx} y={256} textAnchor="middle" fontSize={11} fill="var(--muted)">{padded ? "each core keeps its own line: no transfers" : "one 64-byte line holds every counter"}</text>
         </svg>
         <Stats
           items={[
@@ -178,8 +178,8 @@ export function StructLayoutDemo() {
 // ---------------- 4. lock scaling ----------------
 
 const lockSchema = {
-  critical: select({ label: "Time inside the lock", options: [20, 50, 200, 1000].map((v) => ({ value: String(v), label: `${v} ns` })), default: "50", segmented: true }),
-  work: select({ label: "Time outside the lock", options: [100, 200, 1000].map((v) => ({ value: String(v), label: `${v} ns` })), default: "200", segmented: true }),
+  critical: select({ label: "Time inside the lock (ns)", options: [20, 50, 200, 1000].map((v) => ({ value: String(v), label: String(v) })), default: "50", segmented: true }),
+  work: select({ label: "Time outside the lock (ns)", options: [100, 200, 1000].map((v) => ({ value: String(v), label: String(v) })), default: "200", segmented: true }),
 };
 const LOCKS: { k: LockKind; color: string }[] = [
   { k: "tas", color: "var(--c4)" },

@@ -1,0 +1,56 @@
+---
+summary: How hardware guesses your next miss, measured by coverage and accuracy, and the access patterns no prefetcher can follow.
+---
+import { PrefetchDemo } from "@/demos/CacheHierarchyDemos";
+
+A miss to DRAM costs a few hundred cycles. If the hardware can predict the address a few hundred cycles early, it can fetch the line in the background, so the program never waits. Every modern core has several prefetchers watching the miss stream. Whether your loop runs at cache speed often depends on whether one of them understands your access pattern.
+
+<Predict
+  id="streams"
+  question="One loop reads a[i] (records 192 bytes apart) and b[i] (320 bytes apart), alternating, in two different load instructions. A stride prefetcher that watches the global address stream sees deltas alternating between two values. What does it cover?"
+  options={["Both streams", "Only a[]", "Neither stream"]}
+  answer={2}
+  explain="The global delta stream never repeats the same stride twice in a row, so the detector is never confident. Indexing the stride table by the load instruction's address (PC) separates the streams, and each one becomes perfectly regular."
+>
+<PrefetchDemo />
+</Predict>
+
+Things to try:
+
+1. **Sequential scan** with next-line: almost every miss disappears. This is the easy case, and every CPU handles it.
+2. **Stride of 3 lines** with next-line: full coverage, but only 33% accuracy. Two of every three prefetched lines are never used, and they evict useful data. A stride prefetcher reaches 100% accuracy.
+3. **Two interleaved streams**: global stride 0%, per-PC stride 100%.
+4. **Linked list (pointer chase)**: nothing helps, because the next address is *inside* the data being loaded.
+5. **Indirect gather**: per-PC stride covers the `idx[]` stream, but the random `a[idx[i]]` accesses remain.
+6. Raise the **degree** on next-line with the stride pattern: more wasted prefetches, with no extra coverage.
+
+## Measuring a prefetcher
+
+- **Coverage**: the fraction of would-be misses that became hits thanks to a prefetch.
+- **Accuracy**: the fraction of prefetches that were used before eviction. Useless prefetches waste memory bandwidth and evict useful lines (**pollution**).
+- **Timeliness**: a correct prefetch that arrives too late still stalls. The demo doesn't model time. Real prefetchers prefetch at a **distance** (how far ahead) and a **degree** (how many lines per trigger), tuned so data arrives just before it's needed.
+
+## The classic designs
+
+<Steps>
+<div><b>Next-line / stream buffers</b> (Jouppi, 1990): on a miss, fetch the next few lines. Tagging prefetched lines, so that the first use triggers the next prefetch, keeps a sequential stream running ahead.</div>
+<div><b>Stride (reference prediction table)</b> (Chen and Baer, 1995): per load instruction, remember the last address and stride; once the same stride repeats, prefetch <code>addr + k·stride</code>. Indexing by PC is what separates interleaved streams.</div>
+<div><b>Spatial and region prefetchers</b>: learn which lines of a page tend to be touched together (footprints), useful for structs and objects.</div>
+<div><b>Limits</b>: hardware prefetchers usually stop at 4 KiB page boundaries (the next physical page is unknown without translation), and they back off when memory bandwidth is saturated.</div>
+</Steps>
+
+## When the hardware can't help
+
+Pointer chasing (linked lists, trees, hash chains with pointers) is the hard case: the address of node $i+1$ is only known once node $i$ has arrived. The options, from most to least effective:
+
+- **Change the layout**: store nodes in an array, in traversal order (pool allocators help); use B-trees instead of binary trees; use open addressing instead of chained hashing.
+- **Software prefetch**: `__builtin_prefetch(p)` in C and C++, `@prefetch` in Zig, `_mm_prefetch` from `std::arch` in Rust. Issue it several iterations ahead, when the address is known early (e.g. `a[idx[i + 8]]`).
+- **Overlap independent chains**: walk several lists at once, so their misses are outstanding together (memory-level parallelism).
+
+<Recall cards={[
+  { q: "Coverage vs accuracy of a prefetcher?", a: "Coverage: the share of would-be misses eliminated. Accuracy: the share of issued prefetches that were actually used." },
+  { q: "Why index a stride prefetcher by PC?", a: "Interleaved streams from different load instructions produce an irregular global address stream. Per-PC tracking makes each stream regular." },
+  { q: "Why can't hardware prefetch a linked-list traversal?", a: "The next address is stored in the node being loaded, so it isn't known until that miss completes." },
+  { q: "What is prefetch pollution?", a: "Useless prefetched lines evicting useful data and consuming memory bandwidth." },
+  { q: "Why do hardware prefetchers usually stop at 4 KiB page boundaries?", a: "The physical address of the next virtual page isn't known without a translation, and crossing could touch unmapped memory." },
+]} />

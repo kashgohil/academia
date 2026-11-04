@@ -1,0 +1,151 @@
+---
+summary: "How a device gets the CPU: polling and interrupts, the path through the APIC and IDT, top and bottom halves, coalescing, IRQ affinity, MSI-X, and how NAPI stops receive livelock."
+---
+import { IoCpuTimelineDemo, IoIrqPathDemo, IoLivelockDemo } from "@/demos/os/IoInterruptDemos";
+
+A device works at its own speed, and the CPU must learn when the device has news. The CPU can ask again and again. This is **polling**. The device can also signal the CPU, which then stops its current work. This is an **interrupt**, and [the mode lesson](/os/processes/kernel-mode-and-user-mode) showed it as one of three ways into the kernel. This lesson shows what an interrupt costs and how Linux keeps that cost under control.
+
+<Predict
+  id="share"
+  question="A device makes 100,000 events per second. A hard handler takes 4 µs, and softirq work takes 3 µs per event. How much of the CPU does the running task keep?"
+  options={["About 97%: the handlers are very short", "About 32%", "None: the CPU is full"]}
+  answer={1}
+  explain="4 µs is short, but 100,000 of anything per second is not. Hard handlers take about 37% and softirq work takes 30%, so the task keeps about 32%. Some events arrive during a handler and share the next one, so the hard share is below the simple 40%."
+>
+<IoCpuTimelineDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **100 k per second** and the **2 ms** window. The task lane is full of small holes. It gets 32.1% of the CPU, and each event waits about 19 µs.
+2. Select **8 events or 50 µs**. The task now gets 62.6%, because hard interrupts fall from 37.5% to 7.0%. The cost is delay: each event now waits about 42 µs.
+3. Move the rate to 20 k per second with one event per interrupt. The task gets 84.8%. At low rates, interrupts are cheap.
+4. Move the rate to 200 k per second and select the **20 ms** window. Softirq work cannot finish, so **ksoftirqd** appears after 2 ms. The task still gets 15.6%. With no ksoftirqd it would get nothing.
+
+## Polling or interrupts
+
+| | Polling | Interrupts |
+|---|---|---|
+| CPU cost with no events | constant | zero |
+| CPU cost per event | almost zero | a full entry and exit |
+| Delay | half the poll period | the entry time |
+| Best at | very high event rates | low and moderate rates |
+
+Model inputs: one uncached status read takes 0.5 µs, the poll period is 10 µs, and a hard handler takes 4 µs. The poll loop then uses 5% of the CPU at all times and adds a mean delay of 5 µs. Interrupts use less CPU below 12,500 events per second. So no single method is correct for all loads, and fast drivers change method when the load changes.
+
+## The path of one interrupt
+
+<IoIrqPathDemo />
+
+1. Press **Next** through all 8 stages. Note where interrupts go off and where they come back on.
+2. Find the stage where a second event adds nothing. The APIC holds one pending bit per vector, not a count.
+3. Compare **Top half** and **Softirq**. Neither may sleep, but only the softirq can be preempted by a hard interrupt.
+
+The **local APIC** is the interrupt controller in each CPU core. The **IDT** (interrupt descriptor table) has 256 vectors, and the first 32 are CPU exceptions. Old devices use wires that go through an I/O APIC.
+
+Modern PCIe devices use **MSI** (message signaled interrupts). An MSI is a memory write to an address near `0xFEE00000`, which the local APICs claim. MSI gives a device at most 32 vectors. **MSI-X** gives it up to 2,048, and each vector can target a different CPU.
+
+MSI-X is what makes multi-queue devices work. A NIC hashes each flow to one receive queue, and each queue has its own vector and CPU. An NVMe drive usually has one queue pair per CPU. So completions return to the CPU that asked, and no CPU fights another for a lock.
+
+On arm64 the controller is the GIC, and the vector table is at `VBAR_EL1`. Apple Silicon uses its own controller, the AIC. In macOS, an IOKit driver normally does its interrupt work on a work loop thread.
+
+## Top half and bottom half
+
+A hard handler stops the running task, and it can hold off other interrupts. So it must be short. It acknowledges the device, notes the work and asks for the rest to run later. The later part is the **bottom half**. Linux has four forms:
+
+| Form | Context | May sleep | Use |
+|---|---|---|---|
+| Softirq | interrupt context, interrupts on | no | network, block completion, timers, RCU |
+| Tasklet | built on a softirq | no | old drivers; recent kernels offer BH workqueues instead |
+| Threaded IRQ | kernel thread `irq/N-name` | yes | slow buses such as I2C, and all handlers under `PREEMPT_RT` |
+| Workqueue | kernel thread `kworker` | yes | general deferred work |
+
+There are 10 softirq types, and the set is fixed at compile time. The same softirq can run on several CPUs at once, so its code must use per-CPU data or locks. After a hard handler, the kernel runs pending softirqs. It repeats at most 10 times or for at most 2 ms. If work remains, it wakes **ksoftirqd**, a normal kernel thread that shares the CPU with tasks. This limit is why the task in the demo did not starve.
+
+A threaded handler has two parts. The first part runs in hard context and returns `IRQ_WAKE_THREAD`. The second part runs in a thread at `SCHED_FIFO` priority 50, so it can sleep and the scheduler can preempt it.
+
+```c
+static irqreturn_t my_hard(int irq, void *data)
+{
+    struct my_dev *d = data;
+    if (!(readl(d->regs + STATUS) & IRQ_PENDING))
+        return IRQ_NONE;            /* a shared line: not ours */
+    writel(IRQ_PENDING, d->regs + STATUS);   /* acknowledge */
+    return IRQ_WAKE_THREAD;
+}
+
+static irqreturn_t my_thread(int irq, void *data)
+{
+    mutex_lock(&((struct my_dev *)data)->lock);   /* allowed here */
+    /* slow work */
+    mutex_unlock(&((struct my_dev *)data)->lock);
+    return IRQ_HANDLED;
+}
+
+err = request_threaded_irq(irq, my_hard, my_thread, 0, "my_dev", d);
+```
+
+## Look at a real machine
+
+These tools are for Linux only. macOS has no `/proc` and no `ethtool`.
+
+```sh
+cat /proc/interrupts                    # one column per CPU, one row per IRQ
+cat /proc/softirqs                      # NET_RX, BLOCK, TIMER and others, per CPU
+echo 2-3 > /proc/irq/42/smp_affinity_list   # send IRQ 42 to CPUs 2 and 3
+ethtool -c eth0                         # show coalescing settings
+ethtool -C eth0 rx-usecs 50 rx-frames 32
+```
+
+**IRQ affinity** selects the CPUs that take an interrupt. The `irqbalance` daemon moves interrupts between CPUs, and many drivers set per-queue affinity themselves. A handler on the same CPU as the application keeps caches warm. A handler on another CPU leaves the application undisturbed. Measure both.
+
+**Interrupt coalescing** tells the device to wait. It raises one interrupt after some events or some time, as in the demo. This trades delay for CPU, so the settings depend on the workload.
+
+## Receive livelock
+
+Interrupts have one more failure. Packets can arrive faster than the system can finish them, and each packet still takes its interrupt and its protocol work. The work with the highest priority is then the work that gets dropped later. Mogul and Ramakrishnan named this **receive livelock** in 1996: the system is busy all the time and does nothing useful.
+
+<Predict
+  id="livelock"
+  question="With an interrupt per packet, an application receives its maximum at about 85,000 packets per second. What happens to its goodput at 200,000 packets per second?"
+  options={["It stays at the maximum, and extra packets drop", "It falls by about half", "It falls to zero"]}
+  answer={2}
+  explain="Hard and softirq work have priority over the application. At 200,000 packets per second they use the whole CPU, so the application never runs. All of that work was for nothing."
+>
+<IoLivelockDemo />
+</Predict>
+
+1. Look at the red curve. It rises to about 84,700 packets per second, and it reaches zero at about 155,000. The bar shows no application time at all.
+2. Keep **200 k** and read the orange line. A 50 µs window gives 65,455 packets per second. Coalescing delays the collapse to about 308,500, but it does not remove it. Softirq work still grows with each packet.
+3. Read the green line. It peaks near 119,800 and then holds at 100,000 for all higher rates.
+4. Move the window to **5 µs**. NAPI now peaks near 106,500, and it dips in the middle because polls often end and interrupts fire again. Real drivers use NAPI and coalescing together.
+
+**NAPI** is the Linux receive method that changes between interrupts and polling. The steps are:
+
+1. The first packet raises an interrupt. The handler turns off interrupts for this queue and calls `napi_schedule`.
+2. In softirq context, the driver's poll function takes up to 64 packets from the ring. One softirq run takes at most 300 packets in total, or a limited time.
+3. If the ring is empty, the driver calls `napi_complete_done` and turns interrupts on again.
+4. If the ring is not empty, polling continues. No interrupt fires, because the driver did not turn them on.
+
+Two things stop the collapse. Under load there are almost no hard interrupts. And when softirq work cannot finish, it moves to ksoftirqd, so the application keeps a share of the CPU. The extra packets then drop in the NIC ring, before the CPU has spent anything on them. At 200,000 packets per second, the model drops 33,333 of them in this way. An early drop is the cheapest drop.
+
+<Callout kind="warn" title="The numbers are a model">
+The handler costs and the 50% softirq share are model inputs, not measurements. A packet-by-packet simulation with the same rules agrees with the curves. Real machines also have GRO, RSS and socket limits that move the numbers. The shapes stay the same.
+</Callout>
+
+## Connect
+
+- [Kernel mode and user mode](/os/processes/kernel-mode-and-user-mode) explains the CPU entry and why interrupt context cannot sleep.
+- [The TLB](/os/vm/the-tlb) shows the IPI, an interrupt from another CPU.
+- [Device drivers](/os/io/device-drivers) shows the rings that these handlers empty.
+- [Interrupt handling](/os/kernel/interrupt-handling) builds an IDT and handlers from nothing.
+- [Tail latency](/performance/systems/tail-latency) explains why a coalescing delay matters at the 99th percentile.
+
+<Recall cards={[
+  { q: "When does polling use less CPU than interrupts?", a: "When events are frequent enough that the cost per event is higher than the constant cost of the poll loop. With the model inputs, the break-even point is 12,500 events per second." },
+  { q: "What must a hard interrupt handler do, and what must it not do?", a: "It acknowledges the device, notes the work and schedules the rest. It must not sleep, and it must stay short." },
+  { q: "Name the four bottom half forms and say which of them may sleep.", a: "Softirqs and tasklets may not sleep. Threaded IRQs and workqueues may, because they run in kernel threads." },
+  { q: "What does ksoftirqd do for a task that is starving?", a: "After 10 restarts or 2 ms, softirq work moves to ksoftirqd. It is a normal thread, so the scheduler shares the CPU between it and the task." },
+  { q: "What does MSI-X add to a multi-queue device?", a: "Up to 2,048 vectors, each with its own target CPU. So each queue can complete work on its own CPU." },
+  { q: "Why does coalescing delay receive livelock but not remove it?", a: "It removes most hard interrupts, but softirq work still grows with each packet. NAPI also limits softirq work, so the extra packets drop in the ring at no CPU cost." },
+]} />

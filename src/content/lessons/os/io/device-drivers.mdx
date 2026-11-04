@@ -1,0 +1,171 @@
+---
+summary: "How software talks to hardware: MMIO and port I/O, device registers and their protocols, the bus, device and driver model, /dev and ioctl, barriers and READ_ONCE, and descriptor rings."
+---
+import { IoDescRingDemo, IoToyDeviceDemo } from "@/demos/os/IoDriverDemos";
+
+A **device driver** is the code that knows the rules of one device. To the CPU, a device looks like a few special addresses. A read from such an address can change state in the device. A write can start a motor or send a packet. The device also has its own speed, and it does not wait for the CPU. Most driver bugs come from these two facts.
+
+The demo is a toy device with three registers. **STATUS** says what the device is doing. **COMMAND** starts an operation. **DATA** holds one byte. The device stays busy for some cycles after a command, and it takes the byte from DATA when it finishes.
+
+<Predict
+  id="nowait"
+  question="A driver sends the bytes L, A, B. For each byte it writes DATA and then COMMAND, with no status check. The device is busy for 3 bus cycles. What reaches the wire?"
+  options={["L, A, B: the writes arrive in order", "A, B: the first byte is lost", "Only L: the later writes are ignored"]}
+  answer={1}
+  explain="The write of A lands while the device is busy with L, so it replaces L in the latch. Later, the device ignores a command that arrives while it is busy. The wire gets A and B. Press No wait to see each cycle."
+>
+<IoToyDeviceDemo />
+</Predict>
+
+Things to try:
+
+1. Press **Run a driver: Correct**. The driver reads STATUS until BUSY clears, writes DATA, and writes COMMAND. All 3 bytes arrive in 16 cycles, and 3 status reads are needed for each byte.
+2. Press **No wait**, and read the red lines. The wire shows only A and B.
+3. Set the busy time to **1 cycle** and press **No wait** again. It works. This is the worst kind of bug: the driver passes on a fast device and fails on a slower one.
+4. Keep 1 cycle and press **Command first**. The device sends the old value of DATA, not L. At 2 cycles or more this order also seems to work, but the log shows a write during BUSY.
+5. Select **Receive 3 bytes** and press **No wait** at 3 cycles. The driver reads DATA before DRDY is set, so it gets old values. Then send the commands by hand and check STATUS each time.
+
+## How the CPU reaches a device
+
+| | Memory-mapped I/O (MMIO) | Port I/O |
+|---|---|---|
+| Instruction | normal load and store | `in`, `out` |
+| Address space | physical memory addresses | a separate space of 65,536 ports |
+| Exists on | every CPU | x86 only; arm64 has none |
+| Used by | nearly all modern devices | legacy PC devices |
+
+A PCI device has up to 6 **BARs** (base address registers). Each BAR says where a block of device registers appears in the physical address space. A driver maps a BAR with `pci_iomap` or `ioremap`. The mapping is uncached, because a cached register read would return an old value. On Linux, `/proc/iomem` and `/proc/ioports` list the ranges, and `lspci -v` shows each device's BARs. On macOS, `ioreg -l` shows the device tree.
+
+## The device model
+
+Linux splits the problem into three objects. A **bus** (`struct bus_type`) can list its devices, as PCI and USB can. A **device** (`struct device`) describes one piece of hardware. A **driver** (`struct device_driver`) says which devices it supports.
+
+When a driver and a device match, the kernel calls the driver's **probe** function. When the device goes away, it calls **remove**. Hot plug is therefore the normal path, not a special case. You can read this tree in `/sys/bus` and `/sys/class`.
+
+```c
+static const struct pci_device_id ids[] = {
+    { PCI_DEVICE(0x1234, 0x5678) },
+    { 0 }
+};
+MODULE_DEVICE_TABLE(pci, ids);     /* lets udev load this module */
+
+static int toy_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+    struct toy *t;
+    int err = pcim_enable_device(pdev);   /* pcim_: freed on remove */
+    if (err)
+        return err;
+    t = devm_kzalloc(&pdev->dev, sizeof(*t), GFP_KERNEL);
+    if (!t)
+        return -ENOMEM;
+    t->regs = pcim_iomap(pdev, 0, 0);     /* map BAR 0, uncached */
+    if (!t->regs)
+        return -ENOMEM;
+    pci_set_master(pdev);                 /* allow DMA */
+    err = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSIX | PCI_IRQ_MSI);
+    if (err < 0)
+        return err;
+    pci_set_drvdata(pdev, t);
+    return devm_request_irq(&pdev->dev, pci_irq_vector(pdev, 0), toy_irq, 0, "toy", t);
+}
+
+static struct pci_driver toy_driver = {
+    .name = "toy", .id_table = ids, .probe = toy_probe,
+};
+module_pci_driver(toy_driver);
+```
+
+Three classes face user space:
+
+| Class | Kernel object | User interface | Example |
+|---|---|---|---|
+| Character | `struct cdev`, `file_operations` | `/dev` node; `read`, `write`, `ioctl` | a serial port |
+| Block | `struct gendisk`, `blk_mq_ops` | `/dev` node; the block layer in between | an NVMe drive |
+| Network | `struct net_device` | no `/dev` node; sockets | an Ethernet NIC |
+
+A `/dev` node is a file with a type and two numbers, major and minor. They select the driver and the device, and `ls -l /dev` shows them. **`ioctl`** is the path for everything that is not a plain read or write. Its request number encodes a direction, a size and a command. The driver must check the number and copy the argument with `copy_from_user`. macOS also has `/dev` and `ioctl`. New macOS drivers are usually DriverKit extensions, which run in user space.
+
+## Why the compiler and the CPU are dangerous here
+
+A device changes memory that the compiler thinks is private. It also watches the order of your writes. Four tools handle this:
+
+- **`readl` and `writel`** are the MMIO accessors. They use the correct instruction width and include barriers. Do not cast a register address to a `volatile` pointer. The kernel document on `volatile` explains why: `volatile` stops some compiler changes, but it does not order the CPU.
+- **`READ_ONCE`** reads memory that a device or another CPU can change. Without it, the compiler can read the field twice and see two different values.
+- **`dma_rmb` and `dma_wmb`** order reads and writes of memory that the CPU shares with a device.
+- **`writel_relaxed`** omits the barrier, for hot paths where the driver places its own.
+
+x86-64 keeps stores in order, so a missing barrier often stays hidden there. arm64 can reorder them. A driver that passes all its tests on x86-64 can fail on arm64. The [memory ordering lesson](/concurrency/atomics/memory-orderings-relaxed-acquire-release-seq-cst) explain the machine that does this.
+
+## Descriptor rings
+
+One byte per register access is far too slow for real work. A real device reads a **descriptor ring**: an array in normal memory, shared with the device. Each descriptor holds a buffer address, a length and some flags. The driver and the device each own one end, so they do not need a lock.
+
+<Predict
+  id="ring-cap"
+  question="A ring has 8 slots, and its indices stay below 8. How many buffers can the driver post before it must wait?"
+  options={["8", "7", "4"]}
+  answer={1}
+  explain="If all 8 slots could fill, the write index would meet the clean index in both the full and the empty case. So one slot stays empty, and 8 slots hold 7 buffers. io_uring solves this in another way, with free-running indices."
+>
+<IoDescRingDemo />
+</Predict>
+
+1. Press the **Post buffer** button twice. The slots are orange, and the device cannot see them. Press **Send one**: it is disabled, because the device thinks that the ring is empty.
+2. Press **Ring doorbell**. This MMIO write moves `tail`, and the slots turn blue. Press **Send one** twice. The device works, and the CPU does nothing.
+3. Press **Reap one** twice. Now `clean` catches up with `head`, and `head == tail`. The ring is empty, so the device stops.
+4. Press **Fill the ring**. The ring takes 7 buffers and rejects the 8th. A real driver now calls `netif_stop_queue`, and the reap path restarts the queue.
+5. Turn on **Use writel_relaxed**. Post a buffer, ring the doorbell and press **Send one**. The device reads the descriptor before the CPU store is visible, so it uses a stale address.
+
+Read the order along the ring: `clean`, `head`, `tail`, next write. Four regions follow from it:
+
+| Region | Owner | Meaning |
+|---|---|---|
+| next write to `clean` | driver | free slots |
+| `clean` to `head` | driver | done, buffer not yet freed |
+| `head` to `tail` | device | work to do |
+| `tail` to next write | driver | written, not yet published |
+
+The doorbell is the expensive step. Writes to memory are cheap, but MMIO crosses PCIe and does not use the cache. Model inputs: 10 ns per descriptor and 300 ns per doorbell. One doorbell per packet costs 310 ns per packet. One doorbell per 32 packets costs 19.4 ns per packet. This is why the network stack has `xmit_more` and why NVMe drivers batch their commands.
+
+The device reports completion in one of two ways. It can set a done bit in the descriptor, or it can write an entry into a separate completion ring. The driver must read that bit first, then use `dma_rmb`, then read the other fields:
+
+```c
+struct tx_desc *d = &ring->desc[ring->clean];
+if (!(READ_ONCE(d->status) & DESC_DONE))
+    return;                    /* the device still owns it */
+dma_rmb();                     /* read the other fields after the bit */
+len = le16_to_cpu(d->len);
+```
+
+## Rust for Linux
+
+Linux has accepted Rust code since version 6.1. The goal is to put the rules above into types. A probe function returns an owned driver object, so remove cannot forget to free it. Register access goes through a wrapper with checked offsets, and the wrapper stops working when the device goes away. The barriers stay the same, because the hardware rules stay the same. The kernel crate changes between releases, so read this as a shape, not a current API:
+
+```rust
+impl pci::Driver for ToyDriver {
+    fn probe(pdev: &pci::Device, _info: &Self::IdInfo) -> Result<Pin<KBox<Self>>> {
+        pdev.enable_device_mem()?;
+        pdev.set_master();
+        // A BAR wrapped in Devres: access fails after the device is removed.
+        let bar = pdev.iomap_region_sized::<BAR_SIZE>(0, c_str!("toy"))?;
+        KBox::pin_init(Self::new(pdev, bar), GFP_KERNEL)
+    }
+}
+```
+
+## Connect
+
+- [Interrupts](/os/io/interrupts) shows what happens when the device finishes.
+- [DMA and the IOMMU](/os/io/dma-and-the-iommu) shows how the device reads those buffers.
+- [The block layer](/os/io/the-block-layer-and-i-o-schedulers) feeds an NVMe driver's rings.
+- [io_uring](/os/io/io-uring) uses rings between user space and the kernel.
+- [System calls](/os/processes/system-calls) explains the `copy_from_user` that each `ioctl` needs.
+
+<Recall cards={[
+  { q: "Why does a driver with no status check pass on a fast device and fail on a slow one?", a: "On a fast device, each operation ends before the next register access. On a slow one, the next write lands while the device is busy, so it replaces data or the device ignores it." },
+  { q: "Why is an MMIO mapping uncached?", a: "A register read has a side effect and can return a new value each time. A cache would return an old value and could hide or merge writes." },
+  { q: "What do bus, device and driver each do in the Linux device model?", a: "A bus lists its devices. A device describes hardware. A driver says what it supports. A match makes the kernel call probe." },
+  { q: "Why does a ring with indices below N hold only N - 1 buffers?", a: "Equal indices must mean empty. If the last slot could fill, equal indices could also mean full." },
+  { q: "What is the doorbell, and why do drivers batch it?", a: "It is an MMIO write that publishes the tail to the device. It crosses PCIe and costs far more than a memory write, so one doorbell for many packets saves CPU." },
+  { q: "What goes wrong if the doorbell passes the descriptor write?", a: "The device fetches the slot before the CPU store is visible, so it uses a stale address or length. A barrier before the doorbell prevents this." },
+]} />

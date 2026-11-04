@@ -1,0 +1,161 @@
+---
+summary: "io_uring: two rings in shared memory, u32 head and tail arithmetic, SQE and CQE layouts, SQPOLL, fixed files and registered buffers, links and multishot, a comparison with epoll and libaio, and its security history."
+---
+import { IoPathCostDemo, IoRingDemo } from "@/demos/os/IoUringDemos";
+
+Each system call has a cost, as [the system calls lesson](/os/processes/system-calls) showed. `epoll` plus `read` needs more than one call per operation. Neither call does the I/O in the background. Linux 5.1 added **io_uring**, which changes the interface.
+
+The program and the kernel share two rings in memory. The program writes requests to one ring, and the kernel writes results to the other. The rings make one system call able to carry many operations, and sometimes no call is needed at all.
+
+<Predict
+  id="order"
+  question="A program submits operations 1, 2 and 3 in that order. The kernel finishes operation 3 first. Which CQE does the program read first?"
+  options={["Operation 1: the rings keep the order", "Operation 3: results appear in completion order", "The program must wait until all 3 finish"]}
+  answer={1}
+  explain="The completion ring is in completion order. A fast operation does not wait for a slow one. The user_data field in each CQE says which operation it belongs to."
+>
+<IoRingDemo />
+</Predict>
+
+Things to try:
+
+1. Press **Write SQE 1** and **Write SQE 2**. The SQ tail moves, but the system call count stays at 0 and the kernel has seen nothing.
+2. Press **io_uring_enter**. One system call takes both operations. Finish operation 2 and then operation 1, then read the CQEs. The order is 2, 1.
+3. Write SQEs until the button stops. With 4 entries, the ring is full at `tail - head = 4`, with no empty slot. Compare this with [the descriptor ring](/os/io/device-drivers), which gives up one slot.
+4. Turn on **Start 3 steps before 2^32** and push some operations through. The tail wraps to 0, and the head is still near 4,294,967,296. The fill count stays correct.
+5. Turn on **SQPOLL**. Press **Write SQE** and **SQPOLL thread looks**. The kernel takes the operation with no system call. Then make the thread idle, and see that you need one call to wake it.
+
+## The rings
+
+`io_uring_setup` returns a file descriptor. Three `mmap` calls on it map the SQ ring, the CQ ring and the SQE array. Newer kernels can use one mapping for the two rings. All of it is ordinary memory, seen by the program and the kernel at the same time.
+
+| Ring | Who writes the tail | Who writes the head | Entry size |
+|---|---|---|---|
+| Submission queue (SQ) | the program | the kernel | 64 bytes per SQE |
+| Completion queue (CQ) | the kernel | the program | 16 bytes per CQE |
+
+Each ring has one producer and one consumer, so it needs no lock. It needs memory ordering. The producer fills the entry and then does a store-release of the tail. The consumer does a load-acquire of the tail before it reads the entry. The rule is the one from [the memory ordering lesson](/concurrency/atomics/memory-orderings-relaxed-acquire-release-seq-cst).
+
+The head and the tail are free-running `u32` values. They only go up, and they wrap at $2^{32}$. The ring size is a power of two, so these two rules are enough:
+
+```c
+slot  = tail & (entries - 1);   /* which slot */
+count = tail - head;            /* how many: u32 subtraction wraps correctly */
+```
+
+Say the tail has wrapped to 1 and the head is 4,294,967,295. Then `tail - head` in `u32` arithmetic is 2, which is correct. Full means `count == entries`, and empty means `count == 0`. So no slot is wasted, and full and empty stay different. The test for this lesson runs random operations across the wrap and checks that no completion is lost or duplicated. A `u32` wrap in Rust needs `wrapping_sub`, and Zig needs `-%`.
+
+The CQ has twice as many entries as the SQ by default, because a program can have more operations in flight than the SQ holds. If the CQ fills anyway, modern kernels keep the extra CQEs in a list and flush them later (`IORING_FEAT_NODROP`). A ring holds at most 32,768 SQ entries.
+
+## SQE and CQE
+
+```c
+struct io_uring_sqe {           /* 64 bytes; the main fields */
+    __u8   opcode;              /* IORING_OP_READ, _WRITE, _ACCEPT, ... */
+    __u8   flags;               /* IOSQE_FIXED_FILE, IOSQE_IO_LINK, ... */
+    __u16  ioprio;
+    __s32  fd;
+    __u64  off;
+    __u64  addr;                /* buffer */
+    __u32  len;
+    __u32  op_flags;            /* per-opcode flags */
+    __u64  user_data;           /* comes back in the CQE */
+    /* buffer index, personality and other fields */
+};
+
+struct io_uring_cqe {           /* 16 bytes */
+    __u64  user_data;
+    __s32  res;                 /* as a syscall: count, or -errno */
+    __u32  flags;               /* IORING_CQE_F_MORE, ... */
+};
+```
+
+The kernel can run an operation at once if it would not block. If it must wait, a socket operation usually arms an internal poll. Other operations can go to a pool of kernel workers, called `io-wq`. You see the same CQE in each case. Unlike `epoll`, this also works for regular files. Most programs use the `liburing` wrapper:
+
+```c
+struct io_uring ring;
+io_uring_queue_init(64, &ring, 0);
+
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_read(sqe, fd, buf, 4096, 0);
+io_uring_sqe_set_data64(sqe, 42);
+io_uring_submit(&ring);                  /* one io_uring_enter */
+
+struct io_uring_cqe *cqe;
+io_uring_wait_cqe(&ring, &cqe);
+/* cqe->user_data == 42, cqe->res == bytes or -errno */
+io_uring_cqe_seen(&ring, cqe);           /* moves the CQ head */
+```
+
+## What it saves
+
+The rings save system calls. An SQE also needs no `copy_from_user`, because the kernel reads it from shared memory. Copies of the data itself are another matter. A buffered read still copies from the page cache to your buffer, and `IORING_OP_SEND_ZC` exists for zero-copy sends. Do not assume that io_uring removes data copies on its own.
+
+| Feature | What it does | What it removes |
+|---|---|---|
+| Batching | one `io_uring_enter` for many SQEs | system calls |
+| `IORING_SETUP_SQPOLL` | a kernel thread reads the SQ | all submit calls, at the cost of a spinning core |
+| Fixed files (`io_uring_register_files`) | a table of open files; SQEs use an index | a file reference count per operation |
+| Registered buffers (`io_uring_register_buffers`) | pages stay pinned | page pin and unpin per direct I/O |
+| Links (`IOSQE_IO_LINK`) | the next SQE starts when this one succeeds | a trip to user space between steps |
+| Multishot | one SQE gives many CQEs | one SQE per `accept` or `recv` |
+
+**SQPOLL** spins until `sq_thread_idle` passes, then it sleeps and sets `IORING_SQ_NEED_WAKEUP` in the shared flags. The program checks this flag after it moves the tail. If it is set, the program makes one `io_uring_enter` call with `IORING_ENTER_SQ_WAKEUP`.
+
+**Links** chain operations: for example open, read, close. If one fails, the rest finish with `-ECANCELED`, so each still gets a CQE. **Multishot** accept and receive keep posting CQEs from one SQE. `IORING_CQE_F_MORE` says that more will come. Provided buffer rings let the kernel pick a buffer only when data arrives, so 10,000 idle connections hold no buffers.
+
+<Predict
+  id="cost"
+  question="In a batch of 16 socket reads, io_uring makes 17 times fewer system calls than epoll plus read. How much less CPU does it use per operation in the model?"
+  options={["About 17 times less", "About 5 times less", "About 1.2 times less"]}
+  answer={2}
+  explain="A system call costs 200 ns in the model, and the kernel work of the read costs 800 ns in both designs. So epoll plus read takes 1,093 ns and io_uring takes 883 ns. System calls were never the whole cost."
+>
+<IoPathCostDemo />
+</Predict>
+
+1. At a batch of **16**, read the table. `epoll + read` makes 1.0625 calls per operation, and `io_uring` makes 0.0625. The CPU figures are 1,093 ns and 883 ns.
+2. Read the latency. Batching has a price: operations arrive every 5 µs here, so a batch of 16 adds about 37.5 µs of waiting. A blocking read takes 4.03 µs in this model, with two thread switches. It does not include the time that the data takes to arrive.
+3. Look at **SQPOLL**: 0 calls per operation and 1.17 µs of latency. The price is in the last column: one core spins.
+4. Turn off **CPU mitigations**. A system call now costs 60 ns, so `epoll + read` costs 944 ns and `io_uring` costs 874 ns. The gain shrinks.
+5. Turn on **Fixed files**. It saves 30 ns per operation in the model.
+
+The large gains appear where system calls and per-operation overhead are the main cost. Fast NVMe with `O_DIRECT` and registered buffers is the best case. A small socket read gains less, as the model shows. Measure your own workload.
+
+| | `epoll` + `read` | `libaio` | `io_uring` |
+|---|---|---|---|
+| Model | readiness | completion | completion |
+| Sockets | yes | no | yes |
+| Buffered files | no | blocks | yes |
+| `O_DIRECT` files | no | yes | yes |
+| Calls per operation | more than 1 | submit and reap | can be 0 |
+| Ordering of steps | your code | your code | links |
+| Kernel surface | small | small | very large |
+
+## Security history
+
+io_uring is a second system call interface, and a very large one. It also gained features quickly, in code that runs with kernel rights and shares state across threads. The result was many serious bugs.
+
+- Google reported in 2023 that 60% of the kernel exploits submitted to its kCTF program in 2022 used io_uring. It disabled io_uring for ChromeOS, for Android apps and on its production servers.
+- A seccomp filter can see `io_uring_enter`, but it cannot see the operations inside the ring. It reads only registers. So a filter that blocks `openat` does not stop `IORING_OP_OPENAT`. See [seccomp and sandboxing](/os/isolation/seccomp-and-sandboxing).
+- For these reasons, many sandboxes block the three io_uring calls. Docker's default seccomp profile blocks them.
+- Linux 6.6 added the sysctl `kernel.io_uring_disabled`. A value of 0 allows io_uring, 1 limits it to privileged users or a chosen group, and 2 turns it off.
+
+So check before you depend on it. A library should try `io_uring_setup` and fall back to `epoll` and a thread pool if it gets an error. Tokio's standard reactor still uses `epoll`, and `tokio-uring` is a separate crate. macOS has no io_uring. Its closest tools are `kqueue` for readiness and Grand Central Dispatch for asynchronous file work.
+
+## Connect
+
+- [Blocking, non-blocking and async I/O](/os/io/blocking-non-blocking-and-async-i-o) explains the readiness model that this replaces.
+- [Device drivers](/os/io/device-drivers) shows the same ring idea between a driver and a device.
+- [The block layer](/os/io/the-block-layer-and-i-o-schedulers) receives the storage operations.
+- [I/O performance](/performance/systems/i-o-performance) puts these costs next to queue depth.
+- [Disks and SSDs](/databases/storage/disks-vs-ssds) shows why many requests in flight matter on NVMe.
+
+<Recall cards={[
+  { q: "Who writes the head and the tail of each ring?", a: "SQ: the program writes the tail and the kernel writes the head. CQ: the kernel writes the tail and the program writes the head." },
+  { q: "How do free-running u32 indices tell full from empty, and why do they survive wraparound?", a: "The count is tail minus head in u32 arithmetic: zero is empty and the ring size is full. Modular subtraction stays correct when the tail wraps first." },
+  { q: "Why does each CQE carry user_data?", a: "Completions arrive in completion order, not submission order. The value from the SQE tells the program which operation finished." },
+  { q: "What does SQPOLL trade, and what happens when its thread sleeps?", a: "It removes submit calls at the cost of a spinning core. When idle it sets IORING_SQ_NEED_WAKEUP, and the program must make one system call to wake it." },
+  { q: "Why can 17 times fewer system calls give only a small CPU gain?", a: "The kernel work of the operation stays the same. A system call is only part of the cost, and mitigations change how large that part is." },
+  { q: "Why can a seccomp filter not limit what io_uring does?", a: "A filter sees system call registers. The operations are in shared memory, so it sees only io_uring_enter and not the operations themselves." },
+]} />

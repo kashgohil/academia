@@ -1,0 +1,134 @@
+---
+summary: "Moving data without the CPU: programmed I/O and DMA costs, scatter-gather, bounce buffers, cache coherence and the map and sync API, the IOMMU and IOVA translation, DMA attacks, and IOTLB costs."
+---
+import { IoDmaSyncDemo, IoIommuDemo, IoPioDmaDemo } from "@/demos/os/IoDmaDemos";
+
+With **programmed I/O (PIO)**, the CPU moves the data itself, one register access at a time. With **direct memory access (DMA)**, the CPU gives the device an address and a length, and the device reads or writes memory alone. All fast devices use DMA. But DMA has a cost, and it has a danger: a device with DMA can touch any memory. This lesson covers both.
+
+<Predict
+  id="share"
+  question="A 4 KiB read comes from an NVMe drive with DMA. While the transfer runs, what share of the time is the CPU busy with it?"
+  options={["Below 5%: DMA frees the CPU", "About 50%", "Over 80%"]}
+  answer={2}
+  explain="The wire time at 3,200 MB/s is only 1.28 µs. Setup and the completion interrupt take 6 µs. So the CPU is busy for 82% of the 7.28 µs. DMA still wins by a wide margin: PIO would take 512 µs of CPU, 85 times as much."
+>
+<IoPioDmaDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **4 KiB** with NVMe. PIO takes 512 µs of CPU and DMA takes 6 µs. The busy share of 82% looks bad, but the time saved is 85 times.
+2. Move the size to **1 MiB**. DMA uses 31.5 µs of CPU against 131 ms for PIO, which is 4,161 times less. The busy share is now 8.8%.
+3. Move the size down to 16 B. Find the green line: with these inputs, DMA uses less CPU above 52 B. Below that, a few register accesses are cheaper. This is why small control values go through registers.
+4. Select **Disk**. The busy share falls, because the slow device gives the CPU more free time. The CPU time per transfer does not change.
+5. Raise the **DMA setup** input. The crossover moves to the right, but a large transfer hardly notices.
+
+The numbers above come from model inputs. One uncached MMIO word of 4 bytes takes 0.5 µs, setup takes 2 µs, and the interrupt takes 4 µs. Uncached register reads are slow because each one waits for a full round trip over PCIe.
+
+## Scatter-gather
+
+A device wants contiguous addresses, but a large buffer is rarely contiguous in physical memory. Its virtual pages can sit in any frames. A **scatter-gather (SG) list** solves this. It is a list of address and length pairs, and the device walks through them. In the demo, 1 MiB takes 256 segments if no two frames are adjacent. Each segment costs the CPU a little, and it uses a descriptor.
+
+```c
+int n = dma_map_sg(dev, sgl, nents, DMA_FROM_DEVICE);
+if (n == 0)
+    return -ENOMEM;
+for_each_sg(sgl, sg, n, i)
+    post_descriptor(ring, sg_dma_address(sg), sg_dma_len(sg));
+```
+
+Use `n` from the return value, not `nents`, because the map can merge entries. This is a common driver bug.
+
+## Bounce buffers
+
+A device has a **DMA mask**: the number of address bits that it can use. A driver declares it with `dma_set_mask_and_coherent`. An old device with a 32-bit mask reaches only the first 4 GiB. If a buffer is above that limit, the kernel copies the data through a **bounce buffer** in low memory. The Linux pool for this is **swiotlb**, 64 MiB by default.
+
+A bounce buffer brings back the copy that DMA was meant to remove, and it can run out. Confidential VMs use swiotlb on purpose, because a device cannot read their encrypted memory. So they pay for this copy on all I/O.
+
+## Cache coherence
+
+On x86-64, DMA is **coherent**: the hardware snoops the CPU caches, so the device and the CPU see the same data. Many embedded arm64 systems are not coherent. The device there reads and writes only memory, and the cache can hold a different value.
+
+<IoDmaSyncDemo />
+
+1. On the non-coherent system with **DMA_TO_DEVICE**, press **CPU writes** and then **Device reads**. The device gets old data, because the new data is still dirty in the cache.
+2. Press **Reset**. Press **CPU writes**, **dma_map_single** and **Device reads**. The map cleaned the line, so the device gets the new data.
+3. Select **DMA_FROM_DEVICE**. Press **CPU reads**, **Device writes**, **CPU reads**. The CPU reads its old cached line. The sequence with map and unmap gives the correct value.
+4. Select **Coherent** and repeat step 1. The hardware does the work, and the calls cost almost nothing here. Portable drivers still make them.
+
+The DMA API is an ownership rule. After a map, the device owns the buffer, and the CPU must not touch it. After an unmap, the CPU owns it again. To use a mapped buffer many times, call `dma_sync_single_for_cpu` and `dma_sync_single_for_device`.
+
+```c
+dma_addr_t a = dma_map_single(dev, buf, len, DMA_FROM_DEVICE);
+if (dma_mapping_error(dev, a))
+    return -ENOMEM;
+start_device(a, len);
+/* The device owns buf. The CPU must not read or write it. */
+wait_for_completion(&done);
+dma_unmap_single(dev, a, len, DMA_FROM_DEVICE);
+/* The CPU owns buf. */
+```
+
+Two details cause real bugs. A CPU can fetch a line by speculation while the device owns the buffer, so the unmap must invalidate again. And a DMA buffer must not share a cache line with other data, because a cache operation on one part affects the whole line. `kmalloc` respects this through `ARCH_DMA_MINALIGN`. A buffer on the stack does not, so it is never valid for DMA. For long-lived shared data such as rings, `dma_alloc_coherent` gives memory that needs no sync calls.
+
+## The IOMMU
+
+An **IOMMU** is an MMU for devices. A device then uses an **IOVA** (I/O virtual address), and the IOMMU translates each access through a page table. On x86 the hardware is Intel VT-d or the AMD IOMMU. On arm64 it is the SMMU. Apple Silicon has its own, the DART. Each device or group of devices attaches to a **domain**, and each domain has its own table.
+
+An IOMMU gives two things. It gives **contiguous addresses**: the SG list for scattered pages can be one segment. And it gives **protection**: a device reaches only what the kernel has mapped for it.
+
+<Predict
+  id="attack"
+  question="An IOMMU is on. A device issues a write to a physical address that holds a kernel secret. It knows this address exactly. What happens?"
+  options={["The write succeeds: it is a valid physical address", "The write goes to the physical address, but the CPU cache hides it", "The IOMMU treats the address as an IOVA, finds no mapping and blocks the write"]}
+  answer={2}
+  explain="With an IOMMU, the device has no way to name a physical address. All its addresses are IOVAs, and this one has no mapping. The access does not reach memory, and the IOMMU logs a fault."
+>
+<IoIommuDemo />
+</Predict>
+
+1. Press **Buffer page 0**. The walk reads 4 table levels, the same as a CPU page walk. Press it again: an IOTLB hit needs no table read.
+2. Select **Device writes memory** and press **Buffer page 3**. This page is mapped read-only, so the write is blocked.
+3. Press **Past the buffer**. A bug in a driver or in firmware stops here, with a logged fault and no corrupted memory.
+4. Press the **Physical** address. It is blocked for the same reason.
+5. Turn off **IOMMU on** and press the same address. The device now reads the kernel page. The list also grows from 1 segment to 4.
+
+A **DMA attack** uses this last case. FireWire and Thunderbolt expose DMA to a plug in the side of a laptop, and tools for such attacks are public. So modern systems turn on the IOMMU for external ports. It is not a complete fix. The Thunderclap research of 2019 showed that a malicious device can still abuse data that shares a page with its own mapped buffers.
+
+Linux logs a block with a `DMAR` line on Intel. Useful boot options are `intel_iommu=on`, `iommu=pt` (identity map for kernel drivers) and `iommu.strict=1`. These options and `/sys/kernel/iommu_groups` are Linux only.
+
+## What the IOMMU costs
+
+Each translation can need 4 memory reads, so the IOMMU has its own cache, the **IOTLB**. The model has 64 entries. With 4 KiB pages they cover 256 KiB. With 2 MiB pages they cover 128 MiB, so huge pages help here too.
+
+A NIC that cycles through its ring is the worst case. With 64 buffers, the model has a 100% hit rate after the first round. With 128 buffers and LRU, the hit rate is 0%, and each access costs 4 reads, or 400 ns in the model. The pattern is the same as in [the TLB lesson](/os/vm/the-tlb).
+
+The larger cost is on the CPU, in map and unmap. After an unmap, the old IOTLB entry must go.
+
+| Mode | When the IOTLB entry goes | CPU per I/O (model) | At 1,000,000 I/O per second |
+|---|---|---|---|
+| Strict | at each unmap | 2.6 µs | 2.6 cores |
+| Lazy | in a later batch | 0.6 µs | 0.6 cores |
+| Passthrough | no translation | 0 | 0 cores, and no protection |
+
+Lazy mode leaves a window: a device can still reach a page after its unmap, until the batch flushes. The kernel may already have reused that page. So this is a trade between speed and safety. The default depends on the kernel configuration.
+
+<Callout title="VFIO">
+VFIO gives a whole device to a user process, usually a VM. The IOMMU is what makes this safe: the guest programs real DMA, and the addresses can reach only that guest's memory. See [virtual machines and hypervisors](/os/isolation/virtual-machines-and-hypervisors).
+</Callout>
+
+## Connect
+
+- [Device drivers](/os/io/device-drivers) shows the rings that hold these DMA addresses.
+- [Paging and page tables](/os/vm/paging-and-page-tables) explains the walk that the IOMMU also does.
+- [Huge pages](/os/vm/huge-pages) explains the reach gain.
+- [Disks and SSDs](/databases/storage/disks-vs-ssds) gives the link speeds in the model.
+
+<Recall cards={[
+  { q: "Why can DMA show a high CPU busy share and still be far better than PIO?", a: "On a fast link, a small transfer finishes so quickly that setup and the interrupt fill most of the time. The CPU time is still far below PIO: 6 µs against 512 µs for 4 KiB in the model." },
+  { q: "When does the kernel use a bounce buffer?", a: "When a device cannot reach the buffer's address, for example with a 32-bit DMA mask, and in confidential VMs. The kernel copies the data through low or shared memory." },
+  { q: "On a non-coherent system, what does a map do for DMA_TO_DEVICE and for DMA_FROM_DEVICE?", a: "For DMA_TO_DEVICE it cleans the cache line, so memory has the data. For DMA_FROM_DEVICE it invalidates the line, and the unmap invalidates again because of speculative fetches." },
+  { q: "Why is a stack buffer not valid for DMA?", a: "It can share a cache line with other data, and cache maintenance affects the whole line. It can also be in vmalloc memory." },
+  { q: "What two things does an IOMMU give?", a: "Contiguous device addresses for scattered pages, and protection: a device reaches only mapped pages, with their rights." },
+  { q: "What is the trade between strict and lazy IOTLB invalidation?", a: "Strict removes the entry at each unmap, which costs CPU. Lazy batches the removals, which is faster, but a device can still reach the page until the flush." },
+]} />

@@ -1,0 +1,165 @@
+---
+summary: "The five classic I/O models, O_NONBLOCK and EAGAIN, select, poll and epoll with their costs, level and edge triggering with the stall and starvation bugs, C10K, netpollers and async runtimes, kqueue and POSIX AIO."
+---
+import { IoServerCostDemo, IoStarvationDemo, IoTriggerDemo } from "@/demos/os/IoEventDemos";
+
+A server spends most of its life waiting. The question is how it waits. One thread can sleep in `read` for each connection. One thread can also ask the kernel which of its connections are ready.
+
+The difference looks small in code. At 10,000 connections, it decides how much memory and CPU the server needs. Dan Kegel named this the **C10K problem** in 1999.
+
+Each read from a network has two phases. First, data must arrive. Second, the kernel copies it to your buffer. The five classic models differ in how they handle these two phases.
+
+| Model | Phase 1: wait for data | Phase 2: copy | Example |
+|---|---|---|---|
+| Blocking | the thread sleeps | the thread does it, in the call | plain `read` |
+| Non-blocking | the thread calls again and again, and gets `EAGAIN` | the thread does it, in the call | `O_NONBLOCK` |
+| I/O multiplexing | the thread sleeps in one call for many fds | the thread does it, in `read` | `select`, `poll`, `epoll` |
+| Signal-driven | the kernel sends `SIGIO` | the thread does it, in `read` | `O_ASYNC` |
+| Asynchronous | the kernel does it | the kernel does it | `io_uring`, POSIX AIO |
+
+Only the last model is truly asynchronous, because the kernel does both phases. The others tell you when you can act. This is the **readiness model**, and the last is the **completion model**.
+
+**`O_NONBLOCK`** changes what a call does when it would have to wait. It returns -1 with `errno` set to `EAGAIN`. It does not make the I/O faster or run it in the background. It also has no effect on regular files: a disk read that misses the page cache still sleeps. `epoll` refuses regular files with `EPERM`, because a regular file is always "ready".
+
+## The cost of waiting
+
+| Call | Kernel work per call | State in user space | Limit |
+|---|---|---|---|
+| `select` | scan all fds up to the highest | 3 bitmaps of 128 bytes, rewritten each call | fd values below 1,024 |
+| `poll` | scan all fds | an array, 8 bytes per fd | none |
+| `epoll` | only ready fds | none: the set is in the kernel | `fs.epoll.max_user_watches` |
+
+With `select` and `poll`, each call passes the whole set, and the kernel checks each fd. The cost per call is $O(N)$, even if only one fd is ready. With `epoll`, you register each fd once with `epoll_ctl`. A socket that gets data puts itself on a **ready list** through a callback, and `epoll_wait` returns that list. The cost per call is $O(\text{ready})$. The man page says that each watch costs about 160 bytes on a 64-bit kernel.
+
+<Predict
+  id="poll-vs-epoll"
+  question="A server has 10,000 connections with 10 events per second each. poll and epoll use the same read and the same handler. How much more CPU does poll use?"
+  options={["About the same", "About 3 times as much", "About 10,000 times as much"]}
+  answer={1}
+  explain="epoll uses 32.5% of a core. poll uses a whole core, about 3 times as much, not 10,000 times. When poll falls behind, each slow call returns more events: 57 per call here. Batching limits the damage, but this loop no longer has any idle time."
+>
+<IoServerCostDemo />
+</Predict>
+
+Things to try:
+
+1. At **10,000** connections, read the memory. Threads take 322 MiB, at 32 KiB of resident memory and 1 KiB of state per connection. `epoll` takes 11.3 MiB. These sizes are model inputs, except for the 16 KiB kernel stack.
+2. Read the CPU. Each event costs 6,000 ns with threads, because each event needs two thread switches. It costs 3,250 ns with `epoll`.
+3. Move to about **1,000** connections. `select` uses 45% of a core, and `epoll` uses 3.3%. Past 1,024, `select` cannot name the fd at all, so the table changes to `poll`.
+4. Move past 32,765. The thread design hits `vm.max_map_count`, as [the threads lesson](/os/processes/threads) showed.
+5. Move to **100,000**, or raise the event rate. Now one `epoll` loop also runs out of CPU. At 10 events per second, one core holds 32,786 connections. Real servers run one loop per core.
+
+## Threads and event loops
+
+A thread per connection is simple code: you read, you process, you write. The stack holds your state. Its costs are memory per thread and a switch per event. An event loop has one thread for many connections, so it must keep the state of each connection in a struct. It must also never block, because one blocked handler stops all connections.
+
+Go and Rust both hide the event loop, in different ways:
+
+- **Go** gives each connection a goroutine with its own small stack. A socket read that would block parks the goroutine. The **netpoller** in the runtime uses edge-triggered `epoll` on Linux and `kqueue` on macOS, and it wakes the goroutine when the socket is ready. File reads cannot use this, so they block a thread, and the scheduler hands off its P.
+- **Rust** async gives each task a state machine with no stack. Tokio's reactor uses the `mio` crate, which uses edge-triggered `epoll` or `kqueue`. When a read returns `WouldBlock`, the future returns `Pending`. File I/O goes to a thread pool.
+
+```go
+// One goroutine per connection. The netpoller does the rest.
+for {
+    c, err := ln.Accept()
+    if err != nil {
+        return err
+    }
+    go func() {
+        defer c.Close()
+        io.Copy(c, c)
+    }()
+}
+```
+
+```rust
+loop {
+    let (mut s, _) = listener.accept().await?;
+    tokio::spawn(async move {
+        let (mut r, mut w) = s.split();
+        let _ = tokio::io::copy(&mut r, &mut w).await;
+    });
+}
+```
+
+[Threads](/os/processes/threads) compares their memory, and [context switching](/os/processes/context-switching) explains the switch cost.
+
+## Level and edge triggering
+
+`epoll` has two modes. **Level triggered** is the default: `epoll_wait` reports a socket as long as it has data. **Edge triggered** (`EPOLLET`) reports a socket only when new data arrives. Edge mode saves some calls, because the kernel does not report the same fd again and again. It also places a rule on you: **read until `EAGAIN`**.
+
+<Predict
+  id="edge"
+  question="A socket is in edge-triggered mode. 4,096 bytes arrive, and epoll_wait reports it. The program reads 1,024 bytes and calls epoll_wait again. The peer now waits for a reply. What happens?"
+  options={["epoll_wait returns at once, because 3,072 bytes remain", "epoll_wait sleeps, and the connection hangs", "read returned an error, so the socket closes"]}
+  answer={1}
+  explain="No new data arrived, so there is no new edge. The 3,072 bytes wait in the buffer, the program waits for an event, and the peer waits for the reply. Nothing will ever change. Level mode would report the socket again."
+>
+<IoTriggerDemo />
+</Predict>
+
+1. Press **Read part, wait again**. The program stalls with 3,072 bytes in the buffer. Note that a test with small messages never shows this bug.
+2. Press **Peer sends** and **epoll_wait**. New data makes a new edge, so the program wakes up. On a busy connection, the bug looks like a random delay, not a hang.
+3. Press **Drain, wait again**. The loop reads until `EAGAIN`, and `epoll_wait` correctly sleeps.
+4. Select **Level** and press **Read part, wait again**. No stall: the socket stays on the ready list after each report.
+
+```c
+struct epoll_event ev = { .events = EPOLLIN | EPOLLET, .data.fd = fd };
+epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev);
+
+for (;;) {                      /* for each event from epoll_wait */
+    ssize_t n = read(fd, buf, sizeof buf);
+    if (n > 0) { handle(buf, n); continue; }
+    if (n == 0) { close(fd); break; }
+    if (errno == EAGAIN) break; /* now it is safe to wait */
+    if (errno != EINTR) { close(fd); break; }
+}
+```
+
+A short read does not prove an empty buffer for all socket types. So reading to `EAGAIN` is the safe rule. New data can arrive during the loop and create another edge. That is harmless. `EPOLLONESHOT` turns off a fd after one event, which stops two threads from handling one socket at the same time.
+
+## The starvation bug
+
+The drain rule has its own trap. The `epoll` man page lists it as a pitfall. If a peer sends as fast as you read, the drain loop never reaches `EAGAIN`, and all other connections wait.
+
+<IoStarvationDemo />
+
+1. At **1,000 MB/s**, the drain loop takes 86 µs before the slow socket gets its turn. The budget policy takes 16 µs.
+2. Move past **1,460 MB/s**, about 11.7 Gb/s. Each read now finds a new packet, so the drain loop never ends. The slow socket waits forever.
+3. The budget line does not move. It reads at most 16 times, then it moves on.
+
+The inputs are 1 µs per read and 1,460 bytes per packet. The fix is to keep your own list of ready sockets. Read each one up to a budget. If it has not reached `EAGAIN`, keep it on the list and go to the next. Then call `epoll_wait` with a zero timeout to collect new events. Tokio has a similar budget per task, for the same reason.
+
+## kqueue and POSIX AIO
+
+**`kqueue`** is the macOS and BSD interface, so you can try this on your Mac. It registers and waits in one call, `kevent`, so a single call can apply many changes. It covers more than sockets: files, processes, signals and timers. `EV_CLEAR` gives edge-like behavior.
+
+```c
+int kq = kqueue();
+struct kevent ch;
+EV_SET(&ch, fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+kevent(kq, &ch, 1, NULL, 0, NULL);          /* register */
+
+struct kevent got[64];
+int n = kevent(kq, NULL, 0, got, 64, NULL); /* wait */
+/* got[i].data holds the number of bytes that can be read */
+```
+
+**POSIX AIO** (`aio_read`) looks like the right answer for files, but on Linux it is weak. The C library, glibc, implements it with a pool of user threads. So it scales no better than your own pool. The older Linux-native `io_submit` interface is truly asynchronous mostly with `O_DIRECT`, and it can still block. These limits are why [io_uring](/os/io/io-uring) exists.
+
+## Connect
+
+- [Threads](/os/processes/threads) compares threads, goroutines and async tasks by memory.
+- [Device drivers](/os/io/device-drivers) shows the rings under the socket.
+- [Interrupts](/os/io/interrupts) shows how the data reaches the socket and wakes `epoll`.
+- [I/O performance](/performance/systems/i-o-performance) compares the same designs by cost per request.
+- [Pipes](/os/ipc/pipes) and [Unix domain sockets](/os/ipc/unix-domain-sockets) also work with these calls.
+
+<Recall cards={[
+  { q: "Name the two phases of a read, and say which models hand both to the kernel.", a: "Waiting for data, and copying it to the buffer. Only the asynchronous model hands both to the kernel." },
+  { q: "Why does O_NONBLOCK not help with regular files?", a: "A regular file always counts as ready. A read that misses the page cache sleeps anyway, and epoll refuses such files with EPERM." },
+  { q: "Why is epoll_wait cheap when few fds are ready?", a: "A socket adds itself to a ready list when its state changes. The call returns that list and does not scan the whole set." },
+  { q: "What is the rule for edge-triggered reads, and what happens if you break it?", a: "Read until EAGAIN. If you stop early, data waits in the buffer with no new event, and the connection can hang." },
+  { q: "How does a fast peer starve other connections, and what is the fix?", a: "A drain loop never reaches EAGAIN if data arrives as fast as it reads. Read each socket up to a budget, and keep unfinished sockets on your own list." },
+  { q: "Why does Go need threads for file I/O but not for sockets?", a: "Sockets can report readiness, so the netpoller parks the goroutine. Regular files cannot, so a read blocks a thread." },
+]} />

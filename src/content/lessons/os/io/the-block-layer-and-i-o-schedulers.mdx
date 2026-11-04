@@ -1,0 +1,135 @@
+---
+summary: "From submit_bio to the device: plugging and merging, multi-queue blk-mq, the schedulers none, mq-deadline, BFQ and Kyber, NVMe queues, and why none is often the right choice for NVMe."
+---
+import { IoElevatorDemo, IoSchedPlotDemo } from "@/demos/os/IoBlockDemos";
+
+File systems and raw devices do not talk to a driver directly. They hand their I/O to the **block layer**. This layer can hold I/O for a moment, join adjacent pieces, change the order, and spread the work over hardware queues. On a disk, that work saves a large amount of time. On a fast SSD, the same work can be a net loss. [Disks and SSDs](/databases/storage/disks-vs-ssds) explains why the two devices differ, and this lesson uses its disk model.
+
+Two structures carry the work. A **bio** (`struct bio`) is one I/O as its creator sees it: a start sector, a direction and a list of memory segments. A **request** (`struct request`) is what the driver gets: one or more bios that form a contiguous command.
+
+<Predict
+  id="merge"
+  question="Three programs write to three places on a disk. Each one issues 4 adjacent writes, and their bios arrive interleaved. All 12 bios arrive before the disk takes any. How many requests reach the disk?"
+  options={["12: one per bio", "6: some pairs join", "3: one per program"]}
+  answer={2}
+  explain="Each bio touches the end or the start of a request that is already in the queue. It joins that request, even though other bios arrived between them. The disk gets 3 requests, and the run takes 38.9 ms, not 179.2 ms."
+>
+<IoElevatorDemo />
+</Predict>
+
+Things to try:
+
+1. Select **Three streams** and step through. Each bio finds its stream and joins it, with a back merge or a front merge. The result is 3 requests from 12 bios.
+2. Turn off **Merge adjacent bios** and select the order **none**. The run takes 179.2 ms against 38.9 ms. The elevator alone gets to 43.4 ms, so sorting does most of the work here, and merging saves 9 commands.
+3. Select **Scattered reads**, with merging on. The elevator takes 68.0 ms, and arrival order takes 93.7 ms. Watch the head: it sweeps in one direction instead of jumping.
+4. Select **A far read waits** with the **Elevator**. New work keeps arriving near the head, so the far read finishes last, at 155.9 ms. In arrival order it finishes at 20.3 ms.
+5. Select **Elevator + expiry**. This demo uses a 60 ms limit. The far read now finishes at 82.8 ms, and the whole run takes a little longer. That is the idea of a deadline scheduler.
+
+## The path
+
+```text
+submit_bio
+  submit_bio_noacct          checks, cgroup throttling
+    blk_mq_submit_bio        split if too large, try to merge
+      plug list              per task: hold requests for a moment
+      blk_finish_plug
+        elevator insert      if a scheduler is set
+        blk_mq_run_hw_queue
+          ->queue_rq         the driver: for example nvme_queue_rq
+            doorbell         an MMIO write
+... later ...
+interrupt, softirq or poll
+  blk_mq_complete_request
+    bio_endio                wakes the waiter or runs the callback
+```
+
+**Plugging** is a short pause. A task that is about to issue several bios calls `blk_start_plug`. Its requests then collect in a per-task list, so that they can merge and reach the driver as a batch. `blk_finish_plug` sends them on, and so does going to sleep. The pause costs no timer and almost no time.
+
+**Merging** has limits. Two bios join only if they have the same direction and touch each other, and if the request stays within `max_sectors_kb`. A new bio can also close a gap, so that two requests become one. The test for this lesson checks the key rule: after any merges, each sector of each bio appears exactly once, in order.
+
+## blk-mq
+
+The old block layer had one queue and one lock per device. With many CPUs and a fast SSD, that lock was the bottleneck. **blk-mq** has two levels:
+
+| Level | Structure | How many | Purpose |
+|---|---|---|---|
+| Software queues | `blk_mq_ctx` | one per CPU | collect work with no shared lock |
+| Hardware queues | `blk_mq_hw_ctx` | one per device queue | hand work to the driver |
+
+Each CPU maps to one hardware queue. An NVMe drive can offer up to 65,535 I/O queues with up to 65,536 commands each. The driver usually asks for one queue per CPU, each with its own MSI-X vector. So a request can start and complete on one CPU, through that CPU's own ring, with no shared lock on the path. This is why [interrupts](/os/io/interrupts) and queues go together.
+
+## The schedulers
+
+A scheduler sits between the two levels. It can hold requests and choose the order.
+
+| Scheduler | Idea | Best for | Cost |
+|---|---|---|---|
+| `none` | no reordering; plug merges still happen | fast multi-queue SSDs | almost nothing |
+| `mq-deadline` | sorted batches, with reads first and an expiry time | disks, SATA SSDs | one lock per device |
+| `bfq` | a budget per process, for fair shares and low delay | desktops, slow media | most CPU per request |
+| `kyber` | limits the queue depth to reach a target latency | fast SSDs with mixed load | low |
+
+**mq-deadline** keeps each request in two lists: one by sector and one by arrival time. It sends a sorted batch of up to 16 requests. Reads go first, but a write batch must run after 2 read batches. Reads expire after 500 ms and writes after 5,000 ms, and an expired request goes next.
+
+**BFQ** gives each process a queue and a weight. It serves one queue for a budget, then moves to the next. It can also idle for 8 ms when a queue is empty, in case that process soon asks for a nearby sector. Sync requests expire after 125 ms and async requests after 250 ms.
+
+**Kyber** does not sort. It measures latency and limits the requests in flight, so that a queue of slow writes cannot delay reads. Its default targets are 2 ms for reads and 10 ms for writes.
+
+## What each one buys
+
+<Predict
+  id="nvme-sched"
+  question="On the NVMe model at a queue depth of 1024, which scheduler gives the highest throughput?"
+  options={["mq-deadline: sorted batches are always more efficient", "BFQ: fair queues use the drive better", "none: nothing can be gained by sorting, and any lock only costs"]}
+  answer={2}
+  explain="An SSD has no head, so sector order hardly matters. The model gives none 371,700 requests per second. The single scheduler lock limits mq-deadline to 329,800 and BFQ to 124,800."
+>
+<IoSchedPlotDemo />
+</Predict>
+
+1. Start on the **disk** at depth **32**. The workload is one reader job and one writer job, with random addresses. `none` stays at 78 requests per second at each depth, because it cannot reorder. `mq-deadline` reaches 127 and BFQ reaches 121.
+2. Read the latency. At depth 2, `none` has a read p99 of 39 ms, and `mq-deadline` has 69 ms. Sorting buys throughput, and tail latency pays for some of it. Compare the curves at the same throughput to judge them.
+3. Read the **reads per second** column at depth 32: 53 for `none`, 88 for `mq-deadline` and 97 for BFQ. BFQ gives reads their budget, so the writer gets less.
+4. Select **NVMe SSD**. At low depth, all three curves are almost equal: at depth 2 the read p99 is about 0.15 ms for each. The scheduler has nothing to do.
+5. Follow the curves to the right. BFQ stops at 125,000 and `mq-deadline` stops at 333,333. These are the limits of the model's locks: 8 µs and 3 µs per request. `none` goes on to 371,700, where the drive itself is the limit.
+
+The plots use labelled inputs. The disk and the NAND timings come from the disk model. A buffered write takes 100 µs, and the lock times above are round figures that show the shape. BFQ's two budgets, 16 and 4, are also inputs. The real BFQ also has weights and idling, which this closed-loop model omits.
+
+So the rule is simple. A disk has one head and a high cost for each seek, so the CPU time for sorting pays for itself many times. An NVMe drive has many parallel units and no seek, so reordering saves little. A single lock on a path that wants millions of requests per second can be the bottleneck. The kernel picks `mq-deadline` for a device with one hardware queue and `none` for most devices with several.
+
+`none` does not mean that one job cannot hurt another. A heavy writer can still delay readers inside the drive. If you see this, try `kyber`, or use cgroup limits.
+
+## Try it
+
+These commands are for Linux only. The scheduler is a per-device setting, and the active one is in brackets.
+
+```sh
+cat /sys/block/nvme0n1/queue/scheduler       # [none] mq-deadline kyber bfq
+echo mq-deadline > /sys/block/sda/queue/scheduler
+cat /sys/block/sda/queue/rotational          # 1 means a disk
+cat /sys/block/sda/queue/max_sectors_kb
+iostat -x 1                                  # rrqm/s and wrqm/s show merges
+```
+
+macOS has no such file and no choice of scheduler. Its `iostat` is a different program, and `sudo fs_usage -w -f diskio` shows each I/O.
+
+<Callout title="I/O priority and cgroup limits">
+`ionice` and `ioprio_set` give a task an I/O class: real time, best effort or idle. Only some schedulers act on them, and `none` does not. Cgroup v2 gives limits per group: `io.max` sets hard bandwidth and IOPS limits, `io.latency` protects a latency target, and `io.weight` and `io.bfq.weight` set shares. See [cgroups](/os/isolation/cgroups).
+</Callout>
+
+## Connect
+
+- [Disks and SSDs](/databases/storage/disks-vs-ssds) explains seek, rotation, and why queue depth helps an SSD.
+- [Device drivers](/os/io/device-drivers) shows the ring and the doorbell at the end of this path.
+- [I/O performance](/performance/systems/i-o-performance) shows how to measure the result.
+- [The page cache and writeback](/os/fs/the-page-cache-and-writeback) creates most of the writes that reach this layer.
+- [io_uring](/os/io/io-uring) submits to this layer with fewer system calls.
+
+<Recall cards={[
+  { q: "What is the difference between a bio and a request?", a: "A bio is one I/O as its creator sees it. A request is what the driver gets: one or more bios that form one contiguous command." },
+  { q: "What does plugging do, and when does it end?", a: "It holds a task's requests in a per-task list, so that they merge and reach the driver as a batch. It ends at blk_finish_plug, or when the task sleeps." },
+  { q: "What are the two queue levels in blk-mq, and why do they exist?", a: "Per-CPU software queues and per-device hardware queues. They replace one shared lock, and they let each CPU use its own device queue." },
+  { q: "How does mq-deadline stop the elevator from starving a far request?", a: "Each request has an expiry time, 500 ms for reads and 5,000 ms for writes. An expired request goes next." },
+  { q: "Why is none often the right choice for NVMe?", a: "An SSD has no seek cost, so sorting saves little. A scheduler with one lock adds latency and can cap throughput." },
+  { q: "On a disk, what does a sorted scheduler give and what does it cost?", a: "It gives more throughput, because seeks get shorter. It can raise tail latency, because a request waits for the head to reach it." },
+]} />

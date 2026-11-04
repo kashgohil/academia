@@ -1,0 +1,131 @@
+---
+summary: "Generating machine code for each query: HyPer's data-centric produce/consume model that fuses a pipeline into one loop, LLVM compile time against run time, adaptive execution, the compiled-versus-vectorized comparison of Kersten et al., and JIT-compiled expressions in PostgreSQL."
+---
+import { ProduceConsumeDemo, BreakEvenDemo } from "@/demos/db/QueryCompileDemos";
+
+[Vectorized execution](/databases/query/vectorized-execution) pays the interpretation overhead once per batch. **Query compilation** removes it completely. The engine generates code for this one query, compiles it to machine code, and runs it. The result looks like a loop that a programmer would write by hand for this query, with no operator calls inside.
+
+The idea is old. IBM System R generated machine code for queries in the 1970s, but later IBM systems went back to interpreted plans. Thomas Neumann revived it in the HyPer system ("Efficiently Compiling Efficient Query Plans for Modern Hardware", VLDB 2011). HyPer generated LLVM intermediate code, and LLVM compiled it. Umbra, SingleStore, the in-memory engine of SQL Server (Hekaton) and the whole-stage code generation of Spark all compile queries.
+
+## Data-centric code
+
+A Volcano engine is **operator-centric**: each operator is a function, and a row moves between functions. Neumann made the code **data-centric**: the goal is to keep a row in CPU registers for as long as possible. A row stays in registers inside one pipeline, from its source to the next pipeline breaker. So the compiler generates one loop per [pipeline](/databases/query/volcano-iterator-model), and all operators of that pipeline become code inside the loop body.
+
+For `SELECT SUM(price * qty) FROM lineitem WHERE shipdate < D`, the whole query is one pipeline, and the generated code is one loop:
+
+```rust
+let mut sum: f64 = 0.0;
+for l in lineitem.iter() {
+    if l.shipdate < D1998_09_01 {
+        sum += l.price * l.qty; // price and qty stay in registers
+    }
+}
+out.push(sum);
+```
+
+The filter is an `if`, the aggregate is one addition, and no function call remains. The compiler can also optimize across operator borders. It can hoist constants out of the loop, unroll it, and use SIMD instructions.
+
+## Produce and consume
+
+Generating such code from an operator tree needs a trick. The loop belongs to the scan at the bottom, but the loop body comes from the operators above it. HyPer gives each operator two functions that generate code, not rows:
+
+- `produce()` asks an operator to generate the code that makes all its rows. A scan opens a loop over its table and, inside the loop, calls `consume()` on its parent.
+- `consume(row, from)` is called by a child for one row. It generates the code that handles that row, inside the loop that is open at that moment, and calls `consume()` on its own parent.
+
+A filter's `consume()` emits an `if` and calls its parent inside it. A hash join's `produce()` first calls `produce()` on its build input. When the build side calls the join's `consume()`, the join emits a hash table insert. Then the join calls `produce()` on its probe side. For probe rows, its `consume()` emits a lookup and a loop over the matches, and calls its parent inside that loop.
+
+<Predict
+  id="loops"
+  question="The plan joins customers with a filter on age to orders, then groups by city. It has 5 operators. How many loops over base tables does the generated code have?"
+  options={["5, one for each operator", "2, one for each pipeline that starts at a table", "1: the whole query is a single loop"]}
+  answer={1}
+  explain="The build side (scan customer, filter, hash insert) is one pipeline and one loop. The probe side (scan orders, probe, aggregate) is the second loop. A third, short loop reads the aggregation table to output the groups. The 17 lines contain no call from one operator to another."
+>
+<ProduceConsumeDemo />
+</Predict>
+
+Things to try:
+
+1. Step through the first events. `produce()` travels down from γ to the scan of customer. Only the scan opens a loop.
+2. Keep stepping. `consume()` travels back up: the filter adds an `if`, and the join adds a hash table insert. Each operator adds its code inside the current loop.
+3. Step until the scan of orders. A second loop opens. The join now adds the lookup and an inner loop over the matches, and γ adds the update of its group.
+4. Select **filter + sum**. The whole query is one loop of 7 lines.
+5. Select **two joins**. The code has 25 lines and 3 loops over tables. The probe of the first join feeds the build of the second, inside one loop.
+
+## Compile time against run time
+
+Compiled code runs fast, but compilation takes time before the first row. LLVM with optimizations needs milliseconds to tens of milliseconds for a typical analytic query. A generated query with thousands of lines, such as a report with hundreds of columns, can take seconds. An interpreter starts at once. For a short query, the compile time can be most of the total time.
+
+<Predict
+  id="breakeven"
+  question="A compiled engine needs 40 ms to compile and then 3 ns per row. A vectorized engine needs no compilation and 5 ns per row. Above how many rows does compilation pay off?"
+  options={["About 10,000 rows", "About 1 million rows", "About 20 million rows"]}
+  answer={2}
+  explain="Compilation saves 2 ns per row, so it needs 40 ms / 2 ns = 20 million rows to pay back its 40 ms. Against a tuple-at-a-time interpreter at 50 ns per row, it pays off after about 851,000 rows."
+>
+<BreakEvenDemo />
+</Predict>
+
+1. Move **Compile latency** to 1 ms. Now compiled beats vectorized after 500,000 rows. A fast compiler changes the answer more than fast generated code.
+2. Select **memory-bound joins**. Here vectorized code (10 ns per row) is faster than compiled code (12 ns per row). Compilation never pays off against vectorization.
+3. Set the rows to 10 M with the compute-heavy query. Adaptive execution takes 62 ms: more than vectorized (50 ms), but less than compiled (70 ms).
+4. Move the rows to 10 k. Adaptive execution finishes in the bytecode interpreter before the compiler is ready, so it never pays for compilation.
+
+These per-row costs are model assumptions, chosen to follow the shape of published results. They are not measurements of one engine.
+
+## Adaptive execution
+
+Kohn, Leis and Neumann solved the latency problem with **adaptive execution** (ICDE 2018). The engine generates its intermediate code as before. But it starts at once with a fast **bytecode interpreter** for that code, so translation takes very little time. Execution is morsel-driven, so the engine can measure the progress of each pipeline. If a pipeline will run long, a background thread compiles it with LLVM, and worker threads switch to machine code at the next morsel.
+
+So a short query never waits for a compiler, and a long query gets machine code for its hot pipelines. Umbra, the successor of HyPer, went further. Its own fast code generator, Flying Start, produces machine code directly, without LLVM, and uses LLVM only for long-running pipelines.
+
+## Compiled or vectorized?
+
+Kersten, Leis, Kemper, Neumann, Pavlo and Boncz built both designs inside one test system. Their paper is "Everything You Always Wanted to Know About Compiled and Vectorized Queries But Were Afraid to Ask" (VLDB 2018). Typer compiles in the style of HyPer, and Tectorwise vectorizes in the style of Vectorwise. With the same algorithms and data structures, both were efficient, and neither was better on all queries.
+
+| Aspect | Compiled (Typer) | Vectorized (Tectorwise) |
+|---|---|---|
+| Computation-heavy queries (TPC-H Q1) | faster: values stay in registers | slower: each intermediate is stored in a vector |
+| Memory-bound joins (TPC-H Q3, Q9) | slower: one probe at a time in a deep loop | faster: a vector of probes gives memory-level parallelism |
+| SIMD | hard: the fused loop mixes many operators | easy: each primitive is a simple loop |
+| Start-up | compile latency before the first row | none |
+| Profiling and debugging | hard: the code exists only at run time | easy: primitives are normal functions |
+| OLTP (short queries, few rows) | good if the plan is cached | overhead per vector of a few rows |
+
+The differences between the two models were small compared with the gap to a tuple-at-a-time interpreter. Some modern engines mix them. For example, a compiled engine can still process a vector of probes for each hash table, and a vectorized engine can compile expressions.
+
+## JIT in PostgreSQL
+
+PostgreSQL 11 added just-in-time compilation with LLVM, and version 12 turned it on by default. It does not compile whole plans. It compiles the parts that the interpreter runs most often for each row:
+
+- **Expressions**: WHERE clauses, target lists, aggregate transitions and projections.
+- **Tuple deforming**: code that extracts the columns from a heap tuple, specialized for the table's column types.
+
+The planner decides with the estimated plan cost. `jit_above_cost` (default 100,000) turns JIT on, and `jit_inline_above_cost` and `jit_optimize_above_cost` (default 500,000 each) add inlining and LLVM optimization. `EXPLAIN ANALYZE` then prints a JIT section with the number of functions and the time for generation, inlining, optimization and emission.
+
+```sql
+SET jit = on;
+EXPLAIN (ANALYZE) SELECT sum(price * qty) FROM lineitem WHERE shipdate < '1998-09-01';
+-- JIT:
+--   Functions: ...
+--   Options: Inlining true, Optimization true, Expressions true, Deforming true
+--   Timing: Generation ... ms, Inlining ... ms, Optimization ... ms, Emission ... ms
+```
+
+The cost thresholds use estimates. So JIT can fire on a query that runs in a few milliseconds, and then spend more time in LLVM than in execution. This is a common reason why administrators set `jit = off` for OLTP workloads. Adaptive execution avoids this problem, because it starts to compile only when the query is already running long.
+
+## Connect
+
+- Pipelines and breakers, which decide the loops: [the Volcano iterator model](/databases/query/volcano-iterator-model).
+- The other answer to interpretation overhead: [vectorized execution](/databases/query/vectorized-execution).
+- What the generated loops do with branches and SIMD: [locality](/architecture/caches/locality) and [latency versus throughput](/performance/systems/latency-vs-throughput).
+- How plan costs, which also trigger JIT in PostgreSQL, are estimated: [cost models](/databases/optimizer/cost-models).
+
+<Recall cards={[
+  { q: "What does data-centric code generation try to do with each row?", a: "Keep it in CPU registers for a whole pipeline. All operators of a pipeline become code inside one loop, so the row is never stored or passed through a function call." },
+  { q: "What do produce() and consume() do in the HyPer model?", a: "The function produce() generates the code that makes all rows of an operator; a scan opens a loop there. The function consume() generates the code for one row from a child, inside the current loop." },
+  { q: "What does a hash join emit in consume() for a build row, and for a probe row?", a: "For a build row, a hash table insert. For a probe row, a lookup and a loop over the matches, with the parent's code inside that loop." },
+  { q: "Why is compilation a bad choice for short queries, and how does adaptive execution fix it?", a: "The compile time can be larger than the run time. Adaptive execution starts at once in a fast bytecode interpreter and compiles a pipeline in the background only when it runs long." },
+  { q: "According to Kersten et al. (2018), where does each model win?", a: "Compiled code wins on computation-heavy queries such as TPC-H Q1. Vectorized code wins on memory-bound hash joins such as Q3 and Q9, thanks to memory-level parallelism." },
+  { q: "What does PostgreSQL compile with JIT, and what decides when?", a: "Expressions (WHERE, target lists, aggregates) and tuple deforming, not whole plans. The estimated plan cost decides: jit_above_cost is 100,000, and inlining and optimization start at 500,000." },
+]} />

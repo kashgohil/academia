@@ -1,0 +1,157 @@
+---
+summary: The operators behind every SQL query, how SQL translates into an operator tree, the equivalence rules that let an optimizer rewrite that tree, and the NULL traps of three-valued logic.
+---
+import { AlgebraPlaygroundDemo, RewriteDemo } from "@/demos/db/QueryAlgebraDemos";
+
+SQL says what result you want. It does not say how to compute it. Before a database can run a query, it translates the SQL text into a tree of **operators**. Each operator takes one or two tables as input and makes one new table. This set of operators is the **relational algebra**, which Edgar Codd defined in 1970.
+
+The algebra matters for two reasons. First, it gives each SQL query an exact meaning. Second, it has **equivalence rules**: two different trees can always give the same result. A query optimizer uses these rules to replace a slow tree with a fast one. The rest of this module is about how engines run the operators. This lesson is about what the operators are and how the tree can change.
+
+## Relations, sets and bags
+
+A **relation** is a table: a **schema** (a list of named columns) and a collection of **tuples** (rows). In Codd's model, a relation is a set, so it has no duplicate rows and no row order. SQL tables are **bags** (multisets): the same row can occur many times. SQL keeps duplicates unless you ask for `DISTINCT`, because removing them costs a sort or a hash table.
+
+No relation has an order either. `ORDER BY` is not part of the algebra. It is a request about the final output only. So a subquery with an `ORDER BY` but no `LIMIT` gives the engine no promise, and PostgreSQL can ignore that order.
+
+## The operators
+
+| Operator | Symbol | SQL | Result |
+|---|---|---|---|
+| Selection | $\sigma_p(R)$ | `WHERE p` | the rows of R where p is true |
+| Projection | $\pi_{a,b}(R)$ | `SELECT a, b` | only the columns a and b |
+| Cross product | $R \times S$ | `FROM R, S` | every pair of a row of R and a row of S |
+| Theta join | $R \bowtie_p S$ | `JOIN ... ON p` | $\sigma_p(R \times S)$, computed without the full product |
+| Natural join | $R \bowtie S$ | `NATURAL JOIN` | an equi-join on all columns with the same name |
+| Union, difference, intersection | $\cup$, $-$, $\cap$ | `UNION`, `EXCEPT`, `INTERSECT` | set operations on tables with the same columns |
+| Rename | $\rho_e(R)$ | `FROM emp e` | the same table with a new name |
+| Grouping | $\gamma_{k;\,f}(R)$ | `GROUP BY k` with aggregates f | one row per group |
+| Duplicate removal | $\delta(R)$ | `DISTINCT` | each row once |
+
+A **theta join** has any predicate. An **equi-join** has only equality predicates, such as `e.did = d.did`. Most joins in real queries are equi-joins, and the fast join algorithms in [the join lesson](/databases/query/join-algorithms) need them. Grouping is an extension of Codd's algebra: it has no set-theory meaning, but every engine needs it.
+
+Each operator takes relations and returns a relation, so operators compose. This property is **closure**. It is the reason a query is a tree: the output of one operator is the input of the next.
+
+## Build a tree
+
+The playground has three small tables. `emp` has 8 employees, `dept` has 4 departments and `proj` has 5 projects. Flo has no department, and Gus has no salary: both values are NULL.
+
+<Predict
+  id="natural"
+  question="emp and dept both have the columns did and city. The equi-join on emp.did = dept.did gives 7 rows. How many rows does the natural join of emp and dept give?"
+  options={["7, the same as the equi-join on did", "2", "32, one for each pair of rows"]}
+  answer={1}
+  explain="A natural join compares every column with the same name, so it matches on did and on city. Only Ada (department 10 in Berlin) and Gus (department 30 in Rome) live in the city of their department. A schema change, such as a new column with a common name, can change a natural join without warning."
+>
+<AlgebraPlaygroundDemo />
+</Predict>
+
+Things to try:
+
+1. Click the node `emp` to see all 8 rows. Click σ to see the 4 rows with a salary above 55.
+2. Press **Clear**, then add `⋈ emp.did = dept.did with dept`. The join gives 7 rows, because Flo has a NULL department and NULL never equals anything. Press **Undo** and add the natural join instead: 2 rows.
+3. Start from `emp` and add `σ salary > 55 ∨ salary ≤ 55`. This predicate looks always true, but it keeps 7 of 8 rows. Gus has a NULL salary.
+4. Start from `dept`, keep only did with π, and add `− π did(emp)`. The difference gives department 40, which has no employees.
+5. Start from `emp` and add a γ on did. The COUNT(*) values add up to 8, but COUNT(salary) skips the NULL salary of Gus. Flo forms her own group, because GROUP BY puts all NULL keys together.
+
+## From SQL to a tree
+
+A parser and a binder turn the SQL text into a tree. The direct translation of a `SELECT-FROM-WHERE` block is the **canonical form**. Take the cross product of the FROM tables, apply one selection with the whole WHERE clause, and put a projection on top.
+
+$$\pi_{e.name,\,p.pname}\big(\sigma_{e.did = d.did \,\wedge\, p.did = d.did \,\wedge\, d.city = \text{Berlin} \,\wedge\, p.budget > 100}((E \times D) \times P)\big)$$
+
+`GROUP BY` adds a γ above the selection, and `HAVING` adds a σ above the γ. `DISTINCT` adds a δ at the top. A correlated subquery becomes a **semi-join** (for `EXISTS` or `IN`) or an **anti-join** (for `NOT EXISTS`), when the engine can unnest it.
+
+The canonical form is correct, but it is a terrible plan. With 100 employees, 8 departments and 30 projects, the cross product alone has 24,000 rows.
+
+## Equivalence rules
+
+These rules hold for bags as well as for sets. Each one replaces a subtree with another subtree that gives the same rows.
+
+| Rule | Equivalence | Condition |
+|---|---|---|
+| Cascade | $\sigma_{p \wedge q}(R) \equiv \sigma_p(\sigma_q(R))$ | none |
+| Commute selections | $\sigma_p(\sigma_q(R)) \equiv \sigma_q(\sigma_p(R))$ | none |
+| Push selection | $\sigma_p(R \times S) \equiv \sigma_p(R) \times S$ | p uses only columns of R |
+| Form a join | $\sigma_p(R \times S) \equiv R \bowtie_p S$ | none |
+| Commute joins | $R \bowtie S \equiv S \bowtie R$ | column order is fixed by a projection |
+| Associate joins | $(R \bowtie S) \bowtie T \equiv R \bowtie (S \bowtie T)$ | each predicate moves to a join that has its columns |
+| Push projection | $\pi_a(R \bowtie_p S) \equiv \pi_a(\pi_{a_R}(R) \bowtie_p \pi_{a_S}(S))$ | $a_R$ and $a_S$ keep the columns of a and of p |
+
+A heuristic optimizer applies them in a fixed order. Split each selection into its conjuncts. Push each conjunct down to the lowest node that has all its columns. Turn a selection over a product into a join. Then choose a join order and prune columns.
+
+<Predict
+  id="rewrite"
+  question="With 100 employees, the operators of the canonical tree produce 24,894 rows in total. After the rewrites (push selections, form joins, reorder joins), about how many rows do the operators produce?"
+  options={["About half: 12,000 rows", "About a tenth: 2,500 rows", "Less than 1%: about 100 rows"]}
+  answer={2}
+  explain="The rewritten tree produces 117 rows, 0.47% of the canonical tree. The filters on city and budget run on the small base tables first. The joins then never build the 24,000-row product. The result (94 rows) is the same at every step."
+>
+<RewriteDemo />
+</Predict>
+
+1. Step from 1 to 2. The cascade of selections produces more rows, 40,494, because each σ now outputs a large table. A rule can make the tree worse and still help: it lets the next rule work.
+2. Step to 3. The filters on `d.city` and `p.budget` move to the base tables. The work drops to 743 rows, but two products remain.
+3. Step to 4. Each σ over a × becomes a ⋈. Now the work is 138 rows.
+4. Step to 5. Associativity joins the two small filtered tables first. Step to 6: the row counts stay the same, but the rows get narrower.
+5. Move **Rows in emp** to 200. The canonical tree grows with the product of all three table sizes. The rewritten tree grows only with the size of the result.
+
+## How an optimizer uses the rules
+
+The rules define a **search space**: all the trees that are equivalent to the query. Selection pushdown almost always helps, so engines apply it as a heuristic, with no cost estimate. PostgreSQL attaches each WHERE condition to the lowest relation or join that has its columns. DuckDB has a separate filter pushdown pass in its optimizer.
+
+Join order is different. The best order depends on table sizes and on how selective each predicate is, so the optimizer needs a **cost model**. At 50 employees, the rewritten join order of the demo is better. With other data, it can be worse. PostgreSQL searches join orders with dynamic programming up to 12 tables (`geqo_threshold`), and uses a genetic algorithm above that. The [join ordering lesson](/databases/optimizer/join-ordering) covers this search.
+
+```rust
+// Selection pushdown over a plan tree: put a predicate at the lowest node that has its columns.
+fn push(pred: Pred, plan: Plan) -> Plan {
+    match plan {
+        Plan::Join { left, right, cond } if covers(&left, &pred) =>
+            Plan::Join { left: Box::new(push(pred, *left)), right, cond },
+        Plan::Join { left, right, cond } if covers(&right, &pred) =>
+            Plan::Join { left, right: Box::new(push(pred, *right)), cond },
+        Plan::Select { pred: p, input } => Plan::Select { pred: p, input: Box::new(push(pred, *input)) },
+        other => Plan::Select { pred, input: Box::new(other) },
+    }
+}
+```
+
+The rules break in some places:
+
+- **Outer joins.** In `R LEFT JOIN S ON ...`, a WHERE filter on S cannot move into S while the join stays an outer join. The join makes NULL-padded rows for R rows without a match, and the filter must see them. If the filter rejects NULLs, the optimizer first turns the outer join into an inner join, and PostgreSQL does this. A filter on S in the ON clause is different: it can move into S.
+- **Volatile functions.** A predicate with `random()` or a side effect cannot move, because the number of calls changes.
+- **Projection with DISTINCT.** π and δ do not commute: removing duplicates before or after dropping a column gives different counts.
+
+## NULLs and three-valued logic
+
+SQL uses **three-valued logic**: a comparison is TRUE, FALSE or UNKNOWN. Any comparison with NULL is UNKNOWN, even `NULL = NULL`. AND, OR and NOT follow these tables:
+
+| p | q | p AND q | p OR q | NOT p |
+|---|---|---|---|---|
+| TRUE | UNKNOWN | UNKNOWN | TRUE | FALSE |
+| FALSE | UNKNOWN | FALSE | UNKNOWN | TRUE |
+| UNKNOWN | UNKNOWN | UNKNOWN | UNKNOWN | UNKNOWN |
+
+WHERE keeps a row only when the predicate is TRUE. So rows with UNKNOWN disappear, and this causes real bugs:
+
+- `did = 10` keeps 3 employees and `did <> 10` keeps 4. Together they keep 7 of 8, because Flo matches neither.
+- `NOT IN` with a NULL in the list returns no rows at all. `40 NOT IN (10, 20, NULL)` is UNKNOWN, because `40 = NULL` is UNKNOWN. In the demo data, "departments not in the list of employee departments" returns 0 rows with NOT IN. `NOT EXISTS` and `EXCEPT` both return department 40.
+- Set operations, `DISTINCT` and `GROUP BY` treat two NULLs as the same value. Comparisons do not. SQL calls this "not distinct", and `IS NOT DISTINCT FROM` is the comparison with that meaning.
+- `COUNT(*)` counts rows, so it gives 8. `COUNT(salary)` skips NULLs and gives 7. `SUM` and `AVG` of no values are NULL, not 0.
+
+The rewrite rules stay correct under three-valued logic, because σ treats UNKNOWN like FALSE everywhere. But a rewrite that turns `NOT IN` into an anti-join must handle NULLs on purpose. PostgreSQL does not make this change for `NOT IN` when NULLs are possible. That is one reason why `NOT EXISTS` is often much faster in PostgreSQL.
+
+## Connect
+
+- How the operators run, one row at a time: [the Volcano iterator model](/databases/query/volcano-iterator-model).
+- The physical algorithms behind ⋈: [join algorithms](/databases/query/join-algorithms). Behind γ and δ: [external sorting and aggregation](/databases/query/external-sorting-and-aggregation).
+- Choosing among equivalent trees with estimates: [cost models](/databases/optimizer/cost-models) and [cardinality estimation](/databases/optimizer/cardinality-estimation).
+- What the chosen tree looks like in practice: [reading query plans](/databases/optimizer/reading-query-plans).
+
+<Recall cards={[
+  { q: "Why does SQL keep duplicate rows by default, and which operator removes them?", a: "SQL tables are bags, because removing duplicates costs a sort or a hash table. The δ operator (DISTINCT) removes them. UNION, INTERSECT and EXCEPT also remove them unless you write ALL." },
+  { q: "What is the canonical translation of a SELECT-FROM-WHERE block?", a: "A cross product of the FROM tables, one selection with the whole WHERE clause above it, and a projection of the SELECT list on top." },
+  { q: "When can a selection move below a cross product or an inner join?", a: "When its predicate uses only columns of one input. Then it moves to that input. A predicate on both inputs turns the product into a join." },
+  { q: "Why can the cascade rule make a tree slower, and why is it still useful?", a: "Each σ in the cascade outputs its own table, so the operators produce more rows. But each conjunct can then move down on its own, which makes the later rewrites possible." },
+  { q: "Why does x NOT IN (subquery) return no rows when the subquery returns a NULL?", a: "x NOT IN (a, NULL) means NOT (x = a OR x = NULL). The comparison with NULL is UNKNOWN, so the whole condition is never TRUE for an x that is not in the list." },
+  { q: "Why can a WHERE filter on the right table of a LEFT JOIN not simply move below the join?", a: "The join adds NULL-padded rows for left rows without a match, and the filter must see them. Below the join, it sees only real rows. If the filter rejects NULLs, the optimizer can first make the join an inner join." },
+]} />

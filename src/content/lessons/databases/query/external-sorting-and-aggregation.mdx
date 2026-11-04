@@ -1,0 +1,161 @@
+---
+summary: "Sorting data larger than memory with two-phase external merge sort, the pass formula 1 + ceil(log_(B-1)(N/B)), replacement selection with runs twice as long as memory, sort against hash aggregation with spilling, and top-N with a heap."
+---
+import { ExternalSortDemo, SortPassesDemo, ReplacementSelectionDemo, AggregationDemo } from "@/demos/db/QuerySortDemos";
+
+Many operators need sorted data or groups: `ORDER BY`, `GROUP BY`, `DISTINCT`, the [sort-merge join](/databases/query/join-algorithms) and `CREATE INDEX`. In memory, a sort is easy. But a database must also sort a table of 100 GB with 64 MB of memory, and it must do so with few I/Os. The standard answer is **external merge sort**. It is also the base for one of the two ways to aggregate.
+
+## External merge sort
+
+The algorithm has two phases. Again, the data has N pages, and the sort has B buffer frames.
+
+- **Run generation** (pass 0). Read B pages into memory, sort them, and write them back as a **run**: a sorted file of B pages. Repeat until all input is read. The result is $\lceil N/B \rceil$ runs.
+- **Merge passes.** Keep one input frame for each of B − 1 runs and one output frame. Repeatedly move the smallest head key of the input frames to the output frame. Write the output frame when it is full, and read the next page of a run when its frame is empty. One merge makes one run from B − 1 runs.
+
+Each merge pass divides the number of runs by B − 1. Each pass, including pass 0, reads and writes every page once.
+
+<Steps>
+<div>After pass 0 there are $\lceil N/B \rceil$ runs.</div>
+<div>After merge pass $j$ there are $\lceil N/B \rceil / (B-1)^j$ runs, rounded up. The sort ends when one run is left.</div>
+<div>So the number of merge passes is $\lceil \log_{B-1} \lceil N/B \rceil \rceil$, and the total is $\text{passes} = 1 + \lceil \log_{B-1} \lceil N/B \rceil \rceil$.</div>
+<div>Each pass reads N pages and writes N pages, so the cost is $2N \cdot \text{passes}$ I/Os.</div>
+</Steps>
+
+<Predict
+  id="passes"
+  question="The demo sorts 12 pages with B = 3 frames. How many passes does the sort make, pass 0 included?"
+  options={["2: one to make runs, one to merge them", "3", "4"]}
+  answer={1}
+  explain="Pass 0 makes 4 runs of 3 pages. With 3 frames, a merge takes only 2 runs at a time. Pass 1 makes 2 runs, and pass 2 makes 1. The cost is 2 × 12 × 3 = 72 I/Os."
+>
+<ExternalSortDemo />
+</Predict>
+
+Things to try:
+
+1. Step through pass 0. Three pages fill the three frames, the sort runs in memory, and the frames go back to disk as one run. Pass 0 makes 4 runs.
+2. Step into pass 1. Two frames hold the first page of runs 1 and 2, and the third frame collects the output. Watch a frame empty and the next page of its run come in.
+3. Count the reads and writes at the end: 36 each, so 72 in total.
+4. Set B to 4. Pass 0 makes 3 runs, and one merge of 3 runs finishes the sort. Now the sort needs 2 passes and 48 I/Os.
+
+## How memory changes the passes
+
+The logarithm has base B − 1, so memory has a strong effect. With two passes, the sort can handle $B(B - 1)$ pages: B pages per run, and B − 1 runs in one merge. So a two-pass sort needs only about $\sqrt{N}$ frames of memory.
+
+<Predict
+  id="mem"
+  question="A table has 1 million pages of 8 KiB (7.63 GiB). The sort has 4 MiB of memory, the PostgreSQL default work_mem: 512 frames. How many passes does the sort need?"
+  options={["2", "3", "About 20"]}
+  answer={1}
+  explain="Pass 0 makes 1,954 runs. One merge pass with 511 inputs leaves 4 runs, and a second merge pass finishes. So 3 passes and 6 million I/Os. With 1,001 frames (7.82 MiB), 2 passes are enough."
+>
+<SortPassesDemo />
+</Predict>
+
+1. Move **Memory B** from 512 to about 1,000 frames. The line drops from 3 passes to 2. Twice the memory saves a third of the I/Os.
+2. Move B up to 100,000 frames. The sort still needs 2 passes: memory beyond $\sqrt{N}$ saves nothing more until the whole table fits.
+3. Move **Data size N** to 1 G pages (7.45 TiB). With 512 frames, the sort needs 4 passes. About 31,624 frames (247 MiB) are enough for 2 passes.
+4. Move B down to 3. The sort needs 20 passes, because each merge only combines two runs.
+
+Real engines add three improvements:
+
+- **A heap for the merge.** Picking the smallest of k heads by a linear scan costs k − 1 comparisons per row. A binary heap costs work in proportion to $\log_2 k$. With k = 511, the heap has only 9 levels.
+- **Double buffering.** Two frames per run let the engine read the next page while it merges the current one. The fan-in drops to about B/2, but the CPU never waits for the disk.
+- **Larger I/Os.** Each run is read in blocks of many pages, so the disk sees long sequential reads. This matters most on a hard disk, where each seek costs milliseconds.
+
+```rust
+// k-way merge of sorted runs with a binary heap: log2(k) comparisons per row.
+use std::{cmp::Reverse, collections::BinaryHeap};
+
+fn merge(mut runs: Vec<impl Iterator<Item = u64>>, out: &mut Vec<u64>) {
+    let mut heap = BinaryHeap::new();
+    for (i, r) in runs.iter_mut().enumerate() {
+        if let Some(k) = r.next() { heap.push(Reverse((k, i))); }
+    }
+    while let Some(Reverse((k, i))) = heap.pop() {
+        out.push(k);
+        if let Some(next) = runs[i].next() { heap.push(Reverse((next, i))); } // refill from the same run
+    }
+}
+```
+
+In PostgreSQL, `EXPLAIN ANALYZE` names the method: `quicksort` when the input fits in `work_mem`, and `external merge` with the disk space used when it does not. PostgreSQL 15 replaced its old polyphase merge with a balanced k-way merge. DuckDB converts the sort keys into **normalized keys**: binary strings that compare correctly with `memcmp`.
+
+## Replacement selection
+
+Pass 0 does not have to make runs of exactly B pages. **Replacement selection** keeps a heap of M records. It writes the smallest key to the current run and reads the next input record. If the new key is at least as large as the last key written, it can still join the current run. If not, it is marked for the next run. A run ends when every record in the heap is marked.
+
+On random input, the runs are about 2M records long. Knuth explains this with a snowplow on a circular road in constant snowfall. In the steady state, one lap clears twice the snow that lies on the road at any moment. Longer runs mean fewer runs, and sometimes one merge pass less.
+
+<Predict
+  id="rs"
+  question="Replacement selection runs with a heap of 1,000 records over 100,000 keys in random order. What is the mean length of a run?"
+  options={["1,000: the size of the memory", "About 2,000", "About 10,000"]}
+  answer={1}
+  explain="The simulation makes 51 runs, so the mean run has 1,961 records, close to 2M. Many new keys are larger than the last key written, so they extend the current run. On sorted input, the whole input becomes one run."
+>
+<ReplacementSelectionDemo />
+</Predict>
+
+1. Step through the first keys with M = 6. Keys smaller than the last output get a dashed border: they wait for the next run.
+2. Play to the end. The 48 random keys make 5 runs, not the 8 runs that load-and-sort would make with 6 records.
+3. Select **sorted**. Every new key extends the run, so the whole input is one run, with no merge at all.
+4. Select **reverse**. Every new key is smaller than the last output. The runs are exactly M long, and the mean for 100,000 keys is 1,000.
+
+Replacement selection has a cost: a heap operation for every record, with cache misses in a large heap. A quicksort of a full memory load is much more cache-friendly. PostgreSQL used replacement selection for its first run in version 9.6, and version 11 removed it. On modern hardware, the faster run generation was worth more than the longer runs.
+
+## Sort against hash aggregation
+
+`GROUP BY` and `DISTINCT` need all rows of a group together. There are two ways to do this:
+
+- **Sort aggregation** sorts the input on the group key, then reads it in order. Each group is a range of adjacent rows. The last merge pass can feed the aggregate directly, so it never writes the sorted output.
+- **Hash aggregation** keeps a hash table with one entry per group. Each row updates its entry. Memory depends on the number of groups G, not on the number of rows.
+
+If the groups fit in memory, hash aggregation reads the input once, with no sort at all. If they do not fit, it must **spill**. PostgreSQL 13 added spilling to its `HashAggregate`.
+
+Once the table is full, it still updates the groups that it holds. Rows of new groups go to partition files on disk. Each partition is then aggregated in the same way. DuckDB partitions its hash tables by the hash value before it spills.
+
+<AggregationDemo />
+
+1. Keep G = 20,000 groups. The hash table holds 5,000 groups. Hash aggregation writes 33,104 rows to partitions and needs 2,358 page I/Os. Sort aggregation needs 3,000.
+2. Move G below 5,000. All groups fit, and hash aggregation reads the 1,000 pages once.
+3. Move G to 50,000. Almost every row spills, and hash aggregation costs nearly as much as a sort.
+4. Compare the dots with the line. The dots come from the executed sim and the line from the formula $N + 2N(1 - \text{cap}/G)$. They agree well.
+
+Sort aggregation still has uses. Its output is sorted, which can save a later `ORDER BY`. It also streams if the input is already sorted, for example from an index. A planner compares both, and PostgreSQL shows the choice as `GroupAggregate` or `HashAggregate`.
+
+## Top-N with a heap
+
+`ORDER BY price LIMIT 10` does not need a full sort. A **max-heap** of the 10 smallest keys seen so far is enough. Each new key is compared with the largest key in the heap, and only a smaller key enters. Memory is 10 rows, and almost every row costs one comparison.
+
+```cpp
+// The k smallest keys: one comparison per row, plus log2(k) for the rare row that enters.
+std::vector<int64_t> top_n(std::span<const int64_t> keys, size_t k) {
+    std::priority_queue<int64_t> heap; // max-heap: top() is the largest of the k smallest
+    for (int64_t x : keys) {
+        if (heap.size() < k) heap.push(x);
+        else if (x < heap.top()) { heap.pop(); heap.push(x); }
+    }
+    std::vector<int64_t> out;
+    for (; !heap.empty(); heap.pop()) out.push_back(heap.top());
+    return {out.rbegin(), out.rend()};
+}
+```
+
+For 100,000 random keys and k = 10, the sim counts 100,411 comparisons. A full merge sort of the same keys needs 1,536,789. PostgreSQL uses this method when the limit is known at sort time, and EXPLAIN shows it as `top-N heapsort`.
+
+## Connect
+
+- The joins that need sorted inputs or spill like hash aggregation: [join algorithms](/databases/query/join-algorithms).
+- Where sorts and aggregations sit in a plan: [the Volcano iterator model](/databases/query/volcano-iterator-model) (they are pipeline breakers).
+- Sorted runs on disk in another engine: [compaction in LSM trees](/databases/lsm/compaction-leveled-vs-tiered) is a k-way merge too.
+- Why large sequential reads beat random reads: [disks versus SSDs](/databases/storage/disks-vs-ssds) and [I/O performance](/performance/systems/i-o-performance).
+
+<Recall cards={[
+  { q: "What does pass 0 of external merge sort produce, and how many runs?", a: "Sorted runs of B pages each: it reads B pages, sorts them in memory and writes them back. It produces ceil(N / B) runs." },
+  { q: "Give the number of passes and the I/O cost of external merge sort.", a: "passes = 1 + ceil(log_(B−1)(ceil(N / B))). Each pass reads and writes all N pages, so the cost is 2N · passes." },
+  { q: "About how much memory does a two-pass sort of N pages need, and why?", a: "About the square root of N frames. Two passes can sort B(B − 1) pages: runs of B pages, and B − 1 runs in one merge." },
+  { q: "How long are replacement selection runs on random, sorted and reverse-sorted input?", a: "About 2M on random input, the whole input on sorted input, and exactly M on reverse-sorted input, where M is the heap size in records." },
+  { q: "When does hash aggregation beat sort aggregation, and what does PostgreSQL 13 do when the groups do not fit?", a: "When the groups fit in memory: it reads the input once. When they do not fit, PostgreSQL keeps updating the groups in the table and writes rows of new groups to partitions on disk." },
+  { q: "How does ORDER BY ... LIMIT k avoid a full sort?", a: "With a max-heap of the k smallest keys. Each new key is compared with the heap top, and only a smaller key enters. The cost is about one comparison per row and k rows of memory." },
+]} />

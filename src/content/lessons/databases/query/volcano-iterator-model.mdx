@@ -1,0 +1,151 @@
+---
+summary: "How an engine runs an operator tree: open, next and close, pull-based pipelines, pipeline breakers that hold whole inputs in memory, the cost of one call per row, and the push-based model of HyPer and DuckDB."
+---
+import { IteratorFlowDemo, PipelineBreakerDemo } from "@/demos/db/QueryVolcanoDemos";
+
+The [relational algebra](/databases/query/relational-algebra) says what each operator computes. An engine also needs a way to connect the operators so that rows move from the tables to the client. The classic answer is the **iterator model**, which Goetz Graefe described for the Volcano system in 1994. Most row-oriented databases still use it, PostgreSQL among them.
+
+## One interface for every operator
+
+In the iterator model, every **physical operator** (an operator together with its algorithm, such as a hash join) has the same three functions:
+
+- `open()` prepares the operator and calls `open()` on its inputs.
+- `next()` returns the next output row, or a special end value (EOF) when there are no more rows.
+- `close()` releases memory and calls `close()` on its inputs.
+
+A parent gets rows by calling `next()` on its child. The child calls `next()` on its own child when it needs input. So rows are **pulled** from the root. The client calls `next()` on the root until it gets EOF.
+
+```rust
+trait Operator {
+    fn open(&mut self);
+    fn next(&mut self) -> Option<Row>; // None is EOF
+    fn close(&mut self);
+}
+
+struct Filter { input: Box<dyn Operator>, pred: Box<dyn Fn(&Row) -> bool> }
+
+impl Operator for Filter {
+    fn open(&mut self) { self.input.open() }
+    fn next(&mut self) -> Option<Row> {
+        while let Some(row) = self.input.next() { // pull until a row passes
+            if (self.pred)(&row) { return Some(row); }
+        }
+        None
+    }
+    fn close(&mut self) { self.input.close() }
+}
+```
+
+The design is simple and general. An operator does not know which operators are above or below it. Any tree of operators works, and a new operator needs only these three functions. In PostgreSQL, the function `ExecProcNode` plays the role of `next()`. Each call returns one tuple slot. MySQL 8.0 rewrote its executor into iterators of this kind.
+
+<Predict
+  id="calls"
+  question="The plan is Project(name) on top of Filter(salary > 55) on top of a scan of the 8 employees. 4 rows pass the filter. How many next() calls does the whole query make, over all operators?"
+  options={["4, one for each output row", "12: 8 for the scan and 4 for the project", "19"]}
+  answer={2}
+  explain="Every operator receives one next() call for each row it returns, plus one call that returns EOF. The scan returns 8 rows (9 calls), the filter 4 rows (5 calls) and the project 4 rows (5 calls): 19 calls in total."
+>
+<IteratorFlowDemo />
+</Predict>
+
+Things to try:
+
+1. Press **Step** a few times. The call stack grows from Project down to Scan before the first row moves at all. Then the row Ada travels up one edge per step.
+2. Step on to the row Bo. The filter rejects Bo, so it calls `next()` on the scan again, and Project sees nothing. A filter can make many calls for one output row.
+3. Select **hash join**. On its first `next()`, the hash join reads all 4 departments before it returns anything. Only then does it pull employees from the filter.
+4. Select **sort + limit 2**. The sort pulls all 8 employees before it can return the top salary. The limit makes only 3 calls and then stops, but the scan still makes 9.
+5. Compare **next() calls in the whole query** with the push model count. For the first plan, both are 19.
+
+## Pipelines and pipeline breakers
+
+In the first plan, a row goes from the scan to the client with no stop. It is never stored. A chain of operators like this is a **pipeline**. Pipelining keeps memory low and gives the first result row early.
+
+Some operators cannot return a row before they have read a whole input. They are **pipeline breakers** (blocking operators):
+
+- **Sort** must see every row, because the last input row can be the first output row.
+- **Hash aggregation** must see every row of a group before the group is final. It holds one entry per group.
+- **Hash join** must build its hash table from the whole build input. But it blocks only on that side: probe rows then stream through it.
+- **Materialization**: a nested-loop join that must rescan its inner input, or a common subexpression used twice, stores rows.
+
+A breaker cuts the plan into pipelines. The input pipeline must finish before the output pipeline can start. The breaker holds the data in between, so it needs memory. When the data is larger than memory, it spills to disk: see [external sorting and aggregation](/databases/query/external-sorting-and-aggregation).
+
+<Predict
+  id="breaker"
+  question="1,000 employees go through a filter and a hash join with 8 departments, then an ORDER BY salary. The whole query makes 3,562 next() calls. When does the first row reach the client?"
+  options={["After a few calls, as with a plain projection", "At about call 2,900, after more than 80% of the calls", "Only at the very last call"]}
+  answer={1}
+  explain="The sort must read all 637 joined rows first. That work is 2,925 of the 3,562 calls (82.1%). The remaining calls return the sorted rows one by one. Without the sort, the first row arrives at call 13."
+>
+<PipelineBreakerDemo />
+</Predict>
+
+1. Read the pipelines. Pipeline 1 scans dept into the hash table. Pipeline 2 scans emp, filters, probes and feeds the sort. Pipeline 3 reads the sorted rows.
+2. Look at the plot. The hash table holds 8 rows from the start. The sort buffer grows to 637 rows, one row per joined employee.
+3. Select **project only**. Now the first row arrives at call 13, as soon as the probe finds one match. Nothing above the join blocks.
+4. Select **GROUP BY city**. The first row now arrives at call 2,287 of 2,291, but the aggregation holds only 4 groups. Memory follows the number of groups, not the number of rows.
+5. Move **Rows in emp** to 4,000. The sort buffer grows with the input. The hash table on dept stays at 8 rows.
+
+Engines use this knowledge in their plans. A plan for `ORDER BY ... LIMIT 10` should not have a breaker if an index can return rows in order. PostgreSQL shows breakers in EXPLAIN as `Sort`, `Hash` (the build side of a `Hash Join`), `HashAggregate` and `Materialize`. The first-row time is the startup cost, the first of the two cost numbers in each EXPLAIN line.
+
+## The cost of one call per row
+
+The iterator model is elegant, but it is slow on a modern CPU. Each `next()` is an indirect call through a function pointer or a virtual table. Each operator checks its state, and each expression is interpreted node by node for each row. The plan for TPC-H query 1 does a few additions per row. In an iterator engine, the calls and the bookkeeping cost far more than the additions.
+
+The number of calls is not the main problem. In the demo, a push model needs the same 19 calls as the pull model. The problem is the work per call: it is large, it is not inlined, and it is repeated for every row.
+
+| Cost per row and operator | Why |
+|---|---|
+| An indirect call | the CPU cannot inline it; it may mispredict the target |
+| A state check | each operator must know if it is in its build phase, at EOF, and so on |
+| Interpreted expressions | `salary > 55` is a small tree of nodes, evaluated for each row |
+| Poor locality | the code of all operators runs for each row, so the instruction cache works hard |
+
+Two designs remove this overhead. **Vectorization** keeps the iterator interface but passes about a thousand rows per call, so the overhead is paid once per batch: see [vectorized execution](/databases/query/vectorized-execution). **Compilation** generates a tight loop for each pipeline, so no calls remain between operators: see [query compilation](/databases/query/query-compilation).
+
+## Push instead of pull
+
+In a **push-based** model, control goes the other way. The source of a pipeline (a scan or the output of a breaker) runs a loop. For each row, it calls `consume(row)` on its parent, which processes the row and calls `consume` on its own parent. A breaker ends a pipeline: its `consume` stores the row.
+
+```go
+// A push pipeline: the scan drives the loop; each operator pushes to its parent.
+type Sink interface{ Consume(r Row) }
+
+type Filter struct{ Pred func(Row) bool; Parent Sink }
+func (f *Filter) Consume(r Row) { if f.Pred(r) { f.Parent.Consume(r) } }
+
+func RunPipeline(rows []Row, first Sink) {
+	for _, r := range rows { first.Consume(r) } // the loop lives in the source
+}
+```
+
+HyPer used push-based pipelines for its compiled code in 2011. DuckDB moved from pull to push in 2021. Push has three advantages:
+
+- **Tight loops.** The loop over the rows is in the source, so a compiler can fuse a whole pipeline into one loop.
+- **Scheduling.** The pipeline is a natural unit of work. In **morsel-driven parallelism** (Leis et al., SIGMOD 2014), worker threads take small chunks of a pipeline's input, called morsels. In HyPer, a morsel was about 100,000 rows.
+- **Shared results.** One operator can push its rows to two parents, so a plan can be a graph, not only a tree.
+
+Pull is better at one thing: stopping early. A `LIMIT` in a pull plan simply stops calling `next()`. A push plan must send a signal back to the source to stop it.
+
+| Engine | Model | Unit per call |
+|---|---|---|
+| PostgreSQL | pull (Volcano) | one tuple |
+| MySQL 8.0 | pull (iterators) | one row |
+| SQLite | bytecode program with nested loops | one row |
+| DuckDB | push, morsel-driven | a vector of 2,048 values |
+| HyPer, Umbra | push, compiled to machine code | one row inside a fused loop |
+
+## Connect
+
+- The logical operators these iterators implement: [relational algebra](/databases/query/relational-algebra).
+- What each breaker does when its input does not fit: [join algorithms](/databases/query/join-algorithms) and [external sorting and aggregation](/databases/query/external-sorting-and-aggregation).
+- Why poor locality hurts each row: [locality](/architecture/caches/locality). Why one slow step per row adds up: [latency versus throughput](/performance/systems/latency-vs-throughput).
+- How a plan shows its breakers and startup costs: [reading query plans](/databases/optimizer/reading-query-plans).
+
+<Recall cards={[
+  { q: "What are the three functions of a Volcano iterator, and who drives the execution?", a: "open, next and close. The client calls next on the root. Each operator calls next on its inputs when it needs a row, so rows are pulled from the top." },
+  { q: "How many next calls does an operator receive if it returns n rows?", a: "n + 1: one call per row and one final call that returns EOF (unless a parent such as LIMIT stops earlier)." },
+  { q: "Name three pipeline breakers and what each must hold in memory.", a: "Sort holds all its input rows. Hash aggregation holds one entry per group. Hash join holds its whole build input in a hash table; the probe side streams." },
+  { q: "Why is the iterator model slow on modern CPUs if the call count is no higher than in a push model?", a: "Each call is an indirect call that cannot be inlined, with state checks and interpreted expressions, repeated for every row. The overhead per row is much larger than the useful work." },
+  { q: "In a push-based pipeline, where is the loop, and what ends a pipeline?", a: "The loop is in the source of the pipeline, a scan or the output of a breaker. Each operator calls consume on its parent. A breaker ends the pipeline by storing the rows." },
+  { q: "What does pull do better than push?", a: "Stopping early. A LIMIT in a pull plan stops calling next. A push plan must send a signal back to its source." },
+]} />

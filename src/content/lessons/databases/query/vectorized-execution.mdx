@@ -1,0 +1,125 @@
+---
+summary: "Processing a batch of about a thousand values per call instead of one row: columnar vectors, selection vectors, branch-free predicates and SIMD-friendly loops, as in MonetDB/X100, DuckDB and Velox, and why the best vector size depends on the caches."
+---
+import { VectorSizeDemo, SelectionVectorDemo, BranchDemo } from "@/demos/db/QueryVectorDemos";
+
+The [iterator model](/databases/query/volcano-iterator-model) pays a function call, a state check and an interpreted expression for every row and every operator. On an analytic query that does a few additions per row, this overhead takes most of the time. **Vectorized execution** keeps the operator interface but changes the unit of work. Each `next()` call returns a **vector**, a batch of about a thousand values of each column. The overhead is then paid once per vector, not once per row.
+
+Peter Boncz, Marcin Zukowski and Niels Nes described this design in 2005 as MonetDB/X100, which later became the product Vectorwise. DuckDB, Velox (the execution library of Meta) and the Photon engine of Databricks use it today. DuckDB uses vectors of 2,048 values.
+
+## Columns in memory, loops over arrays
+
+A vector holds the values of one column as a plain array, such as `[f64; 2048]`. A batch of rows is a set of such vectors, one per column, plus a count. Operators work through **primitives**: small functions that run one tight loop over whole vectors.
+
+```rust
+// A primitive: one loop, no calls inside, no type checks per value.
+fn mul_f64(n: usize, a: &[f64], b: &[f64], out: &mut [f64]) {
+    for i in 0..n {
+        out[i] = a[i] * b[i]; // the compiler can turn this into SIMD instructions
+    }
+}
+```
+
+The engine picks the primitive once per vector, by the types of the inputs. Inside the loop, there is no virtual call, no branch on the type and no tuple layout to decode. A loop like this runs at one or two CPU cycles per value. The compiler can also use **SIMD** (single instruction, multiple data) instructions: AVX2 multiplies 4 doubles in one instruction. DuckDB writes such loops in plain C++ and lets the compiler vectorize them.
+
+## How big should a vector be?
+
+A larger vector makes the overhead per value smaller. But an operator writes a whole output vector before the next operator reads it. These intermediate vectors must stay in the CPU caches, or each value goes through memory. The original MonetDB processed whole columns at a time, which is the extreme case: every intermediate result is a full column in RAM.
+
+<Predict
+  id="vsize"
+  question="A pipeline of 4 primitives costs about 10 ns of overhead per call. Which vector size gives the lowest time per tuple in this model?"
+  options={["1: tuple at a time, so everything stays in registers", "About 1,000 values", "As large as possible: whole columns"]}
+  answer={1}
+  explain="At size 1, the call overhead costs 42.6 ns per tuple. At 1,024 values, the overhead is almost gone, and the 4 intermediate vectors (32 KiB) still fit in the L1 cache: 2.68 ns. Whole columns of 16 M values must go through DRAM: 8.15 ns."
+>
+<VectorSizeDemo />
+</Predict>
+
+Things to try:
+
+1. Read the left end. At size 1, the red line (call overhead) is the whole cost: the model is a Volcano engine. The time falls as 1/size up to about 1,000 values.
+2. Read the right end. Past the L1 line, the orange line (intermediate vectors) rises in steps at L2 and at L3. Full columns cost 8.15 ns per tuple, three times the best size.
+3. Move the overhead per call to 50 ns. Size 1 now costs 202.6 ns, but the best size stays at 1,024. The flat bottom of the curve hides the overhead.
+4. Move the primitives to 8. The working set of one batch doubles, so it fits in L1 only up to 768 values. The best size moves down to 512.
+
+The model is a sum of three terms per tuple. The overhead term is $k \cdot c_{call} / V$ for k primitives and vector size V. The work term is $k \cdot c_{work}$. The memory term charges each intermediate byte at the cost of the cache level that holds the working set $V \cdot 8 \cdot k$ bytes. The values are assumptions of a typical server core, not measurements.
+
+The published curves have the same U shape. In the X100 paper, the time of TPC-H query 1 fell steeply from size 1 to about 1,000 values. It then rose again when the vectors no longer fitted in the cache.
+
+## Selection vectors
+
+A filter in a vectorized engine does not copy the rows that pass. It writes a **selection vector**: the list of positions in the batch that are still alive. The next operator reads its input only at those positions. Copying is expensive when rows have many columns, and a selection vector costs one small integer per surviving row.
+
+<Predict
+  id="sel"
+  question="A batch has 16 rows. Filter 1 (a > 40) keeps 10 of them. On how many rows does filter 2 (b < 50) evaluate its predicate?"
+  options={["16: every filter reads the whole batch", "10: only the positions in the selection vector", "8"]}
+  answer={1}
+  explain="Filter 2 reads b only at the 10 positions of sel₁, and 8 rows pass. The two filters evaluate 26 predicates, not 32. The aggregate then reads a and b only at the 8 positions of sel₂, and no row is ever copied."
+>
+<SelectionVectorDemo />
+</Predict>
+
+1. Move **Filter 1** to 90. Only 2 rows pass. Filter 2 evaluates just those 2, and most of column b is never read.
+2. Move **Filter 1** to 0. Every row passes, so sel₁ lists all 16 positions. A real engine skips the selection vector in this case and uses a flat loop.
+3. Select **SUM(a × b)**. The aggregate follows sel₂, so a batch can lose rows in many filters without any copy.
+
+A selection vector has a cost too. Access through it is indirect: `a[sel[j]]`, not `a[j]`. With few survivors, the batch is mostly empty, and each primitive call does little work. Some engines then **compact** the surviving rows into a new dense batch. DuckDB passes selection vectors between filters and projections, and it materializes dense vectors at pipeline breakers.
+
+## Branch-free predicates
+
+The obvious filter loop has a branch: `if a[i] > x { sel[k] = i; k += 1; }`. A modern CPU guesses the outcome of each branch before it knows it. A wrong guess flushes the pipeline, which costs about 15 to 20 cycles on recent x86 cores. If the data is random and half of the rows pass, half of the guesses are wrong.
+
+The **branch-free** loop always writes the position and moves the cursor by the result of the comparison:
+
+```c
+// Branch-free selection: no jump depends on the data.
+size_t select_gt(const double *a, size_t n, double x, uint32_t *sel) {
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        sel[k] = (uint32_t)i;
+        k += (a[i] > x); // 0 or 1
+    }
+    return k;
+}
+```
+
+Kenneth Ross compared the two forms in 2002. The branching form is faster when almost all rows pass or almost none do, because the predictor is then nearly always right. The branch-free form has a constant cost, and it wins in the middle.
+
+<BranchDemo />
+
+1. Keep selectivity at 50%. The simulated 2-bit predictor misses 50.4% of the branches, and the branching loop costs 8.57 cycles per row. The branch-free loop costs 2.
+2. Move selectivity to 5%. The predictor is almost always right, and the branching loop costs 1.79 cycles: it is now faster.
+3. Read **branch-free wins between**: from 8% to 93% in this model. A vectorized engine can measure the selectivity of each vector and choose the flavor at run time.
+4. Move the penalty to 30 cycles. The middle region, where branch-free wins, gets wider.
+
+Vectorwise did this choice at run time. It kept several flavors of each primitive, such as branching and branch-free, and timed them on real vectors. Råducanu, Boncz and Zukowski called this **micro adaptivity** (SIGMOD 2013).
+
+## Where vectorization helps, and where it does not
+
+Vectorization removes interpretation overhead, which matters most for simple, computation-heavy work: filters, arithmetic and aggregates. In the sim, the query `SUM(a * b) WHERE a > x AND b < y` over 10,000 rows takes 40 primitive calls with vectors of 1,024. Row by row, the same query takes 31,032 interpretation steps.
+
+For hash joins, the cost is mostly cache misses into a large hash table. A vectorized probe still helps, but in another way. The loop over a vector issues many independent loads, so the CPU can wait for several misses at the same time. This **memory-level parallelism** is one reason why vectorized engines do well on join-heavy queries. The [query compilation lesson](/databases/query/query-compilation) compares both designs.
+
+Vectorization also has limits:
+
+- **Every intermediate result is stored.** A value that a compiled loop keeps in a register is written to a vector and read back. This costs bandwidth, even in L1.
+- **Complex expressions** need several primitives, each with its own loop and its own temporary vector.
+- **Row-at-a-time logic,** such as a user-defined function or a recursive operator, does not fit a loop over a vector.
+
+## Connect
+
+- The per-row overhead that vectorization removes: [the Volcano iterator model](/databases/query/volcano-iterator-model).
+- The other way to remove it, with generated code: [query compilation](/databases/query/query-compilation).
+- Why the vector must fit in a cache: [multi-level caches](/architecture/caches/multi-level-caches) and [locality](/architecture/caches/locality).
+- Columns on disk and in memory: [column stores](/databases/olap/column-stores) and [late materialization](/databases/olap/late-materialization).
+
+<Recall cards={[
+  { q: "What does a vectorized next() call return, and why is that faster than one row?", a: "A batch of about a thousand values per column. The call overhead, the state checks and the choice of primitive happen once per batch, so their cost per value becomes tiny." },
+  { q: "Why is a vector of a whole column slower than a vector of about 1,000 values?", a: "Each operator writes a full intermediate vector before the next reads it. Whole columns do not fit in the CPU caches, so every intermediate value goes through DRAM." },
+  { q: "What is a selection vector?", a: "A list of positions in the batch that are still alive after a filter. Later operators read only those positions, so no row is copied." },
+  { q: "When is a branching filter loop faster than a branch-free one?", a: "When almost all rows pass or almost none do. The branch predictor is then nearly always right. Near 50% selectivity, half the guesses are wrong, and the branch-free loop wins." },
+  { q: "What is micro adaptivity in Vectorwise?", a: "The engine keeps several flavors of a primitive, such as branching and branch-free, times them on real vectors, and picks the fastest at run time." },
+  { q: "How does vectorization help a hash join probe, where the work is cache misses?", a: "The loop over a vector issues many independent loads, so the CPU waits for several cache misses at the same time (memory-level parallelism)." },
+]} />

@@ -1,0 +1,151 @@
+---
+summary: "Nested loop, block nested loop, index nested loop, sort-merge, and hash joins (in memory, Grace and hybrid): what each one reads and writes, the I/O formulas with B buffer pages, when each wins, and how skew breaks hash partitioning."
+---
+import { JoinStepperDemo, JoinCostDemo, GracePartitionDemo } from "@/demos/db/QueryJoinDemos";
+
+A join is the most expensive operator in most queries. The algebra defines $R \bowtie_p S$ as $\sigma_p(R \times S)$, but no engine builds the product. Each **join algorithm** avoids most of the pairs in a different way: with a loop over blocks, an index, sorted order or a hash table. Which one is best depends on the table sizes, the memory and the available indexes.
+
+## The cost model
+
+This lesson uses the textbook model of CMU 15-445 and of Ramakrishnan and Gehrke. Table R has **M** pages and **m** tuples. Table S has **N** pages and **n** tuples. The join has **B** buffer frames of memory. A page read or a page write is one **I/O**. The output costs the same for every algorithm, so its writes are not counted.
+
+The running example has M = 1,000 pages with 100 tuples each (m = 100,000), and N = 500 pages with 80 tuples each (n = 40,000). At 0.1 ms per I/O, 10,000 I/Os take one second.
+
+## Nested loops
+
+The **tuple nested-loop join** is the definition, run directly. For each tuple of R, it reads all of S. The cost is $M + m \cdot N$: 50,001,000 I/Os, or 83.3 minutes in the example. A **page nested-loop join** reads S once per page of R, not once per tuple. It costs $M + M \cdot N$ = 501,000 I/Os.
+
+The **block nested-loop join** uses the memory. It fills B − 2 frames with a block of R pages. One frame reads S and one holds the output. S is scanned once per block:
+
+$$\text{cost} = M + \left\lceil \frac{M}{B - 2} \right\rceil \cdot N$$
+
+With B = 100, this is 6,500 I/Os. Put the smaller table outside: with B = 102, R outside costs 6,000 I/Os and S outside costs 5,500. When the whole smaller table fits in memory, the cost is M + N, and no algorithm can do better. MySQL used this algorithm, with a join buffer of `join_buffer_size` (256 KiB by default), until version 8.0.18 added hash joins.
+
+<Predict
+  id="nlj"
+  question="R has 6 tuples in 3 pages, and S has 8 tuples in 4 pages. How many page I/Os does the tuple nested-loop join need?"
+  options={["7: read each page once", "15: R once, and S once per page of R", "27: R once, and S once per tuple of R"]}
+  answer={2}
+  explain="For each of the 6 tuples of R, the join reads all 4 pages of S: 24 reads. With the 3 reads of R, that is 27. The block nested-loop join with B = 4 holds 2 pages of R at a time and needs only 11."
+>
+<JoinStepperDemo />
+</Predict>
+
+Things to try:
+
+1. Play the nested loop. Every tuple of R meets every tuple of S: 48 comparisons for 8 output pairs. Each S page is read again for each tuple of R.
+2. Select **block NL** with B = 4. The block holds 2 pages of R, and S is read twice: 11 I/Os. Set B to 5. The whole of R fits, S is read once, and the cost is 7.
+3. Select **index NL**. Each R tuple makes one probe into the index and one fetch per match. The join needs 6 probes and 17 I/Os.
+4. Select **sort-merge**. Both inputs are sorted first. Then two cursors move forward, and the cursor with the smaller key steps.
+5. Select **hash**. The build puts R into 4 buckets. Each S tuple then checks only one bucket: 8 probes, 7 I/Os.
+
+## Index nested-loop join
+
+If S has an index on the join key, the join does not need to scan S. For each tuple of R, it probes the index and fetches the matches. The cost is $M + m \cdot C$, where C is the cost of one probe and its fetches. For a B+ tree with cached inner levels and one unclustered match, C is about 2. In the example, the cost is 201,000 I/Os, which is bad.
+
+But index nested loops win when the outer input is small. If a filter leaves 10 rows of R on one page, the join costs 1 + 10 × 2 = 21 I/Os. No other algorithm reads less than the whole of S. This is the common plan for an OLTP query, and SQLite has only nested-loop joins for this reason. It builds an automatic index on the inner table when no useful index exists.
+
+## Sort-merge join
+
+The **sort-merge join** sorts both inputs on the join key, then merges them. Two cursors start at the first tuples. If the keys differ, the cursor with the smaller key moves. If they are equal, the join outputs all pairs of the two groups with that key.
+
+$$\text{cost} = \text{sort}(M) + \text{sort}(N) + M + N, \qquad \text{sort}(X) = 2X \cdot \left(1 + \left\lceil \log_{B-1} \lceil X/B \rceil \right\rceil\right)$$
+
+With B = 100, each sort needs 2 passes, so the cost is 4,000 + 2,000 + 1,500 = 7,500 I/Os. An engine can merge the last sort runs inside the join, without writing the sorted tables. Then the cost drops to 3(M + N) = 4,500, if B is larger than the square root of the larger table. The [external sorting lesson](/databases/query/external-sorting-and-aggregation) derives the sort cost.
+
+Sort-merge wins when an input is already sorted, for example by an index scan, or when the query needs sorted output anyway. Its weakness is a key with many duplicates on both sides. The join then must rescan a large group of S for each tuple of R with that key.
+
+## Hash join
+
+The **hash join** has two phases. The **build** phase reads the smaller input, R, and puts each tuple into a hash table on the join key. The **probe** phase reads S and looks up each key in the table. Each probe touches one bucket, not the whole table. If R fits in B − 2 frames, the cost is M + N.
+
+```zig
+// In-memory hash join: build on R, probe with S.
+fn hashJoin(alloc: std.mem.Allocator, r: []const Tuple, s: []const Tuple, out: *std.ArrayList(Pair)) !void {
+    var ht = std.AutoHashMap(u64, std.ArrayListUnmanaged(Tuple)).init(alloc);
+    defer ht.deinit();
+    for (r) |t| { // build
+        const e = try ht.getOrPut(t.key);
+        if (!e.found_existing) e.value_ptr.* = .{};
+        try e.value_ptr.append(alloc, t);
+    }
+    for (s) |t| { // probe
+        if (ht.get(t.key)) |matches| for (matches.items) |m| try out.append(.{ .r = m, .s = t });
+    }
+}
+```
+
+### Grace hash join
+
+When R does not fit, the **Grace hash join** (Kitsuregawa and others, 1983) first partitions both inputs. With one input frame and B − 1 output frames, it hashes each tuple of R with a function h1 into one of B − 1 partitions. A full output frame is written to disk. Then it partitions S with the same h1. Two tuples with the same key always land in partitions with the same number. So the join needs only to join each pair $R_i$, $S_i$, each with an in-memory hash join and a different hash function h2.
+
+Each page is read, written and read again, so the cost is about 3(M + N) = 4,500 I/Os. This works if each partition of R fits in memory: $M / (B - 1) \le B - 2$, so B must be larger than about $\sqrt{M}$. If a partition is still too large, the join partitions it again with a new hash function. Each extra level costs 2(M + N) more.
+
+<Predict
+  id="cost"
+  question="M = 1,000 pages, N = 500 pages and B = 100 frames. Which join needs the fewest page I/Os?"
+  options={["Block nested loop", "Sort-merge", "Hybrid hash"]}
+  answer={2}
+  explain="Hybrid hash needs 4,234 I/Os, Grace hash 4,500, block nested loop 6,500 and sort-merge 7,500. But with B = 500, block nested loop needs only 2,500: it reads R once and S twice, and never writes anything."
+>
+<JoinCostDemo />
+</Predict>
+
+1. Move **Buffer frames B** down below 34, close to $\sqrt{M}$. Grace needs a second level of partitioning, and its cost jumps from 4,500 to 7,500 I/Os.
+2. Move B up to 500. Block nested loop falls to 2,500 I/Os and beats Grace. When memory is large, the simple algorithm reads the least.
+3. Move B to 1,002. Now R fits in B − 2 frames. Block nested loop and both hash joins cost M + N = 1,500.
+4. Look at index nested loop. It is a flat line, because it uses no extra memory. It pays 2 I/Os for each of the 100,000 outer tuples.
+5. Read the table. The tuple nested loop takes 83.3 minutes. The best plan takes less than half a second.
+
+### Hybrid hash join
+
+Grace writes every partition to disk, even when memory has room for more. The **hybrid hash join** (DeWitt and others, 1984) keeps partition 0 of R in memory as a hash table. It writes only the other k partitions. Tuples of S that hash to partition 0 probe the table at once, and the join never writes them. The cost is
+
+$$M + N + 2(M - M_0) + 2(N - N_0)$$
+
+where $M_0$ pages of R stay in memory, and $N_0$ is the share of S that matches them. With B = 100, the plan keeps 89 pages of R in memory, spills 10 partitions, and costs 4,234 I/Os. When R almost fits, hybrid hash costs almost M + N. Grace would still cost 3(M + N).
+
+PostgreSQL runs a hybrid hash join. It sizes the hash table with `work_mem` × `hash_mem_multiplier` (2.0 by default since version 15). `EXPLAIN ANALYZE` reports `Batches: 1` when the build side fits, and a larger power of two when it spills. DuckDB also partitions its hash joins and spills partitions when the build side does not fit.
+
+<GracePartitionDemo />
+
+1. Press **Play** with B = 6. Each tuple goes to one of 5 partitions. All partitions of R fit in 4 pages, and the join needs 90 I/Os. The formula 3(M + N) gives 84: the extra I/Os are pages that are only partly full.
+2. Set B to 4. Now 3 partitions of 12 pages cannot each fit in 2 pages. The join partitions them again, and the total grows to 167 I/Os.
+3. Set B back to 6 and turn on **Hybrid**. Partition 0 stays in memory, its S tuples probe at once, and the total falls to 82. At B = 8, hybrid needs 56 I/Os and Grace 98.
+4. Turn on **Skewed keys**. Key 0 is very common, so one partition is much larger than the others. At B = 6, the join needs 9 partition joins and 120 I/Os.
+5. With skew, set B to 4. Some partitions hold only copies of one key. No hash function can split them, so they use a nested-loop join.
+
+## Skew and overflow
+
+Partitioning assumes that the hash function spreads the keys evenly. **Skew** breaks this assumption. If one key is in 30% of the rows, its partition holds at least 30% of R, at any number of partitions. Repartitioning cannot help, because all copies of the key hash to the same place. The engine must fall back to a block nested-loop join for that partition, or accept that it does not fit.
+
+PostgreSQL has a **skew optimization** for hash joins. From the statistics, it knows the most common values of the probe input. It keeps the build tuples with those keys in a special in-memory table, which uses 2% of the hash memory. So the most frequent probe tuples join in the first batch and are never written to disk.
+
+## When each algorithm wins
+
+| Algorithm | Cost in I/Os | Wins when |
+|---|---|---|
+| Block nested loop | $M + \lceil M/(B-2) \rceil N$ | one input fits in memory, or the predicate is not an equality |
+| Index nested loop | $M + m \cdot C$ | the outer input is small and the inner has an index |
+| Sort-merge | $\text{sort}(M) + \text{sort}(N) + M + N$ | inputs are already sorted, or the output must be sorted |
+| Grace hash | about $3(M + N)$ if $B > \sqrt{M}$ | large equi-joins with unsorted inputs |
+| Hybrid hash | between $M + N$ and $3(M + N)$ | the same, when the build input is close to memory size |
+
+Only nested loops work for any predicate, such as `r.a < s.b`. Hash joins, and the sort-merge joins of most engines, need an equality. The optimizer chooses with its [cost model](/databases/optimizer/cost-models), and a wrong estimate of the input sizes picks the wrong algorithm. A nested-loop join over an outer input that was estimated at 1 row, but has 100,000, is a classic slow plan.
+
+## Connect
+
+- The sort behind sort-merge, and why its cost has a logarithm: [external sorting and aggregation](/databases/query/external-sorting-and-aggregation).
+- Where a page I/O goes and why repeated reads may hit memory: [buffer pools](/databases/storage/buffer-pools).
+- The index that index nested loops probe: [B+ trees](/databases/btrees/b-trees) and [hash indexes](/databases/indexes/hash-indexes).
+- How the optimizer chooses the build side and the join order: [join ordering](/databases/optimizer/join-ordering).
+- Hash tables and cache misses in memory: [cache organization and access patterns](/architecture/caches/cache-organization-and-access-patterns).
+
+<Recall cards={[
+  { q: "Give the I/O cost of a block nested-loop join and say which input should be the outer one.", a: "M + ceil(M / (B − 2)) · N, with R as the outer input of M pages. The smaller input should be outside, so that S is scanned fewer times." },
+  { q: "Why can a Grace hash join join each pair of partitions on its own?", a: "Both inputs are partitioned with the same hash function h1, so tuples with equal keys land in partitions with the same number. No pair from different partitions can match." },
+  { q: "Where does the 3(M + N) cost of Grace hash join come from, and when does it hold?", a: "Partitioning reads and writes both inputs (2(M + N)); the join phase reads them again (M + N). It holds when each partition of R fits in memory, which needs B larger than about the square root of M." },
+  { q: "What does hybrid hash join do differently from Grace, and when does it help most?", a: "It keeps partition 0 of R in memory and probes it with S tuples at once, so those tuples are never written. It helps most when R is just a little larger than memory." },
+  { q: "Why does repartitioning not fix a partition that overflows because of skew?", a: "All copies of a hot key hash to the same value with any hash function. The partition stays too large, so the engine falls back to nested loops for it." },
+  { q: "When does an index nested-loop join beat a hash join?", a: "When the outer input is small. It pays per outer tuple (a probe and a fetch), while a hash join must read all of the inner table." },
+]} />

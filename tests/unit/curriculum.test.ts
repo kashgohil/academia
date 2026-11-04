@@ -1,4 +1,4 @@
-import { readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { describe, expect, test } from "vitest";
 import { TRACKS, LIVE, allLessons } from "@/content/curriculum";
@@ -35,6 +35,16 @@ describe("curriculum", () => {
     for (const t of TRACKS) {
       expect(new Set(t.modules.map((m) => m.level)).size, t.slug).toBeGreaterThanOrEqual(3);
       for (const m of t.modules) expect(m.lessons.length, `${t.slug}/${m.slug}`).toBeGreaterThanOrEqual(3);
+    }
+  });
+
+  test("front matter summaries are valid YAML scalars", () => {
+    for (const path of mdxFiles(root)) {
+      const src = readFileSync(join(root, `${path}.mdx`), "utf8");
+      const m = src.match(/^---\nsummary: (.*)\n---/);
+      expect(m, `${path}: missing summary`).not.toBeNull();
+      const v = m![1]!;
+      if (!v.startsWith('"')) expect(v.includes(": "), `${path}: quote the summary, it contains ": "`).toBe(false);
     }
   });
 });

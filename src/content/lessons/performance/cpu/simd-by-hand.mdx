@@ -1,0 +1,78 @@
+---
+summary: One instruction, many lanes. Writing vector code with intrinsics or portable vector types, turning branches into masks, and reducing across lanes.
+---
+import { SimdDemo } from "@/demos/CpuDemos";
+
+SIMD (single instruction, multiple data) registers hold several values at once: 4 floats in 128-bit SSE or NEON registers, 8 in 256-bit AVX2, 16 in AVX-512. One instruction operates on all lanes. For data-parallel loops that's a direct multiplier on throughput, on top of the instruction-level parallelism from the previous lesson.
+
+<Predict
+  id="simd"
+  question="Summing 4096 floats. Version A: scalar, one accumulator. Version B: AVX2 (8 lanes) with 8 vector accumulators. Roughly how much faster is B?"
+  options={["About 8× (the lane count)", "About 16×", "Over 50×"]}
+  answer={2}
+  explain="The speedups multiply. Eight independent accumulators lift scalar code from 4 cycles per element to 0.5 (8×, the ILP lesson). Eight lanes per add multiply that again (about 7× after loads and the final reduction). The schedule gives 16,389 cycles vs 288: about 57×."
+>
+<SimdDemo />
+</Predict>
+
+1. With **1 vector accumulator**, AVX2 is only 8× faster than scalar: still one dependency chain, just a wider one.
+2. Add **8 vector accumulators**: both limits are now used. Then try **16 lanes**.
+3. The mask table shows how `if (x > 0) sum += x` vectorizes: compare all lanes at once into a mask, AND it with the values, and add. There's no branch, so there's nothing to mispredict.
+
+## Writing it
+
+```rust
+use std::arch::x86_64::*;
+#[target_feature(enable = "avx2")]
+unsafe fn sum(a: &[f32]) -> f32 {
+    let mut acc = [_mm256_setzero_ps(); 4];
+    let chunks = a.chunks_exact(32);
+    let tail = chunks.remainder();
+    for c in chunks {
+        for k in 0..4 { acc[k] = _mm256_add_ps(acc[k], _mm256_loadu_ps(c.as_ptr().add(8 * k))); }
+    }
+    let v = _mm256_add_ps(_mm256_add_ps(acc[0], acc[1]), _mm256_add_ps(acc[2], acc[3]));
+    let mut lanes = [0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), v);
+    lanes.iter().sum::<f32>() + tail.iter().sum::<f32>()   // horizontal reduction + tail
+}
+```
+
+```zig
+fn sum(a: []const f32) f32 {
+    const V = @Vector(8, f32);
+    var acc: V = @splat(0);
+    var i: usize = 0;
+    while (i + 8 <= a.len) : (i += 8) acc += a[i..][0..8].*;
+    var s = @reduce(.Add, acc);
+    while (i < a.len) : (i += 1) s += a[i];
+    return s;
+}
+```
+
+Options from most to least portable:
+- **Portable vector types**: Zig `@Vector`, Odin `#simd[8]f32`, C++26 `std::simd`, Rust `std::simd` (nightly) or the `wide` crate, GCC/Clang vector extensions.
+- **Intrinsics**: `immintrin.h` and `arm_neon.h`; Rust `std::arch`.
+- **Libraries** that already do it: simdjson, Highway, xsimd.
+
+## The recurring problems
+
+<Steps>
+<div><b>Tails</b>: n is rarely a multiple of the lane count. Handle the remainder with a scalar loop, masked loads (AVX-512, SVE), or padding.</div>
+<div><b>Horizontal operations</b>: combining lanes (sum, max) needs log₂(lanes) shuffle-and-add steps. Do it once at the end, never inside the loop.</div>
+<div><b>Branches become masks</b>: compute both sides and blend, or use the mask to select lanes. Cheap for simple conditions; wasteful if one side is expensive and rarely needed.</div>
+<div><b>Data layout</b>: SIMD wants each field contiguous (the SoA lesson). Gathers from scattered addresses are much slower than contiguous loads.</div>
+<div><b>Dispatch</b>: not every CPU has AVX2 or AVX-512. Detect at runtime (`is_x86_feature_detected!`, `__builtin_cpu_supports`) or compile multiple versions.</div>
+</Steps>
+
+<Callout kind="warn" title="Wider isn't always faster">
+On some older Intel server CPUs, heavy AVX-512 use lowered the core clock, slowing surrounding scalar code. Memory-bound loops gain nothing from wider vectors either: they wait on bandwidth. Measure before committing to the widest instruction set.
+</Callout>
+
+<Recall cards={[
+  { q: "How many 32-bit floats per register in SSE/NEON, AVX2, AVX-512?", a: "4, 8 and 16." },
+  { q: "Why use several vector accumulators?", a: "One vector accumulator is still a single dependency chain; several independent ones hide add latency (as with scalar ILP)." },
+  { q: "How does SIMD handle `if (x > 0) sum += x`?", a: "Compare all lanes into a mask, AND (or blend) the values with it, and add, with no branch." },
+  { q: "What is a horizontal reduction?", a: "Combining the lanes of one vector (e.g. summing them), using log₂(lanes) shuffle-and-add steps; done once at the end." },
+  { q: "Zig's portable SIMD type, and how to sum its lanes?", a: "@Vector(N, T); @reduce(.Add, v)." },
+]} />

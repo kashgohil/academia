@@ -1,3 +1,4 @@
+import { loadWasm } from "./load";
 /** Typed bindings for crates/cachesim (raw C ABI, no bindgen). */
 export type Policy = "lru" | "fifo" | "random";
 export const OUTCOME = { hit: 0, compulsory: 1, capacity: 2, conflict: 3 } as const;
@@ -11,17 +12,8 @@ interface Exports {
   cachesim_run(addrs: number, n: number, out: number, size: number, line: number, ways: number, policy: number): number;
 }
 
-let mod: Promise<Exports> | null = null;
-
-export function loadCacheSim(source?: () => Promise<BufferSource>): Promise<Exports> {
-  mod ??= (async () => {
-    const bytes = source
-      ? await source()
-      : await (await fetch(`${import.meta.env.BASE_URL}wasm/cachesim.wasm`)).arrayBuffer();
-    const { instance } = await WebAssembly.instantiate(bytes, {});
-    return instance.exports as unknown as Exports;
-  })();
-  return mod;
+export async function loadCacheSim(source?: () => Promise<BufferSource>): Promise<Exports> {
+  return (await loadWasm("cachesim", source)).exports as unknown as Exports;
 }
 
 const POLICY: Record<Policy, number> = { lru: 0, fifo: 1, random: 2 };

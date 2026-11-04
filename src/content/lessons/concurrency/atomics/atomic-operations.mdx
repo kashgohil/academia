@@ -1,43 +1,72 @@
 ---
-summary: What "atomic" guarantees, what it doesn't, and how hardware makes a read-modify-write indivisible.
+summary: What an atomic operation guarantees, what it does not guarantee, and how the hardware makes a read-modify-write indivisible.
 ---
 import { LitmusDemo } from "@/demos/LitmusDemo";
+import { LostUpdateDemo, TornValueDemo } from "@/demos/AtomicsExtrasDemos";
 import { LESSON_PRESETS } from "@/sims/memmodel/presets";
 
-An atomic operation is one that no other thread can observe half-done. That single property removes a whole class of bugs, but it is narrower than it sounds. Atomicity is about *one* operation on *one* location. It says nothing about the order in which other memory becomes visible (that's the orderings lesson), and nothing about a sequence of operations taken together.
+An **atomic operation** is an operation that no other thread can see half-done. Other threads see the state before it or the state after it, never a state in the middle. This property removes a large class of bugs. But it is narrower than it sounds.
+
+Atomicity applies to *one* operation on *one* memory location. It does not set the order in which other memory becomes visible to other threads. The lesson on memory orderings covers that. Atomicity also does not join a sequence of operations into one indivisible step.
 
 <Predict
   id="lost"
-  question="Two threads each run: r = count.load(relaxed); count.store(r + 1, relaxed). Both the load and the store are atomic. What can count be at the end?"
+  question="Two threads each run: r = count.load(relaxed); count.store(r + 1, relaxed). The load and the store are both atomic. What can count be at the end?"
   options={["Always 2", "1 or 2", "0, 1 or 2"]}
   answer={1}
-  explain="Each access is atomic, but the increment isn't. Both threads can load 0 before either stores, and then both store 1. Atomic loads and stores prevent torn values and data races, not lost updates. For that you need a single read-modify-write such as fetch_add."
+  explain="Each access is atomic, but the increment is not. Both threads can load 0 before either thread stores. Then both threads store 1. Atomic loads and stores prevent torn values and data races. They do not prevent lost updates. For that, you need one read-modify-write, such as fetch_add."
 >
-<LitmusDemo presets={LESSON_PRESETS.atomics} />
+<LostUpdateDemo />
 </Predict>
 
-How the explorer works: it runs the program under every possible scheduling and, for the C++ column, every value each load is allowed to return. Each row is a distinct final state. Things to try:
+Each thread loads `count` into a register, adds 1, and stores the result. You choose which thread runs its next step. The bars show the final result of every possible order of the steps.
 
-1. **Counter: plain read + write** shows `count=1` and a **data race** banner. With plain `int`, the program has undefined behavior, so even `count=1` is optimistic.
-2. **Counter: atomic load, then atomic store**: no race, but `count=1` is still there.
-3. **Counter: fetch_add**: one row, `count=2`, under every model, even with `relaxed`.
-4. **Coherence**: relaxed loads can be stale, but never go *backwards*. Edit the test to add a third load and check.
+1. On Thread 0, click **Run next step** three times. Then do the same on Thread 1. The result is `count = 2`, because one thread finished before the other started.
+2. Click **Reset**. Run the load of Thread 0, then the load of Thread 1. Look at the dark bars: every order that remains now gives `count = 1`.
+3. Look at the light bars. 18 of the 20 possible orders lose an update. Only the 2 orders where one thread finishes before the other starts give 2.
+4. Select **3** threads. Only 6 of the 1680 orders give the correct value 3.
+5. Select **one fetch_add**. Each thread now has one step, and every order gives the correct count.
+
+The demo counts each order once. Real hardware does not pick all orders with equal probability. The time between the load and the store is usually short, so the bug can be rare. A rare bug is dangerous, because the tests pass and the program fails later in production.
+
+## The same test in the litmus explorer
+
+A **litmus test** is a small program that shows one behavior of a memory model. The explorer runs the program under every possible schedule. For the C++ column, it also tries every value that each load may legally return. Each row is a different final state.
+
+<LitmusDemo presets={LESSON_PRESETS.atomics} />
+
+1. **Counter: plain read + write** shows `count=1` and a **data race** banner. A data race is two accesses to one location from different threads, with no synchronization, where one writes and one is not atomic. With a plain `int` the program has undefined behavior, so even `count=1` is an optimistic result.
+2. **Counter: atomic load, then atomic store** has no data race, but `count=1` is still possible.
+3. **Counter: fetch_add** has one row, `count=2`, under all three models, even with `relaxed`.
+4. **Coherence (CoRR)**: a relaxed load can read an old value, but the reads of one thread never go backwards. Add a third load to the test and check.
+
+## Torn values
+
+A value is **torn** when a reader sees part of an old value and part of a new value. Atomic accesses are never torn. A plain access can be torn when the CPU must split it into smaller accesses.
+
+<TornValueDemo />
+
+1. Run one writer step, then both reader steps. The reader gets `0x00000000_FFFFFFFF`. No thread ever wrote that value.
+2. Look at the bars. The 6 possible orders give 4 different values, and 2 of those values are torn.
+3. Select **one 64-bit atomic**. Each thread now has one step. Only the old value and the new value remain.
 
 ## What an atomic gives you
 
 <Steps>
-<div><b>No tearing.</b> A 64-bit atomic store is seen entirely or not at all, never as half old and half new bytes.</div>
-<div><b>No data race.</b> Concurrent atomic accesses to the same location are defined behavior. Concurrent plain accesses where at least one writes are undefined behavior in C, C++, Rust and Zig.</div>
-<div><b>One modification order per location.</b> All threads agree on the order of writes to a single atomic variable, and each thread's reads move forward through it (coherence).</div>
-<div><b>Indivisible read-modify-write.</b> <code>fetch_add</code>, <code>exchange</code> and <code>compare_exchange</code> read and write as one step. No other write to that location can land in between.</div>
+<div><b>No tearing.</b> A reader sees all of an atomic store or none of it. It never sees some old bytes and some new bytes.</div>
+<div><b>No data race.</b> Concurrent atomic accesses to one location are defined behavior. Concurrent plain accesses, where at least one access writes, are undefined behavior in C, C++, Rust and Zig.</div>
+<div><b>One modification order per location.</b> All threads agree on the order of the writes to one atomic variable. The reads of each thread move forward through that order. This property is called <b>coherence</b>.</div>
+<div><b>Indivisible read-modify-write.</b> A <b>read-modify-write</b> (RMW) reads a value and writes a new value in one step. <code>fetch_add</code>, <code>exchange</code> and <code>compare_exchange</code> are RMWs. No other write to that location can occur between the read and the write.</div>
 </Steps>
 
-## How hardware does it
+## How the hardware does it
 
-- **Plain loads and stores** of naturally aligned values up to the word size (8 bytes, sometimes 16) are already atomic on mainstream CPUs. An atomic load is often the same instruction as a normal load; what changes is what the *compiler* may do with it.
-- **Read-modify-writes** need the cache line held exclusively for the duration. x86 uses `LOCK`-prefixed instructions (`lock xadd`, `lock cmpxchg`). ARM uses load-linked/store-conditional pairs (`ldxr`/`stxr`, which retry if another core touched the line) or, since ARMv8.1, single atomic instructions (`ldadd`, `cas`).
-- **Contention is the cost.** Every RMW from a different core moves the line across the cache coherence fabric, tens of nanoseconds per transfer. One hot atomic counter updated by every core can be slower than a mutex-free per-thread counter by orders of magnitude. **False sharing** (two unrelated atomics on one 64-byte line) has the same cost without any real sharing.
-- Types too large for hardware atomics fall back to a hidden lock. `std::atomic<T>::is_always_lock_free` tells you which you got.
+- **Plain loads and stores** of naturally aligned values up to the word size (8 bytes, sometimes 16) are already atomic on mainstream CPUs. A value is **naturally aligned** when its address is a multiple of its size. An atomic load is often the same instruction as a normal load. The difference is what the *compiler* may do with it.
+- **Read-modify-writes** must hold the cache line exclusively for the duration of the operation. x86 uses instructions with a `LOCK` prefix, such as `lock xadd` and `lock cmpxchg`.
+- ARM uses **load-linked/store-conditional** (LL/SC) pairs, `ldxr` and `stxr`. The store-conditional fails if another core touched the line, and the loop tries again. Since ARMv8.1, ARM also has single atomic instructions, such as `ldadd` and `cas`.
+- **Contention is the cost.** Contention means that many cores use the same location at the same time. Each RMW from a different core moves the cache line between cores, and each transfer takes tens of nanoseconds. One hot counter that every core updates can be orders of magnitude slower than one counter per thread.
+- **False sharing** has the same cost without real sharing. It occurs when two unrelated atomics are on the same 64-byte cache line.
+- A type that is too large for the hardware atomics falls back to a hidden lock. `std::atomic<T>::is_always_lock_free` tells you which one you got.
 
 ## The same operation in your languages
 
@@ -48,12 +77,13 @@ How the explorer works: it runs the program under every possible scheduling and,
 | Zig | `var c = std.atomic.Value(u32).init(0); _ = c.fetchAdd(1, .monotonic);` |
 | Go | `var c atomic.Int64; c.Add(1)` (Go atomics are always sequentially consistent) |
 
-Odin exposes the same operations and orderings through `intrinsics.atomic_*_explicit` and `core:sync`.
+Odin gives the same operations and orderings through `intrinsics.atomic_*_explicit` and `core:sync`.
 
 <Recall cards={[
-  { q: "Four things an atomic variable guarantees?", a: "No tearing, no data race, a single modification order per location (coherence), and indivisible read-modify-write operations." },
-  { q: "Why can an atomic load followed by an atomic store still lose an update?", a: "Another thread's store can land between them. Only a single RMW (fetch_add, CAS) makes read-and-update indivisible." },
-  { q: "How do x86 and ARM implement atomic read-modify-write?", a: "x86: LOCK-prefixed instructions holding the cache line exclusively. ARM: LL/SC (ldxr/stxr retry loops), or ARMv8.1 LSE instructions such as ldadd and cas." },
-  { q: "What makes heavily shared atomics slow?", a: "Each RMW from another core must move the cache line between cores (coherence traffic); false sharing causes the same cost for unrelated variables on one line." },
-  { q: "What ordering do Go's sync/atomic operations have?", a: "Sequentially consistent: Go does not expose weaker orderings." },
+  { q: "What four things does an atomic variable guarantee?", a: "No tearing, no data race, one modification order per location (coherence), and indivisible read-modify-write operations." },
+  { q: "Why can an atomic load followed by an atomic store still lose an update?", a: "The store of another thread can occur between them. Only one RMW, such as fetch_add or CAS, makes the read and the update indivisible." },
+  { q: "Two threads each run load, add 1, store on a counter that starts at 0. How many of the 20 orders of the steps give 2?", a: "Only 2: the orders where one thread finishes before the other starts. The other 18 orders lose an update." },
+  { q: "What is a torn value?", a: "A value that is part old and part new, because the CPU split the access into smaller accesses. No thread ever wrote it. Atomic accesses are never torn." },
+  { q: "How do x86 and ARM implement an atomic read-modify-write?", a: "x86 uses LOCK-prefixed instructions that hold the cache line exclusively. ARM uses LL/SC retry loops (ldxr/stxr), or ARMv8.1 instructions such as ldadd and cas." },
+  { q: "What makes heavily shared atomics slow?", a: "Each RMW from another core must move the cache line between cores. False sharing causes the same cost for unrelated variables on one line." },
 ]} />

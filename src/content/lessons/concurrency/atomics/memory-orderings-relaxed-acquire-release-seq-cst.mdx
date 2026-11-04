@@ -2,43 +2,59 @@
 summary: Why your writes can appear out of order to other cores, and exactly what relaxed, acquire, release and seq_cst forbid.
 ---
 import { LitmusDemo } from "@/demos/LitmusDemo";
+import { StoreBufferDemo } from "@/demos/AtomicsExtrasDemos";
 import { LESSON_PRESETS } from "@/sims/memmodel/presets";
 
-Within one thread, code appears to run in program order. Across threads it doesn't. Compilers reorder independent memory operations, CPUs execute out of order and let loads overtake buffered stores, and on some architectures different cores see writes in different orders. A **memory order** on an atomic operation tells the compiler and CPU which of those reorderings to prevent, and therefore which instructions they must emit.
+Inside one thread, code appears to run in program order. Across threads, it does not. Compilers reorder memory operations that do not depend on each other. CPUs execute instructions out of order, and they let a load pass a store that waits in a buffer. On some architectures, different cores see writes in different orders.
+
+A **memory order** on an atomic operation tells the compiler and the CPU which reorderings to prevent. So it also tells them which instructions to emit.
 
 <Predict
   id="sb"
   question="T0: x.store(1, release); r0 = y.load(acquire). T1: y.store(1, release); r1 = x.load(acquire). Can both threads read 0?"
   options={[
     "No: release/acquire keeps each store before the following load",
-    "Yes: release/acquire doesn't order a store before a later load",
+    "Yes: release/acquire does not order a store before a later load",
     "Only on ARM, never on x86",
   ]}
   answer={1}
-  explain="Release orders earlier operations before the store; acquire orders later operations after the load. Neither stops a store from being delayed past a later load. Each store can sit in its core's store buffer while the load reads the old value. Even x86 does this. Only seq_cst (or a seq_cst fence) forbids it."
+  explain="Release keeps earlier operations before the store. Acquire keeps later operations after the load. Neither one stops a store from being delayed past a later load. Each store can wait in the store buffer of its core while the load reads the old value. Even x86 does this. Only seq_cst (or a seq_cst fence) forbids it."
 >
 <LitmusDemo presets={LESSON_PRESETS.orderings} />
 </Predict>
 
-Work through the presets in order. Highlighted rows are outcomes no interleaving could produce:
+Work through the presets in order. Highlighted rows are outcomes that no interleaving can produce.
 
-1. **Message passing, relaxed**: the C++ model allows the reader to see the flag but stale data. x86 never does this (TSO keeps stores in order), but ARM and POWER do, and so may the compiler.
-2. **Message passing, release/acquire**: the stale outcome disappears. This is the pattern behind every lock, queue and `Arc`.
-3. **Store buffering** (relaxed, release/acquire, seq_cst): both-zero survives everything except seq_cst, and it shows up in the x86 column too.
-4. **IRIW**: with acquire loads, two readers can disagree about which of two independent writes happened first. seq_cst restores a single global order.
-5. **Coherence**: no ordering lets a single location go backwards.
+1. **Message passing, relaxed**: the C++ model lets the reader see the flag but old data. x86 never does this, because TSO keeps stores in order. ARM and POWER can do it, and so can the compiler.
+2. **Message passing, release/acquire**: the stale outcome disappears. This pattern is the base of every lock, every queue and `Arc`.
+3. **Store buffering** with relaxed, release/acquire and seq_cst: both-zero survives everything except seq_cst. It also appears in the x86 column.
+4. **IRIW** (independent reads of independent writes): with acquire loads, two readers can disagree about which of two writes occurred first. With seq_cst, all threads agree on one global order again.
+5. **Coherence**: no ordering lets the value of one location go backwards.
+
+## See the store buffer
+
+A **store buffer** is a small queue in each core. A store waits there before it goes to the cache, and the core continues without waiting. A later load on the same core can read memory before the store leaves the buffer. This is how both threads can read 0 in store buffering.
+
+<StoreBufferDemo />
+
+1. Click **Run** on Core 0, Core 1, Core 0 and Core 1. Both stores wait in the buffers, and both loads read 0 from memory. Then drain both buffers. The result `r0=0 r1=0` is not sequentially consistent.
+2. Click **Reset**. This time, click **Drain** right after each store. The result is now one that an interleaving gives. On x86 this program has 4 possible outcomes, but under sequential consistency only 3.
+3. Select **Store buffering, seq_cst**. The store becomes `xchg`, which drains the buffer first. The fourth outcome is gone.
+4. Select **Message passing, relaxed**. Try to get `r0=1 r1=0`. You cannot, because the buffer drains the oldest store first. x86 keeps stores in order.
+
+The model in this demo is **x86-TSO** (total store order), the memory model of x86. ARM and POWER allow more reorderings than TSO. The litmus explorer shows them in the C++ column.
 
 ## The four orders
 
 | Order | Guarantees | Typical use |
 |---|---|---|
-| `relaxed` | atomicity and per-location coherence only | counters, statistics, flags that don't publish data |
-| `release` (stores) | everything before it in this thread is visible to whoever acquires this value | publishing data, unlocking |
+| `relaxed` | atomicity and per-location coherence only | counters, statistics, flags that do not publish data |
+| `release` (stores) | everything before it in this thread is visible to a thread that acquires this value | publishing data, unlocking |
 | `acquire` (loads) | everything after it sees what the releasing thread wrote before its release | consuming data, locking |
 | `acq_rel` (RMWs) | both, on one read-modify-write | lock-free updates that both consume and publish |
-| `seq_cst` | acquire/release, plus one total order of all seq_cst operations that every thread agrees on | the default; Dekker-style "I write, then check yours" logic |
+| `seq_cst` | acquire and release, plus one total order of all seq_cst operations that every thread agrees on | the default; Dekker-style "I write, then check yours" logic |
 
-Release and acquire work as a **pair**: a release store and an acquire load that reads the value it wrote. Either one alone orders nothing across threads.
+Release and acquire work as a **pair**: a release store, and an acquire load that reads the value it wrote. One of them alone orders nothing across threads.
 
 ## What it compiles to
 
@@ -49,23 +65,24 @@ Release and acquire work as a **pair**: a release store and an acquire load that
 | seq_cst store | `xchg` (or `mov` + `mfence`) | `stlr` |
 | RMW (any order) | `lock xadd`, `lock cmpxchg` | `ldadd`/`cas` variants, or LL/SC loops |
 
-On x86, everything except seq_cst stores is free at the hardware level, because TSO already gives acquire/release. That's why relaxed-ordering bugs often hide on x86 and appear on ARM (phones, Apple silicon, AWS Graviton). The *compiler* can still reorder relaxed accesses on any architecture.
+On x86, everything except seq_cst stores is free at the hardware level, because TSO already gives acquire and release. That is why relaxed-ordering bugs often hide on x86. They appear on ARM: phones, Apple silicon and AWS Graviton. The *compiler* can still reorder relaxed accesses on every architecture.
 
-<Callout title="What this simulator does and doesn't show">
-The C++ column is an operational model: threads keep views of memory, release writes carry views, and acquire reads merge them. It reproduces the standard results for MP, SB, IRIW, coherence and fences. It does not produce "load buffering" outcomes (both threads reading each other's *later* writes), which the C++ standard technically allows but no mainstream hardware exhibits, and it places relaxed writes in execution order. ARMv8 is "multi-copy atomic", so real ARM forbids the IRIW outcome that the C++ model allows; POWER allows it.
+<Callout title="What this simulator shows and does not show">
+The C++ column is an operational model. Each thread keeps a view of memory, a release write carries the view of its thread, and an acquire read merges that view. It reproduces the standard results for MP, SB, IRIW, coherence and fences. It does not produce "load buffering" outcomes, where both threads read the *later* writes of each other. The C++ standard allows them, but no mainstream hardware shows them. The model also puts relaxed writes in execution order. ARMv8 is "multi-copy atomic", so real ARM forbids the IRIW outcome that the C++ model allows, but POWER allows it.
 </Callout>
 
-## Choosing
+## How to choose
 
-1. **Start with seq_cst** (the default everywhere, and the only option in Go). It is correct for any data-race-free reasoning based on interleavings.
-2. **Use release/acquire** for publish/consume pairs (flags, queues, reference counts dropping to zero), after you can name the pair.
-3. **Use relaxed** only when no other memory depends on the value: statistics, unique-ID counters, and the increment (not the decrement) in reference counting.
-4. Treat `consume` as acquire: every major compiler already does.
+1. **Start with seq_cst.** It is the default everywhere, and the only option in Go. It is correct for any reasoning about a data-race-free program as interleavings.
+2. **Use release/acquire** for pairs that publish and consume data: flags, queues and reference counts that drop to zero. Use it only after you can name the pair.
+3. **Use relaxed** only when no other memory depends on the value: statistics, counters for unique IDs, and the increment (not the decrement) of a reference count.
+4. **Treat `consume` as acquire.** Every major compiler already does this.
 
 <Recall cards={[
-  { q: "What does a release store paired with an acquire load guarantee?", a: "If the load reads the stored value, everything the writer did before the release is visible to the reader after the acquire." },
-  { q: "Which litmus outcome does release/acquire NOT forbid, and what does?", a: "Store buffering (both threads read 0). Only seq_cst operations or seq_cst fences forbid it." },
-  { q: "Why do relaxed-ordering bugs often hide on x86?", a: "x86-TSO keeps loads and stores in order (except store→load), so plain movs already behave like acquire/release; ARM and POWER reorder more." },
-  { q: "What extra guarantee does seq_cst add over acq_rel?", a: "A single total order of all seq_cst operations that every thread observes consistently." },
-  { q: "When is relaxed ordering appropriate?", a: "When no other data depends on the value: counters, statistics, IDs, refcount increments." },
+  { q: "What does a release store paired with an acquire load guarantee?", a: "If the load reads the stored value, the reader sees everything that the writer did before the release, after the acquire." },
+  { q: "Which litmus outcome does release/acquire NOT forbid, and what does forbid it?", a: "Store buffering, where both threads read 0. Only seq_cst operations or seq_cst fences forbid it." },
+  { q: "How does a store buffer make both threads read 0 in store buffering?", a: "Each store waits in the buffer of its core. Meanwhile each load reads the old value from memory. The stores reach memory later." },
+  { q: "Why do relaxed-ordering bugs often hide on x86?", a: "x86-TSO keeps loads and stores in order, except a store before a later load. So plain mov instructions already act like acquire and release. ARM and POWER reorder more." },
+  { q: "What extra guarantee does seq_cst add over acq_rel?", a: "One total order of all seq_cst operations that every thread observes in the same way." },
+  { q: "When is relaxed ordering correct?", a: "When no other data depends on the value: counters, statistics, IDs and reference-count increments." },
 ]} />

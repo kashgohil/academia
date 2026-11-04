@@ -1,31 +1,46 @@
 ---
-summary: The universal atomic primitive, the retry loop, why it degrades under contention, and when fetch_add is the better tool.
+summary: The universal atomic primitive, the retry loop, the ABA problem, why CAS slows down under contention, and when fetch_add is the better tool.
 ---
 import { LitmusDemo } from "@/demos/LitmusDemo";
 import { CasContentionDemo } from "@/demos/CasContentionDemo";
+import { CasLoopDemo, AbaDemo } from "@/demos/AtomicsExtrasDemos";
 import { LESSON_PRESETS } from "@/sims/memmodel/presets";
 
-`compare_exchange(expected, desired)` atomically does: *if the value is still `expected`, replace it with `desired` and report success; otherwise report the current value.* With it you can build any atomic update, such as max, a linked-list push or a state-machine transition, and every lock-free data structure. Herlihy showed CAS is *universal* in exactly this sense, which plain loads and stores are not.
+`compare_exchange(expected, desired)` is an atomic read-modify-write. If the value is still `expected`, it writes `desired` and reports success. If not, it writes nothing, reports failure and returns the current value. It does all of this in one indivisible step. The common name is **CAS** (compare-and-swap).
+
+With CAS you can build any atomic update: a maximum, a push onto a linked list, or a change of state. Every lock-free data structure uses it. Herlihy proved that CAS is **universal**: it can implement any wait-free shared object for any number of threads. Plain loads and stores cannot do this.
 
 <Predict
   id="relaxed-lock"
-  question="A spinlock acquires with compare_exchange(0, 1, relaxed) in a loop and releases with store(0, relaxed). Two threads increment a plain counter inside it. What does the C++ model say?"
+  question="A spinlock locks with compare_exchange(0, 1, relaxed) in a loop and unlocks with store(0, relaxed). Two threads increment a plain counter inside it. What does the C++ model say?"
   options={[
     "Fine: the CAS already gives mutual exclusion",
     "Data race on the counter: relaxed gives mutual exclusion but no happens-before",
     "Deadlock",
   ]}
   answer={1}
-  explain="Only one thread is inside at a time, but nothing makes the first thread's writes to the counter happen-before the second thread's reads. A lock needs acquire on lock and release on unlock; that's what the default m.lock() / m.unlock() do."
+  explain="Only one thread is inside the lock at a time. But nothing makes the counter writes of the first thread happen-before the counter reads of the second thread. A lock needs acquire on lock and release on unlock. The default m.lock() and m.unlock() do exactly that."
 >
 <LitmusDemo presets={LESSON_PRESETS.cas} />
 </Predict>
 
-Try **Spinlock protecting a plain counter** (no race, always 2) against **Spinlock with relaxed ordering** (race banner). The atomics are identical apart from their memory order.
+1. Select **Two CAS on the same value**. In every row, exactly one CAS succeeds.
+2. Select **Spinlock protecting a plain counter**. There is no data race, and `count` is always 2.
+3. Select **Spinlock with relaxed ordering**. The data race banner appears. The atomic operations are the same, and only their memory order is different.
 
 ## The retry loop
 
-Every CAS-based update follows one shape:
+Every update with CAS has the same shape. Load the value and compute the new value from it. Then try the CAS. If the CAS fails, another thread changed the value first. The failed CAS gives you the current value, so you compute again and try again.
+
+<CasLoopDemo />
+
+1. Click **Run** once on each thread, so that all threads load `x = 1`. Then run Thread 0 again. Its CAS succeeds.
+2. Run Thread 1. Its CAS fails, because `x` is not 1 now. The failed CAS also gives it the new value. Run it again, and it succeeds.
+3. Look at **fewest / most attempts**. With 3 threads, the best order needs 3 attempts and the worst order needs 6. With 4 threads, the worst order needs 10.
+4. Look at **final x**. It is the same for every order, because CAS never loses an update.
+5. Select **x * 2**. C++ and Rust have no atomic multiply, and x86 and ARM have no instruction for it. A CAS loop can still do it.
+
+Each failure means that another thread succeeded after your load. So with n threads, one thread can fail at most n − 1 times. In the worst order, the threads need n(n+1)/2 attempts in total. A `fetch_add` needs exactly n.
 
 ```rust
 let mut cur = x.load(Ordering::Relaxed);
@@ -33,7 +48,7 @@ loop {
     let new = f(cur);
     match x.compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Relaxed) {
         Ok(_) => break,
-        Err(actual) => cur = actual, // someone else won; retry with what they wrote
+        Err(actual) => cur = actual, // another thread won; retry with the value it wrote
     }
 }
 ```
@@ -45,27 +60,46 @@ while (x.cmpxchgWeak(cur, f(cur), .acq_rel, .monotonic)) |actual| {
 }
 ```
 
-- **Weak vs strong**: `compare_exchange_weak` may fail *spuriously*, even when the value matched. On LL/SC machines (ARM, RISC-V) the store-conditional fails if anything disturbed the line. Inside a loop, use weak; for a single attempt, use strong.
-- **Two orderings**: one for success (the full RMW), one for failure (just a load). Failure can't be `release`, because nothing was written.
-- **ABA**: CAS checks the *value*, not whether it changed. If it went A → B → A in between, CAS succeeds, which breaks pointer-based structures whose nodes were freed and reused. The lock-free module covers tagged pointers, hazard pointers and epochs.
+- **Weak and strong.** `compare_exchange_weak` can fail **spuriously**, which means that it can fail when the value matched. On LL/SC machines such as ARM and RISC-V, the store-conditional fails if anything disturbed the cache line. Use weak inside a loop. Use strong for a single attempt.
+- **Two orderings.** The first ordering applies on success, to the full read-modify-write. The second ordering applies on failure, which is only a load. The failure ordering cannot be `release`, because the CAS wrote nothing.
+
+## The ABA problem
+
+CAS compares values. It cannot see that a value changed from A to B and then back to A. In that case, the CAS succeeds when it should fail. This is the **ABA problem**. It breaks structures that hold pointers, when a node is freed and its memory is used again.
+
+The demo shows a **Treiber stack**: a lock-free stack where `top` points to the first node. A pop reads `top` and `top.next`, then tries `CAS(top, old, next)`.
+
+<AbaDemo />
+
+1. Click **Set up the bad order**. Thread 0 read `old = A` and `next = B`. Then Thread 1 popped A, popped and freed B, and pushed A back.
+2. Run Thread 0. Its CAS sees `top = A` and succeeds. Now `top` points to the freed node B.
+3. Select **a pointer and a tag**. A **tag** is a counter stored next to the pointer, and every successful CAS adds 1 to it. Set up the bad order again, and run Thread 0 until it is done.
+4. The CAS of Thread 0 fails, because the tag changed. Thread 0 reads fresh values and pops A correctly. Only C stays on the stack.
+5. Click **Reset**. Run Thread 0 to the end before Thread 1 starts. There is no problem, because the operations do not overlap.
+
+A tag is one common fix. It needs a double-width CAS, or spare bits in the pointer. The lock-free module also covers hazard pointers and epoch-based reclamation.
 
 ## Contention
 
 <CasContentionDemo />
 
-Each failed CAS is wasted work *and* another trip of the cache line between cores. In this simulation the attempts per increment grow from 1.0 with one thread to about 2.7 with 8 and 3.7 with 16. Randomized exponential backoff after a failure cuts that to about 2.0 and 2.4. On real hardware each attempt also includes a cross-core line transfer, so the cost per increment grows faster still.
+1. Move **Threads** from 1 to 16. The CAS attempts per increment grow.
+2. Turn on **Exponential backoff**. After each failure, a thread waits a random time before it tries again, and the maximum wait doubles. The attempts drop.
+
+Each failed CAS is wasted work. It is also one more transfer of the cache line between cores. In this simulation, the attempts per increment are 1.0 with one thread, about 2.7 with 8 threads and about 3.7 with 16 threads. With backoff, the numbers drop to about 2.0 and 2.4. On real hardware, each attempt also includes a transfer between cores, so the cost per increment grows faster still.
 
 Practical rules:
 
-- **Prefer a dedicated RMW** (`fetch_add`, `fetch_or`, `exchange`) when one exists. It can't fail and it's one instruction.
-- **Test-and-test-and-set**: spin on a plain `load` until the lock looks free, *then* CAS. Loads can share the line; every CAS needs it exclusive.
-- **Back off** under contention, and on x86 use a pause hint while spinning (`_mm_pause`, `std::hint::spin_loop()` in Rust, `std.atomic.spinLoopHint()` in Zig).
-- **Shard** hot counters per thread or per core and sum them when read.
+- **Use a dedicated RMW** (`fetch_add`, `fetch_or`, `exchange`) when one exists. It cannot fail, and it is one instruction.
+- **Test-and-test-and-set**: spin on a plain `load` until the lock looks free, and only *then* try the CAS. Many cores can share the cache line for loads, but every CAS needs it exclusively.
+- **Back off** under contention. On x86, use a pause hint while you spin: `_mm_pause` in C, `std::hint::spin_loop()` in Rust, `std.atomic.spinLoopHint()` in Zig.
+- **Shard** a hot counter: keep one counter per thread or per core, and add them together when you read.
 
 <Recall cards={[
-  { q: "What does compare_exchange(expected, desired) do?", a: "Atomically: if the value equals expected, store desired and succeed; otherwise fail and return the current value." },
-  { q: "Weak vs strong compare_exchange?", a: "Weak may fail spuriously (LL/SC), so use it in loops. Strong only fails if the value really differs, so use it for single attempts." },
-  { q: "What orderings does a spinlock need?", a: "Acquire on the successful lock CAS and release on the unlocking store, so that critical sections are ordered by happens-before." },
-  { q: "What is the ABA problem?", a: "A value changes A → B → A between your load and CAS, so the CAS wrongly succeeds, which is dangerous when A is a pointer to reused memory." },
-  { q: "Why spin on a load before attempting the CAS (test-and-test-and-set)?", a: "Loads can share the cache line among spinning cores; each CAS demands exclusive ownership and moves the line." },
+  { q: "What does compare_exchange(expected, desired) do?", a: "In one atomic step: if the value equals expected, it stores desired and succeeds. If not, it fails and returns the current value." },
+  { q: "With n threads that each do one CAS-loop increment, how many CAS attempts does the worst order need?", a: "n(n+1)/2, because each failure needs another thread to succeed first. For 4 threads that is 10. A fetch_add needs exactly n." },
+  { q: "What is the difference between weak and strong compare_exchange?", a: "Weak can fail spuriously on LL/SC machines, so use it in a loop. Strong fails only if the value really differs, so use it for a single attempt." },
+  { q: "What orderings does a spinlock need?", a: "Acquire on the successful lock CAS and release on the unlock store. Then the critical sections are ordered by happens-before." },
+  { q: "What is the ABA problem, and what is one fix?", a: "The value changes from A to B and back to A between the load and the CAS, so the CAS wrongly succeeds. A tag that changes on every update makes the CAS fail." },
+  { q: "Why spin on a load before you try the CAS (test-and-test-and-set)?", a: "Loads can share the cache line among the spinning cores. Each CAS needs exclusive ownership and moves the line." },
 ]} />

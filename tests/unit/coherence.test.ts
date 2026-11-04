@@ -51,3 +51,28 @@ describe("protocol comparisons (4 cores)", () => {
     expect([c.state(0, 0), c.state(1, 0), c.memValue(0)]).toEqual(["S", "S", 5]);
   });
 });
+
+describe("store buffer machine", async () => {
+  const { parse } = await import("@/sims/memmodel");
+  const { PRESETS } = await import("@/sims/memmodel/presets");
+  const SB = await import("@/sims/storebuffer");
+  const outs = (id: string, mode: "sc" | "tso" | "pso") => SB.allOutcomes(parse(PRESETS[id]!.src), mode);
+  const has = (s: Set<string>, frag: string) => [...s].some((k) => k.includes(frag));
+  test("SB: both-zero needs a store buffer; a seq_cst fence removes it", () => {
+    expect(has(outs("sb-relaxed", "sc"), "r0=0 r1=0")).toBe(false);
+    expect(has(outs("sb-relaxed", "tso"), "r0=0 r1=0")).toBe(true);
+    expect(has(outs("sb-fence-sc", "tso"), "r0=0 r1=0")).toBe(false);
+  });
+  test("MP: TSO keeps stores in order; PSO doesn't, unless a release fence separates them", () => {
+    expect(has(outs("mp-relaxed", "tso"), "r0=1 r1=0")).toBe(false);
+    expect(has(outs("mp-relaxed", "pso"), "r0=1 r1=0")).toBe(true);
+    expect(has(outs("mp-one-fence", "pso"), "r0=1 r1=0")).toBe(false);
+  });
+  test("TSO outcomes match the litmus explorer's TSO model", async () => {
+    const { runTso } = await import("@/sims/memmodel");
+    for (const id of ["sb-relaxed", "mp-relaxed", "sb-fence-sc", "iriw-acq"]) {
+      const p = parse(PRESETS[id]!.src);
+      expect([...SB.allOutcomes(p, "tso")].sort()).toEqual(runTso(p, true).outcomes.map((o) => o.key).sort());
+    }
+  });
+});

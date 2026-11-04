@@ -1,0 +1,41 @@
+---
+summary: Per-type object caches on pages, why allocators keep empty slabs around, and how kernels allocate objects.
+---
+import { SlabDemo } from "@/demos/AllocatorDemos";
+
+Kernels allocate the same few object types (inodes, dentries, socket buffers, task structs) millions of times. Jeff Bonwick's **slab allocator** (SunOS, 1994; the basis of Linux's SLAB and today's SLUB) gives each type or size its own **cache**. A cache owns **slabs**: pages carved into equal-sized objects, plus a small descriptor. Allocation pops a free object from a partially used slab. When a slab becomes completely empty, its page can go back to the page allocator, which is usually a buddy allocator.
+
+<Predict
+  id="thrash"
+  question="A cache holds no objects. A loop allocates one 40-byte object and immediately frees it, 10 times. With no empty slabs kept in reserve, how many times does the allocator take a page from the page pool?"
+  options={["1", "2", "10", "0"]}
+  answer={2}
+  explain="Each free empties the only slab, so its page is returned. The next allocation has to fetch a page again. That ping-pong is slab thrashing, and it is why real slab allocators keep a few empty slabs per cache. Turn on “Keep one empty slab” and it drops to 1."
+>
+<SlabDemo />
+</Predict>
+
+Things to try:
+
+1. Run **alloc + free one 40 B object × 10**, with and without *Keep one empty slab per cache*.
+2. Run **Mixed objects**: 15 objects of 7 sizes map to 5 caches (16, 32, 64, 128, 256 B) and occupy 5 pages, most of them nearly empty. Per-size caches waste memory when a size has only a few live objects.
+3. Fill one cache until a second slab opens, then free objects from the first. The cache keeps allocating into partial slabs before touching empty ones, which keeps memory dense.
+4. Look at the slack at the end of each 512 B page: 480 usable bytes split into 128 B objects leaves 96 B unused. Real implementations choose slab sizes (sometimes several pages) to keep this small.
+
+## What a slab allocator adds
+
+- **Exact-fit caches.** A cache for a 192-byte struct wastes nothing per object, unlike power-of-two rounding.
+- **Partial-first allocation.** Filling partial slabs before using empty ones lets empty slabs accumulate, so they can be returned.
+- **Object caching.** Bonwick's original insight was that constructing an object (initializing locks, lists, reference counts) often costs more than allocating it. Freed objects stay in their constructed state, so reallocation skips initialization.
+- **Cache coloring.** Different slabs start their objects at slightly different offsets, so the same field in objects from different slabs doesn't always map to the same CPU cache set (see Computer Architecture → Caches).
+- **Per-CPU caches.** SLUB and magazine-based designs keep small per-CPU stacks of free objects, so the common path takes no lock.
+
+On Linux, `/proc/slabinfo` and `slabtop` list every cache with its object size, objects per slab and active counts.
+
+<Recall cards={[
+  { q: "What is a slab, and what is a cache, in a slab allocator?", a: "A slab is a page (or a few pages) carved into equal objects plus a descriptor. A cache is the set of slabs for one object type or size." },
+  { q: "Why keep empty slabs instead of freeing them immediately?", a: "To avoid thrashing: an alloc/free pattern at a slab boundary would otherwise fetch and return a page on every operation." },
+  { q: "Bonwick's object-caching insight?", a: "Keep freed objects in their constructed state, so reallocating skips expensive initialization." },
+  { q: "What does cache coloring do?", a: "It offsets object start addresses differently per slab, so hot fields don't all collide in the same CPU cache sets." },
+  { q: "Why allocate from partial slabs before empty ones?", a: "It packs live objects densely, so empty slabs appear and can be returned to the page allocator." },
+]} />

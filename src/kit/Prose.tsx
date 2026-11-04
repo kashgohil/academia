@@ -1,5 +1,4 @@
-import { Children, useState, type ReactNode } from "react";
-import katex from "katex";
+import { Children, useEffect, useState, type ReactNode } from "react";
 
 export function Callout({ title, kind = "note", children }: { title?: string; kind?: "note" | "warn"; children: ReactNode }) {
   return (
@@ -28,7 +27,17 @@ export function Steps({ children }: { children: ReactNode }) {
   );
 }
 
-/** Inline TeX for use inside TSX demos (MDX prose uses $…$ directly). */
+type Katex = typeof import("katex").default;
+let katexP: Promise<Katex> | null = null;
+
+/** Inline TeX for use inside TSX demos and JSX props (MDX prose uses $…$ directly). KaTeX loads lazily. */
 export function Tex({ children, block }: { children: string; block?: boolean }) {
-  return <span dangerouslySetInnerHTML={{ __html: katex.renderToString(children, { displayMode: block, throwOnError: false }) }} />;
+  const [html, setHtml] = useState<string | null>(null);
+  useEffect(() => {
+    katexP ??= import("katex").then((m) => m.default);
+    let live = true;
+    void katexP.then((k) => live && setHtml(k.renderToString(children, { displayMode: block, throwOnError: false })));
+    return () => { live = false; };
+  }, [children, block]);
+  return html ? <span dangerouslySetInnerHTML={{ __html: html }} /> : <code>{children}</code>;
 }

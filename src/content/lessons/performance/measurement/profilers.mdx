@@ -1,0 +1,52 @@
+---
+summary: How sampling profilers estimate where time goes, how accurate they are, and why instrumenting every call distorts the answer.
+---
+import { ProfilerDemo } from "@/demos/MeasurementDemos";
+
+A profiler answers "where does the time go?". There are two ways to ask:
+
+- **Sampling**: interrupt the program at regular intervals (or every N hardware events), record the current stack, and count. A function's share of samples estimates its share of time. `perf`, Instruments, VTune, `pprof`, py-spy and samply all work this way.
+- **Instrumentation**: insert timing code at every function entry and exit and add up exact durations. Valgrind's callgrind, compiler `-pg` / gprof and tracing frameworks work this way.
+
+Instrumentation sounds more accurate. For finding hotspots, it usually isn't.
+
+<Predict
+  id="instr"
+  question="A request handler spends 25% of its time in socket_read (6,000 calls) and 4% in hash_key (600,000 tiny calls). An instrumenting profiler adds about 300 ns to every call it times. Which function does it report as the bigger cost?"
+  options={["socket_read, by a lot", "About equal", "hash_key"]}
+  answer={2}
+  explain="600,000 calls × 300 ns adds 180 ms to hash_key, ten times its real 18 ms, while socket_read's few long calls barely change. The instrumented profile shows hash_key at 29% and socket_read at 16%: the ranking is inverted, and the program ran 55% slower."
+>
+<ProfilerDemo />
+</Predict>
+
+1. At **100 Hz**, a 445 ms run gives only about 45 samples. Small functions get 0 samples or wildly wrong shares, as the ± column shows.
+2. At **10 kHz** (about 4,450 samples) every estimate is within about a percentage point.
+3. Raise the **instrumentation cost** and watch the functions with the most calls (`hash_key`, `alloc_string`, `escape_html`) inflate.
+
+## How accurate is sampling?
+
+Each sample is an independent draw, so a function that truly takes fraction $p$ of the time gets a sample share with standard error
+
+$$\text{SE} = \sqrt{\frac{p(1-p)}{n}}.$$
+
+With $n = 1000$ samples, a 25% function is measured within about ±2.7 points (95%), and a 4% function within ±1.2. Most profilers default to around 1–4 kHz. Profile long enough to collect a few thousand samples in the code you care about, and ignore functions with a handful of samples.
+
+## What sampling gets wrong
+
+- **Skid**: the reported instruction is often a few instructions after the one that caused the event. Use precise events (Intel PEBS, AMD IBS: `perf record -e cycles:pp`) when you look at individual instructions.
+- **Inlining**: inlined functions don't have frames. Build with debug info so the profiler can recover inline frames from DWARF.
+- **Missing stacks**: frame-pointer-less builds break stack walking. Compile with `-fno-omit-frame-pointer` (or Rust `-C force-frame-pointers=yes`), or use DWARF or LBR unwinding (`perf record --call-graph dwarf|lbr`).
+- **Off-CPU time**: a CPU sampler doesn't see time spent *blocked* (I/O, locks, sleep). Use off-CPU profiling (`perf sched`, eBPF `offcputime`) or wall-clock sampling for latency questions.
+
+## Instrumentation's place
+
+Instrumentation gives exact **call counts** and full traces, which samplers can't. Use it for "how many times is this called?", for causal traces of a single request (OpenTelemetry spans, Tracy, `tracing` in Rust), and on coarse boundaries where the overhead is negligible. Don't use per-function instrumentation for hotspot ranking.
+
+<Recall cards={[
+  { q: "How does a sampling profiler estimate a function's cost?", a: "By the fraction of periodic stack samples in which the function is executing (self) or on the stack (inclusive)." },
+  { q: "Standard error of a sampled share p with n samples?", a: "√(p(1−p)/n)." },
+  { q: "Why does instrumentation distort hotspot rankings?", a: "It adds fixed overhead per call, so small, frequently called functions are inflated relative to long, rarely called ones." },
+  { q: "What is skid, and how do you reduce it?", a: "The sampled instruction is a few instructions past the culprit. Precise sampling (PEBS/IBS, e.g. cycles:pp) reduces it." },
+  { q: "What does a CPU sampling profiler miss?", a: "Off-CPU time: blocking on I/O, locks or sleep. Use off-CPU or wall-clock profiling for that." },
+]} />

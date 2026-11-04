@@ -36,6 +36,14 @@ export const LIVE = new Set<string>([
   "statistics/limit-theorems/central-limit-theorem",
   "deep-learning/optimization/gradient-descent-on-loss-surfaces",
   "architecture/caches/cache-organization-and-access-patterns",
+  "systems/allocators/bump-allocators",
+  "systems/allocators/arena-allocators",
+  "systems/allocators/pool-allocators",
+  "systems/allocators/free-lists",
+  "systems/allocators/buddy-allocator",
+  "systems/allocators/slab-allocator",
+  "systems/allocators/general-purpose-allocators",
+  "systems/allocators/fragmentation",
 ]);
 
 export function slugify(s: string): string {

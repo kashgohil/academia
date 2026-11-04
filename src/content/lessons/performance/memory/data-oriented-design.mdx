@@ -1,45 +1,52 @@
 ---
-summary: Organizing data by how it's processed rather than by what it represents, and why objects with pointers are the slowest layout.
+summary: Organize data by how the code uses it, not by what it represents. Objects behind pointers are the slowest layout.
 ---
 import { DodDemo } from "@/demos/MemoryHierarchyDemos";
+import { HotColdDemo } from "@/demos/PerfExtrasDemos";
 
-Object-oriented design groups data by **what it is**: an `Entity` holds its position, velocity, health, name, inventory and AI state, often behind a pointer for polymorphism. **Data-oriented design** (Mike Acton, the Bitsquid and Molly Rocket engines, Andrew Kelley's talks on Zig's compiler) groups data by **how it's used**: the loop that updates positions reads positions and velocities, so those live together, densely, and nothing else comes along.
+Object-oriented design groups data by **what it is**. An `Entity` object has a position, a velocity, health, a name and an inventory. Often each object is behind a pointer.
+
+**Data-oriented design** groups data by **how the code uses it**. The loop that moves entities reads positions and velocities. So the positions and velocities are stored together, with nothing else. Mike Acton, game engines and Andrew Kelley's Zig compiler made this approach popular.
+
+## Hot bytes and cold bytes
+
+<HotColdDemo />
+
+1. Select **Objects** (128 bytes each). The update needs 24 bytes of each object. But the cache loads full 64-byte lines. Only 38% of the loaded bytes are useful.
+2. Select **Hot arrays**. The positions are next to each other, and so are the velocities. All the loaded bytes are useful.
+
+## How much faster?
 
 <Predict
   id="dod"
-  question="Updating position += velocity for 100,000 game entities of 128 bytes each. Option A: an array of pointers to individually allocated objects. Option B: separate arrays of positions and velocities. Roughly how much faster is B?"
-  options={["About 2×", "About 10×", "Nearly 100×"]}
+  question="You update position += velocity for 100,000 entities of 128 bytes each. Option A: an array of pointers to separately allocated objects. Option B: separate arrays for positions and velocities. About how much faster is B?"
+  options={["About 2 times", "About 10 times", "Almost 100 times"]}
   answer={2}
-  explain="Scattered heap objects cost about 98 ns each: one unpredictable miss per entity. Separate hot arrays cost about 1.2 ns: they stream, and only 24 of every 128 bytes are needed, so they stay in cache. That's an 80× difference for the same arithmetic."
+  explain="Objects behind pointers cost about 98 ns each: each object is an unpredictable miss. Separate arrays cost about 1.2 ns: the accesses are predictable, and only the needed bytes are loaded. That is about 80 times faster."
 >
 <DodDemo />
 </Predict>
 
-The three layouts tell a story in two steps:
-
-1. **Remove the pointers** (objects inline in an array): from about 98 ns to 4.75 ns. Accesses become predictable, so misses overlap.
-2. **Remove the cold bytes** (hot fields in their own arrays): from 4.75 ns to about 1.2 ns. Each line now carries only data the loop uses, so the working set is 5× smaller and fits in cache.
-
-Try **5,000** entities: everything fits in cache, and the gap shrinks to about 8×. Data-oriented layout pays most at scale.
+1. **Remove the pointers** (objects stored in the array): the time drops from about 98 ns to 4.75 ns. The accesses become predictable.
+2. **Remove the cold bytes** (hot fields in their own arrays): the time drops to about 1.2 ns. The data is 5 times smaller and fits in the cache.
+3. Select **5,000** entities. All layouts fit in the cache, and the difference is smaller.
 
 ## The method
 
 <Steps>
-<div><b>Start from the transformations</b>, not the nouns: what does each hot loop read and write, and how often?</div>
-<div><b>Split hot from cold.</b> Fields touched every frame go in one place; rarely used ones (names, debug info, inventory) go elsewhere, linked by index.</div>
-<div><b>Prefer arrays and indices to pointers.</b> Indices are smaller, survive reallocation, serialize trivially, and keep data contiguous. Use generational indices for safety (the pool allocator lesson).</div>
-<div><b>Process in batches, by kind.</b> Instead of a virtual call per object (each a likely branch mispredict and i-cache miss), keep one array per kind and loop over each. Entity Component Systems (Bevy, EnTT, flecs) are this idea packaged.</div>
-<div><b>Encode state in where data lives, not in flags.</b> Dead entities removed or moved to another array means no `if (alive)` branch in the hot loop.</div>
+<div>Start from the loops. Find what each hot loop reads and writes, and how often.</div>
+<div>Split hot data from cold data. Put the fields that each frame uses in one place. Put names and debug data in another place.</div>
+<div>Use arrays and indices, not pointers. Indices are smaller, and they stay valid when an array grows.</div>
+<div>Process items in groups by type. One loop for each type is faster than a virtual call for each object.</div>
+<div>Use the position of data to show its state. For example, keep dead entities in a different array, so the hot loop needs no `if alive` check.</div>
 </Steps>
 
-## Costs
-
-Data-oriented code trades encapsulation for throughput. Invariants that a class would enforce are now spread across parallel arrays that must stay in sync, and adding a field means touching every system that copies entities. Apply it where profiles show memory-bound loops over many items: simulations, game engines, compilers (Zig's and Carbon's compilers use flat, index-based ASTs), databases, ML preprocessing. Keep ordinary design elsewhere.
+Data-oriented code is faster, but the invariants are less visible. Parallel arrays must stay in sync. Use this approach where a profile shows memory-bound loops over many items. Examples are simulations, game engines, compilers and databases. Entity Component Systems such as Bevy, EnTT and flecs package this approach.
 
 <Recall cards={[
-  { q: "Core idea of data-oriented design?", a: "Lay out data by how hot loops access it, not by conceptual objects, so each loop streams only the bytes it needs." },
-  { q: "Two steps that took the entity update from ~98 ns to ~1.2 ns?", a: "Remove pointer indirection (store objects contiguously), then split hot fields from cold ones into separate arrays." },
-  { q: "Why prefer indices over pointers in data-oriented code?", a: "They are smaller, stay valid when arrays reallocate, serialize easily, and keep data contiguous." },
-  { q: "Why process entities by kind instead of with virtual calls?", a: "Per-object dynamic dispatch causes branch mispredicts and instruction-cache misses; per-kind loops are tight and predictable." },
-  { q: "What is an Entity Component System?", a: "An architecture that stores each component type in its own dense array and runs systems over the arrays, which is data-oriented design as a framework." },
+  { q: "What is the main idea of data-oriented design?", a: "Store data by how hot loops use it, so each loop loads only the bytes that it needs." },
+  { q: "Which two changes made the entity update about 80 times faster?", a: "Remove the pointers (store objects in an array), then split the hot fields into their own arrays." },
+  { q: "Why use indices instead of pointers?", a: "Indices are smaller, stay valid when arrays grow, and keep the data contiguous." },
+  { q: "Why process entities in groups by type?", a: "A virtual call for each object causes mispredictions and instruction-cache misses. One loop per type is simple and predictable." },
+  { q: "What is an Entity Component System?", a: "A design that stores each component type in its own array and runs systems over those arrays." },
 ]} />

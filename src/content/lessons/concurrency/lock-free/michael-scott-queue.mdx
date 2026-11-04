@@ -1,0 +1,60 @@
+---
+summary: A lock-free FIFO with a dummy node and a tail pointer that's allowed to lag, kept consistent by threads helping each other.
+---
+import { LockFreeStepper } from "@/demos/LockFreeStepper";
+import { StressDemo } from "@/demos/LockFreeStress";
+import { MSQ, MSQ_SCRIPTS, STRESS_MSQ } from "@/demos/lockfreeConfigs";
+
+A queue needs two ends, so a lock-free queue must coordinate two pointers with single-word CAS. Maged Michael and Michael Scott's design (1996), used in Java's `ConcurrentLinkedQueue` and many others, does it with two ideas:
+
+- **A dummy node.** `head` always points to a node whose value has already been consumed. The first real element is `head.next`. Enqueue and dequeue never touch the same pointer, even when the queue has one element.
+- **A lagging tail, plus helping.** Enqueue takes *two* CASes: link the new node after the last node, then swing `tail` to it. Another thread can run between them and find `tail` pointing at a node whose `next` isn't null. Instead of waiting, it **helps**: it swings `tail` forward itself, then carries on.
+
+<Predict
+  id="help"
+  question="T0 has linked its node after the last node, but stalls before swinging tail. T1 now enqueues: it reads tail, then tail.next, which isn't null. What does T1 do?"
+  options={[
+    "Waits for T0 to swing tail",
+    "Swings tail forward itself (helping), then retries its own enqueue",
+    "Links its node after the stale tail, overwriting T0's node",
+  ]}
+  answer={1}
+  explain="A non-null tail.next means some enqueue is halfway done. Waiting would make the queue blocking, so T1 completes T0's second step with a CAS on tail and retries. When T0 resumes, its own tail CAS simply fails, which is fine."
+>
+<LockFreeStepper title="Michael–Scott queue" scenario={MSQ} scripts={MSQ_SCRIPTS} schemes={["leak", "hazard", "epoch"]} />
+</Predict>
+
+1. Run **T0 links its node, then stalls before swinging tail**. In the log T1 performs `help: swing lagging tail`, then its own enqueue. T2 dequeues 1, then 10.
+2. Reset and step a dequeue by hand. The value is read from `head.next`, and the old dummy is retired: the node whose value was just taken becomes the new dummy.
+3. Step a dequeue on a queue whose `head == tail` while an enqueue is half done. The dequeuer helps swing `tail` before it can proceed, so `head` never overtakes `tail`.
+
+## The invariants
+
+<Steps>
+<div>The list from <code>head</code> is never broken. Nodes are only ever appended (a CAS on the last <code>next</code>, from null) or dropped from the front (a CAS on <code>head</code>).</div>
+<div><code>tail</code> points to the last node or the one before it: it lags by at most one, and any thread that sees the lag fixes it.</div>
+<div><code>head</code> never passes <code>tail</code>: a dequeuer seeing <code>head == tail</code> with a non-null next first helps advance <code>tail</code>.</div>
+<div>Linearization points: a successful enqueue at its CAS on <code>last.next</code>; a successful dequeue at its CAS on <code>head</code>.</div>
+</Steps>
+
+The stepper checks the first three after every step, and the final value accounting checks FIFO completeness.
+
+## Memory reclamation, again
+
+<StressDemo configs={STRESS_MSQ} />
+
+The queue reads `head.next` and `tail.next` through pointers that other threads may retire, so it needs a scheme. Hazard pointers need *two* slots in dequeue, `head` and `head.next`, and the second must be validated by re-checking `head`. Switch the stepper to hazard pointers and look for `hazard[1]`.
+
+## In practice
+
+- **Contention on two hot pointers** limits scalability. Production queues often use arrays and ring buffers (bounded MPMC queues such as Vyukov's, LMAX Disruptor), or segment linked arrays (crossbeam's `SegQueue`, `ConcurrentLinkedQueue` with batching), to touch fewer cache lines per operation.
+- **Single-producer or single-consumer variants** drop most atomics and are much faster. Choose the weakest variant your design allows.
+- **Helping** is a general technique: whenever an operation is visible in an intermediate state, design it so that any thread can finish it. That's how lock-free structures avoid waiting on stalled threads.
+
+<Recall cards={[
+  { q: "Why does the Michael–Scott queue use a dummy node?", a: "So head and tail never need to change together. Enqueue and dequeue update different pointers, even for a single-element queue." },
+  { q: "Why can tail lag behind the last node?", a: "Enqueue links the node (CAS on last.next) and swings tail (second CAS) in separate steps; another thread can run in between." },
+  { q: "What is helping?", a: "A thread that finds another operation half-done (e.g. a lagging tail) completes that step itself instead of waiting." },
+  { q: "Linearization point of a successful MS-queue enqueue?", a: "The successful CAS that links the new node onto last.next." },
+  { q: "How many hazard pointers does an MS-queue dequeue need, and why?", a: "Two: one for head and one for head.next, whose value is read. The second is validated by re-checking head." },
+]} />

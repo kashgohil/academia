@@ -12,6 +12,7 @@
     "typecheck": "tsc -b",
     "test": "vitest run",
     "test:e2e": "node tests/e2e/smoke.mjs",
+    "test:kernels": "node scripts/test-kernels.mjs",
     "new:lesson": "node scripts/new-lesson.mjs"
   },
   "dependencies": {

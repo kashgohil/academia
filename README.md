@@ -29,6 +29,7 @@ src/wasm/       bindings for crates/
 src/content/    curriculum registry + lessons/<track>/<module>/<lesson>.mdx
 src/review/     spaced repetition
 crates/         Rust simulators compiled to wasm32
+kernels/        real x86-64 kernels that the "Writing a kernel" lessons quote
 ```
 
 ## Add a lesson
@@ -52,3 +53,9 @@ cargo test --manifest-path crates/cachesim/Cargo.toml
 ```bash
 pnpm build && pnpm test:e2e
 ```
+
+```bash
+pnpm test:kernels
+```
+
+`test:kernels` boots the kernels in QEMU, and each kernel tests itself. It needs `brew install qemu` and `rustup target add x86_64-unknown-none`. Zig and GRUB cases also run if `brew install zig i686-elf-grub xorriso mtools` has run.

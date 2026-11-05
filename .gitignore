@@ -5,3 +5,6 @@ public/wasm/*.wasm
 tests/e2e/shots
 *.log
 *.tsbuildinfo
+kernels/zig/kernel.elf
+kernels/zig/kernel.elf.o
+.zig-cache

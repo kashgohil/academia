@@ -2,7 +2,6 @@
 summary: "Why translation must be cached: TLB structure and reach, ASIDs and PCIDs, shootdowns by IPI and what they cost on many cores, and the effect on pointer chasing. Includes a TLB simulator with real page walks."
 ---
 import { VmTlbSimDemo, VmNestedWalkDemo, VmTlbReachDemo, VmShootdownDemo } from "@/demos/os/VmTlbDemos";
-import { VmTable } from "@/demos/os/VmUi";
 
 A page walk costs up to 4 memory reads. If each load needed a walk, each load would cost 5 reads. The **translation lookaside buffer (TLB)** avoids this. It is a small cache in the CPU core that maps a virtual page number to a frame number and its rights. A hit costs almost nothing. A miss starts the walker, which fills the entry.
 
@@ -42,11 +41,11 @@ A modern core has two levels, as CPU caches do. The **L1 TLBs** are small and fa
 
 This table lists the model input for this lesson, the data side of an Intel Skylake core. Other CPUs differ:
 
-<VmTable head={["Page size", "L1 entries", "L2 entries", "L1 reach", "L2 reach"]} rows={[
-  ["4 KiB", "64, 4 ways", "1,536, 12 ways", "256 KiB", "6 MiB"],
-  ["2 MiB", "32, 4 ways", "1,536, 12 ways", "64 MiB", "3 GiB"],
-  ["1 GiB", "4", "16", "4 GiB", "16 GiB"],
-]} />
+| Page size | L1 entries | L2 entries | L1 reach | L2 reach |
+|---|---|---|---|---|
+| 4 KiB | 64, 4 ways | 1,536, 12 ways | 256 KiB | 6 MiB |
+| 2 MiB | 32, 4 ways | 1,536, 12 ways | 64 MiB | 3 GiB |
+| 1 GiB | 4 | 16 | 4 GiB | 16 GiB |
 
 **TLB reach** is entries times page size. It is the memory that the TLB can map without a miss. It is the most useful single number about a TLB. Compare 6 MiB with the size of your last-level cache: on a large server, data can sit in the cache while its translation misses.
 

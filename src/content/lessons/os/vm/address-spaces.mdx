@@ -2,7 +2,6 @@
 summary: "Why every process gets its own address space: the layout of a Linux x86-64 process, canonical addresses and the 47-bit limit, /proc/pid/maps, VMAs and ASLR, and the older designs that it replaced."
 ---
 import { VmAddressMapDemo, VmProcMapsDemo, VmTwoProcessesDemo } from "@/demos/os/VmAddressDemos";
-import { VmTable } from "@/demos/os/VmUi";
 
 A program uses addresses, but those addresses do not name memory cells. They are **virtual addresses**. The CPU translates each one to a **physical address** on every load, store and instruction fetch. The operating system controls the translation. The set of virtual addresses that a process can use is its **address space**.
 
@@ -35,14 +34,14 @@ An x86-64 address has 64 bits, but with 4-level paging only the low 48 bits sele
 
 Linux uses the two ranges as follows:
 
-<VmTable head={["Range", "Size", "Use"]} rows={[
-  ["`0x0000_0000_0000_0000` to `0x0000_7fff_ffff_f000`", "128 TiB", "User space"],
-  ["`0xffff_8880_0000_0000`", "64 TiB", "Direct map of all physical memory"],
-  ["`0xffff_c900_0000_0000`", "32 TiB", "vmalloc and ioremap"],
-  ["`0xffff_ea00_0000_0000`", "1 TiB", "`struct page` array (vmemmap)"],
-  ["`0xffff_ffff_8000_0000`", "512 MiB", "Kernel text"],
-  ["`0xffff_ffff_a000_0000`", "1,520 MiB", "Kernel modules"],
-]} />
+| Range | Size | Use |
+|---|---|---|
+| `0x0000_0000_0000_0000` to `0x0000_7fff_ffff_f000` | 128 TiB | User space |
+| `0xffff_8880_0000_0000` | 64 TiB | Direct map of all physical memory |
+| `0xffff_c900_0000_0000` | 32 TiB | vmalloc and ioremap |
+| `0xffff_ea00_0000_0000` | 1 TiB | `struct page` array (vmemmap) |
+| `0xffff_ffff_8000_0000` | 512 MiB | Kernel text |
+| `0xffff_ffff_a000_0000` | 1,520 MiB | Kernel modules |
 
 The **direct map** is a simple idea. Every physical frame also has a kernel virtual address, at a fixed offset. The kernel can reach any frame by adding a constant. Page tables, as you will see, store physical addresses, so the kernel needs this.
 
@@ -84,11 +83,11 @@ A Go program shows a different heap. On linux/amd64, the Go runtime asks for its
 
 **Address space layout randomization (ASLR)** adds a random offset to each base when the program starts. An attacker who finds a memory bug then does not know where the useful code is. `/proc/sys/kernel/randomize_va_space` controls it: 0 is off, 1 randomizes the stack, mmap area and vDSO, and 2 also randomizes the heap.
 
-<VmTable head={["Base", "Random page bits", "Range"]} rows={[
-  ["mmap area and PIE base", "28 (kernel default, `mmap_rnd_bits`)", "1 TiB"],
-  ["Stack", "22", "16 GiB"],
-  ["Heap start", "13", "32 MiB"],
-]} />
+| Base | Random page bits | Range |
+|---|---|---|
+| mmap area and PIE base | 28 (kernel default, `mmap_rnd_bits`) | 1 TiB |
+| Stack | 22 | 16 GiB |
+| Heap start | 13 | 32 MiB |
 
 Some distributions raise `mmap_rnd_bits`.
 

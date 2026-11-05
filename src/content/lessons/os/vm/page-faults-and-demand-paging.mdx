@@ -2,19 +2,18 @@
 summary: "What happens when a walk fails: the error code, CR2, the VMA lookup, then a minor fault, a major fault or SIGSEGV. Demand zero, the zero page, file-backed faults, first touch, overcommit modes, fault cost, and how to count faults."
 ---
 import { VmFaultPathDemo, VmDemandPagingDemo, VmFaultCostDemo, VmOvercommitDemo } from "@/demos/os/VmFaultDemos";
-import { VmTable } from "@/demos/os/VmUi";
 
 A **page fault** is an exception that the CPU raises when a walk cannot finish or the entry forbids the access. The word "fault" misleads. Most page faults are not errors. They are how the kernel builds an address space: it does nothing until a page is needed, and the fault tells it when.
 
 The hardware gives the kernel two facts. **CR2** holds the address that failed. The **error code** says why:
 
-<VmTable head={["Bit", "Name", "If set"]} rows={[
-  ["0", "P", "The page was present, so this is a rights violation. If clear, the page was not present."],
-  ["1", "W", "The access was a write."],
-  ["2", "U", "The access came from user mode."],
-  ["3", "RSVD", "An entry had a reserved bit set. This is a kernel bug or a corrupted table."],
-  ["4", "I", "The access was an instruction fetch."],
-]} />
+| Bit | Name | If set |
+|---|---|---|
+| 0 | P | The page was present, so this is a rights violation. If clear, the page was not present. |
+| 1 | W | The access was a write. |
+| 2 | U | The access came from user mode. |
+| 3 | RSVD | An entry had a reserved bit set. This is a kernel bug or a corrupted table. |
+| 4 | I | The access was an instruction fetch. |
 
 <Predict
   id="readonly-write"
@@ -43,14 +42,14 @@ On x86-64, the entry point is `exc_page_fault`. It calls `do_user_addr_fault` fo
 2. **Do the VMA rights allow this access?** If not, the kernel sends `SIGSEGV` with `SEGV_ACCERR`.
 3. **What does the PTE hold?** `handle_mm_fault` allocates missing tables, and `handle_pte_fault` chooses the handler.
 
-<VmTable head={["State of the PTE and VMA", "Handler", "Result"]} rows={[
-  ["Empty PTE, anonymous VMA, read", "`do_anonymous_page`", "Map the zero page. Minor."],
-  ["Empty PTE, anonymous VMA, write", "`do_anonymous_page`", "New zeroed frame. Minor."],
-  ["Empty PTE, file VMA, page in cache", "`do_fault`", "Map the cached page. Minor."],
-  ["Empty PTE, file VMA, page not in cache", "`do_fault`, `filemap_fault`", "Read from disk. Major."],
-  ["Swap entry in the PTE", "`do_swap_page`", "Read from swap. Major."],
-  ["Read-only PTE, writable VMA, a write", "`do_wp_page`", "Copy, or reuse if sole owner. Minor."],
-]} />
+| State of the PTE and VMA | Handler | Result |
+|---|---|---|
+| Empty PTE, anonymous VMA, read | `do_anonymous_page` | Map the zero page. Minor. |
+| Empty PTE, anonymous VMA, write | `do_anonymous_page` | New zeroed frame. Minor. |
+| Empty PTE, file VMA, page in cache | `do_fault` | Map the cached page. Minor. |
+| Empty PTE, file VMA, page not in cache | `do_fault`, `filemap_fault` | Read from disk. Major. |
+| Swap entry in the PTE | `do_swap_page` | Read from swap. Major. |
+| Read-only PTE, writable VMA, a write | `do_wp_page` | Copy, or reuse if sole owner. Minor. |
 
 A **minor fault** needs no I/O. A **major fault** blocks the thread on a disk read. After the handler returns, the CPU runs the same instruction again. The program sees only lost time.
 
@@ -100,15 +99,15 @@ A program that cannot accept fault latency can take the faults early. `MAP_POPUL
 
 These are the model inputs, in `FAULT_COST_NS` and `DEVICE_NS`:
 
-<VmTable head={["Event", "Model input"]} rows={[
-  ["DRAM access", "100 ns"],
-  ["Minor fault, zero page", "0.5 µs"],
-  ["Minor fault, new frame", "1 µs"],
-  ["Minor fault, copy on write", "1.5 µs"],
-  ["Major fault, NVMe SSD", "100 µs"],
-  ["Major fault, SATA SSD", "200 µs"],
-  ["Major fault, hard disk", "8 ms"],
-]} />
+| Event | Model input |
+|---|---|
+| DRAM access | 100 ns |
+| Minor fault, zero page | 0.5 µs |
+| Minor fault, new frame | 1 µs |
+| Minor fault, copy on write | 1.5 µs |
+| Major fault, NVMe SSD | 100 µs |
+| Major fault, SATA SSD | 200 µs |
+| Major fault, hard disk | 8 ms |
 
 Real values depend on the CPU and the mitigations. With these inputs, a new 16 MiB block takes about 4.1 ms of faults. The first request after a deploy pays this time. The average access time is $(1-p) \cdot t_{\text{DRAM}} + p \cdot (t_{\text{device}} + t_{\text{DRAM}})$.
 
@@ -138,11 +137,11 @@ Because allocation is lazy, the kernel can promise more than it has. `vm.overcom
 2. Select mode 2. The limit is now swap plus half of RAM: 12 GiB here. Requests that mode 0 allowed now fail.
 3. Select mode 1. Everything passes, even 128 GiB.
 
-<VmTable head={["Mode", "Name", "Rule"]} rows={[
-  ["0", "Heuristic (default)", "Refuse only an obvious overcommit: one request larger than RAM plus swap."],
-  ["1", "Always", "Never refuse."],
-  ["2", "Never", "Refuse if the total commitment passes `CommitLimit`."],
-]} />
+| Mode | Name | Rule |
+|---|---|---|
+| 0 | Heuristic (default) | Refuse only an obvious overcommit: one request larger than RAM plus swap. |
+| 1 | Always | Never refuse. |
+| 2 | Never | Refuse if the total commitment passes `CommitLimit`. |
 
 `CommitLimit` is swap plus RAM times `vm.overcommit_ratio` percent, and the ratio is 50 by default. `/proc/meminfo` shows `CommitLimit` and `Committed_AS`. In modes 0 and 1, `malloc` almost never fails. The failure comes later, at a page fault, when no frame is left. The kernel cannot return an error from a load instruction, so it starts [the OOM killer](/os/memory/swapping-and-the-oom-killer). Check the return value of `malloc` anyway, but do not expect it to save you.
 

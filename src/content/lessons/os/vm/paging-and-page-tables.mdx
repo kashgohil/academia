@@ -2,7 +2,6 @@
 summary: "Pages, frames and the radix page table: why a flat table is too large, the x86-64 4-level walk, 5-level paging, PTE bits, CR3, and what tables cost for sparse and dense mappings. With arm64 granules and the 16 KiB pages of Apple Silicon."
 ---
 import { VmPageWalkDemo, VmPageTable3DDemo, VmTableCostDemo } from "@/demos/os/VmPagingDemos";
-import { VmTable } from "@/demos/os/VmUi";
 
 Paging divides virtual memory into fixed-size **pages** and physical memory into **frames** of the same size. On x86-64 the base size is 4 KiB. An address has two parts. The low 12 bits are the **offset** in the page, and the CPU does not translate them. The rest is the **virtual page number**. A **page table** maps each virtual page number to a frame.
 
@@ -43,12 +42,12 @@ Programs use a very small part of this range, with large gaps. A sparse structur
 
 The fix is a **radix tree**. A table is one page, and it holds $4096 / 8 = 512$ entries, so one level consumes 9 bits. Four levels give $9 + 9 + 9 + 9 + 12 = 48$ bits. A table exists only if something below it is mapped. One empty entry at the top removes 512 GiB of address range, and it needs no tables below it.
 
-<VmTable head={["Level", "Intel name", "Linux name", "One entry maps", "Bits of the address"]} rows={[
-  ["1", "PML4", "`pgd`", "512 GiB", "47 to 39"],
-  ["2", "PDPT", "`pud`", "1 GiB", "38 to 30"],
-  ["3", "PD", "`pmd`", "2 MiB", "29 to 21"],
-  ["4", "PT", "`pte`", "4 KiB", "20 to 12"],
-]} />
+| Level | Intel name | Linux name | One entry maps | Bits of the address |
+|---|---|---|---|---|
+| 1 | PML4 | `pgd` | 512 GiB | 47 to 39 |
+| 2 | PDPT | `pud` | 1 GiB | 38 to 30 |
+| 3 | PD | `pmd` | 2 MiB | 29 to 21 |
+| 4 | PT | `pte` | 4 KiB | 20 to 12 |
 
 Linux has a generic fifth level, `p4d`, which folds away on a 4-level system. **CR3** is the register that holds the physical address of the top table. A context switch to another process writes CR3, and this switches the whole address space. Each entry holds a physical frame number, not a virtual address. The walker has no translation for its own reads, so physical addresses are the only choice.
 
@@ -76,16 +75,16 @@ fn walk(cr3: u64, va: u64, phys: &[u64]) -> Result<u64, Fault> {
 
 A leaf entry holds a frame number and these bits:
 
-<VmTable head={["Bit", "Name", "Meaning"]} rows={[
-  ["0", "P (present)", "The entry is valid. If it is clear, the CPU raises a page fault, and the other bits belong to the kernel."],
-  ["1", "RW (writable)", "Writes are allowed."],
-  ["2", "US (user)", "User mode can use the page."],
-  ["5", "A (accessed)", "The CPU sets it on use. Page replacement reads and clears it."],
-  ["6", "D (dirty)", "The CPU sets it on a write. The kernel must save the page before it reuses the frame."],
-  ["7", "PS (page size)", "In a PD or PDPT entry: this entry is a leaf, not a link to a table."],
-  ["8", "G (global)", "The translation stays in the TLB across a CR3 write. The kernel uses it for its own pages."],
-  ["63", "NX (no execute)", "An instruction fetch from this page raises a page fault."],
-]} />
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 | P (present) | The entry is valid. If it is clear, the CPU raises a page fault, and the other bits belong to the kernel. |
+| 1 | RW (writable) | Writes are allowed. |
+| 2 | US (user) | User mode can use the page. |
+| 5 | A (accessed) | The CPU sets it on use. Page replacement reads and clears it. |
+| 6 | D (dirty) | The CPU sets it on a write. The kernel must save the page before it reuses the frame. |
+| 7 | PS (page size) | In a PD or PDPT entry: this entry is a leaf, not a link to a table. |
+| 8 | G (global) | The translation stays in the TLB across a CR3 write. The kernel uses it for its own pages. |
+| 63 | NX (no execute) | An instruction fetch from this page raises a page fault. |
 
 Rights combine along the path. The walker takes the AND of RW and US across all levels, and the OR of NX. Linux therefore keeps the upper levels permissive and sets the real rights in the leaf.
 

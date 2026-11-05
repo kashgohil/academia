@@ -2,7 +2,6 @@
 summary: "2 MiB and 1 GiB pages and the TLB reach arithmetic behind them; hugetlbfs against Transparent Huge Pages; khugepaged, compaction, latency spikes and bloat; why databases often turn THP off; folios, mTHP and 16 KiB base pages."
 ---
 import { VmReachCalcDemo, VmThpSimDemo } from "@/demos/os/VmHugeDemos";
-import { VmTable } from "@/demos/os/VmUi";
 
 A **huge page** is a page that one upper-level entry maps. On x86-64, a PD entry with the PS bit maps 2 MiB, and a PDPT entry with the PS bit maps 1 GiB. The walk ends early, with 3 reads or 2 reads instead of 4. The main gain, however, is in the TLB: one 2 MiB entry maps 512 times more memory.
 
@@ -41,13 +40,13 @@ The cost is planning. Reserved memory is unavailable for other uses, even if nob
 
 **Transparent Huge Pages (THP)** is the automatic way. The kernel gives a program huge pages without any change to the program. Its controls are in `/sys/kernel/mm/transparent_hugepage/`:
 
-<VmTable head={["File", "Values", "Meaning"]} rows={[
-  ["`enabled`", "`always`, `madvise`, `never`", "For all anonymous memory, only for regions marked with `madvise(MADV_HUGEPAGE)`, or never."],
-  ["`defrag`", "`always`, `defer`, `defer+madvise`, `madvise`, `never`", "What a fault does when no free block exists."],
-  ["`khugepaged/pages_to_scan`", "4096 by default", "PTEs scanned per pass, which is 8 regions."],
-  ["`khugepaged/scan_sleep_millisecs`", "10000 by default", "The sleep between passes."],
-  ["`khugepaged/max_ptes_none`", "511 by default", "Empty PTEs allowed in a region that it collapses."],
-]} />
+| File | Values | Meaning |
+|---|---|---|
+| `enabled` | `always`, `madvise`, `never` | For all anonymous memory, only for regions marked with `madvise(MADV_HUGEPAGE)`, or never. |
+| `defrag` | `always`, `defer`, `defer+madvise`, `madvise`, `never` | What a fault does when no free block exists. |
+| `khugepaged/pages_to_scan` | 4096 by default | PTEs scanned per pass, which is 8 regions. |
+| `khugepaged/scan_sleep_millisecs` | 10000 by default | The sleep between passes. |
+| `khugepaged/max_ptes_none` | 511 by default | Empty PTEs allowed in a region that it collapses. |
 
 A region must be aligned to 2 MiB and large enough. A program that opts in usually aligns its own block:
 
@@ -85,11 +84,11 @@ A 2 MiB page needs 512 contiguous frames, aligned to 2 MiB. After a machine has 
 
 **khugepaged** is a kernel thread that fixes the fallback later. It scans a process, finds a 2 MiB range of small pages, allocates a huge page, copies the data, and replaces the PMD. This needs a write lock on the whole address space for part of the work, and a TLB flush. `MADV_COLLAPSE` asks for the same work directly.
 
-<VmTable head={["Case, 24 regions, model", "Worst fault", "All faults", "TLB entries"]} rows={[
-  ["THP off", "1 µs", "12.3 ms", "12,288"],
-  ["THP on, fall back", "100 µs", "6.5 ms", "5,134"],
-  ["THP on, direct compaction", "1,545 µs", "16.9 ms", "24"],
-]} />
+| Case, 24 regions, model | Worst fault | All faults | TLB entries |
+|---|---|---|---|
+| THP off | 1 µs | 12.3 ms | 12,288 |
+| THP on, fall back | 100 µs | 6.5 ms | 5,134 |
+| THP on, direct compaction | 1,545 µs | 16.9 ms | 24 |
 
 The model inputs are in `THP_COST`. A small fault costs 1 µs, and a huge fault costs 100 µs because the kernel must clear 2 MiB. Migrating one page costs 5 µs. Note the middle row. A huge fault is slower than a small fault, but it replaces 512 of them.
 

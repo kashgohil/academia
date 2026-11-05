@@ -10,7 +10,7 @@
  * (cache-line transfer plus lock-specific overhead).
  */
 import { Coherence } from "../coherence";
-import { simulateCas } from "../../demos/CasContentionDemo";
+import { simulateCas } from "../cas";
 
 export const GHZ = 3; // cycles per ns, for converting coherence cycles to time
 

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { parse, runCxx, runTso } from "@/sims/memmodel";
 import { PRESETS } from "@/sims/memmodel/presets";
-import { simulateCas } from "@/demos/CasContentionDemo";
+import { simulateCas } from "@/sims/cas";
 import {
   completions, counterMachine, tearMachine, isTorn, total, replay,
   casInit, casStep, casDone, casAttempts, casAttemptRange,

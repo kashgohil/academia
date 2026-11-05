@@ -10,7 +10,6 @@
  * 7. A copy of the CAS contention simulation (the lesson quotes its numbers).
  */
 import { parse, runCxx, runTso, type Result } from "./memmodel";
-import { mulberry32 } from "./rng";
 
 // =====================================================================
 // 1. Interleaving machine
@@ -521,30 +520,7 @@ export function scOutcomes(p: TsoProgram): string[] {
 }
 
 // =====================================================================
-// 7. CAS contention (same algorithm as CasContentionDemo.simulateCas)
+// 7. CAS contention
 // =====================================================================
 
-/**
- * n threads each perform `perThread` increments of one counter with a CAS loop.
- * A random scheduler picks which thread takes its next step. Returns CAS attempts per increment.
- */
-export function casContention(n: number, perThread: number, backoff: boolean, seed = 1): number {
-  const r = mulberry32(seed);
-  let x = 0, attempts = 0, done = 0;
-  const loaded = new Array<number | null>(n).fill(null);
-  const left = new Array<number>(n).fill(perThread);
-  const sleep = new Array<number>(n).fill(0);
-  const fails = new Array<number>(n).fill(0);
-  const all = n * perThread;
-  while (done < all) {
-    const t = Math.floor(r() * n);
-    if (left[t] === 0) continue;
-    if (sleep[t]! > 0) { sleep[t]!--; continue; }
-    if (loaded[t] === null) { loaded[t] = x; continue; }
-    attempts++;
-    if (x === loaded[t]) { x++; done++; left[t]!--; fails[t] = 0; }
-    else if (backoff) { fails[t]!++; sleep[t] = Math.floor(r() * 2 ** Math.min(6, fails[t]!)); }
-    loaded[t] = null;
-  }
-  return attempts / all;
-}
+export { simulateCas as casContention } from "./cas";

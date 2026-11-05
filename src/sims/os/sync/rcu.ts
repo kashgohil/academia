@@ -9,6 +9,7 @@
 import { mulberry32 } from "../../rng";
 import { LineBus } from "./spinlocks";
 import type { Model, Step } from "./machine";
+import { GHZ } from "../../perf/contention";
 
 export interface RcuCpu { inCs: boolean; holds: number | null; entered: number }
 
@@ -163,8 +164,8 @@ export function rcuModel(o: RcuOpts): Model<RcuState> {
 
 // ---------------------------------------------------------------- read scaling
 
-/** MODEL INPUT: clock rate, cycles per ns. It equals GHZ in src/sims/perf/contention.ts (a test checks this). */
-export const GHZ = 3;
+/** MODEL INPUT: clock rate, cycles per ns. */
+export { GHZ };
 
 export type ReadLock = "mutex" | "rwlock" | "rcu";
 

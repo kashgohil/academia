@@ -1,8 +1,8 @@
 /** Lesson: a simple allocator. A boot memory map with frame allocators, and a heap bring-up stepper. */
 import { useMemo, useRef, useState } from "react";
-import { Canvas2D, Demo, Param, Stats, bytes, cssVar, range } from "../../kit";
+import { Canvas2D, Demo, Param, Stats, bytes, cssVar, range, Banner, IndexButtons, IndexSlider, Note, Panel, SmallLabel, mono, seg, tint } from "../../kit";
 import { BitmapFrames, DEMO_FRAMES, DEMO_MAP, StackFrames, bitmapBytes, carve, heapSnaps, placeEarly, type FrameAllocator, type HeapAlloc, type MemEntry, type MemType, type TableSource } from "../../sims/os/kernel";
-import { Cap, Msg, Note, Panel, StepButtons, StepSlider, Verdict, mono, seg, tint } from "./KernelUi";
+import { Msg } from "./KernelUi";
 
 const TYPE_COLOR: Record<MemType, string> = { usable: "--c3", reserved: "--muted", acpi: "--faint", bootloader: "--c5", kernel: "--c1", framebuffer: "--faint" };
 const MAX_CELL = 7;
@@ -140,9 +140,9 @@ export function HeapBringupDemo() {
   return (
     <Demo
       title="Bring up the kernel heap"
-      actions={<StepButtons k={kk} n={snaps.length} set={setK} />}
+      actions={<IndexButtons k={kk} n={snaps.length} set={setK} />}
       controls={<>
-        <StepSlider k={kk} n={snaps.length} set={setK} />
+        <IndexSlider k={kk} n={snaps.length} set={setK} />
         <Param spec={seg<HeapAlloc>("Heap", [["bump", "bump"], ["list", "free list"]], "bump")} value={alloc} onChange={(v) => setAlloc(v as HeapAlloc)} />
         <Param spec={seg<TableSource>("Table frames come from", [["frames", "frame allocator"], ["heap", "kmalloc"]], "frames")} value={tables} onChange={(v) => setTables(v as TableSource)} />
       </>}
@@ -168,7 +168,7 @@ export function HeapBringupDemo() {
           </div>
         </Panel>
       </div>
-      <Cap><span style={{ display: "block", marginTop: 10 }}>Heap, from HEAP_BASE. Thin lines mark page boundaries.</span></Cap>
+      <SmallLabel><span style={{ display: "block", marginTop: 10 }}>Heap, from HEAP_BASE. Thin lines mark page boundaries.</span></SmallLabel>
       <svg viewBox={`0 0 ${span} 1`} preserveAspectRatio="none" style={{ display: "block", width: "100%", height: 34, border: "1px solid var(--border)", borderRadius: 3, background: "var(--subtle)" }} role="img" aria-label="Heap blocks">
         {s.blocks.map((b, i) => <rect key={i} x={b.off} y={0} width={b.size} height={1} fill={b.free ? "var(--faint)" : `var(--c${(i % 3) + 1})`} opacity={b.free ? 0.35 : 0.85} />)}
         {Array.from({ length: pages - 1 }, (_, i) => <rect key={i} x={(i + 1) * 4096 - span / 400} y={0} width={span / 200} height={1} fill="var(--fg)" />)}
@@ -180,7 +180,7 @@ export function HeapBringupDemo() {
         { label: "live bytes", value: s.liveBytes.toLocaleString("en-US") },
         { label: "bytes up to the last used block", value: s.usedSpan.toLocaleString("en-US") },
       ]} />
-      {s.hazard && <Verdict tone="bad">Fix: page tables take frames directly from the frame allocator. The frame allocator has fixed data, so it never needs a new mapping or the heap.</Verdict>}
+      {s.hazard && <Banner tone="bad">Fix: page tables take frames directly from the frame allocator. The frame allocator has fixed data, so it never needs a new mapping or the heap.</Banner>}
     </Demo>
   );
 }

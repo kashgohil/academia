@@ -1,30 +1,13 @@
 /** Small shared pieces for the isolation demos. */
 import type { CSSProperties, ReactNode } from "react";
-
-export { mono, Note, Meter, seg, Caption } from "../db/StorageUi";
+import { toneColor, type Tone } from "../../kit";
 
 export const card: CSSProperties = { border: "1px solid var(--border)", borderRadius: 6, padding: 10, minWidth: 0 };
 export const cardTitle: CSSProperties = { fontSize: 11.5, color: "var(--muted)", marginBottom: 6 };
 export const twoCol: CSSProperties = { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 10 };
 
-export const Card = ({ title, children, style }: { title?: ReactNode; children: ReactNode; style?: CSSProperties }) => (
-  <div style={{ ...card, ...style }}>
-    {title && <div style={cardTitle}>{title}</div>}
-    {children}
-  </div>
-);
-
-export type Tone = "good" | "bad" | "warn" | "info" | "none";
-const TONE: Record<Tone, string> = { good: "var(--c3)", bad: "var(--c4)", warn: "var(--c2)", info: "var(--c1)", none: "var(--faint)" };
-export const toneColor = (t: Tone) => TONE[t];
-
 export const Badge = ({ tone = "none", children }: { tone?: Tone; children: ReactNode }) => (
-  <span style={{ display: "inline-block", fontSize: 11.5, fontWeight: 550, padding: "1px 7px", borderRadius: 4, color: "var(--bg)", background: TONE[tone], whiteSpace: "nowrap" }}>{children}</span>
-);
-
-/** A one-line result strip with a coloured left edge. */
-export const Verdict = ({ tone, children }: { tone: Tone; children: ReactNode }) => (
-  <div style={{ borderLeft: `3px solid ${TONE[tone]}`, padding: "6px 10px", fontSize: 13, background: "var(--subtle)", borderRadius: 3, marginTop: 8, lineHeight: 1.45 }}>{children}</div>
+  <span style={{ display: "inline-block", fontSize: 11.5, fontWeight: 550, padding: "1px 7px", borderRadius: 4, color: "var(--bg)", background: toneColor(tone), whiteSpace: "nowrap" }}>{children}</span>
 );
 
 export const smallTable: CSSProperties = { width: "100%", borderCollapse: "collapse", fontSize: 12.5 };

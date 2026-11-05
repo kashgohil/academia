@@ -1,16 +1,14 @@
 /** Shared views for the recovery demos: log list with transaction lanes, pages, small tables. */
-import type { CSSProperties, ReactNode } from "react";
+import type { ReactNode } from "react";
 import type { LogRecord, Lsn, Page, Frame, AttEntry } from "../../sims/db/recovery/core";
 import { pageName } from "../../sims/db/recovery/aries";
+import { SmallLabel, mono } from "../../kit";
 
-export const mono: CSSProperties = { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontVariantNumeric: "tabular-nums" };
 
 const TXN_COLORS = ["var(--c1)", "var(--c2)", "var(--c5)", "var(--c3)"];
 export const txnColor = (t: number) => TXN_COLORS[(t - 1) % TXN_COLORS.length]!;
 
-export const Note = ({ children }: { children: ReactNode }) => <p className="muted" style={{ fontSize: 12.5, margin: "10px 0 0" }}>{children}</p>;
 
-export const Label = ({ children }: { children: ReactNode }) => <div className="muted" style={{ fontSize: 12, margin: "0 0 4px" }}>{children}</div>;
 
 export const Tag = ({ t }: { t: number }) => (
   <span style={{ display: "inline-block", minWidth: 22, textAlign: "center", padding: "0 3px", borderRadius: 3, fontSize: 10.5, fontWeight: 600, color: "#fff", background: txnColor(t) }}>T{t}</span>
@@ -126,7 +124,7 @@ export function PageBox({ page, dirty, tone, note, values }: { page: Page; dirty
 export function PageRow({ pages, frames, label, tone, note }: { pages: Page[]; frames?: Map<number, Frame>; label: ReactNode; tone?: (p: Page) => "bad" | "good" | "hot" | undefined; note?: (p: Page) => ReactNode }) {
   return (
     <div style={{ marginBottom: 8 }}>
-      <Label>{label}</Label>
+      <SmallLabel>{label}</SmallLabel>
       <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
         {pages.map((p) => <PageBox key={p.id} page={p} dirty={frames?.get(p.id)?.dirty} tone={tone?.(p)} note={note?.(p)} />)}
       </div>
@@ -135,10 +133,10 @@ export function PageRow({ pages, frames, label, tone, note }: { pages: Page[]; f
 }
 
 /** Small table (ATT, DPT). */
-export function MiniTable({ title, head, rows, empty = "empty", highlight }: { title: ReactNode; head: string[]; rows: ReactNode[][]; empty?: string; highlight?: number }) {
+export function TitledTable({ title, head, rows, empty = "empty", highlight }: { title: ReactNode; head: string[]; rows: ReactNode[][]; empty?: string; highlight?: number }) {
   return (
     <div style={{ minWidth: 0, flex: "1 1 140px" }}>
-      <Label>{title}</Label>
+      <SmallLabel>{title}</SmallLabel>
       <table style={{ borderCollapse: "collapse", fontSize: 12, width: "100%", ...mono }}>
         <thead>
           <tr>{head.map((h) => <th key={h} style={{ textAlign: "left", fontWeight: 500, color: "var(--muted)", borderBottom: "1px solid var(--border)", padding: "2px 6px 2px 0" }}>{h}</th>)}</tr>
@@ -159,10 +157,3 @@ export function MiniTable({ title, head, rows, empty = "empty", highlight }: { t
 export const attRows = (att: Iterable<AttEntry>) => [...att].sort((a, b) => a.txn - b.txn).map((a) => [<Tag key="t" t={a.txn} />, a.status, a.lastLSN]);
 export const dptRows = (dpt: Iterable<{ page: number; recLSN: Lsn }>) => [...dpt].sort((a, b) => a.page - b.page).map((d) => [pageName(d.page), d.recLSN]);
 
-export function Verdict({ ok, children }: { ok: boolean; children: ReactNode }) {
-  return (
-    <div style={{ borderLeft: `3px solid ${ok ? "var(--c3)" : "var(--c4)"}`, padding: "4px 10px", fontSize: 13, margin: "8px 0", background: "var(--subtle)", borderRadius: "0 6px 6px 0" }}>
-      {children}
-    </div>
-  );
-}

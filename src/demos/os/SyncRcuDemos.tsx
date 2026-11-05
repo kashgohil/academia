@@ -1,8 +1,7 @@
 /** Demos for "read-copy-update": a stepper with a grace period timeline, and read scaling. */
 import { useMemo, useState } from "react";
-import { Demo, Legend, Line, Param, Plot, Stats, range, si, toggle, useParams } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, Stats, range, si, toggle, useParams, Banner, MONO, useChunked } from "../../kit";
 import { RCU_SETUP_SCRIPT, READ_CORES, READ_DEFAULTS, READ_LABEL, canFree, rcuActions, rcuApply, rcuInit, readScale, type RcuAction, type RcuOpts, type RcuState, type ReadLock, type ReadScaleResult } from "../../sims/os/sync/rcu";
-import { Banner, MONO, useChunked } from "./SyncShared";
 
 const CPUS = 3;
 const OPTS: RcuOpts = { cpus: CPUS, maxVersions: 6, maxSections: 99 };
@@ -117,7 +116,7 @@ export function SyncReadScaleDemo() {
   const readCycles = Math.round(P.values.readCycles);
   const locks: ReadLock[] = ["mutex", "rwlock", "rcu"];
   const tasks = useMemo(() => locks.flatMap((l) => READ_CORES.map((c) => () => readScale(l, c, { readCycles }))), [readCycles]); // eslint-disable-line react-hooks/exhaustive-deps
-  const { results } = useChunked<ReadScaleResult>(tasks, String(readCycles));
+  const results = useChunked<ReadScaleResult>(String(readCycles), tasks);
   const at = (l: ReadLock, c: number) => results[locks.indexOf(l) * READ_CORES.length + READ_CORES.indexOf(c)];
   const line = (l: ReadLock) => READ_CORES.flatMap((c) => { const r = at(l, c); return r ? [[c, r.mReadsPerSec] as [number, number]] : []; });
   const top = Math.max(100, ...results.map((r) => r?.mReadsPerSec ?? 0));

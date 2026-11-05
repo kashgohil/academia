@@ -1,12 +1,11 @@
 /** Demos for "shared memory": one frame in two address spaces, the SPSC ring, the cache lines of its indices, and the cost model. */
 import { useMemo, useState } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleX, Stats, bytes, range, select, si, toggle, useParams } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleX, Stats, bytes, range, select, si, toggle, useParams, Banner, MONO } from "../../kit";
 import {
   CONSUMER_LINES, CORRECT_ORDERS, IPC_COST, IPC_KINDS, IPC_LABEL, LIST_NODES, PRODUCER_LINES, RELAXED_ORDERS, ShmWorld, buildList, exploreSpsc, ipcCost, messageValue, slotKey,
   spscDone, spscInitial, spscLineTraffic, spscLitmus, spscSteps, walkList, type IpcKind, type Msg, type RefMode, type SpscSpec, type SpscState,
 } from "../../sims/os/ipc";
 import { parse, runCxx, runTso } from "../../sims/memmodel";
-import { Banner, MONO } from "./SyncShared";
 
 // ---------------------------------------------------------------- 1. two mappings
 

@@ -1,11 +1,10 @@
 /** Demos for "Column stores": a byte-level layout visualizer, a bytes-read sweep and a 3D table block. */
 import { lazy, Suspense, useMemo, useState } from "react";
-import { Demo, Stats, Param, Legend, range, Plot, Line, RuleX, Dots, bytes, pct } from "../../kit";
+import { Demo, Stats, Param, Legend, range, Plot, Line, RuleX, Dots, bytes, pct, MiniTable, Note, int, mono, seg } from "../../kit";
 import {
   Layout, footprint, cellsOf, ORDERS, QUERIES, CACHE_LINE, scanFootprint, pointFootprint, wideSchema,
   type LayoutKind, type QueryName,
 } from "../../sims/db/olap";
-import { seg, mono, Note, MiniTable, int } from "./OlapShared";
 
 const KIND_LABEL: Record<LayoutKind, string> = { nsm: "NSM (rows)", dsm: "DSM (columns)", pax: "PAX" };
 const LETTER = ["i", "d", "c", "p", "q", "$", "%"];

@@ -1,10 +1,9 @@
 /** Demos for the lesson on page faults and demand paging. */
 import { useMemo, useRef, useState } from "react";
-import { Area, Canvas2D, Demo, Dots, Line, Param, Plot, RuleX, RuleY, SimButtons, Stats, cssVar, range, useParams, useSim } from "../../kit";
+import { Area, Canvas2D, Demo, Dots, Line, Param, Plot, RuleX, RuleY, SimButtons, Stats, cssVar, range, useParams, useSim, Meter, Note, mono, seg } from "../../kit";
 import {
   AddressSpace, DEVICE_NS, DRAM_NS, FAULT_COST_NS, GiB, MiB, OUTCOME_LABEL, PAGE_SIZE, VmKernel, effectiveAccessNs, faultRateForSlowdown, fmtBytes, hexVa, isMajor, isMinor, isSegv, overcommitCheck, vmaLabel, vmaPerms, type AccessKind, type AccessResult, type DecisionId, type FaultOutcome, type OvercommitMode, type PteState,
 } from "../../sims/os/vm";
-import { Meter, Note, mono, seg } from "../db/StorageUi";
 
 // ---------------- fault path ----------------
 

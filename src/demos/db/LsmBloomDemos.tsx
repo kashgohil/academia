@@ -1,11 +1,10 @@
 /** Demos for "Bloom filters": a filter you can poke, an FPR sweep, and I/Os per missing-key lookup. */
 import { useEffect, useMemo, useState } from "react";
-import { Demo, Stats, Param, Legend, range, Plot, Line, Dots, RuleX, RuleY, pct } from "../../kit";
+import { Demo, Stats, Param, Legend, range, Plot, Line, Dots, RuleX, RuleY, pct, Btn, ButtonRow, Note, fixed, mono, seg } from "../../kit";
 import {
   BloomFilter, BlockedBloomFilter, bloomFpr, blockedBloomFpr, bestIntegerK, keySets, measureFpr,
   leveledRunSizes, missLookupIos,
 } from "../../sims/db/lsm";
-import { seg, mono, Note, Btn, ButtonRow, fx } from "./LsmShared";
 
 // ================= a small filter =================
 
@@ -85,8 +84,8 @@ export function BloomPlayDemo() {
       </p>
       <Stats
         items={[
-          { label: "bits per key (m/n)", value: n ? fx(m / n, 1) : "–" },
-          { label: "bits set: measured (formula)", value: `${filled} (${fx(m * (1 - Math.exp((-k * n) / m)), 1)})` },
+          { label: "bits per key (m/n)", value: n ? fixed(m / n, 1) : "–" },
+          { label: "bits set: measured (formula)", value: `${filled} (${fixed(m * (1 - Math.exp((-k * n) / m)), 1)})` },
           { label: "FPR formula (1 − e^(−kn/m))^k", value: pct(n ? bloomFpr(m / n, k) : 0) },
           { label: "FPR measured, 4,000 probes", value: pct(measured) },
         ]}
@@ -191,9 +190,9 @@ export function MissIoDemo() {
       </div>
       <Stats
         items={[
-          { label: "no filters: one block read per run", value: fx(r.none, 0) },
-          { label: "same bits per key in every run", value: fx(r.uniformTotal, 4) },
-          { label: "Monkey allocation, same memory", value: fx(r.monkeyTotal, 4) },
+          { label: "no filters: one block read per run", value: fixed(r.none, 0) },
+          { label: "same bits per key in every run", value: fixed(r.uniformTotal, 4) },
+          { label: "Monkey allocation, same memory", value: fixed(r.monkeyTotal, 4) },
           { label: "Monkey saves", value: bpk > 0 ? pct(1 - r.monkeyTotal / r.uniformTotal) : "–" },
         ]}
       />
@@ -208,7 +207,7 @@ function Row({ name, share, a, b, ab, bb, max, filters }: { name: string; share:
       <div style={{ flex: 1, height: 12, background: "var(--subtle)", borderRadius: 3, overflow: "hidden" }}>
         <div style={{ width: `${(100 * v) / max}%`, height: "100%", background: color, transition: "width 0.25s" }} />
       </div>
-      <span style={{ ...mono, fontSize: 10.5, minWidth: 74, textAlign: "right" }}>{filters ? `${v < 1e-4 ? v.toExponential(0) : pct(v, v < 0.001 ? 3 : 2)} · ${fx(bits, 1)}b` : "100%"}</span>
+      <span style={{ ...mono, fontSize: 10.5, minWidth: 74, textAlign: "right" }}>{filters ? `${v < 1e-4 ? v.toExponential(0) : pct(v, v < 0.001 ? 3 : 2)} · ${fixed(bits, 1)}b` : "100%"}</span>
     </div>
   );
   return (

@@ -1,11 +1,11 @@
 /** Lesson: eBPF. A real verifier and interpreter in the browser, and a latency histogram with bytes moved. */
 import { useMemo, useState } from "react";
-import { Bars, Demo, Legend, Line, Param, Plot, RuleX, Stats, range, select, si, useParams } from "../../kit";
+import { Bars, Demo, Legend, Line, Param, Plot, RuleX, Stats, range, select, si, useParams, IndexButtons, IndexSlider, Note, Panel, SmallLabel, mono, seg, tint } from "../../kit";
 import {
   AGG_INPUTS, BPF_PRESETS, BpfVm, HIST_BYTES, EVENT_BYTES_DEFAULT, SIM_COMPLEXITY_LIMIT, aggregateInUser, assemble, bytesRatio, fmtReg, formatInsn, hexOf, latencySample, mapBytesPerSecond, mapCpuShare, presetById, runInKernel, shipBytesPerSecond, shipCpuShare, verify,
   type LogEntry, type LogKind, type PresetGroup, type Reg,
 } from "../../sims/os/observability";
-import { Cap, Msg, Note, Panel, StepButtons, StepSlider, mono, seg, tint } from "./ProcessesUi";
+import { Msg } from "./ProcessesUi";
 
 const GROUP_LABEL: Record<PresetGroup, string> = { safe: "Safe", unsafe: "Unsafe", correct: "Correct, but rejected" };
 
@@ -77,9 +77,9 @@ export function BpfVerifierDemo() {
   return (
     <Demo
       title="A real verifier: walk each path"
-      actions={<StepButtons k={kk} n={Math.max(1, log.length)} set={setK} />}
+      actions={<IndexButtons k={kk} n={Math.max(1, log.length)} set={setK} />}
       controls={<>
-        <StepSlider k={kk} n={Math.max(1, log.length)} set={setK} />
+        <IndexSlider k={kk} n={Math.max(1, log.length)} set={setK} />
         <Param spec={p.schema.loops} value={p.values.loops} onChange={(v) => { p.set("loops", v as "allow"); setK(0); }} />
         <Param spec={p.schema.input} value={p.values.input} onChange={(v) => p.set("input", v as string)} />
         <Param spec={p.schema.pkt} value={p.values.pkt} onChange={(v) => p.set("pkt", v as number)} />
@@ -191,14 +191,14 @@ export function LatencyHistogramDemo() {
     </>}>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(270px, 1fr))", gap: 12 }}>
         <div style={{ minWidth: 0 }}>
-          <Cap>The map after {SAMPLE_EVENTS} events: the real program ran once for each event.</Cap>
+          <SmallLabel>The map after {SAMPLE_EVENTS} events: the real program ran once for each event.</SmallLabel>
           <Plot x={[8, 28]} y={[0, maxY * 1.05]} height={200} xLabel="latency (log2 of ns)" yLabel="events" xTicks={[10, 14, 18, 22, 26]} xFormat={(t) => (t < 20 ? `${si(2 ** t * 1e-9, "s", 2)}` : si(2 ** t * 1e-9, "s", 2))}>
             <Bars bins={bins} color="var(--c1)" />
           </Plot>
           <div style={{ fontSize: 12.5, marginTop: 4, color: same ? "var(--c3)" : "var(--c4)" }}>{same ? "All 64 buckets match the histogram from every shipped event." : "The histograms differ."}</div>
         </div>
         <div style={{ minWidth: 0 }}>
-          <Cap>Bytes per second across the kernel boundary.</Cap>
+          <SmallLabel>Bytes per second across the kernel boundary.</SmallLabel>
           <Plot x={[100, 1e7]} y={[10, 1e10]} logX logY height={200} xLabel="events per second" yLabel="bytes/s" xTicks={[1e2, 1e4, 1e6]} yTicks={[1e2, 1e4, 1e6, 1e8, 1e10]} xFormat={(t) => si(t)} yFormat={(t) => si(t)}>
             <Line points={xs.map((x) => [x, shipBytesPerSecond({ ...input, eventsPerSecond: x })] as [number, number])} color="var(--c4)" />
             <Line points={xs.map((x) => [x, mapBytesPerSecond({ ...input, eventsPerSecond: x })] as [number, number])} color="var(--c3)" />

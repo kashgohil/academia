@@ -1,8 +1,8 @@
 /** Demos for "block allocation and extents": a block grid and a size calculator. */
 import { useMemo } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleX, Stats, bytes, pct, range, select, toggle, useParams } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleX, Stats, bytes, pct, range, select, toggle, useParams, MONO, MiniTable, Note, SmallLabel } from "../../kit";
 import { ALLOC_DEFAULTS, AllocSim, POLICY_LABEL, ext2Limit, fragReadCost, indirectMeta, mappingCompare, maxFileSize, type AllocMetrics, type AllocPolicy, type IndirectSpec } from "../../sims/os/fs/alloc";
-import { Heading, MONO, MiniTable, Note, fileColor } from "./FsUi";
+import { fileColor } from "./FsUi";
 
 const POLICIES: AllocPolicy[] = ["immediate", "delayed", "prealloc"];
 const G = {
@@ -80,7 +80,7 @@ export function FsAllocGridDemo() {
         ]} />
       </div>
       <div style={{ marginTop: 10 }}>
-        <Heading>All three policies at this point</Heading>
+        <SmallLabel>All three policies at this point</SmallLabel>
         <MiniTable
           head={["Policy", "Pieces", "Extents", "Tree", "Indirect", "HDD", "SSD"]}
           rows={costRows}
@@ -136,7 +136,7 @@ export function FsMaxSizeDemo() {
     </>}>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(230px, 1fr))", gap: 12 }}>
         <div>
-          <Heading>What each part of the inode reaches</Heading>
+          <SmallLabel>What each part of the inode reaches</SmallLabel>
           <div style={{ fontFamily: MONO, fontSize: 12 }}>
             {mx.perLevel.map((n, i) => (
               <div key={i} style={{ display: "flex", justifyContent: "space-between", borderBottom: "1px solid var(--border)", padding: "2px 0" }}>
@@ -151,7 +151,7 @@ export function FsMaxSizeDemo() {
           <Note>{mx.ptrs} pointers fit in one block. {ptrBytes === 4 && direct === 12 && levels === 3 && blockSize <= 4096 && `ext2 caps this at ${bigBytes(ext2Limit(blockSize).limit)}, because i_blocks counts 512-byte units in 32 bits.`}</Note>
         </div>
         <div>
-          <Heading>Overhead against file size</Heading>
+          <SmallLabel>Overhead against file size</SmallLabel>
           <Plot x={[4096, FILE_SIZES[FILE_SIZES.length - 1]!]} y={[1e-6, 10]} logX logY height={190} xLabel="file size" yLabel="metadata, % of file" xTicks={[4096, 1 << 20, 1 << 30, 2 ** 40]} xFormat={(v) => bigBytes(v)} yTicks={[1e-5, 1e-3, 0.1, 10]} yFormat={(v) => `${v}`}>
             <Line points={indLine} color="var(--c4)" />
             <Line points={extLine} color="var(--c3)" />

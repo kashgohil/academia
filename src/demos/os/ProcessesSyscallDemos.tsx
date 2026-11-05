@@ -1,11 +1,11 @@
 /** Lesson: system calls. A write stepper with registers, and a cost model. */
 import { useMemo, useState } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleX, Stats, range, select, si, toggle, useParams } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleX, Stats, range, select, si, toggle, useParams, IndexButtons, IndexSlider, Note, Panel, SmallLabel, mono, tint } from "../../kit";
 import {
   ALL_MITIGATIONS, COST_INPUTS, MSG_ADDR, NO_MITIGATIONS, REG_ORDER, TABLE_EXCERPT, VARIANT_LABEL, cpuShare, libcView, syscallNs, syscallRate, vdsoNs, vdsoRate, writeSteps,
   type Mitigations, type Regs, type WriteVariant,
 } from "../../sims/os/processes";
-import { Cap, ModeBar, Msg, Note, Panel, StepButtons, StepSlider, mono, tint } from "./ProcessesUi";
+import { ModeBar, Msg } from "./ProcessesUi";
 
 const REG_ROLE: Record<keyof Regs, string> = {
   rax: "number, then result", rdi: "argument 1", rsi: "argument 2", rdx: "argument 3", r10: "argument 4", r8: "argument 5", r9: "argument 6",
@@ -35,9 +35,9 @@ export function WriteStepperDemo() {
   return (
     <Demo
       title='write(1, "hi", 2)'
-      actions={<StepButtons k={kk} n={steps.length} set={setK} />}
+      actions={<IndexButtons k={kk} n={steps.length} set={setK} />}
       controls={<>
-        <StepSlider k={kk} n={steps.length} set={setK} />
+        <IndexSlider k={kk} n={steps.length} set={setK} />
         <Param spec={p.schema.variant} value={p.values.variant} onChange={(v) => { p.set("variant", v as WriteVariant); setK(0); }} />
         <Param spec={p.schema.kpti} value={p.values.kpti} onChange={(v) => { p.set("kpti", v as boolean); setK(0); }} />
       </>}
@@ -112,7 +112,7 @@ export function SyscallCostDemo() {
       <Param spec={p.schema.spectre} value={v.spectre} onChange={(x) => p.set("spectre", x as boolean)} />
       <Param spec={p.schema.mds} value={v.mds} onChange={(x) => p.set("mds", x as boolean)} />
     </>}>
-      <Cap>One CPU in a loop: user work, then one call. All costs here are model inputs.</Cap>
+      <SmallLabel>One CPU in a loop: user work, then one call. All costs here are model inputs.</SmallLabel>
       <Plot x={[10, 100000]} y={[5e3, 5e7]} logX logY height={250} xLabel="user work between calls (ns)" yLabel="calls per second" xTicks={[10, 100, 1000, 10000, 100000]} yTicks={[1e4, 1e5, 1e6, 1e7]} xFormat={(t) => si(t)} yFormat={(t) => si(t)}>
         <Line points={vd} color="var(--c3)" />
         <Line points={bare} color="var(--faint)" dash="4 3" />

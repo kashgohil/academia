@@ -3,9 +3,8 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperti
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
-import { Demo, Param, Stats, cssVar, range, useParams, useWidth } from "../../kit";
+import { Demo, Param, Stats, cssVar, range, useParams, useWidth, seg } from "../../kit";
 import { ENTRIES_PER_TABLE, GiB, LEVEL_NAMES, PAGE_SIZE, PageTable, flatTableBytes, fmtBytes, hexVa, splitVa, type TableNode } from "../../sims/os/vm";
-import { seg } from "../db/StorageUi";
 
 const VARS = ["--c1", "--c2", "--c3", "--c4", "--c5", "--fg", "--muted", "--faint", "--border", "--bg", "--subtle"] as const;
 type Theme = Record<(typeof VARS)[number], string>;

@@ -1,8 +1,8 @@
 /** Lesson: booting. A timeline from power on to the first character, and a linker script explorer. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, toggle, select, bytes } from "../../kit";
+import { Demo, Param, Stats, toggle, select, bytes, Banner, IndexButtons, IndexSlider, Note, Panel, SmallLabel, mono, seg, tint } from "../../kit";
 import { BASE_OPTIONS, DEFAULT_ORDER, SECTIONS, bootStages, layout, type BootPath, type RegionKind, type SectionName, type StageOwner } from "../../sims/os/kernel";
-import { Cap, Msg, Note, Panel, RegCell, RegGrid, StepButtons, StepSlider, Verdict, mono, seg, tint } from "./KernelUi";
+import { Msg, RegCell, RegGrid } from "./KernelUi";
 
 const OWNER_COLOR: Record<StageOwner, string> = { firmware: "var(--c5)", loader: "var(--c2)", kernel: "var(--c1)" };
 const KIND_COLOR: Record<RegionKind, string> = { rom: "var(--muted)", firmware: "var(--c5)", loader: "var(--c2)", kernel: "var(--c1)", free: "var(--c3)", unknown: "var(--faint)", device: "var(--muted)" };
@@ -17,9 +17,9 @@ export function BootTimelineDemo() {
   return (
     <Demo
       title="From power on to the first character"
-      actions={<StepButtons k={kk} n={stages.length} set={setK} />}
+      actions={<IndexButtons k={kk} n={stages.length} set={setK} />}
       controls={<>
-        <StepSlider k={kk} n={stages.length} set={setK} label="Stage" />
+        <IndexSlider k={kk} n={stages.length} set={setK} label="Stage" />
         <Param spec={seg<BootPath>("Path", [["uefi", "UEFI + Limine"], ["bios", "BIOS + Multiboot2"]], "uefi")} value={path} onChange={(v) => { setPath(v as BootPath); }} />
       </>}
     >
@@ -36,18 +36,18 @@ export function BootTimelineDemo() {
       </div>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
         <div style={{ flex: "1 1 220px", minWidth: 0 }}>
-          <Cap>CPU</Cap>
+          <SmallLabel>CPU</SmallLabel>
           <RegGrid min={130}>
             <RegCell name="rip" value={s.rip} />
             <RegCell name="paging" value={s.paging} />
             <RegCell name="interrupts" value={s.interrupts} />
             <RegCell name="stack" value={s.stack} />
           </RegGrid>
-          <Cap><span style={{ display: "block", marginTop: 8 }}>Serial console (COM1)</span></Cap>
+          <SmallLabel><span style={{ display: "block", marginTop: 8 }}>Serial console (COM1)</span></SmallLabel>
           <div style={{ ...mono, fontSize: 15, border: "1px solid var(--border)", borderRadius: 4, padding: "4px 8px", minHeight: 30, background: "var(--subtle)" }}>{s.console || <span className="muted" style={{ fontSize: 12 }}>nothing yet</span>}</div>
         </div>
         <div style={{ flex: "1 1 260px", minWidth: 0 }}>
-          <Cap>What memory holds</Cap>
+          <SmallLabel>What memory holds</SmallLabel>
           <div style={{ display: "grid", gap: 3 }}>
             {s.regions.map((r) => (
               <div key={r.label} style={{ display: "flex", gap: 7, alignItems: "stretch", border: "1px solid var(--border)", borderRadius: 4, overflow: "hidden" }}>
@@ -97,7 +97,7 @@ export function LinkerExplorerDemo() {
     >
       <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
         <div style={{ flex: "1 1 220px", minWidth: 0 }}>
-          <Cap>Section order in the script</Cap>
+          <SmallLabel>Section order in the script</SmallLabel>
           <div style={{ display: "grid", gap: 3 }}>
             {order.map((n, i) => {
               const s = SECTIONS.find((x) => x.name === n)!;
@@ -113,12 +113,12 @@ export function LinkerExplorerDemo() {
           </div>
         </div>
         <div style={{ flex: "1 1 240px", minWidth: 0 }}>
-          <Cap>Generated script</Cap>
+          <SmallLabel>Generated script</SmallLabel>
           <pre style={{ ...mono, fontSize: 10.5, lineHeight: 1.35, margin: 0, padding: "4px 7px", border: "1px solid var(--border)", borderRadius: 4, background: "var(--subtle)", overflowX: "auto" }}>{r.script}</pre>
         </div>
       </div>
       <div style={{ marginTop: 10 }}>
-        <Cap>Memory image. Each tick is one 4 KiB page. The rights of a page cover all sections in it.</Cap>
+        <SmallLabel>Memory image. Each tick is one 4 KiB page. The rights of a page cover all sections in it.</SmallLabel>
         <svg viewBox={`0 0 ${pages * 4096} 1`} preserveAspectRatio="none" style={{ display: "block", width: "100%", height: 32, border: "1px solid var(--border)", borderRadius: 3 }} role="img" aria-label="Sections in memory">
           {r.placed.map((p) => <rect key={p.name} x={Number(p.vma - b)} y={0} width={p.size} height={1} fill={SEC_COLOR[p.name]} opacity={p.nobits ? 0.45 : 0.9} />)}
           {Array.from({ length: pages }, (_, i) => <rect key={i} x={i * 4096 - 12} y={0} width={24} height={1} fill="var(--bg)" />)}
@@ -147,8 +147,8 @@ export function LinkerExplorerDemo() {
         { label: "pages with W and X", value: r.wxPages },
       ]} />
       {r.problems.length === 0
-        ? <Verdict tone="good">This link is clean: each page has one set of rights, and the file stores no zeros for .bss.</Verdict>
-        : r.problems.map((p) => <Verdict key={p.text} tone={p.level === "error" ? "bad" : "plain"}>{p.text}</Verdict>)}
+        ? <Banner tone="good">This link is clean: each page has one set of rights, and the file stores no zeros for .bss.</Banner>
+        : r.problems.map((p) => <Banner key={p.text} tone={p.level === "error" ? "bad" : "plain"}>{p.text}</Banner>)}
       <Note>Section sizes are model inputs. The model places sections and merges segments the way a simple script with GNU ld or LLD does.</Note>
     </Demo>
   );

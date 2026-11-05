@@ -1,12 +1,12 @@
 /** Demos for "semaphores": bounded buffer stepper, readers-writers simulator, dining philosophers. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, range, select, useParams } from "../../kit";
+import { Demo, Param, Stats, range, select, useParams, Banner, MONO, MiniTable } from "../../kit";
 import { allDone, canRun, clone, exec, initial, type MState } from "../../sims/os/sync/machine";
 import {
   RW_DEFAULTS, RW_LABEL, boundedBufferProg, checkBuffer, checkDining, diningProg, simulateRw,
   type BufferVariant, type DiningVariant, type RwPolicy, type RwResult,
 } from "../../sims/os/sync/semaphores";
-import { Banner, Cell, CellRow, MONO, MiniTable, SyncStepper, TC } from "./SyncShared";
+import { Cell, CellRow, SyncStepper, TC } from "./SyncShared";
 
 const BUF = {
   variant: select({

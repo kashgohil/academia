@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
-import { Demo, Stats, Param, Controls, useParams, select, range, toggle, useSim, pct } from "../kit";
+import { Demo, Stats, Param, Controls, useParams, select, range, toggle, useSim, pct, MONO } from "../kit";
 import { parse } from "../sims/memmodel";
 import { PRESETS } from "../sims/memmodel/presets";
 import { avgHops } from "../sims/interconnect";
@@ -18,7 +18,6 @@ import {
 const ST_COLOR: Record<St, string> = { M: "var(--c4)", O: "var(--c5)", E: "var(--c3)", S: "var(--c1)", I: "var(--faint)" };
 const ST_NAME: Record<St, string> = { M: "Modified", O: "Owned", E: "Exclusive", S: "Shared", I: "Invalid" };
 const NODE_COLOR = ["var(--c1)", "var(--c3)", "var(--c2)", "var(--c5)"];
-const mono = "ui-monospace, Menlo, monospace";
 
 const reducedMotion = () => typeof window !== "undefined" && !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
@@ -157,7 +156,7 @@ export function MesiStateMachineDemo() {
           <>
             <b>{COH_EVENT_LABEL[last.ev]}</b>: this core {last.from} → {last.to}, other core {last.otherFrom} → {last.otherTo}.{" "}
             {last.bus ? <span style={{ color: "var(--c4)" }}>Bus: {last.bus}.</span> : <span style={{ color: "var(--c3)" }}>No bus transaction.</span>}
-            <div className="muted" style={{ fontFamily: mono, fontSize: 11.5, marginTop: 2 }}>C{last.ev.startsWith("my") ? 0 : 1} {last.text}</div>
+            <div className="muted" style={{ fontFamily: MONO, fontSize: 11.5, marginTop: 2 }}>C{last.ev.startsWith("my") ? 0 : 1} {last.text}</div>
           </>
         ) : (
           <span className="muted">Both caches start without the line (I). Click an action. The circle that is filled is the state of the line in this core.</span>
@@ -337,7 +336,7 @@ export function HopMapDemo() {
           );
         })}
       </svg>
-      <div className="muted" style={{ fontSize: 12, fontFamily: mono, margin: "6px 0 10px", overflowWrap: "anywhere" }}>route: {path.join(" → ")}</div>
+      <div className="muted" style={{ fontSize: 12, fontFamily: MONO, margin: "6px 0 10px", overflowWrap: "anywhere" }}>route: {path.join(" → ")}</div>
       <Stats items={[
         { label: "hops, start to end", value: path.length - 1 },
         { label: "average hops", value: avgHops(topo, n).toFixed(2) },
@@ -428,7 +427,7 @@ export function DirectoryDemo() {
         <text x={C[0]} y={C[1] - 14} textAnchor="middle" fontSize={11} fontWeight={600} fill="var(--fg)">{view === "dir" ? "home node: directory" : "shared bus"}</text>
         {view === "dir" ? (
           <>
-            <text x={C[0]} y={C[1] + 3} textAnchor="middle" fontSize={11} fontFamily={mono} fill="var(--fg)">sharers {sharers.join("")}</text>
+            <text x={C[0]} y={C[1] + 3} textAnchor="middle" fontSize={11} fontFamily={MONO} fill="var(--fg)">sharers {sharers.join("")}</text>
             <text x={C[0]} y={C[1] + 19} textAnchor="middle" fontSize={10.5} fill="var(--muted)">state {dirState}</text>
           </>
         ) : (
@@ -517,14 +516,14 @@ export function StoreBufferTimelineDemo() {
               <text x={4} y={y + 4} fontSize={11.5} fontWeight={600} fill="var(--fg)">Core {i}</text>
               <line x1={x0} x2={x1} y1={y} y2={y} stroke="var(--border)" strokeWidth={1.2} />
               {/* the store waits in the buffer, then reaches memory */}
-              <text x={X(st)} y={y - 28} fontSize={11} fontFamily={mono} fill="var(--c2)">{names[i]!.st}{vis - st > 0 && X(vis) - X(st) > 120 ? " waits in the buffer" : ""}</text>
+              <text x={X(st)} y={y - 28} fontSize={11} fontFamily={MONO} fill="var(--c2)">{names[i]!.st}{vis - st > 0 && X(vis) - X(st) > 120 ? " waits in the buffer" : ""}</text>
               {vis > st && <rect x={X(st)} y={y - 22} width={X(vis) - X(st)} height={9} rx={2} fill="var(--c2)" opacity={0.3} />}
               <line x1={X(vis)} x2={X(vis)} y1={y - 25} y2={y - 10} stroke="var(--c2)" strokeWidth={2.4} />
               {/* fence stall */}
               {tl.stall[i]! > 0 && <rect x={X(st + 1)} y={y - 5} width={X(ld) - X(st + 1)} height={10} fill="var(--c4)" opacity={0.22} />}
               <rect x={X(st) - 4} y={y - 7} width={8} height={14} rx={2} fill="var(--c2)" />
               <circle cx={X(ld)} cy={y} r={6.5} fill={read ? "var(--c3)" : "var(--c4)"} />
-              <text x={Math.min(X(ld) - 4, x1 - 78)} y={y + 22} fontSize={11} fontFamily={mono} fontWeight={600} fill={read ? "var(--c3)" : "var(--c4)"}>{names[i]!.ld} → {read}</text>
+              <text x={Math.min(X(ld) - 4, x1 - 78)} y={y + 22} fontSize={11} fontFamily={MONO} fontWeight={600} fill={read ? "var(--c3)" : "var(--c4)"}>{names[i]!.ld} → {read}</text>
             </g>
           );
         })}
@@ -574,7 +573,7 @@ export function ScheduleCountDemo() {
     >
       <div style={{ display: "grid", gridTemplateColumns: `repeat(${p.threads.length}, minmax(0, 1fr))`, gap: 10, marginBottom: 12 }}>
         {p.threads.map((th, i) => (
-          <div key={i} style={{ fontFamily: mono, fontSize: 11.5, border: "1px solid var(--border)", borderRadius: 6, padding: "6px 8px", minWidth: 0, overflowWrap: "anywhere" }}>
+          <div key={i} style={{ fontFamily: MONO, fontSize: 11.5, border: "1px solid var(--border)", borderRadius: 6, padding: "6px 8px", minWidth: 0, overflowWrap: "anywhere" }}>
             <b style={{ fontFamily: "inherit" }}>Core {i}</b>
             {th.map((ins, k) => <div key={k}>{lines[ins.line - 1]!.trim()}</div>)}
           </div>
@@ -587,7 +586,7 @@ export function ScheduleCountDemo() {
           const on = o.key === chosen.key;
           return (
             <button key={o.key} onClick={() => setPick(o.key)} style={{ all: "unset", cursor: "pointer", display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", gap: 4, padding: "6px 8px", borderRadius: 6, border: `1px solid ${on ? "var(--fg)" : "var(--border)"}`, background: on ? "var(--subtle)" : "transparent" }}>
-              <span style={{ fontFamily: mono, fontSize: 12.5 }}>{short(o.key)} {weak && <span style={{ fontFamily: "inherit", color: "var(--c4)", fontWeight: 600, fontSize: 11.5 }}>· impossible under SC</span>}</span>
+              <span style={{ fontFamily: MONO, fontSize: 12.5 }}>{short(o.key)} {weak && <span style={{ fontFamily: "inherit", color: "var(--c4)", fontWeight: 600, fontSize: 11.5 }}>· impossible under SC</span>}</span>
               <span style={{ fontSize: 12, fontVariantNumeric: "tabular-nums" }}>{o.count} of {res.schedules}</span>
               <span style={{ gridColumn: "1 / -1", height: 6, borderRadius: 3, background: "var(--subtle)", overflow: "hidden" }}>
                 <span style={{ display: "block", height: "100%", width: `${(100 * o.count) / max}%`, background: weak ? "var(--c4)" : "var(--c1)" }} />

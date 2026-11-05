@@ -1,9 +1,8 @@
 /** Demos for "Crash testing the engine": a crash fuzzer with deliberate bugs and a coverage heatmap, and a bug replay. */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Demo, Stats, Param, range, toggle, pct } from "../../kit";
+import { Demo, Stats, Param, range, toggle, pct, Banner, Note, SmallLabel, mono, seg } from "../../kit";
 import { BUGS, IO_KINDS, IO_CTXS, type BugId, type KvConfig } from "../../sims/db/engine/kv";
 import { Campaign, shrink, replay, cellKey, findAndShrink, FUZZ_CFG, opText, type Trace, type RunResult, type TraceLine } from "../../sims/db/engine/fuzz";
-import { mono, seg, Note, Label, Verdict } from "./EngineShared";
 
 const CTX_LABEL: Record<string, string> = { write: "put", read: "get", commit: "commit", abort: "abort", checkpoint: "checkpoint", redo: "redo", undo: "undo", restart: "restart" };
 const KIND_LABEL: Record<string, string> = { "log.write": "log write", "log.fsync": "log fsync", "page.write": "page write", "data.fsync": "data fsync", "master.write": "master" };
@@ -128,17 +127,17 @@ export function CrashFuzzerDemo() {
         { label: "violations", value: s.violations },
         { label: "detected, stopped", value: s.detected },
       ]} />
-      <Label style={{ marginTop: 10 }}>Crash-point coverage: where each power cut landed ({s.cells.size} of {IO_KINDS.length * IO_CTXS.length} cells)</Label>
+      <SmallLabel style={{ marginTop: 10 }}>Crash-point coverage: where each power cut landed ({s.cells.size} of {IO_KINDS.length * IO_CTXS.length} cells)</SmallLabel>
       <Heatmap cells={s.cells} />
       {ff && (
         <>
-          <Verdict ok={false}>
+          <Banner ok={false}>
             <b>Run {ff.run} fails.</b> {ff.result.violations[0]?.text ?? ff.result.detected}
-          </Verdict>
+          </Banner>
           {phase === "shrink" && <p style={{ fontSize: 13 }}>Shrinking: {shr.current?.tries ?? 0} replays, the trace is down to {shr.current?.ops ?? 0} operations…</p>}
           {phase === "done" && shr.current?.result && (
             <>
-              <Label>Minimal reproducing trace: {shr.current.result.ops.length} operations (from {ff.trace.ops.length}), {shr.current.tries} replays</Label>
+              <SmallLabel>Minimal reproducing trace: {shr.current.result.ops.length} operations (from {ff.trace.ops.length}), {shr.current.tries} replays</SmallLabel>
               <TraceView lines={shr.current.lines} />
             </>
           )}
@@ -208,16 +207,16 @@ export function BugReplayDemo() {
       </p>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
         <div style={{ flex: "1 1 260px", minWidth: 0 }}>
-          <Label>With the bug</Label>
+          <SmallLabel>With the bug</SmallLabel>
           <TraceView lines={upTo(bad)} max={300} />
         </div>
         <div style={{ flex: "1 1 260px", minWidth: 0 }}>
-          <Label>The correct engine, same trace</Label>
+          <SmallLabel>The correct engine, same trace</SmallLabel>
           <TraceView lines={upTo(good)} max={300} />
         </div>
       </div>
       {step > n && (
-        <Verdict ok={false}><b>Fix:</b> {FIX[bug]}</Verdict>
+        <Banner ok={false}><b>Fix:</b> {FIX[bug]}</Banner>
       )}
       <Note>Crash points are I/O points: write() or fsync() of the log, a page write, the data-file fsync, the master record. The power cut keeps a random prefix of unsynced log records and each unsynced page write with probability 1/2.</Note>
     </Demo>

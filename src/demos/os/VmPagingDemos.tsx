@@ -1,10 +1,9 @@
 /** Demos for the lesson on paging and page tables. */
 import { lazy, Suspense, useMemo, useRef, useState } from "react";
-import { Demo, Dots, Legend, Line, Param, Plot, RuleX, Stats, range, useParams } from "../../kit";
+import { Demo, Dots, Legend, Line, Param, Plot, RuleX, Stats, range, useParams, Note, mono, seg } from "../../kit";
 import {
   GiB, KiB, LEVEL_NAMES, MiB, PAGE_SIZE, PTE, PTE_BIT_INFO, PageTable, SIZE_2M, TiB, canonicalize, describeErrorCode, entryPfn, flatTableBytes, fmtBytes, has, hexVa, joinVa, parseVa, splitVa, tablesForStride, vaBits, type AccessKind, type Levels,
 } from "../../sims/os/vm";
-import { Note, mono, seg } from "../db/StorageUi";
 
 const FIELD_COLORS = ["var(--c1)", "var(--c3)", "var(--c5)", "var(--c2)", "var(--c4)"];
 

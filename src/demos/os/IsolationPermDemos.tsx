@@ -1,11 +1,11 @@
 /** Demos for "users, permissions and capabilities": the check stepper, the setuid walk and the capability calculator. */
 import { useMemo, useState } from "react";
-import { Demo } from "../../kit";
+import { Demo, Banner, Note, Panel, mono } from "../../kit";
 import {
   S_ISGID, S_ISUID, S_ISVTX, caps, capable, checkPermission, classBits, execCred, execveCaps, makeCred, mayDelete, modeString, newFileGid, permClass, seteuid, setuid,
   ALL_CAPS, NO_CAPS, type Cap, type CapSet, type Cred, type ExecFile, type Inode, type PermClass, type ProcCaps, type Want,
 } from "../../sims/os/isolation";
-import { Badge, Card, Note, Scroll, Verdict, mono, smallTable, td, th, twoCol } from "./IsolationUi";
+import { Badge, Scroll, smallTable, td, th, twoCol } from "./IsolationUi";
 
 // ---------------- the permission check ----------------
 
@@ -62,7 +62,7 @@ export function IsolationPermCheckDemo() {
         {PRESETS.map((p) => <button key={p.id} className={preset === p.id ? "on" : ""} onClick={() => { setS(p.s); setPreset(p.id); setStepAt(null); }}>{p.label}</button>)}
       </div>
       <div style={twoCol}>
-        <Card title="The file">
+        <Panel title="The file">
           <div style={{ ...mono, fontSize: 13, marginBottom: 8, overflowWrap: "anywhere" }}>{modeString(s.mode, s.isDir)} {nameOf(userList, s.uid)} {nameOf(groupList, s.gid)} <span className="muted">{(s.mode).toString(8).padStart(4, "0")}</span></div>
           <Picker label="Owner" value={s.uid} options={userList} onChange={(v) => up({ uid: v })} />
           <Picker label="Group" value={s.gid} options={GROUPS} onChange={(v) => up({ gid: v })} />
@@ -91,8 +91,8 @@ export function IsolationPermCheckDemo() {
             ))}
             <label className="row" style={{ gap: 4 }}><input type="checkbox" checked={s.isDir} onChange={() => up({ isDir: !s.isDir })} />directory</label>
           </div>
-        </Card>
-        <Card title="The process">
+        </Panel>
+        <Panel title="The process">
           <Picker label="fsuid" value={s.pUid} options={userList} onChange={(v) => up({ pUid: v, dacCap: v === 0 ? true : s.dacCap })} />
           <Picker label="fsgid" value={s.pGid} options={groupList} onChange={(v) => up({ pGid: v })} />
           <div className="row" style={{ fontSize: 12.5, gap: 10, margin: "4px 0 8px" }}>
@@ -105,7 +105,7 @@ export function IsolationPermCheckDemo() {
           <div className="param"><span className="param-label">The access it wants</span>
             <div className="seg">{BITS.map(([b]) => <button key={b} className={s.want === b ? "on" : ""} onClick={() => up({ want: b })}>{b === "r" ? "read" : b === "w" ? "write" : "execute"}</button>)}</div>
           </div>
-        </Card>
+        </Panel>
       </div>
       <div style={{ marginTop: 10 }}>
         <div className="row" style={{ justifyContent: "space-between" }}>
@@ -123,9 +123,9 @@ export function IsolationPermCheckDemo() {
           ))}
         </ol>
         {done && (
-          <Verdict tone={res.allowed ? "good" : "bad"}>
+          <Banner tone={res.allowed ? "good" : "bad"}>
             <b>{res.allowed ? "Allowed" : "EACCES"}</b>: the {res.cls} bits are <span style={mono}>{modeString(classBits(s.mode, res.cls)).slice(7)}</span>{res.override ? `, and ${res.override} overrides the denial` : ""}.
-          </Verdict>
+          </Banner>
         )}
         <Note>
           {!s.isDir && (s.mode & S_ISUID || (s.mode & S_ISGID && s.mode & 0o010))
@@ -164,17 +164,17 @@ export function IsolationSetuidDemo() {
         <button className="btn" onClick={() => act((x) => setuid(x, 1000), "setuid(1000)")}>setuid(1000)</button>
       </div>
       <div style={twoCol}>
-        <Card title="Process credentials">
+        <Panel title="Process credentials">
           <table style={smallTable}><tbody>
             {rows.map(([n, v, d]) => <tr key={n}><td style={td}>{n}</td><td style={{ ...td, ...mono, fontWeight: 600, color: v === 0 ? "var(--c4)" : "var(--fg)" }}>{v}</td><td style={{ ...td, fontSize: 11.5 }} className="muted">{d}</td></tr>)}
           </tbody></table>
-          <Verdict tone={canRead ? "warn" : "none"}>Read <span style={mono}>/etc/shadow</span> ({modeString(SHADOW.mode)} root shadow): <b>{canRead ? "allowed" : "EACCES"}</b></Verdict>
-        </Card>
-        <Card title="What happened">
+          <Banner tone={canRead ? "warn" : "none"}>Read <span style={mono}>/etc/shadow</span> ({modeString(SHADOW.mode)} root shadow): <b>{canRead ? "allowed" : "EACCES"}</b></Banner>
+        </Panel>
+        <Panel title="What happened">
           <div style={{ ...mono, fontSize: 12, lineHeight: 1.5, maxHeight: 170, overflowY: "auto" }}>
             {log.slice(-7).map((l, i) => <div key={i}>{l}</div>)}
           </div>
-        </Card>
+        </Panel>
       </div>
     </Demo>
   );
@@ -235,7 +235,7 @@ export function IsolationCapExecDemo() {
         {CAP_PRESETS.map((p) => <button key={p.id} className={preset === p.id ? "on" : ""} onClick={() => { setS(p.s); setPreset(p.id); }}>{p.label}</button>)}
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(270px, 1fr))", gap: 10 }}>
-        <Card title="Process before execve">
+        <Panel title="Process before execve">
           <Scroll><table style={smallTable}>
             <thead><tr><th style={th} />{KEYS.map((k) => <th key={k} title={SET_NAMES[k]} style={{ ...th, textAlign: "center", padding: "2px" }}>{k}</th>)}</tr></thead>
             <tbody>{SHOW.map((c) => (
@@ -246,8 +246,8 @@ export function IsolationCapExecDemo() {
             <label className="row" style={{ gap: 4 }}>UID <select style={sel} value={s.uid} onChange={(e) => up({ uid: Number(e.target.value) })}><option value={1000}>1000</option><option value={0}>0</option></select></label>
             <label className="row" style={{ gap: 4 }}><input type="checkbox" checked={s.nnp} onChange={() => up({ nnp: !s.nnp })} />no_new_privs</label>
           </div>
-        </Card>
-        <Card title="The file">
+        </Panel>
+        <Panel title="The file">
           <Scroll><table style={smallTable}>
             <thead><tr><th style={th} /><th style={{ ...th, textAlign: "center" }}>F(P)</th><th style={{ ...th, textAlign: "center" }}>F(I)</th></tr></thead>
             <tbody>{SHOW.map((c) => (
@@ -262,8 +262,8 @@ export function IsolationCapExecDemo() {
             <label className="row" style={{ gap: 4 }}><input type="checkbox" disabled={!s.hasCaps} checked={s.fE} onChange={() => up({ fE: !s.fE })} />F(effective)</label>
             <label className="row" style={{ gap: 4 }}><input type="checkbox" checked={s.setuidRoot} onChange={() => up({ setuidRoot: !s.setuidRoot })} />setuid root</label>
           </div>
-        </Card>
-        <Card title="Process after execve">
+        </Panel>
+        <Panel title="Process after execve">
           <Scroll><table style={smallTable}>
             <thead><tr><th style={th} />{KEYS.map((k) => <th key={k} style={{ ...th, textAlign: "center", padding: "2px" }}>{k}&prime;</th>)}</tr></thead>
             <tbody>{SHOW.map((c) => (
@@ -271,7 +271,7 @@ export function IsolationCapExecDemo() {
             ))}</tbody>
           </table></Scroll>
           <Note>An orange ring means that the bit changed. Effective UID after execve: {n.euid}.</Note>
-        </Card>
+        </Panel>
       </div>
       <div style={{ marginTop: 10 }}>
         <Scroll>
@@ -281,7 +281,7 @@ export function IsolationCapExecDemo() {
             ))}
           </tbody></table>
         </Scroll>
-        <Verdict tone={bindOk ? "good" : "none"}>Can the new program bind port 80? <b>{bindOk ? "Yes" : "No"}</b>: <span style={mono}>capable(CAP_NET_BIND_SERVICE)</span> reads the effective set. {out.privilegedFile && s.A.size > 0 ? <Badge tone="warn">ambient cleared</Badge> : null} {out.rootRule ? <Badge tone="info">root rule applied</Badge> : null}</Verdict>
+        <Banner tone={bindOk ? "good" : "none"}>Can the new program bind port 80? <b>{bindOk ? "Yes" : "No"}</b>: <span style={mono}>capable(CAP_NET_BIND_SERVICE)</span> reads the effective set. {out.privilegedFile && s.A.size > 0 ? <Badge tone="warn">ambient cleared</Badge> : null} {out.rootRule ? <Badge tone="info">root rule applied</Badge> : null}</Banner>
       </div>
     </Demo>
   );

@@ -1,13 +1,13 @@
 /** Demos for two-phase locking and optimistic concurrency control. */
 import { useMemo, useRef, useState } from "react";
-import { Demo, Stats, Param, Plot, Line, Dots, Legend, range, select, toggle, useParams, pct } from "../../kit";
+import { Demo, Stats, Param, Plot, Line, Dots, Legend, range, select, toggle, useParams, pct, BAD, Chip, GOOD, MONO, Panel, StepButtons, StepCaption, StepSlider, useChunked, useStepper } from "../../kit";
 import {
   LOCK_SCRIPTS, runLockScript, lineText, LockManager, MODES, COMPAT, HIER, HIER_ACTIONS, hierLocks, tn, sup,
   type Policy, type LMode, type HierAction,
 } from "../../sims/db/txn/locks";
 import { simulate, MPL_SWEEP, THETA_SWEEP, hottestShare, type Protocol } from "../../sims/db/txn/contention";
 import { OCC_SCRIPTS, runOcc, occLineText, type OccMode } from "../../sims/db/txn/occ";
-import { tcol, GOOD, BAD, MONO, useStepper, StepButtons, StepSlider, Caption, Chip, Panel, Digraph, useChunked, type DEdge } from "./TxnShared";
+import { tcol, Digraph, type DEdge } from "./TxnShared";
 
 // ============================================================================ 1. Lock manager stepper
 
@@ -80,7 +80,7 @@ export function LockStepperDemo() {
           <Digraph id="txn-lock-g" nodes={nodes} edges={edges} size={190} r={18} />
         </Panel>
       </div>
-      <Caption tone={f.tone} label={`${s.i}/${frames.length - 1}`}>{f.text}</Caption>
+      <StepCaption tone={f.tone} label={`${s.i}/${frames.length - 1}`}>{f.text}</StepCaption>
     </Demo>
   );
 }
@@ -199,7 +199,7 @@ export function LockHierarchyDemo() {
           </table>
         </Panel>
       </div>
-      <Caption tone={msg.tone}>{msg.text}</Caption>
+      <StepCaption tone={msg.tone}>{msg.text}</StepCaption>
     </Demo>
   );
 }
@@ -225,7 +225,7 @@ export function DeadlockSweepDemo() {
   const wf = P.values.writeFrac;
   const cores = P.values.cpu ? 4 : Infinity;
   const jobs = SWEEP_POL.flatMap((p) => MPL_SWEEP.map((mpl) => ({ p: p.id, mpl })));
-  const res = useChunked(jobs.length, (i) => simulate({ protocol: jobs[i]!.p, mpl: jobs[i]!.mpl, items, writeFrac: wf, cores, ops: 8 }), [items, wf, cores]);
+  const res = useChunked(`${items}:${wf}:${cores}`, jobs.map((j) => () => simulate({ protocol: j.p, mpl: j.mpl, items, writeFrac: wf, cores, ops: 8 })));
   const series = SWEEP_POL.map((_, pi) => MPL_SWEEP.map((mpl, mi) => [mpl, res[pi * MPL_SWEEP.length + mi]] as const).filter((x) => x[1]).map(([mpl, r]) => ({ mpl, r: r! })));
   const maxT = Math.max(0.2, ...series.flat().map((x) => x.r.throughput)) * 1.1;
   const best = series.map((s) => s.reduce((a, x) => (x.r.throughput > a.r.throughput ? x : a), s[0] ?? { mpl: 0, r: { throughput: 0 } as never }));
@@ -306,7 +306,7 @@ export function OccStepperDemo() {
           ))}
         </Panel>
       </div>
-      <Caption tone={f.tone} label={`${s.i}/${frames.length - 1}`}>{f.text}</Caption>
+      <StepCaption tone={f.tone} label={`${s.i}/${frames.length - 1}`}>{f.text}</StepCaption>
       <div style={{ marginTop: 8 }}><Stats items={[{ label: "operations thrown away by aborts", value: f.wasted }]} /></div>
     </Demo>
   );
@@ -330,7 +330,7 @@ export function OccSkewDemo() {
   const wf = P.values.writeFrac;
   const cores = P.values.cpu ? 4 : Infinity;
   const jobs = SKEW_PROTOS.flatMap((p) => THETA_SWEEP.map((theta) => ({ p: p.id, theta })));
-  const res = useChunked(jobs.length, (i) => simulate({ protocol: jobs[i]!.p, theta: jobs[i]!.theta, mpl, writeFrac: wf, cores, items: 1000, ops: 8 }), [mpl, wf, cores]);
+  const res = useChunked(`${mpl}:${wf}:${cores}`, jobs.map((j) => () => simulate({ protocol: j.p, theta: j.theta, mpl, writeFrac: wf, cores, items: 1000, ops: 8 })));
   const series = SKEW_PROTOS.map((_, pi) => THETA_SWEEP.map((th, k) => [th, res[pi * THETA_SWEEP.length + k]] as const).filter((x) => x[1]).map(([th, r]) => ({ th, r: r! })));
   const maxT = Math.max(0.1, ...series.flat().map((x) => x.r.throughput)) * 1.1;
   return (

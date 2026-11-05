@@ -1,8 +1,7 @@
 /** Demos for /os/memory/copy-on-write. */
 import { useMemo, useRef, useState } from "react";
-import { Demo, Stats, Param, Plot, Line, RuleX, Dots, Legend, range, useParams, bytes, pct } from "../../kit";
+import { Demo, Stats, Param, Plot, Line, RuleX, Dots, Legend, range, useParams, bytes, pct, Note, seg, sig } from "../../kit";
 import { CowMemory, snapshotExtra, firstWriteNs, forkPteBytes, COW_COSTS, SNAPSHOT_DEFAULTS, type CowProc, type WriteResult } from "../../sims/os/memory";
-import { seg, Note, fx } from "../db/StorageUi";
 
 const PAGES = ["A", "B", "C", "D"];
 
@@ -128,7 +127,7 @@ const RATES = Array.from({ length: 41 }, (_, i) => 10 ** (1 + (i * 5) / 40));
 
 export function SnapshotDemo() {
   const p = useParams("snap", {
-    rate: range({ label: "Writes per second", min: 10, max: 1e6, log: true, default: 1e4, format: (x) => fx(x, 3) }),
+    rate: range({ label: "Writes per second", min: 10, max: 1e6, log: true, default: 1e4, format: (x) => sig(x, 3) }),
     gib: range({ label: "Dataset", min: 1, max: 64, step: 1, default: 16, format: (x) => `${x} GiB` }),
     disk: seg("Snapshot write speed (model input)", [["50", "50 MiB/s"], ["200", "200 MiB/s"], ["1000", "1 GiB/s"]], "200"),
     page: seg("Page size", [["4096", "4 KiB"], ["2097152", "2 MiB (THP)"]], "4096"),
@@ -149,7 +148,7 @@ export function SnapshotDemo() {
       <Param spec={p.schema.disk} value={v.disk} onChange={(x) => p.set("disk", x as string)} />
       <Param spec={p.schema.page} value={v.page} onChange={(x) => p.set("page", x as string)} />
     </>}>
-      <Plot x={[10, 1e6]} y={[0, 1]} logX height={230} xLabel="writes per second" yLabel="memory copied, share of the dataset" yFormat={(y) => `${Math.round(y * 100)}%`} xTicks={[10, 100, 1e3, 1e4, 1e5, 1e6]} xFormat={(x) => fx(x, 1)}>
+      <Plot x={[10, 1e6]} y={[0, 1]} logX height={230} xLabel="writes per second" yLabel="memory copied, share of the dataset" yFormat={(y) => `${Math.round(y * 100)}%`} xTicks={[10, 100, 1e3, 1e4, 1e5, 1e6]} xFormat={(x) => sig(x, 1)}>
         <Line points={curves.thp} color="var(--c4)" />
         <Line points={curves.uni} color="var(--c1)" />
         <Line points={curves.skew} color="var(--c3)" dash="5 4" />
@@ -158,12 +157,12 @@ export function SnapshotDemo() {
       </Plot>
       <Legend items={[{ label: "4 KiB pages, uniform writes", color: "var(--c1)" }, { label: "4 KiB pages, 90% of writes on 10% of pages", color: "var(--c3)" }, { label: "2 MiB pages, uniform writes", color: "var(--c4)" }]} />
       <Stats items={[
-        { label: "snapshot time", value: `${fx(cur.seconds, 3)} s` },
-        { label: "writes in that time", value: fx(cur.writes, 3) },
-        { label: "pages copied", value: fx(cur.copiedPages, 3) },
+        { label: "snapshot time", value: `${sig(cur.seconds, 3)} s` },
+        { label: "writes in that time", value: sig(cur.writes, 3) },
+        { label: "pages copied", value: sig(cur.copiedPages, 3) },
         { label: "extra memory", value: bytes(Math.round(cur.extraBytes)) },
         { label: "share of dataset", value: pct(cur.extraShare, 1) },
-        { label: "one COW fault (model)", value: fault >= 1e4 ? `${fx(fault / 1000, 3)} µs` : `${fx(fault, 3)} ns` },
+        { label: "one COW fault (model)", value: fault >= 1e4 ? `${sig(fault / 1000, 3)} µs` : `${sig(fault, 3)} ns` },
         { label: "PTEs copied by fork", value: bytes(forkPteBytes(v.gib * 2 ** 30)) },
       ]} />
       <Note>Model inputs: a fault costs {COW_COSTS.faultNs} ns and memcpy runs at {COW_COSTS.copyGiBps} GiB/s. Each write dirties one page.</Note>

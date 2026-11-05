@@ -1,8 +1,7 @@
 /** Lesson: kernel mode and user mode. An instruction runner, and a timeline of one CPU's mode. */
 import { useMemo, useState } from "react";
-import { Demo, Legend, Param, Stats, pct, range, select, useWidth } from "../../kit";
+import { Demo, Legend, Param, Stats, pct, range, select, useWidth, Note, SmallLabel, mono, seg, tint } from "../../kit";
 import { ENTRY_INFO, ENTRY_US, initialBits, instructionsFor, timeline, type Arch, type CpuBits, type EntryKind, type Instruction, type Mode, type Outcome } from "../../sims/os/processes";
-import { Cap, Note, mono, seg, tint } from "./ProcessesUi";
 
 const MODE_NAME: Record<Arch, Record<Mode, string>> = { x86: { user: "ring 3", kernel: "ring 0" }, arm: { user: "EL0", kernel: "EL1" } };
 
@@ -31,7 +30,7 @@ export function InstructionRunnerDemo() {
         <Param spec={select<Mode>({ label: "Current mode", segmented: true, default: "user", options: [{ value: "user", label: `${MODE_NAME[arch].user} (user)` }, { value: "kernel", label: `${MODE_NAME[arch].kernel} (kernel)` }] })} value={bits.mode} onChange={(v) => setBits({ ...bits, mode: v as Mode })} />
       </>}
     >
-      <Cap>Click an instruction. Green ran, and red faulted, in the current mode.</Cap>
+      <SmallLabel>Click an instruction. Green ran, and red faulted, in the current mode.</SmallLabel>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 5 }}>
         {list.map((i) => {
           const o = last.get(i.id);
@@ -123,7 +122,7 @@ export function ModeTimelineDemo() {
           <path d={path} fill="none" stroke="var(--fg)" strokeWidth={1.5} />
         </svg>
       </div>
-      <Cap>The low line is user mode, and the high line is kernel mode. Widths use a square-root scale, so that short slices stay visible.</Cap>
+      <SmallLabel>The low line is user mode, and the high line is kernel mode. Widths use a square-root scale, so that short slices stay visible.</SmallLabel>
       <Legend box items={[
         { label: `syscall (short ${ENTRY_US.getpid} µs, long ${ENTRY_US.read} µs)`, color: "var(--c1)" },
         { label: `page fault (${ENTRY_US.fault} µs)`, color: "var(--c2)" },

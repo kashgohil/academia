@@ -1,80 +1,16 @@
 /** Shared pieces for the query-processing demos: colors, a frame stepper, captions, an operator tree and a row table. */
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Param, range, usePlot } from "../../kit";
+import { useEffect, useRef, useState } from "react";
+import { usePlot, MONO } from "../../kit";
 
-export const MONO = "ui-monospace, Menlo, monospace";
-export const GOOD = "var(--c3)";
-export const BAD = "var(--c4)";
 export const ACC = "var(--c1)";
 export const WARM = "var(--c2)";
 export const ALT = "var(--c5)";
 
-/** Index into a list of frames, with play, back, step and a slider. */
-export function useStepper(n: number, fps = 2) {
-  const [i, setI] = useState(0);
-  const [running, setRunning] = useState(false);
-  const last = Math.max(0, n - 1);
-  const cur = Math.min(i, last);
-  const ref = useRef(cur);
-  ref.current = cur;
-  useEffect(() => {
-    if (!running) return;
-    const id = window.setInterval(() => {
-      if (ref.current >= last) { setRunning(false); return; }
-      setI(ref.current + 1);
-    }, 1000 / fps);
-    return () => window.clearInterval(id);
-  }, [running, last, fps]);
-  return {
-    i: cur, n, atEnd: cur >= last, running,
-    go: (j: number) => { setRunning(false); setI(Math.max(0, Math.min(last, j))); },
-    toggle: () => { if (cur >= last && !running) setI(0); setRunning((r) => !r); },
-    reset: () => { setRunning(false); setI(0); },
-  };
-}
-export type Stepper = ReturnType<typeof useStepper>;
 
-export function StepButtons({ s }: { s: Stepper }) {
-  return (
-    <>
-      <button className="btn primary" onClick={s.toggle}>{s.running ? "Pause" : s.atEnd ? "Replay" : "Play"}</button>
-      <button className="btn" onClick={() => s.go(s.i - 1)} disabled={s.i === 0}>Back</button>
-      <button className="btn" onClick={() => s.go(s.i + 1)} disabled={s.atEnd}>Step</button>
-    </>
-  );
-}
 
-export function StepSlider({ s, label = "Step" }: { s: Stepper; label?: string }) {
-  return <Param spec={range({ label, min: 0, max: Math.max(1, s.n - 1), step: 1, default: 0, format: (v) => `${v} of ${s.n - 1}` })} value={s.i} onChange={(v) => s.go(v as number)} />;
-}
 
-export function Caption({ children, tone, label }: { children: ReactNode; tone?: "good" | "bad" | null; label?: ReactNode }) {
-  return (
-    <div style={{ fontSize: 13.5, lineHeight: 1.45, minHeight: 42, padding: "8px 10px 8px 13px", marginTop: 10, background: "var(--subtle)", borderRadius: 6, border: "1px solid var(--border)", boxShadow: `inset 3px 0 0 ${tone === "bad" ? BAD : tone === "good" ? GOOD : "var(--border)"}` }}>
-      {label !== undefined && <span className="muted" style={{ fontSize: 11.5, marginRight: 8, fontVariantNumeric: "tabular-nums" }}>{label}</span>}
-      {children}
-    </div>
-  );
-}
 
-export function Chip({ children, color = "var(--fg)", filled, dashed, faint, bold, title, onClick }: { children: ReactNode; color?: string; filled?: boolean; dashed?: boolean; faint?: boolean; bold?: boolean; title?: string; onClick?: () => void }) {
-  return (
-    <span
-      title={title}
-      onClick={onClick}
-      style={{
-        display: "inline-block", fontFamily: MONO, fontSize: 11.5, lineHeight: "17px", padding: "0 5px", borderRadius: 4,
-        border: `1.5px ${dashed ? "dashed" : "solid"} ${color}`, background: filled ? color : "var(--bg)", color: filled ? "var(--bg)" : color,
-        opacity: faint ? 0.35 : 1, cursor: onClick ? "pointer" : undefined, whiteSpace: "nowrap", fontWeight: bold ? 700 : 400,
-        transition: "background 0.2s, color 0.2s, opacity 0.2s",
-      }}
-    >
-      {children}
-    </span>
-  );
-}
 
-export const Note = ({ children }: { children: ReactNode }) => <p className="muted" style={{ fontSize: 12, margin: "10px 0 0", lineHeight: 1.45 }}>{children}</p>;
 
 // ------------------------------------------------------------------ operator tree
 
@@ -197,14 +133,6 @@ export function RowTable({ head, rows, max = 12, highlight, dim }: { head: strin
   );
 }
 
-/** Small arrowhead marker; give each a unique id. */
-export function Arrow({ id, color = "var(--muted)" }: { id: string; color?: string }) {
-  return (
-    <marker id={id} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-      <path d="M0 0L10 5L0 10z" fill={color} />
-    </marker>
-  );
-}
 
 /**
  * Runs `f` in a timeout after render, so heavy work does not block a frame. Returns the last finished value
@@ -221,8 +149,6 @@ export function useLater<T>(f: () => T, deps: readonly unknown[]): T | null {
   return v ? v.val : null;
 }
 
-/** Formats an integer with thousands separators. */
-export const int = (n: number) => Math.round(n).toLocaleString("en-US");
 
 /** Bars that start at `base` (needed on a log y axis, where 0 has no position). Must be inside <Plot>. */
 export function BaseBars({ bins, base, color = "var(--c1)", opacity = 0.8 }: { bins: { x0: number; x1: number; y: number; color?: string }[]; base: number; color?: string; opacity?: number }) {

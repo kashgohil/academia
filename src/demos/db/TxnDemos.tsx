@@ -1,6 +1,6 @@
 /** Demos for the Transactions module: ACID, schedules, isolation anomalies, the anomaly matrix and SSI. */
 import { useEffect, useMemo, useState } from "react";
-import { Demo, Stats, Param, Legend, range, select, toggle, useParams, useWidth } from "../../kit";
+import { Demo, Stats, Param, Legend, range, select, toggle, useParams, useWidth, BAD, Chip, GOOD, MONO, Panel, StepButtons, StepCaption, StepSlider, useStepper } from "../../kit";
 import { mulberry32 } from "../../sims/rng";
 import {
   TXN_SETS, serialSchedule, precedenceGraph, findCycle, topoOrder, moveLeft, runConcrete, matchingSerialOrders, txnName,
@@ -10,7 +10,7 @@ import {
   SCENARIOS, SSI_SCENARIOS, LEVELS, buildPath, runnable, verdict, isMvcc, opText, tname, dangerousStructures, exploreIter, cellKind,
   type Scenario, type Level, type EState, type Explored,
 } from "../../sims/db/txn/engine";
-import { tcol, GOOD, BAD, MONO, useStepper, StepButtons, StepSlider, Caption, Chip, Panel, Digraph, type DEdge } from "./TxnShared";
+import { tcol, Digraph, type DEdge } from "./TxnShared";
 
 // ============================================================================ 1. Atomicity: crash during transfers
 
@@ -72,11 +72,11 @@ export function BankCrashDemo() {
           </div>
         </div>
       )}
-      <Caption tone={ok ? "good" : "bad"}>
+      <StepCaption tone={ok ? "good" : "bad"}>
         {atomic
           ? r.undone.length ? `Recovery reads the log. ${r.undone.map(txnName).join(", ")} has no commit record, so recovery writes back the old values. ${r.committed} transfer${r.committed === 1 ? "" : "s"} stay.` : `Every logged transfer has a commit record. Recovery has nothing to undo.`
           : ok ? `The crash fell between two transfers, so the disk holds only whole transfers. This time, nothing broke.` : `The crash fell inside a transfer: the debit reached the disk, but the credit did not. Without a log, restart cannot know this.`}
-      </Caption>
+      </StepCaption>
     </Demo>
   );
 }
@@ -305,7 +305,7 @@ export function EngineStepper({ id, title, scenarios, levels, defScenario, defLe
         <Panel title={isMvcc(level) ? "Versions of each row" : "Rows and locks"}><DataView st={st} /></Panel>
         {graph && <Panel title="Dependency graph (red dashed = rw)"><DepGraph sc={sc} st={st} id={`${id}-g`} /></Panel>}
       </div>
-      <Caption tone={done && v ? (v.anomaly ? "bad" : "good") : tone} label={`${s.i}/${path.states.length - 1}`}>
+      <StepCaption tone={done && v ? (v.anomaly ? "bad" : "good") : tone} label={`${s.i}/${path.states.length - 1}`}>
         {s.i === 0 ? `Start. What can go wrong: ${sc.bad} Step through, or pick which transaction runs next.` : newEvents.map((e) => e.text).join(" ")}
         {done && v && (
           <div style={{ marginTop: 4, fontWeight: 600, color: v.anomaly ? BAD : GOOD }}>
@@ -314,7 +314,7 @@ export function EngineStepper({ id, title, scenarios, levels, defScenario, defLe
               : v.committed.length === 0 ? "Nothing committed." : `Serializable: same result as ${v.matches.map((m) => m.map(tname).join(" → ")).join(" or ")}${v.engineAborts.length ? `, after the engine aborted ${v.engineAborts.map(tname).join(", ")}` : ""}.`}
           </div>
         )}
-      </Caption>
+      </StepCaption>
     </Demo>
   );
 }
@@ -407,12 +407,12 @@ export function AnomalyMatrixDemo() {
         <Legend box items={Object.values(KIND_STYLE).map((k) => ({ label: k.label, color: k.bg }))} />
       </div>
       <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>A number is the count of interleavings with the anomaly. A = aborts, W = waits, ✓ = neither. {done < jobs.length ? `Exploring: ${done} of ${jobs.length} cells.` : `All ${jobs.length} cells explored.`}</div>
-      <Caption tone={cur ? (cur.anomalies ? "bad" : "good") : null}>
+      <StepCaption tone={cur ? (cur.anomalies ? "bad" : "good") : null}>
         <b>{job.sc.name}</b> under <b>{LEVELS.find((l) => l.id === job.level)!.name}</b>:{" "}
         {cur
           ? `${cur.runs} interleavings. ${cur.anomalies ? `${cur.anomalies} show the anomaly (${job.sc.bad})` : "None shows the anomaly."} A transaction waited in ${cur.blocked}, and the engine aborted one in ${cur.aborted}.${cur.example ? ` One bad order: ${cur.example.map(tname).join(" ")}.` : ""}`
           : "exploring…"}
-      </Caption>
+      </StepCaption>
     </Demo>
   );
 }

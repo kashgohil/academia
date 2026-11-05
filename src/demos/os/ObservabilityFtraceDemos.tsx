@@ -1,11 +1,11 @@
 /** Lesson: tracepoints and ftrace. Live patching of a function entry, a per-CPU ring buffer, a loss plot, and sampling against tracing. */
 import { useMemo, useRef, useState } from "react";
-import { Canvas2D, Demo, Legend, Line, Param, Plot, RuleX, RuleY, SimButtons, Stats, cssVar, range, si, toggle, useParams, useSim, bytes as fmtBytes } from "../../kit";
+import { Canvas2D, Demo, Legend, Line, Param, Plot, RuleX, RuleY, SimButtons, Stats, cssVar, range, si, toggle, useParams, useSim, bytes as fmtBytes, IndexButtons, IndexSlider, Note, Panel, SmallLabel, mono, seg, tint } from "../../kit";
 import {
   BODY_AFTER_SITE, CALL_BYTES, DEFAULT_BUFFER_KIB, FTRACE_INPUTS, NOP5, PROFILER_HZ, RingBuffer, SAMPLE_INPUTS, TraceBuffers, costPerCallNs, cpuShareAt, encodeRel32, lossModel, naivePatch, pMissAll, pSeen, samplerCpuShare, simulateSampler, textPokeBp, tracerCpuShare,
   FN_ENTRY, type FnTracer, type RingMode, type SiteView,
 } from "../../sims/os/observability";
-import { Cap, Msg, Note, Panel, StepButtons, StepSlider, mono, seg, tint } from "./ProcessesUi";
+import { Msg } from "./ProcessesUi";
 
 const hex2 = (n: number) => n.toString(16).padStart(2, "0");
 const ns = (x: number) => `${x} ns`;
@@ -60,9 +60,9 @@ export function FunctionPatchDemo() {
   return (
     <Demo
       title="The first bytes of a kernel function"
-      actions={<StepButtons k={kk} n={fr.length} set={setK} />}
+      actions={<IndexButtons k={kk} n={fr.length} set={setK} />}
       controls={<>
-        <StepSlider k={kk} n={fr.length} set={setK} />
+        <IndexSlider k={kk} n={fr.length} set={setK} />
         <Param spec={p.schema.how} value={p.values.how} onChange={(v) => { p.set("how", v as "bp"); setK(0); }} />
         <Param spec={p.schema.tracer} value={p.values.tracer} onChange={(v) => p.set("tracer", v as "function")} />
         <Param spec={p.schema.rate} value={p.values.rate} onChange={(v) => p.set("rate", v as number)} />
@@ -162,7 +162,7 @@ export function RingBufferDemo() {
         <Param spec={p.schema.mode} value={p.values.mode} onChange={(v) => p.set("mode", v as "overwrite")} />
       </>}
     >
-      <Cap>Each ring has {SMALL_PAGES} small pages of 4 events. A real page holds about 127 events of 32 bytes.</Cap>
+      <SmallLabel>Each ring has {SMALL_PAGES} small pages of 4 events. A real page holds about 127 events of 32 bytes.</SmallLabel>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
         <button className="btn" onClick={() => write(0, 1)}>Write 1, CPU 0</button>
         <button className="btn" onClick={() => write(0, 10)}>Burst 10, CPU 0</button>

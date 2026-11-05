@@ -1,12 +1,11 @@
 /** Demos for "Compression": an encoding lab, SUM on compressed data, and sort order vs run counts. */
 import { useMemo, useRef, useState } from "react";
-import { Demo, Stats, Param, Legend, range, useSim, SimButtons, pct } from "../../kit";
+import { Demo, Stats, Param, Legend, range, useSim, SimButtons, pct, Bar, Note, SectionLabel, fixed, int, mono, seg } from "../../kit";
 import {
   dataset, encodeAll, chooseEncoding, plainBytes, runColumn, runsOf, sumDecodeThenAdd, sumOnRuns,
   countEqStrings, countEqDict, COUNTRIES, salesTable, runCounts, SORT_KEYS, SALES_COLUMNS, sortRows, encode,
   type DatasetName, type EncodingName,
 } from "../../sims/db/olap";
-import { seg, mono, Note, Caption, Bar, int, fx } from "./OlapShared";
 
 const ENC_LABEL: Record<EncodingName, string> = {
   plain: "plain", rle: "run-length", dict: "dictionary", for: "frame of reference", delta: "delta", bitpack: "bit-packing", lz4: "LZ4 (general)",
@@ -40,7 +39,7 @@ export function CompressionLabDemo() {
             <div key={r.encoding}>
               <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "space-between", gap: "0 10px", fontSize: 12.5 }}>
                 <span style={{ fontWeight: win ? 700 : 500 }}>{ENC_LABEL[r.encoding]}{win ? " · the analyzer picks this" : ""}</span>
-                <span style={mono}>{int(r.bytes)} B · {r.ratio >= 10 ? fx(r.ratio, 1) : fx(r.ratio, 2)}×</span>
+                <span style={mono}>{int(r.bytes)} B · {r.ratio >= 10 ? fixed(r.ratio, 1) : fixed(r.ratio, 2)}×</span>
               </div>
               <Bar frac={r.bytes / Math.max(plain, ...results.map((x) => x.bytes))} color={win ? "var(--c3)" : r.ratio < 1 ? "var(--c4)" : "var(--c1)"} />
               <div className="muted" style={{ ...mono, fontSize: 11, marginTop: 2, overflowWrap: "anywhere" }}>{r.preview}</div>
@@ -99,7 +98,7 @@ export function CompressedSumDemo() {
         </>
       }
     >
-      <Caption>SUM over {SUM_N} values stored as {runs.length} runs</Caption>
+      <SectionLabel>SUM over {SUM_N} values stored as {runs.length} runs</SectionLabel>
       <div className="muted" style={{ fontSize: 12 }}>Each bar is one run: its width is the run length and its height is the value. Both workers do 2 operations per tick.</div>
       <div style={{ fontSize: 12.5, margin: "6px 0 3px" }}>Decode, then add: {int(decValues)} of {SUM_N} values · partial sum {int(partial(decValues))}</div>
       {strip(decValues, "var(--c2)")}
@@ -109,11 +108,11 @@ export function CompressedSumDemo() {
         items={[
           { label: "operations, decode then add", value: int(dec.ops) },
           { label: "operations, on runs", value: int(rle.ops) },
-          { label: "fewer operations", value: `${fx(dec.ops / rle.ops, 1)}×` },
+          { label: "fewer operations", value: `${fixed(dec.ops / rle.ops, 1)}×` },
           { label: "both sums", value: dec.result === rle.result ? `${int(rle.result)} = ${int(dec.result)}` : "differ" },
         ]}
       />
-      <Caption style={{ marginTop: 16 }}>COUNT(*) WHERE country = '{needle}' over {int(countries.length)} rows</Caption>
+      <SectionLabel style={{ marginTop: 16 }}>COUNT(*) WHERE country = '{needle}' over {int(countries.length)} rows</SectionLabel>
       <Stats
         items={[
           { label: "plain strings: byte comparisons", value: int(str.byteCompares) },

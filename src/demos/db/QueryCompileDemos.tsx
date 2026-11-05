@@ -1,8 +1,8 @@
 /** Demos for query compilation: produce/consume code generation step by step, and compile latency against run time. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, Plot, Line, Dots, RuleX, Legend, range, select, si } from "../../kit";
+import { Demo, Param, Stats, Plot, Line, Dots, RuleX, Legend, range, select, si, BAD, GOOD, MONO, StepButtons, StepCaption, StepSlider, int, useStepper } from "../../kit";
 import { CG_PLANS, NS_PER_ROW, generate, scanLoops, engineTime, breakEven, type CgNode, type Engine, type Workload } from "../../sims/db/query/codegen";
-import { ACC, ALT, BAD, Caption, GOOD, MONO, OpTree, StepButtons, StepSlider, WARM, int, useStepper, type TreeNode } from "./QueryUi";
+import { ACC, ALT, OpTree, WARM, type TreeNode } from "./QueryUi";
 
 const OP_COLORS = [GOOD, WARM, ACC, ALT, BAD, "var(--muted)"];
 
@@ -50,7 +50,7 @@ export function ProduceConsumeDemo() {
           {lineCount === 0 && <span className="muted">fn query(out: &mut Vec&lt;Row&gt;) {"{ … }"}</span>}
         </pre>
       </div>
-      <Caption label={`${s.i}/${g.events.length}`}>{text}</Caption>
+      <StepCaption label={`${s.i}/${g.events.length}`}>{text}</StepCaption>
       <div style={{ height: 10 }} />
       <Stats items={[
         { label: "lines so far", value: `${lineCount} of ${g.lines.length}` },

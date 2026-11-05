@@ -1,10 +1,10 @@
 /** Demos for "A tiny key-value store, end to end": a console playground and a B+ tree vs LSM workload runner. */
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Demo, Stats, Param, Plot, Line, Dots, RuleX, Legend, range, toggle, pct } from "../../kit";
+import { Demo, Stats, Param, Plot, Line, Dots, RuleX, Legend, range, toggle, pct, Banner, Note, SmallLabel, mono, seg } from "../../kit";
 import { TinyKv, reopen, ConflictError, CorruptPageError, type LogRec, type DurableImage, type RecoveryReport } from "../../sims/db/engine/kv";
 import { measureSteps, deviceTime, SWEEP, WL_DEFAULTS, type IoProfile, type EngineMode, type FsyncDevice } from "../../sims/db/engine/workload";
 import { mulberry32 } from "../../sims/rng";
-import { mono, seg, Note, Label, PageChip, Verdict, chainText, fmt } from "./EngineShared";
+import { PageChip, chainText, fmt } from "./EngineShared";
 
 // ============================================================================
 // The playground
@@ -111,10 +111,10 @@ export function KvPlaygroundDemo() {
         {out.map((o, i) => <div key={out.length - i} style={{ color: o.tone === "bad" ? "var(--c4)" : i === 0 ? "var(--fg)" : "var(--muted)" }}>&gt; {o.text}</div>)}
       </div>
       {off ? (
-        <Verdict ok={null}>The engine is down. Memory is gone: the buffer pool, the transaction table and the log tail. Press recover.</Verdict>
+        <Banner ok={null}>The engine is down. Memory is gone: the buffer pool, the transaction table and the log tail. Press recover.</Banner>
       ) : (
         <>
-          <Label>B+ tree (4 keys per leaf). Grey pages are dirty in the buffer pool.</Label>
+          <SmallLabel>B+ tree (4 keys per leaf). Grey pages are dirty in the buffer pool.</SmallLabel>
           <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 10 }}>
             {levels.map((lv, d) => (
               <div key={d} style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
@@ -126,7 +126,7 @@ export function KvPlaygroundDemo() {
       )}
       <div style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>
         <div style={{ flex: "1 1 200px", minWidth: 0 }}>
-          <Label>Buffer pool frames: page, pins, recLSN</Label>
+          <SmallLabel>Buffer pool frames: page, pins, recLSN</SmallLabel>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(52px, 1fr))", gap: 3 }}>
             {frs.map((f) => (
               <div key={f.frame} style={{ ...mono, fontSize: 10.5, border: "1px solid var(--border)", borderRadius: 4, padding: "2px 4px", background: off ? "transparent" : f.dirty ? "var(--subtle)" : "var(--bg)", opacity: off ? 0.4 : 1 }}>
@@ -136,7 +136,7 @@ export function KvPlaygroundDemo() {
               </div>
             ))}
           </div>
-          <Label style={{ marginTop: 10 }}>Live transactions (click to select)</Label>
+          <SmallLabel style={{ marginTop: 10 }}>Live transactions (click to select)</SmallLabel>
           <table style={{ borderCollapse: "collapse", fontSize: 12, width: "100%", ...mono }}>
             <thead><tr>{["txn", "status", "snap", "lastLSN", "writes"].map((h) => <th key={h} style={{ textAlign: "left", fontWeight: 500, color: "var(--muted)", borderBottom: "1px solid var(--border)", padding: "1px 6px 1px 0" }}>{h}</th>)}</tr></thead>
             <tbody>
@@ -150,7 +150,7 @@ export function KvPlaygroundDemo() {
           </table>
         </div>
         <div style={{ flex: "1 1 240px", minWidth: 0 }}>
-          <Label>Log tail. Filled dot: durable. Hollow: in memory only.</Label>
+          <SmallLabel>Log tail. Filled dot: durable. Hollow: in memory only.</SmallLabel>
           <div style={{ border: "1px solid var(--border)", borderRadius: 6, fontSize: 11.5 }}>
             {tail.map((r) => {
               const durable = r.lsn <= e.syncedLSN;
@@ -256,7 +256,7 @@ export function WorkloadRunnerDemo() {
           </div>
         ))}
       </div>
-      <Label style={{ marginTop: 12 }}>Operations per second (device-time model, thousands){done < 22 ? ` – running ${done} of 22` : ""}</Label>
+      <SmallLabel style={{ marginTop: 12 }}>Operations per second (device-time model, thousands){done < 22 ? ` – running ${done} of 22` : ""}</SmallLabel>
       <Plot x={[0, 1]} y={[0, yMax]} height={200} xLabel="share of writes" yLabel="k ops/s" xFormat={(v) => pct(v, 0)}>
         <Line points={bt} color="var(--c2)" />
         <Line points={ls} color="var(--c1)" />

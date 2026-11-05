@@ -1,10 +1,9 @@
 /** Demos for the lesson on the TLB. */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleX, SimButtons, Stats, range, select, toggle, useParams, useSim, useWidth } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleX, SimButtons, Stats, range, select, toggle, useParams, useSim, useWidth, Note, SmallLabel, mono, seg, useChunked } from "../../kit";
 import {
   GiB, KiB, MiB, Mmu, PAGE_SIZES, PAGE_SIZE_LABEL, PageTable, SHOOTDOWN_MODEL, SIZE_2M, TLB_MODEL, TLB_PATTERN_LABEL, Tlb, chase, fmtBytes, nestedWalkReads, reachBytes, runTrace, shootdown, tlbPattern, type PageSizeId, type Translation, type TlbPatternId,
 } from "../../sims/os/vm";
-import { Caption, Note, mono, seg, useChunked } from "../db/StorageUi";
 
 // ---------------- simulator ----------------
 
@@ -174,7 +173,7 @@ export function VmTlbReachDemo() {
         <Param spec={p.schema.data} value={p.values.data} onChange={(x) => p.set("data", x as boolean)} />
       </>}
     >
-      <Caption>{p.values.data ? "Translation plus the data read." : "Translation only: L2 TLB hits and page walks."} Model inputs: an Intel Skylake TLB and typical cache latencies.</Caption>
+      <SmallLabel>{p.values.data ? "Translation plus the data read." : "Translation only: L2 TLB hits and page walks."} Model inputs: an Intel Skylake TLB and typical cache latencies.</SmallLabel>
       <Plot x={[16 * KiB, WS_MAX]} y={[1, 500]} logX logY height={280} xLabel="working set" yLabel="cycles per access (log), floor 1" xFormat={(x) => fmtBytes(x)} yFormat={(y) => String(y)} yTicks={[1, 10, 100]} xTicks={[64 * KiB, MiB, 16 * MiB, 256 * MiB, 4 * GiB, 64 * GiB]}>
         {REACH_SIZES.map((id) => <Line key={id} points={series(id)} color={REACH_COLOR[id]} />)}
         <RuleX at={reachBytes(m4.l1.entries, PAGE_SIZES["4k"])} label="L1 reach" />

@@ -1,14 +1,12 @@
 /** Demos for the ARIES and checkpoint lessons. */
 import { useMemo, useRef, useState } from "react";
-import { Demo, Stats, Param, Plot, Line, Area, Dots, RuleX, Legend, range, select, useWidth, si } from "../../kit";
+import { Demo, Stats, Param, Plot, Line, Area, Dots, RuleX, Legend, range, useWidth, si, Banner, Note, SmallLabel, mono, seg } from "../../kit";
 import type { Db, LogRecord, Lsn } from "../../sims/db/recovery/core";
 import { Recovery, pageName, type RecoveryEvent } from "../../sims/db/recovery/aries";
 import { ARIES, ARIES_DEFAULT_CRASH, ariesDb, runScript, undoUnderCrashes, FUZZY, fuzzyDb, recoveryPlan } from "../../sims/db/recovery/scenarios";
 import { simulateCheckpoints, PAGE_BYTES } from "../../sims/db/recovery/checkpointsim";
-import { LogView, PageBox, MiniTable, Label, Note, Verdict, attRows, dptRows, mono } from "./RecoveryUi";
+import { LogView, PageBox, TitledTable, attRows, dptRows } from "./RecoveryUi";
 
-const seg = <T extends string>(label: string, options: [T, string][], def: T) =>
-  select<T>({ label, options: options.map(([value, l]) => ({ value, label: l })), default: def, segmented: true });
 
 // ============================================================================
 // ARIES simulator
@@ -71,14 +69,14 @@ export function AriesDemo() {
       <p style={{ fontSize: 13, margin: "0 0 10px", minHeight: 38 }}>{r.last?.text ?? `The log has ${db.lastLSN} durable records; ${r.lost.length} record(s) were only in memory and are lost. Press Step.`}</p>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>
         <div style={{ flex: "1 1 280px", minWidth: 0 }}>
-          <Label>Log. Lines join each transaction's prevLSN chain; dashed arcs are undoNextLSN.</Label>
+          <SmallLabel>Log. Lines join each transaction's prevLSN chain; dashed arcs are undoNextLSN.</SmallLabel>
           <LogView log={db.log} lost={r.lost} flushedLSN={db.flushedLSN} cursor={cursor} lanes
             mark={(l) => marks.has(l) ? <span style={{ fontSize: 10.5, color: marks.get(l) === "redo" ? "var(--c3)" : "var(--muted)" }}>{marks.get(l) === "redo" ? "redo" : "skip"}</span> : null} />
         </div>
         <div style={{ flex: "1 1 240px", minWidth: 0 }}>
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 10 }}>
-            <MiniTable title="Transaction table (ATT)" head={["txn", "status", "lastLSN"]} rows={attRows(att)} />
-            <MiniTable title="Dirty page table (DPT)" head={["page", "recLSN"]} rows={dptRows([...rec.dpt].map(([page, recLSN]) => ({ page, recLSN })))} />
+            <TitledTable title="Transaction table (ATT)" head={["txn", "status", "lastLSN"]} rows={attRows(att)} />
+            <TitledTable title="Dirty page table (DPT)" head={["page", "recLSN"]} rows={dptRows([...rec.dpt].map(([page, recLSN]) => ({ page, recLSN })))} />
           </div>
           {rec.phase !== "analysis" && (
             <div style={{ fontSize: 12.5, marginBottom: 8 }}>
@@ -86,11 +84,11 @@ export function AriesDemo() {
               {rec.phase === "undo" && <><span className="muted"> · ToUndo: </span><b style={mono}>{[...rec.toUndo].sort((a, b) => b - a).join(", ") || "–"}</b></>}
             </div>
           )}
-          <Label>Pages now (buffer pool, else disk)</Label>
+          <SmallLabel>Pages now (buffer pool, else disk)</SmallLabel>
           <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
             {pages.map((p) => <PageBox key={p.id} page={p} dirty={db.pool.get(p.id)?.dirty} tone={r.last?.page === p.id ? "hot" : undefined} />)}
           </div>
-          <Label>Disk</Label>
+          <SmallLabel>Disk</SmallLabel>
           <div style={{ display: "flex", gap: 6 }}>
             {db.disk.map((p) => <PageBox key={p.id} page={p} />)}
           </div>
@@ -103,11 +101,11 @@ export function AriesDemo() {
         { label: "CLRs written", value: rec.counts.clrs },
       ]} />
       {rec.done && (
-        <Verdict ok={diff.length === 0}>
+        <Banner ok={diff.length === 0}>
           {diff.length === 0
             ? <>The pages match the committed state: {db.acked.map((v, p) => `${pageName(p)} = ${v[0]}`).join(", ")}.</>
             : <>Mismatch: {diff.map((d) => `${pageName(d.page)} is ${d.actual}, should be ${d.expected}`).join("; ")}.</>}
-        </Verdict>
+        </Banner>
       )}
     </Demo>
   );
@@ -216,7 +214,7 @@ export function CheckpointTimelineDemo() {
         </>
       }
     >
-      <Label>Write rate (MiB/s). Vertical lines are checkpoint starts: grey by time, orange by WAL size.</Label>
+      <SmallLabel>Write rate (MiB/s). Vertical lines are checkpoint starts: grey by time, orange by WAL size.</SmallLabel>
       <Plot x={[0, T]} y={[0, yMax]} height={180} xLabel="time (s)" xTicks={[0, 600, 1200, 1800, 2400, 3000, 3600]}>
         <Area points={writesMB} color="var(--c1)" opacity={0.35} />
         <Line points={writesMB} color="var(--c1)" width={1.2} />
@@ -226,7 +224,7 @@ export function CheckpointTimelineDemo() {
       </Plot>
       <Legend items={[{ label: "data page writes by the checkpointer", color: "var(--c1)" }, { label: "WAL writes (records + full page images)", color: "var(--c2)" }]} />
       <div style={{ marginTop: 10 }}>
-        <Label>Recovery time if the crash happens at time t (replay from the redo point of the last complete checkpoint)</Label>
+        <SmallLabel>Recovery time if the crash happens at time t (replay from the redo point of the last complete checkpoint)</SmallLabel>
         <Plot x={[0, T]} y={[0, recMax]} height={150} xLabel="crash time (s)" yLabel="recovery (s)" xTicks={[0, 600, 1200, 1800, 2400, 3000, 3600]}>
           <Line points={rec} color="var(--c3)" />
           <RuleX at={t} color="var(--c4)" dash="none" />
@@ -274,15 +272,15 @@ export function FuzzyCheckpointDemo() {
       <p style={{ fontSize: 13, margin: "0 0 10px", minHeight: 20 }}>{kk === 0 ? "Nothing has happened yet." : <>Step {kk}: <b style={{ fontWeight: 600 }}>{FUZZY[kk - 1]!.label}</b>.</>}{kk < FUZZY.length && <span className="muted"> Next: {FUZZY[kk]!.label}.</span>}</p>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>
         <div style={{ flex: "1 1 260px", minWidth: 0 }}>
-          <Label>Log</Label>
+          <SmallLabel>Log</SmallLabel>
           <LogView log={db.log} flushedLSN={db.flushedLSN} lanes before={false} />
         </div>
         <div style={{ flex: "1 1 240px", minWidth: 0 }}>
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 10 }}>
-            <MiniTable title="Live DPT (in memory)" head={["page", "recLSN"]} rows={dptRows(live)} />
-            <MiniTable title={snap ? `Snapshot at begin (LSN ${snap.beginLSN})${db.pending ? ", not written yet" : ""}` : "Snapshot"} head={["page", "recLSN"]} rows={snap ? dptRows(snap.dpt) : []} empty="no checkpoint yet" />
+            <TitledTable title="Live DPT (in memory)" head={["page", "recLSN"]} rows={dptRows(live)} />
+            <TitledTable title={snap ? `Snapshot at begin (LSN ${snap.beginLSN})${db.pending ? ", not written yet" : ""}` : "Snapshot"} head={["page", "recLSN"]} rows={snap ? dptRows(snap.dpt) : []} empty="no checkpoint yet" />
           </div>
-          <MiniTable title="Snapshot ATT" head={["txn", "status", "lastLSN"]} rows={snap ? attRows(snap.att) : []} empty="–" />
+          <TitledTable title="Snapshot ATT" head={["txn", "status", "lastLSN"]} rows={snap ? attRows(snap.att) : []} empty="–" />
           <div style={{ display: "flex", gap: 6, margin: "10px 0 0" }}>
             {Array.from({ length: db.nPages }, (_, p) => {
               const inSnap = snap?.dpt.some((d) => d.page === p);
@@ -292,7 +290,7 @@ export function FuzzyCheckpointDemo() {
           </div>
         </div>
       </div>
-      <Label>If the power fails now</Label>
+      <SmallLabel>If the power fails now</SmallLabel>
       <Stats items={[
         { label: "analysis starts at", value: <span style={mono}>LSN {plan.analysisFrom}</span> },
         { label: "redo starts at", value: <span style={mono}>{plan.redoFrom ? `LSN ${plan.redoFrom}` : "no redo"}</span> },

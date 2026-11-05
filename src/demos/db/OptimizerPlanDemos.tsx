@@ -1,11 +1,11 @@
 /** Demos for "Reading query plans": an interactive EXPLAIN reader and a "find the problem" exercise set. */
 import { useMemo, useState, type ReactNode } from "react";
-import { Demo, Param, Stats, range, toggle, useParams } from "../../kit";
+import { Demo, Param, Stats, range, toggle, useParams, Btn, ButtonRow, Note, SectionLabel, fixed, int, mono, seg } from "../../kit";
 import {
   PG_DEFAULTS, shopScenario, exercises, renderExplain, renderMysqlTree, walkPlan, selfMs, rowError, executionMs, bufferText, CAUSE_LABEL, BLCKSZ,
   type PNode, type Line as PlanLine, type Cause,
 } from "../../sims/db/optimizer";
-import { seg, mono, Note, Caption, Code, fx, int, Btn, Row } from "./OptimizerUi";
+import { Code } from "./OptimizerUi";
 
 const PROP_HELP: Record<string, string> = {
   "Index Cond": "The condition the index answers. Only these rows are read from the index.",
@@ -27,16 +27,16 @@ const PROP_HELP: Record<string, string> = {
 function fieldRows(n: PNode, analyze: boolean, buffers: boolean): [string, ReactNode][] {
   const out: [string, ReactNode][] = [];
   const kids = n.children.length > 0;
-  out.push([`cost=${fx(n.est.startup)}..${fx(n.est.total)}`, <>Estimated cost in planner units (1.0 = one sequential page read). <b>{fx(n.est.startup)}</b> is the startup cost: the work before the first row. <b>{fx(n.est.total)}</b> is the total cost for all rows{kids ? ", including the children" : ""}{n.act.loops > 1 ? ", for one loop" : ""}.</>]);
+  out.push([`cost=${fixed(n.est.startup)}..${fixed(n.est.total)}`, <>Estimated cost in planner units (1.0 = one sequential page read). <b>{fixed(n.est.startup)}</b> is the startup cost: the work before the first row. <b>{fixed(n.est.total)}</b> is the total cost for all rows{kids ? ", including the children" : ""}{n.act.loops > 1 ? ", for one loop" : ""}.</>]);
   out.push([`rows=${n.est.rows}`, <>The planner's estimate of rows this node returns{n.act.loops > 1 ? " per loop" : ""}. Every cost above this node depends on it.</>]);
   out.push([`width=${n.est.width}`, <>Estimated average size of one output row, in bytes. It sets the memory for hashes and sorts.</>]);
   if (analyze) {
-    out.push([`actual time=${fx(n.act.startup, 3)}..${fx(n.act.total, 3)}`, <>Milliseconds until the first row and until the last row{n.act.loops > 1 ? `, averaged over the ${int(n.act.loops)} loops. The node spent ${fx(n.act.total * n.act.loops, 1)} ms in total` : ""}. The time includes the children.</>]);
+    out.push([`actual time=${fixed(n.act.startup, 3)}..${fixed(n.act.total, 3)}`, <>Milliseconds until the first row and until the last row{n.act.loops > 1 ? `, averaged over the ${int(n.act.loops)} loops. The node spent ${fixed(n.act.total * n.act.loops, 1)} ms in total` : ""}. The time includes the children.</>]);
     out.push([`rows=${Math.round(n.act.rows)} loops=${n.act.loops}`, <>Rows returned per loop, and how many times the node ran. Total rows = {int(n.act.rows)} × {int(n.act.loops)} = <b>{int(n.act.rows * n.act.loops)}</b>.</>]);
   }
   if (analyze && buffers) {
     const b = bufferText(n.buf);
-    if (b) out.push([`Buffers: ${b}`, <>8 KiB pages this node and its children touched. <b>hit</b> pages were in shared_buffers; <b>read</b> pages came from the OS ({fx(((n.buf.read * BLCKSZ) / 2 ** 20), 1)} MiB). <b>temp</b> pages went to temporary files.</>]);
+    if (b) out.push([`Buffers: ${b}`, <>8 KiB pages this node and its children touched. <b>hit</b> pages were in shared_buffers; <b>read</b> pages came from the OS ({fixed(((n.buf.read * BLCKSZ) / 2 ** 20), 1)} MiB). <b>temp</b> pages went to temporary files.</>]);
   }
   for (const p of n.props) if (!p.runtime || analyze) out.push([`${p.key}: ${p.value}`, PROP_HELP[p.key] ?? ""]);
   return out;
@@ -66,15 +66,15 @@ function PlanCards({ root, sel, onPick, analyze }: { root: PNode; sel: number; o
           <div key={n.id} onClick={() => onPick(n.id)} style={{ marginLeft: Math.min(d, 6) * 14, border: `1px solid ${n.id === sel ? "var(--c1)" : "var(--border)"}`, borderRadius: 6, padding: "4px 8px", cursor: "pointer", background: n.id === sel ? "var(--subtle)" : "var(--bg)", minWidth: 0 }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", fontSize: 12.5 }}>
               <b>{n.op}<span className="muted" style={{ fontWeight: 400 }}>{n.target ? ` ${n.target}` : ""}</span></b>
-              <span style={{ ...mono, fontSize: 11.5 }}>cost {fx(n.est.total, 0)}</span>
+              <span style={{ ...mono, fontSize: 11.5 }}>cost {fixed(n.est.total, 0)}</span>
             </div>
             {analyze && (
               <div style={{ display: "flex", gap: 10, alignItems: "center", fontSize: 11.5, flexWrap: "wrap" }}>
-                <span style={{ ...mono, color: bad ? "var(--c4)" : "var(--muted)" }}>rows est {int(n.est.rows)} · actual {int(n.act.rows)}{n.act.loops > 1 ? ` × ${int(n.act.loops)} loops` : ""}{e.q >= 2 ? ` (${e.under ? "↓" : "↑"}${fx(e.q, 0)}×)` : ""}</span>
+                <span style={{ ...mono, color: bad ? "var(--c4)" : "var(--muted)" }}>rows est {int(n.est.rows)} · actual {int(n.act.rows)}{n.act.loops > 1 ? ` × ${int(n.act.loops)} loops` : ""}{e.q >= 2 ? ` (${e.under ? "↓" : "↑"}${fixed(e.q, 0)}×)` : ""}</span>
                 <span style={{ flex: "1 1 60px", height: 6, background: "var(--subtle)", border: "1px solid var(--border)", borderRadius: 3, overflow: "hidden", minWidth: 40 }}>
                   <span style={{ display: "block", width: `${Math.min(100, share * 100)}%`, height: "100%", background: "var(--c2)" }} />
                 </span>
-                <span style={mono}>self {fx(selfMs(n), 1)} ms</span>
+                <span style={mono}>self {fixed(selfMs(n), 1)} ms</span>
               </div>
             )}
           </div>
@@ -113,7 +113,7 @@ export function ExplainReaderDemo() {
       <div className="muted" style={{ fontSize: 12, margin: "6px 0 8px" }}>{sc.context}</div>
       {v.view === "tree" ? <PlanCards root={sc.root} sel={selNode.id} onPick={pick} analyze={v.analyze} /> : <PlanText lines={lines} sel={selNode.id} onPick={pick} />}
       {v.view === "mysql" && <Note>The same plan in MySQL's EXPLAIN FORMAT=TREE shape (EXPLAIN ANALYZE adds the actual part). MySQL has no bitmap scans and uses other cost units, so only row estimates are shown.</Note>}
-      <Caption>{selNode.op}{selNode.target ? ` ${selNode.target}` : ""}</Caption>
+      <SectionLabel>{selNode.op}{selNode.target ? ` ${selNode.target}` : ""}</SectionLabel>
       <p style={{ fontSize: 13, margin: "0 0 6px" }}>{selNode.note}</p>
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 0.9fr) minmax(0, 2fr)", gap: "5px 12px", fontSize: 12.5, alignItems: "baseline" }}>
         {fields.map(([k, d]) => (
@@ -124,13 +124,13 @@ export function ExplainReaderDemo() {
         ))}
       </div>
       {selNode.terms.length > 0 && <>
-        <Caption>Where this node's own cost comes from (our model of costsize.c)</Caption>
+        <SectionLabel>Where this node's own cost comes from (our model of costsize.c)</SectionLabel>
         <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1.4fr) auto", gap: "2px 10px", fontSize: 12, alignItems: "baseline" }}>
           {selNode.terms.map((t, i) => (
             <div key={i} style={{ display: "contents" }}>
               <span className="muted">{t.label}</span>
               <span style={{ ...mono, fontSize: 11, overflowWrap: "anywhere" }}>{t.expr}</span>
-              <span style={{ ...mono, textAlign: "right" }}>{fx(t.value)}</span>
+              <span style={{ ...mono, textAlign: "right" }}>{fixed(t.value)}</span>
             </div>
           ))}
         </div>
@@ -138,8 +138,8 @@ export function ExplainReaderDemo() {
       {v.analyze && <Stats items={[
         { label: "scan on orders", value: sc.path === "seq" ? "Seq Scan" : sc.path === "bitmap" ? "Bitmap Heap Scan" : "Index Scan" },
         { label: "hash table built on", value: sc.hashOrders ? "orders" : "customers" },
-        { label: "self time of this node", value: `${fx(selfMs(selNode), 2)} ms` },
-        { label: "execution time", value: `${fx(executionMs(sc.root), 1)} ms` },
+        { label: "self time of this node", value: `${fixed(selfMs(selNode), 2)} ms` },
+        { label: "execution time", value: `${fixed(executionMs(sc.root), 1)} ms` },
       ]} />}
     </Demo>
   );
@@ -166,19 +166,19 @@ export function FindProblemDemo() {
       <Code style={{ fontSize: 11 }}>{e.sql}</Code>
       <div className="muted" style={{ fontSize: 12, margin: "6px 0 8px" }}>{e.context}</div>
       <PlanText lines={renderExplain(e.root, { analyze: true, buffers: true })} />
-      <Caption>What is the main problem?</Caption>
-      <Row>
+      <SectionLabel>What is the main problem?</SectionLabel>
+      <ButtonRow>
         {CAUSES.map((c) => (
           <Btn key={c} on={a === c} onClick={() => setAnswers((s) => s.map((x, k) => (k === i ? c : x)))}>{CAUSE_LABEL[c]}</Btn>
         ))}
-      </Row>
+      </ButtonRow>
       {a && (
         <div style={{ marginTop: 10, fontSize: 13 }}>
           <p style={{ margin: "0 0 6px" }}><b style={{ color: a === e.cause ? "var(--c3)" : "var(--c4)" }}>{a === e.cause ? "Correct." : `Not quite: the cause is "${CAUSE_LABEL[e.cause].toLowerCase()}".`}</b> {e.clue}</p>
           <p style={{ margin: "0 0 6px" }}>{e.why}</p>
-          <Caption>The fix</Caption>
+          <SectionLabel>The fix</SectionLabel>
           <Code style={{ fontSize: 11 }}>{e.fix.sql}</Code>
-          <Caption>The plan after the fix{e.fix.settings ? ` (${e.fix.settings})` : ""}: {fx(before, 1)} ms → {fx(after, 1)} ms</Caption>
+          <SectionLabel>The plan after the fix{e.fix.settings ? ` (${e.fix.settings})` : ""}: {fixed(before, 1)} ms → {fixed(after, 1)} ms</SectionLabel>
           <PlanText lines={renderExplain(e.fix.root, { analyze: true, buffers: true })} />
         </div>
       )}

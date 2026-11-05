@@ -1,12 +1,11 @@
 /** Demos for "Compaction: leveled vs tiered": a side-by-side race, a WA-vs-T sweep, and write stalls. */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Demo, Stats, Param, Legend, SimButtons, useSim, range, Plot, Line, Dots, RuleY, bytes, pct } from "../../kit";
+import { Demo, Stats, Param, Legend, SimButtons, useSim, range, Plot, Line, Dots, RuleY, bytes, pct, Note, fixed, mono, seg } from "../../kit";
 import { mulberry32 } from "../../sims/rng";
 import {
   LsmTree, writeAmp, levelCount, stallTimeline, deepWriteAmp, STALL_DEFAULTS, raceOptions, nextWrite, sweepRun, RACE_MEMTABLE, SWEEP_T, SWEEP_WRITES,
   type Strategy, type CompactionEvent, type Stream, type SweepPoint,
 } from "../../sims/db/lsm";
-import { seg, mono, Note, fx } from "./LsmShared";
 
 // ================= the race =================
 
@@ -122,9 +121,9 @@ export function CompactionRaceDemo() {
               <p className="muted" style={{ fontSize: 12, margin: "6px 0 0", minHeight: 34 }}>{describe(r.last)}</p>
               <Stats
                 items={[
-                  { label: "write amp", value: fx(t.writeAmp(), 2) },
+                  { label: "write amp", value: fixed(t.writeAmp(), 2) },
                   { label: "sorted runs", value: t.sortedRuns() },
-                  { label: "space amp", value: fx(t.spaceAmp(), 2) },
+                  { label: "space amp", value: fixed(t.spaceAmp(), 2) },
                   { label: "bytes written", value: bytes(t.stats.flushBytes + t.stats.compactWriteBytes) },
                 ]}
               />
@@ -199,7 +198,7 @@ export function WaVsTDemo() {
       </Plot>
       <Legend items={[{ label: "leveled: measured (dots), model (line)", color: "var(--c1)" }, { label: "tiered: measured, model", color: "var(--c5)" }]} />
       <Stats
-        items={[4, 10].flatMap((T) => (["leveled", "tiered"] as const).map((s) => ({ label: `${s}, T = ${T}`, value: get(s, T) ? fx(val(get(s, T)!), metric === "runs" ? 1 : 2) : "…" })))}
+        items={[4, 10].flatMap((T) => (["leveled", "tiered"] as const).map((s) => ({ label: `${s}, T = ${T}`, value: get(s, T) ? fixed(val(get(s, T)!), metric === "runs" ? 1 : 2) : "…" })))}
       />
       <Note>{busy ? `Running the real engine: ${busy}…` : "Each dot is the real LsmTree after 20,000 writes. "}{metric === "sa" ? " Dashed lines: worst case for updates, T/(T−1) for leveled and T for tiered." : " Lines: the closed-form model from the text."}</Note>
     </Demo>
@@ -243,13 +242,13 @@ export function StallDemo() {
       </Plot>
       <Stats
         items={[
-          { label: "average accepted writes", value: `${fx(r.avgIngest, 1)} MiB/s` },
+          { label: "average accepted writes", value: `${fixed(r.avgIngest, 1)} MiB/s` },
           { label: "time slowed down", value: pct(r.stallShare, 0) },
           { label: "time stopped", value: pct(r.stopShare, 0) },
-          { label: "compaction needed below L1", value: `${fx(w * deep * 2, 0)} MiB/s` },
+          { label: "compaction needed below L1", value: `${fixed(w * deep * 2, 0)} MiB/s` },
         ]}
       />
-      <Note>A 100 GiB tree, T = 10, L1 = 256 MiB: each byte that leaves L1 is rewritten about {fx(deep, 1)} times further down. That work takes compaction bandwidth first; the rest drains L0.</Note>
+      <Note>A 100 GiB tree, T = 10, L1 = 256 MiB: each byte that leaves L1 is rewritten about {fixed(deep, 1)} times further down. That work takes compaction bandwidth first; the rest drains L0.</Note>
     </Demo>
   );
 }

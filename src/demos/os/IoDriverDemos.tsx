@@ -1,12 +1,10 @@
 /** Demos for "device drivers": a toy device with registers, and a descriptor ring. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, range, toggle, useParams } from "../../kit";
+import { Demo, Param, Stats, range, toggle, useParams, Banner, Panel, mono, seg, tint } from "../../kit";
 import {
   DescRing, STATUS, recvActions, replayDescRing, replayDevice, sendActions, statusText,
   type DevAction, type RingAction, type SlotState,
 } from "../../sims/os/io";
-import { Banner } from "./SyncShared";
-import { Panel, mono, seg, tint } from "./ProcessesUi";
 
 // ---------------------------------------------------------------- toy device
 

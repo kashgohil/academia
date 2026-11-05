@@ -1,11 +1,11 @@
 /** Demos for the join algorithms lesson: a join stepper, an I/O cost plot, and Grace / hybrid hash partitioning. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, Plot, Line, RuleX, Legend, range, select, toggle, si } from "../../kit";
+import { Demo, Param, Stats, Plot, Line, RuleX, Legend, range, select, toggle, si, BAD, GOOD, MONO, Note, StepButtons, StepCaption, StepSlider, int, useStepper } from "../../kit";
 import {
   paged, nestedLoopJoin, blockNlj, indexNlj, sortMergeJoin, hashJoin, graceHashJoin, hybridHashJoin, hash32, joinCost, hybridPlan,
   uniformKeys, zipfKeys, type JoinEvent, type JoinResult, type JTuple, type JoinAlgo, type PagedRel,
 } from "../../sims/db/query/joins";
-import { ACC, ALT, BAD, Caption, GOOD, MONO, Note, StepButtons, StepSlider, WARM, int, useStepper } from "./QueryUi";
+import { ACC, ALT, WARM } from "./QueryUi";
 
 // ============================================================================ 1. stepper
 
@@ -162,7 +162,7 @@ export function JoinStepperDemo() {
         </div>
       )}
       <div style={{ fontSize: 12.5 }}><span className="muted">Output: </span><span style={{ fontFamily: MONO, fontSize: 12 }}>{st.out.length ? st.out.join(" ") : "none yet"}</span></div>
-      <Caption label={`${s.i}/${frames.length}`}>{st.text}</Caption>
+      <StepCaption label={`${s.i}/${frames.length}`}>{st.text}</StepCaption>
       <div style={{ height: 10 }} />
       <Stats items={[
         { label: "page I/Os so far", value: st.io },
@@ -332,7 +332,7 @@ export function GracePartitionDemo() {
           );
         })}
       </div>
-      <Caption label={`${s.i}/${firstLevel.length + 1}`} tone={phase2 && res.fallbacks ? "bad" : null}>{textNow}</Caption>
+      <StepCaption label={`${s.i}/${firstLevel.length + 1}`} tone={phase2 && res.fallbacks ? "bad" : null}>{textNow}</StepCaption>
       <div style={{ height: 10 }} />
       <Stats items={[
         { label: "page reads", value: res.reads },

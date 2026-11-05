@@ -1,11 +1,11 @@
 /** Demos for external sorting and aggregation: a sort stepper, passes vs memory, replacement selection, sort vs hash aggregation. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, Plot, Line, Dots, RuleX, Legend, range, select, toggle, si, bytes } from "../../kit";
+import { Demo, Param, Stats, Plot, Line, Dots, RuleX, Legend, range, select, toggle, si, bytes, BAD, GOOD, MONO, Note, StepButtons, StepCaption, StepSlider, int, useStepper } from "../../kit";
 import {
   externalSort, sortPasses, sortPassesWithRuns, sortPassesFormula, replacementSelection, sortInput, hashAggIO, sortAggIO, hashAggregate, twoPassBuffer, type InputOrder,
 } from "../../sims/db/query/extsort";
 import { uniformKeys } from "../../sims/db/query/joins";
-import { ACC, ALT, BAD, Caption, GOOD, MONO, Note, StepButtons, StepSlider, WARM, int, useLater, useStepper } from "./QueryUi";
+import { ACC, ALT, WARM, useLater } from "./QueryUi";
 
 // ============================================================================ 1. external sort stepper
 
@@ -69,7 +69,7 @@ export function ExternalSortDemo() {
           );
         })}
       </div>
-      <Caption label={`${s.i + 1}/${res.frames.length}`}>{f.text}</Caption>
+      <StepCaption label={`${s.i + 1}/${res.frames.length}`}>{f.text}</StepCaption>
       <div style={{ height: 10 }} />
       <Stats items={[
         { label: "page reads", value: f.reads },
@@ -180,7 +180,7 @@ export function ReplacementSelectionDemo() {
           </div>
         ))}
       </div>
-      <Caption label={`${s.i}/${run.frames.length}`}>{f ? f.text : `Fill the heap with the first ${m} keys, then repeat: write the smallest key that can still go into the current run.`}</Caption>
+      <StepCaption label={`${s.i}/${run.frames.length}`}>{f ? f.text : `Fill the heap with the first ${m} keys, then repeat: write the smallest key that can still go into the current run.`}</StepCaption>
       <div style={{ height: 10 }} />
       <Stats items={[
         { label: "runs for these 48 keys", value: run.runs.length },

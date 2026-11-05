@@ -1,6 +1,6 @@
 /** Shared SVG renderer for small B+ trees (used by all B-tree lesson demos). */
 import type { ReactNode } from "react";
-import { useWidth } from "../../kit";
+import { useWidth, mono } from "../../kit";
 
 export interface ViewNode {
   id: number | string;
@@ -166,7 +166,7 @@ export function TreeView({ root, color, fill, keyColor, faint, chain = true, cha
   );
 }
 
-export const mono = { fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12 } as const;
+export const codeText = { ...mono, fontSize: 12 };
 
 /** Small colored badge. */
 export function Badge({ color, children }: { color: string; children: ReactNode }) {

@@ -1,13 +1,11 @@
 /** Demos for "DMA and the IOMMU": PIO against DMA, scatter-gather with translation, and the map and sync API. */
 import { useMemo, useState } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleX, Stats, bytes as fmtBytes, pct, range, toggle, useParams, useWidth } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleX, Stats, bytes as fmtBytes, pct, range, toggle, useParams, useWidth, Banner, Note, Panel, mono, seg } from "../../kit";
 import {
   DMA_DEVICES, DMA_MODEL, DmaLine, Iommu, dmaCrossoverBytes, dmaMapSg, pioVsDma,
   type DmaDeviceId, type DmaDir, type IommuResult,
 } from "../../sims/os/io";
 import { hexVa, PAGE_SIZE } from "../../sims/os/vm";
-import { Banner } from "./SyncShared";
-import { Note, Panel, mono, seg } from "./ProcessesUi";
 
 const us = (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(v >= 10000 ? 0 : 1)} ms` : `${v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2)} µs`);
 

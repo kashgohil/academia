@@ -1,13 +1,12 @@
 /** Demos for the Storage module: disks and SSDs, slotted pages, heap files. Lessons 4–6 are in StorageDemosB.tsx. */
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
-import { Demo, Stats, Param, Plot, Line, RuleX, Dots, Legend, range, toggle, useParams, useSim, useWidth, SimButtons, bytes, pct } from "../../kit";
+import { Demo, Stats, Param, Plot, Line, RuleX, Dots, Legend, range, toggle, useParams, useSim, useWidth, SimButtons, bytes, pct, Note, SmallLabel, StackBar, mono, ms, seg, sig, useChunked } from "../../kit";
 import {
   HDDS, type HddId, hddAccess, ssdRead, SSD_NVME, SSD_SATA, hddIopsAtQd, Ftl, ftlStream, steadyWa, PAGE_VALID, PAGE_INVALID,
   type FtlWorkload, type FtlEvent,
   SlottedPage, LP_NORMAL, LP_DEAD, LP_UNUSED, PAGE_HEADER, SLOT_BYTES, alignUp, pgTupleLayout, type PgColumn, type PgType, toastThreshold,
   heapRun, type InsertStrategy, FreeSpaceMap, availToCat, needToCat, fsmStep, tablePages, scanMs, rowsPerPage,
 } from "../../sims/db/storage";
-import { seg, mono, Note, Caption, StackBar, useChunked, fx, ms } from "./StorageUi";
 
 // =====================================================================================
 // Lesson 1: Disks vs SSDs
@@ -35,7 +34,7 @@ export function AccessTimeDemo() {
   const COL = { seek: "var(--c4)", rotate: "var(--c2)", transfer: "var(--c3)" };
   return (
     <Demo title="Where the time of one read goes" controls={<><Param spec={p.schema.size} value={p.values.size} onChange={(v) => p.set("size", v as number)} /><Param spec={p.schema.disk} value={p.values.disk} onChange={(v) => p.set("disk", v as HddId)} /></>}>
-      <Caption>One random read of {bytes(size)} on a {d.name}: {ms(rnd.total)} in total</Caption>
+      <SmallLabel>One random read of {bytes(size)} on a {d.name}: {ms(rnd.total)} in total</SmallLabel>
       <StackBar parts={[{ label: "seek", value: rnd.seek, color: COL.seek }, { label: "rotate", value: rnd.rotate, color: COL.rotate }, { label: "transfer", value: rnd.transfer, color: COL.transfer }]} />
       <div style={{ margin: "6px 0 12px" }}>
         <Legend items={[{ label: `seek ${ms(rnd.seek)}`, color: COL.seek }, { label: `rotation ${ms(rnd.rotate)}`, color: COL.rotate }, { label: `transfer ${ms(rnd.transfer)}`, color: COL.transfer }]} />
@@ -50,12 +49,12 @@ export function AccessTimeDemo() {
       </Plot>
       <Legend items={[{ label: "disk, random", color: "var(--c4)" }, { label: "disk, sequential (dashed)", color: "var(--c4)" }, { label: "NVMe SSD, random, 1 at a time", color: "var(--c1)" }, { label: "NVMe SSD, 32 at a time (dashed)", color: "var(--c1)" }]} />
       <Stats items={[
-        { label: "disk random reads/s", value: fx(rnd.iops) },
-        { label: "disk random MB/s", value: fx(rnd.mbps) },
-        { label: "disk sequential MB/s", value: fx(seq.mbps) },
-        { label: "sequential ÷ random", value: `${fx(seq.mbps / rnd.mbps)}×` },
-        { label: "SSD latency, 1 read", value: `${fx(nv1.latUs)} µs` },
-        { label: "SSD MB/s, 32 at a time", value: fx(nv32.mbps) },
+        { label: "disk random reads/s", value: sig(rnd.iops) },
+        { label: "disk random MB/s", value: sig(rnd.mbps) },
+        { label: "disk sequential MB/s", value: sig(seq.mbps) },
+        { label: "sequential ÷ random", value: `${sig(seq.mbps / rnd.mbps)}×` },
+        { label: "SSD latency, 1 read", value: `${sig(nv1.latUs)} µs` },
+        { label: "SSD MB/s, 32 at a time", value: sig(nv32.mbps) },
       ]} />
     </Demo>
   );
@@ -82,7 +81,7 @@ export function QueueDepthDemo() {
   const nv = ssdRead(SSD_NVME, 4096, qd);
   return (
     <Demo title="4 KiB random reads: more requests in flight" controls={<Param spec={p.schema.qd} value={p.values.qd} onChange={(v) => p.set("qd", v as number)} />}>
-      <Plot x={[1, 256]} y={[30, 2e6]} logX logY height={250} xLabel="queue depth" yLabel="reads per second" xTicks={QDS} xFormat={String} yTicks={[100, 1e3, 1e4, 1e5, 1e6]} yFormat={(v) => fx(v, 1)}>
+      <Plot x={[1, 256]} y={[30, 2e6]} logX logY height={250} xLabel="queue depth" yLabel="reads per second" xTicks={QDS} xFormat={String} yTicks={[100, 1e3, 1e4, 1e5, 1e6]} yFormat={(v) => sig(v, 1)}>
         <Line points={hdd.map((h) => [h.q, h.fifo] as const)} color="var(--c4)" dash="5 4" />
         <Line points={hdd.map((h) => [h.q, h.elev] as const)} color="var(--c4)" />
         <Line points={QDS.map((q) => [q, sata(q)] as const)} color="var(--c2)" />
@@ -91,10 +90,10 @@ export function QueueDepthDemo() {
       </Plot>
       <Legend items={[{ label: "7,200 rpm disk, FIFO (dashed)", color: "var(--c4)" }, { label: "disk, elevator order", color: "var(--c4)" }, { label: "SATA SSD (at most 32 queued)", color: "var(--c2)" }, { label: "NVMe SSD", color: "var(--c1)" }]} />
       <Stats items={[
-        { label: `disk, elevator, ${near.q} queued`, value: fx(near.elev) },
-        { label: "SATA SSD", value: fx(sata(qd)) },
-        { label: "NVMe SSD", value: fx(nv.iops) },
-        { label: "NVMe latency per read", value: `${fx((qd / nv.iops) * 1e6)} µs` },
+        { label: `disk, elevator, ${near.q} queued`, value: sig(near.elev) },
+        { label: "SATA SSD", value: sig(sata(qd)) },
+        { label: "NVMe SSD", value: sig(nv.iops) },
+        { label: "NVMe latency per read", value: `${sig((qd / nv.iops) * 1e6)} µs` },
       ]} />
       <Note>Latency here follows Little's law: requests in flight ÷ reads per second. When the SSD saturates, more depth only adds waiting time.</Note>
     </Demo>
@@ -177,7 +176,7 @@ export function FtlDemo() {
         </>
       }
     >
-      <Caption>{FTL_BLOCKS} erase blocks (columns) of {FTL_PPB} pages. The host sees {f.logical} of the {f.physical} pages: {pct(f.spareRatio, 0)} spare.</Caption>
+      <SmallLabel>{FTL_BLOCKS} erase blocks (columns) of {FTL_PPB} pages. The host sees {f.logical} of the {f.physical} pages: {pct(f.spareRatio, 0)} spare.</SmallLabel>
       <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", display: "block" }}>
         {Array.from({ length: FTL_BLOCKS }, (_, b) => (
           <g key={b}>
@@ -205,7 +204,7 @@ export function FtlDemo() {
         { label: "write amplification", value: f.hostWrites ? f.wa.toFixed(2) : "–" },
       ]} />
       <div style={{ marginTop: 12 }}>
-        <Caption>Steady-state write amplification against spare space (a larger drive model: 256 blocks of 32 pages)</Caption>
+        <SmallLabel>Steady-state write amplification against spare space (a larger drive model: 256 blocks of 32 pages)</SmallLabel>
         <Plot x={[5, 100]} y={[0, 12]} height={190} logX xLabel="spare space, % of host capacity" yLabel="WA" xTicks={[5, 10, 20, 50, 100]} xFormat={(x) => `${x}%`}>
           <Line points={pts} color="var(--c4)" />
           <Dots points={pts} color="var(--c4)" r={2.5} />
@@ -393,7 +392,7 @@ export function TupleLayoutDemo() {
           </label>
         ))}
       </div>
-      <Caption>{shown < lay.len ? `First ${shown} of ${lay.len} bytes` : `All ${lay.len} bytes`}, one cell per byte, 32 per row</Caption>
+      <SmallLabel>{shown < lay.len ? `First ${shown} of ${lay.len} bytes` : `All ${lay.len} bytes`}, one cell per byte, 32 per row</SmallLabel>
       <svg viewBox={`0 0 ${32 * 10} ${Math.ceil(shown / 32) * 12}`} style={{ width: "100%", display: "block" }}>
         {lay.segments.flatMap((s, k) => Array.from({ length: Math.max(0, Math.min(s.len, shown - s.start)) }, (_, j) => {
           const i = s.start + j;
@@ -461,7 +460,7 @@ export function HeapInsertDemo() {
         <Param spec={p.schema.vacuum} value={v.vacuum} onChange={(x) => p.set("vacuum", x as boolean)} />
       </>}
     >
-      <Caption>Each bar is one 8 KiB page. 3,000 rows of 60 to 200 bytes filled {run.pagesAfterLoad} pages.</Caption>
+      <SmallLabel>Each bar is one 8 KiB page. 3,000 rows of 60 to 200 bytes filled {run.pagesAfterLoad} pages.</SmallLabel>
       <svg viewBox={`0 0 ${W} ${H + 14}`} style={{ width: "100%", display: "block" }}>
         {Array.from({ length: npages }, (_, pIdx) => {
           const u = used[pIdx] ?? 0, d = dead[pIdx] ?? 0;
@@ -571,7 +570,7 @@ export function SeqScanDemo() {
       <Param spec={p.schema.ff} value={v.ff} onChange={(x) => p.set("ff", x as number)} />
       <Param spec={p.schema.row} value={v.row} onChange={(x) => p.set("row", x as string)} />
     </>}>
-      <Caption>The first {SHOW} pages of a table with 1,000,000 live rows. One cell ≈ {fx(scale, 2)} row slot{scale > 1.01 ? "s" : ""}.</Caption>
+      <SmallLabel>The first {SHOW} pages of a table with 1,000,000 live rows. One cell ≈ {sig(scale, 2)} row slot{scale > 1.01 ? "s" : ""}.</SmallLabel>
       <svg viewBox={`0 0 ${W} ${SHOW * PH}`} style={{ width: "100%", display: "block" }}>
         {Array.from({ length: SHOW }, (_, r) => {
           const filled = Math.round(rpp / scale);

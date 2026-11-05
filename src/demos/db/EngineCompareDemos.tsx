@@ -1,8 +1,8 @@
 /** Demos for "SQLite, LMDB and RocksDB compared": one put() in three designs, and a workload-fit chart. */
 import { useMemo, useState } from "react";
-import { Demo, Param, range, toggle, useSim, pct } from "../../kit";
+import { Demo, Param, range, toggle, useSim, pct, Note, SmallLabel, mono, seg } from "../../kit";
 import { putSteps, putSummary, fitAll, REAL_LABEL, PUT_DEFAULTS, MIX_DEFAULTS, type RealId, type PutStep, type Mix, type Fit } from "../../sims/db/engine/compare";
-import { mono, seg, Note, Label, fmt } from "./EngineShared";
+import { fmt } from "./EngineShared";
 
 const IDS: RealId[] = ["sqlite", "lmdb", "rocksdb"];
 const bytes = (v: number) => `${Math.round(v).toLocaleString("en-US")} B`;
@@ -134,7 +134,7 @@ export function WorkloadFitDemo() {
           const w = (v: number) => (mt.log ? Math.max(2, (Math.log10(Math.max(1, v)) / Math.log10(Math.max(10, max))) * 100) : Math.max(2, (v / max) * 100));
           return (
             <div key={mt.key}>
-              <Label>{mt.label} <span style={{ color: "var(--faint)" }}>({mt.better === "high" ? "higher" : "lower"} is better{mt.log ? ", log scale" : ""})</span></Label>
+              <SmallLabel>{mt.label} <span style={{ color: "var(--faint)" }}>({mt.better === "high" ? "higher" : "lower"} is better{mt.log ? ", log scale" : ""})</span></SmallLabel>
               {fits.map((f) => {
                 const v = f[mt.key] as number;
                 return (

@@ -1,8 +1,8 @@
 /** Demos for "the page cache and writeback": a write burst against the dirty limits, and read-ahead. */
 import { useMemo, useState } from "react";
-import { Area, Demo, Legend, Line, Param, Plot, RuleX, RuleY, Stats, bytes, range, select, useParams } from "../../kit";
+import { Area, Demo, Legend, Line, Param, Plot, RuleX, RuleY, Stats, bytes, range, select, useParams, Banner, MONO, Note, SmallLabel } from "../../kit";
 import { BURST_DEFAULTS, READ_AHEAD_DEFAULT_KB, Readahead, burstRun, raPages, type RaResult, type WriterState } from "../../sims/os/fs/pagecache";
-import { Banner, Heading, MONO, Note, smallBtn } from "./FsUi";
+import { smallBtn } from "./FsUi";
 
 const W = {
   dirtyRatio: range({ label: "vm.dirty_ratio", min: 1, max: 60, step: 1, default: BURST_DEFAULTS.dirtyRatio, format: (v) => `${v}%` }),
@@ -38,7 +38,7 @@ export function FsWriteBurstDemo() {
       <Param spec={W.writer} value={writer} onChange={(v) => P.set("writer", v as number)} />
       <Param spec={W.cursor} value={cursor} onChange={(v) => P.set("cursor", v as number)} />
     </>}>
-      <Heading>Dirty memory at the cursor: t = {at.t.toFixed(1)} s, writer: <span style={{ color: STATE_COLOR[at.state] }}>{STATE_NAME[at.state]}</span>, flusher: {at.flushing ? "writing" : "asleep"}</Heading>
+      <SmallLabel>Dirty memory at the cursor: t = {at.t.toFixed(1)} s, writer: <span style={{ color: STATE_COLOR[at.state] }}>{STATE_NAME[at.state]}</span>, flusher: {at.flushing ? "writing" : "asleep"}</SmallLabel>
       <div style={{ position: "relative", height: 26, background: "var(--subtle)", borderRadius: 3, overflow: "hidden" }}>
         <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: barScale(at.dirty), background: STATE_COLOR[at.state], opacity: 0.8 }} />
         {[["bg", L.bg], ["free run", L.freerun], ["limit", L.limit]].map(([n, v]) => (
@@ -145,7 +145,7 @@ export function FsReadaheadDemo() {
       </div>
       <Banner>{last ? last.say : "The cache is empty. Read page 0."}</Banner>
       <div style={{ marginTop: 10 }}>
-        <Heading>Window size of each read-ahead, in pages</Heading>
+        <SmallLabel>Window size of each read-ahead, in pages</SmallLabel>
         <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 54, overflowX: "auto" }}>
           {bars.length === 0 && <span className="muted" style={{ fontSize: 12 }}>none yet</span>}
           {bars.map((b, i) => (

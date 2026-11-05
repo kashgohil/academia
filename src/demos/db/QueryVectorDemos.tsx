@@ -1,8 +1,8 @@
 /** Demos for vectorized execution: the vector-size cost model, selection vectors, and branching vs branch-free selection. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, Plot, Line, Dots, RuleX, Legend, range, select, si, bytes } from "../../kit";
+import { Demo, Param, Stats, Plot, Line, Dots, RuleX, Legend, range, select, si, bytes, BAD, GOOD, MONO, Note, StepCaption } from "../../kit";
 import { VEC_MODEL, vectorCost, bestVectorSize, fitsIn, DEMO_BATCH, selectionSteps, branchSim, BRANCH_MODEL } from "../../sims/db/query/vector";
-import { ACC, BAD, Caption, GOOD, MONO, Note, WARM } from "./QueryUi";
+import { ACC, WARM } from "./QueryUi";
 
 // ============================================================================ 1. vector size
 
@@ -112,11 +112,11 @@ export function SelectionVectorDemo() {
         <span style={{ color: stage === "p2" ? GOOD : "var(--muted)" }}>{"// filter 2: only the rows in sel1\nlet mut k2 = 0;\nfor &i in &sel1[..k] { sel2[k2] = i; k2 += (b[i] < y) as usize; }\n"}</span>
         <span style={{ color: stage === "agg" ? WARM : "var(--muted)" }}>{"// aggregate: no copy, follow sel2\nfor &i in &sel2[..k2] { sum += a[i] * b[i]; }"}</span>
       </pre>
-      <Caption>
+      <StepCaption>
         {stage === "p1" && `Filter 1 tests a > ${x} on all 16 rows and writes the ${st.p1.sel.length} passing positions into a selection vector. No row is copied.`}
         {stage === "p2" && `Filter 2 tests b < ${y} only on the ${st.p1.sel.length} positions in sel₁, and ${st.p2.sel.length} remain. Faded cells were never read.`}
         {stage === "agg" && `The aggregate reads a and b only at the ${st.p2.sel.length} positions of sel₂: SUM(a × b) = ${sum}.`}
-      </Caption>
+      </StepCaption>
       <div style={{ height: 10 }} />
       <Stats items={[
         { label: "predicate evaluations", value: st.p1.evaluated + (stage === "p1" ? 0 : st.p2.evaluated) },

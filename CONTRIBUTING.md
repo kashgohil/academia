@@ -33,12 +33,27 @@ Use Rust → WASM (`crates/<name>`, raw `extern "C"` exports, see `crates/caches
 | `<Plot x y>` + `Line Area Bars Dots RuleX RuleY Label` | SVG charts in data coordinates; `usePlot()` gives the scales for custom marks |
 | `<Canvas2D draw deps>` | DPR-aware canvas for dense views; `cssVar("--c1")` for theme colors |
 | `<Stats>`, `<Legend>`, `<Graph>` | readouts, keys, node/edge diagrams |
+| `seg`, `mono`, `tint`, `<Btn>`, `<ButtonRow>` | a segmented select, monospace style, a theme-safe tint, buttons |
+| `<Note>`, `<SmallLabel>`, `<SectionLabel>` | muted remarks and headings inside a demo |
+| `<Banner tone>`, `<StepCaption>` | a result strip with a colored edge; the text for the current step |
+| `<Panel>`, `<Chip>`, `<Meter>`, `<Bar>`, `<StackBar>`, `<MiniTable>` | boxes, labels, bars, a compact table |
+| `useStepper` + `<StepButtons>` + `<StepSlider>` | frames with play, back and step |
+| `<IndexButtons>` + `<IndexSlider>` | back and next for a position that the demo holds itself |
+| `useChunked(key, jobs)` | heavy sweeps in time slices, so that a render never blocks |
+| `int`, `fixed`, `sig`, `ms`, `si`, `bytes`, `pct` | number formats: `fixed(3.14159)` is `3.14`, and `sig(1234.5)` is `1,230` |
+
+Use these before you write a helper. Put a view that only one module needs in `src/demos/<track>/<Module>Ui.tsx`. `tests/unit/architecture.test.ts` fails if a demo redefines a kit helper, or if a sim imports React, the kit or a demo.
 
 Colors: use only `var(--c1)`…`var(--c5)`, `--fg`, `--muted`, `--faint` and `--border`. They switch with the theme.
 
 ## 4. Write the MDX
 
 Available in MDX without importing: `<Predict>`, `<Recall>`, `<Callout>`, `<Steps>`, `<Tex>`. Math uses `$inline$` and `$$display$$`. Inside JSX props, use `<Tex>{"..."}</Tex>` instead of `$`.
+
+Two MDX traps, both checked by `tests/unit/mdx-prose.test.ts`:
+
+- Never write `{...}` in prose. MDX runs it as JavaScript, and the lesson goes blank at runtime. Use a code span.
+- In a pipe table, write a literal pipe as `\|`, even inside a code span. Otherwise the row silently loses cells.
 
 - **Predict**: ask something with a plausible wrong answer. Wrap the demo in it so it unlocks after answering.
 - **Things to try**: 3–5 concrete experiments, each revealing one idea.

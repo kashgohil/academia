@@ -1,8 +1,8 @@
 /** Demos for "condition variables": a stepper that finds the bug schedule, and the thundering herd. */
 import { useMemo } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleX, Stats, range, select, si, toggle, useParams } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleX, Stats, range, select, si, toggle, useParams, MONO, MiniTable } from "../../kit";
 import { HERD_SWITCH_NS, checkCondvar, checkFutexCondvar, condvarProg, futexCondvarProg, simulateHerd, type CvOpts, type CvScenario, type Guard, type Notify } from "../../sims/os/sync/condvar";
-import { Cell, CellRow, MONO, MiniTable, SyncStepper, TC } from "./SyncShared";
+import { Cell, CellRow, SyncStepper, TC } from "./SyncShared";
 
 const CV = {
   guard: select({ label: "Guard", options: [{ value: "if", label: "if" }, { value: "while", label: "while" }], default: "if", segmented: true }),

@@ -1,12 +1,10 @@
 /** Demos for "io_uring": the shared rings, and the cost of each I/O path. */
 import { useMemo, useState } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleX, Stats, range, toggle, useParams } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleX, Stats, range, toggle, useParams, Banner, Panel, SmallLabel, mono, seg, tint } from "../../kit";
 import {
   ALL_MITIGATIONS, IO_PATH_LABEL, NO_MITIGATIONS, URING_FACTS, ioPathCost, replayRing,
   type IoPath, type IoRing, type UringAction,
 } from "../../sims/os/io";
-import { Banner } from "./SyncShared";
-import { Cap, Panel, mono, seg, tint } from "./ProcessesUi";
 
 // ---------------------------------------------------------------- ring stepper
 
@@ -17,7 +15,7 @@ function Strip({ title, n, filled, head, tail, headName, tailName, rawHead, rawT
   const pct = 100 / n;
   return (
     <div style={{ marginBottom: 12 }}>
-      <Cap>{title}</Cap>
+      <SmallLabel>{title}</SmallLabel>
       <div style={{ position: "relative", paddingBottom: 34 }}>
         <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 4, overflow: "hidden" }}>
           {Array.from({ length: n }, (_, i) => (
@@ -137,14 +135,14 @@ export function IoPathCostDemo() {
     >
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12 }}>
         <div>
-          <Cap>System calls per operation</Cap>
+          <SmallLabel>System calls per operation</SmallLabel>
           <Plot x={[1, 256]} y={[0, 2.1]} logX height={190} xTicks={[1, 4, 16, 64, 256]} xFormat={(v) => String(v)} xLabel="operations per batch">
             {PATHS.map((path, i) => <Line key={path} points={curves[i]!.map((c, k) => [xs[k]!, c.syscallsPerOp] as [number, number])} color={COLOR[path]} />)}
             <RuleX at={batch} />
           </Plot>
         </div>
         <div>
-          <Cap>Latency per operation, with batch fill time</Cap>
+          <SmallLabel>Latency per operation, with batch fill time</SmallLabel>
           <Plot x={[1, 256]} y={[500, 1e6]} logX logY height={190} xTicks={[1, 4, 16, 64, 256]} yTicks={[1e3, 1e4, 1e5, 1e6]} xFormat={(v) => String(v)} yFormat={ns} xLabel="operations per batch">
             {PATHS.map((path, i) => <Line key={path} points={curves[i]!.map((c, k) => [xs[k]!, c.latencyNs] as [number, number])} color={COLOR[path]} />)}
             <RuleX at={batch} />

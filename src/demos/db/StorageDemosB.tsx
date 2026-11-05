@@ -1,13 +1,12 @@
 /** Demos for the Storage module, lessons 4–6: buffer pools, durability, amplification. */
 import { useMemo, useRef, useState, type PointerEvent as RPointerEvent } from "react";
-import { Demo, Stats, Param, Plot, Line, RuleX, Dots, Legend, range, toggle, select, useParams, bytes, pct } from "../../kit";
+import { Demo, Stats, Param, Plot, Line, RuleX, Dots, Legend, range, toggle, select, useParams, bytes, pct, Meter, Note, SmallLabel, mono, seg, sig, useChunked } from "../../kit";
 import {
   BufferPool, BufferPoolFullError, type PolicyId, POLICY_LABEL, mixedTrace, runTrace,
   SCENARIOS, runScenario, type DeviceCache, lostOnCrash, visible, type StackOp,
   tornUpdate, crashRecover, PROTECTION_LABEL, OUTCOME_LABEL, type Protection, type SectorOrder, type Outcome, pageBytes, hex32, checkpointCost,
   designSpace, AMP_ENV, FAMILY_LABEL, type FamilyId, rumWeights, readCost, enginePresets, deviceWa, chain,
 } from "../../sims/db/storage";
-import { seg, mono, Note, Caption, Meter, useChunked, fx } from "./StorageUi";
 
 // =====================================================================================
 // Lesson 4: Buffer pools
@@ -138,7 +137,7 @@ export function PolicyRaceDemo() {
         <Param spec={p.schema.window} value={v.window} onChange={(x) => p.set("window", x as boolean)} />
       </>}
     >
-      <Caption>{RACE_HOT} hot pages take 90% of the lookups, 5,000 cold pages take 10%. After every 1,000 lookups, a scan reads pages that nobody reads again. {done < jobs.length ? `Computing… ${done} of ${jobs.length}` : ""}</Caption>
+      <SmallLabel>{RACE_HOT} hot pages take 90% of the lookups, 5,000 cold pages take 10%. After every 1,000 lookups, a scan reads pages that nobody reads again. {done < jobs.length ? `Computing… ${done} of ${jobs.length}` : ""}</SmallLabel>
       <Plot x={[25, 250]} y={[0, 1]} height={250} xLabel="frames in the pool" yLabel="hit rate of hot-page lookups" yFormat={(y) => `${Math.round(y * 100)}%`} xTicks={[50, 100, 150, 200, 250]}>
         {RACE_POLICIES.map((pol) => {
           const pts = POOL_SIZES.map((n) => [n, at(pol, n)] as const).filter((x): x is readonly [number, number] => x[1] !== undefined);
@@ -283,7 +282,7 @@ export function TornPageDemo() {
         <Param spec={p.schema.order} value={v.order} onChange={(x) => p.set("order", x as SectorOrder)} />
       </>}
     >
-      <Caption>{PROTECTION_LABEL[v.prot]}: the steps of one page update (v1 → v2). Colour = what recovery finds if the power fails after that step.</Caption>
+      <SmallLabel>{PROTECTION_LABEL[v.prot]}: the steps of one page update (v1 → v2). Colour = what recovery finds if the power fails after that step.</SmallLabel>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginBottom: 10 }}>
         <span title="crash before step 1" style={{ ...chip, background: OUTCOME_COLOR[all[0]!], outline: k === 0 ? "2px solid var(--fg)" : undefined }}>start</span>
         {steps.map((s, j) => (
@@ -292,17 +291,17 @@ export function TornPageDemo() {
       </div>
       <div style={{ display: "grid", gap: 8 }}>
         <div>
-          <Caption>WAL on disk</Caption>
+          <SmallLabel>WAL on disk</SmallLabel>
           <div style={{ ...chip, display: "inline-block", background: rec.state.walDurable ? "var(--c1)" : "var(--subtle)", color: rec.state.walDurable ? "#fff" : "var(--muted)" }}>{rec.state.walDurable ? (rec.state.walFpi ? `change + full image of the page (${bytes(L.page)})` : "change record only (about 100 B)") : "nothing for this change yet"}</div>
         </div>
         {v.prot === "doublewrite" && (
           <div>
-            <Caption>Doublewrite area {rec.state.dwSynced ? "(synced)" : ""}</Caption>
+            <SmallLabel>Doublewrite area {rec.state.dwSynced ? "(synced)" : ""}</SmallLabel>
             <div style={{ display: "flex", gap: 2 }}>{Array.from({ length: sectors }, (_, i) => sectorBox(i < rec.state.dw ? 2 : null, i, small))}</div>
           </div>
         )}
         <div>
-          <Caption>The page in the data file: {sectors} sectors of {bytes(L.sector)}</Caption>
+          <SmallLabel>The page in the data file: {sectors} sectors of {bytes(L.sector)}</SmallLabel>
           <div style={{ display: "flex", gap: 2 }}>{rec.state.page.map((ver, i) => sectorBox(ver, i, small))}</div>
         </div>
       </div>
@@ -324,15 +323,15 @@ const UPD = Array.from({ length: 41 }, (_, i) => Math.pow(10, 3 + (i * 4) / 40))
 
 export function ProtectionCostDemo() {
   const p = useParams("fpwcost", {
-    table: range({ label: "Table size (8 KiB pages)", min: 1e3, max: 1e6, log: true, default: 1e5, format: (x) => `${fx(x, 2)} (${bytes(x * 8192)})` }),
-    upd: range({ label: "Updates between checkpoints", min: 1e3, max: 1e7, log: true, default: 1e5, format: (x) => fx(x, 2) }),
+    table: range({ label: "Table size (8 KiB pages)", min: 1e3, max: 1e6, log: true, default: 1e5, format: (x) => `${sig(x, 2)} (${bytes(x * 8192)})` }),
+    upd: range({ label: "Updates between checkpoints", min: 1e3, max: 1e7, log: true, default: 1e5, format: (x) => sig(x, 2) }),
   });
   const P = p.values.table, N = p.values.upd;
   const cur = checkpointCost({ tablePages: P, updates: N, recordBytes: 100, pageBytes: 8192 });
   const curve = useMemo(() => UPD.map((u) => ({ u, c: checkpointCost({ tablePages: P, updates: u, recordBytes: 100, pageBytes: 8192 }) })), [P]);
   return (
     <Demo title="What torn-page protection costs: bytes written per 100-byte update" controls={<><Param spec={p.schema.table} value={P} onChange={(x) => p.set("table", x as number)} /><Param spec={p.schema.upd} value={N} onChange={(x) => p.set("upd", x as number)} /></>}>
-      <Plot x={[1e3, 1e7]} y={[50, 3e4]} logX logY height={240} xLabel="updates between checkpoints" yLabel="bytes written per update" xTicks={[1e3, 1e4, 1e5, 1e6, 1e7]} xFormat={(x) => fx(x, 1)} yTicks={[100, 1000, 1e4]} yFormat={(x) => fx(x, 1)}>
+      <Plot x={[1e3, 1e7]} y={[50, 3e4]} logX logY height={240} xLabel="updates between checkpoints" yLabel="bytes written per update" xTicks={[1e3, 1e4, 1e5, 1e6, 1e7]} xFormat={(x) => sig(x, 1)} yTicks={[100, 1000, 1e4]} yFormat={(x) => sig(x, 1)}>
         <Line points={curve.map((x) => [x.u, x.c.perUpdate.plain] as const)} color="var(--c3)" />
         <Line points={curve.map((x) => [x.u, x.c.perUpdate.fpw] as const)} color="var(--c1)" />
         <Line points={curve.map((x) => [x.u, x.c.perUpdate.doublewrite] as const)} color="var(--c4)" dash="5 4" />
@@ -341,11 +340,11 @@ export function ProtectionCostDemo() {
       </Plot>
       <Legend items={[{ label: "no protection (WAL + page flushes)", color: "var(--c3)" }, { label: "full-page writes", color: "var(--c1)" }, { label: "doublewrite (dashed): the same total", color: "var(--c4)" }]} />
       <Stats items={[
-        { label: "distinct pages changed", value: fx(cur.distinct, 3) },
+        { label: "distinct pages changed", value: sig(cur.distinct, 3) },
         { label: "WAL, no images", value: bytes(cur.walPlain) },
         { label: "WAL with full-page images", value: bytes(cur.walFpw) },
-        { label: "WAL growth from images", value: `${fx(cur.walFpw / cur.walPlain, 3)}×` },
-        { label: "bytes per update: none / FPW / doublewrite", value: `${fx(cur.perUpdate.plain, 3)} / ${fx(cur.perUpdate.fpw, 3)} / ${fx(cur.perUpdate.doublewrite, 3)}` },
+        { label: "WAL growth from images", value: `${sig(cur.walFpw / cur.walPlain, 3)}×` },
+        { label: "bytes per update: none / FPW / doublewrite", value: `${sig(cur.perUpdate.plain, 3)} / ${sig(cur.perUpdate.fpw, 3)} / ${sig(cur.perUpdate.doublewrite, 3)}` },
       ]} />
       <Note>Full-page writes add each changed page to the WAL once per checkpoint. Doublewrite writes each flushed page twice. Both double the bytes when each page changes only once.</Note>
     </Demo>
@@ -398,11 +397,11 @@ export function RumTriangleDemo() {
         <div style={{ flex: "1 1 220px", minWidth: 0 }}>
           <div style={{ fontWeight: 600, fontSize: 14 }}>{FAMILY_LABEL[d.family]}</div>
           <div className="muted" style={{ fontSize: 12.5, marginBottom: 8 }}>{d.knob || "one design"}</div>
-          <Meter label="Point lookup, I/Os" value={Math.log10(Math.max(1, d.amp.ra)) + 0.05} max={4} color="var(--c1)" text={fx(d.amp.ra, 3)} />
-          <Meter label={`Range of ${env.rangeRecords} records, I/Os`} value={Math.log10(Math.max(1, d.amp.raRange)) + 0.05} max={4} color="var(--c1)" text={fx(d.amp.raRange, 3)} />
-          <Meter label="Write amplification" value={Math.log10(Math.max(1, d.amp.wa)) + 0.05} max={4} color="var(--c2)" text={`${fx(d.amp.wa, 3)}×`} />
-          <Meter label="Space amplification" value={d.amp.sa - 1 + 0.02} max={5} color="var(--c5)" text={`${fx(d.amp.sa, 3)}×`} />
-          <div className="muted" style={{ fontSize: 11.5 }}>Read placement uses √(point × range) = {fx(readCost(d.amp), 3)} I/Os.</div>
+          <Meter label="Point lookup, I/Os" value={Math.log10(Math.max(1, d.amp.ra)) + 0.05} max={4} color="var(--c1)" text={sig(d.amp.ra, 3)} />
+          <Meter label={`Range of ${env.rangeRecords} records, I/Os`} value={Math.log10(Math.max(1, d.amp.raRange)) + 0.05} max={4} color="var(--c1)" text={sig(d.amp.raRange, 3)} />
+          <Meter label="Write amplification" value={Math.log10(Math.max(1, d.amp.wa)) + 0.05} max={4} color="var(--c2)" text={`${sig(d.amp.wa, 3)}×`} />
+          <Meter label="Space amplification" value={d.amp.sa - 1 + 0.02} max={5} color="var(--c5)" text={`${sig(d.amp.sa, 3)}×`} />
+          <div className="muted" style={{ fontSize: 11.5 }}>Read placement uses √(point × range) = {sig(readCost(d.amp), 3)} I/Os.</div>
         </div>
       </div>
       <div style={{ marginTop: 8 }}><Legend items={fams.map((f) => ({ label: FAMILY_LABEL[f], color: FAMILY_COLOR[f] }))} /></div>
@@ -417,7 +416,7 @@ const RATES = Array.from({ length: 31 }, (_, i) => Math.pow(10, -1 + (i * 3) / 3
 export function WaChainDemo() {
   const presets = useMemo(() => enginePresets(), []);
   const p = useParams("wachain", {
-    rate: range({ label: "User data written", min: 0.1, max: 100, log: true, default: 1, format: (x) => `${fx(x, 2)} MB/s` }),
+    rate: range({ label: "User data written", min: 0.1, max: 100, log: true, default: 1, format: (x) => `${sig(x, 2)} MB/s` }),
     engine: seg("Engine", presets.map((e) => [e.id, e.label] as [string, string]), "btree"),
     fs: range({ label: "File system factor (journal, metadata)", min: 1, max: 2, step: 0.05, default: 1.1, format: (x) => `${x.toFixed(2)}×` }),
     op: seg("SSD spare space", [["0.07", "7%"], ["0.28", "28%"]], "0.07"),
@@ -446,11 +445,11 @@ export function WaChainDemo() {
       <Param spec={p.schema.pe} value={v.pe} onChange={(x) => p.set("pe", x as string)} />
     </>}>
       <div style={{ display: "grid", gridTemplateColumns: "1fr auto 1fr auto 1fr auto 1fr", alignItems: "center", gap: 4 }}>
-        {box(`${fx(e.appWa, 3)}`, "engine")}{op_}
+        {box(`${sig(e.appWa, 3)}`, "engine")}{op_}
         {box(`${v.fs.toFixed(2)}`, "file system")}{op_}
         {box(dWa === undefined ? "…" : dWa.toFixed(2), "SSD (FTL)")}
         <span className="muted" style={{ fontSize: 14 }}>=</span>
-        {box(c ? fx(c.total, 3) : "…", "NAND bytes per user byte", "var(--c4)", "#fff")}
+        {box(c ? sig(c.total, 3) : "…", "NAND bytes per user byte", "var(--c4)", "#fff")}
       </div>
       <p className="muted" style={{ fontSize: 12.5, margin: "8px 0 10px" }}>The engine writes {e.note}, so the SSD sees a {e.deviceWorkload} write pattern.</p>
       <Plot x={[0.1, 100]} y={[0.01, 1000]} logX logY height={220} xLabel="user writes, MB/s" yLabel="SSD life, years" xTicks={[0.1, 1, 10, 100]} xFormat={(x) => String(x)} yTicks={[0.01, 0.1, 1, 10, 100, 1000]} yFormat={(x) => String(x)}>
@@ -465,9 +464,9 @@ export function WaChainDemo() {
       </Plot>
       <Legend items={presets.map((pr, i) => ({ label: pr.label, color: ["var(--c4)", "var(--c3)", "var(--c2)", "var(--c5)"][i]! }))} />
       <Stats items={[
-        { label: "NAND writes", value: c ? `${fx(c.nandMBps, 3)} MB/s` : "…" },
-        { label: "NAND writes per day", value: c ? `${fx(c.nandTBPerDay, 3)} TB` : "…" },
-        { label: "SSD life", value: c ? (c.years >= 1 ? `${fx(c.years, 3)} years` : `${fx(c.years * 365, 3)} days`) : "…" },
+        { label: "NAND writes", value: c ? `${sig(c.nandMBps, 3)} MB/s` : "…" },
+        { label: "NAND writes per day", value: c ? `${sig(c.nandTBPerDay, 3)} TB` : "…" },
+        { label: "SSD life", value: c ? (c.years >= 1 ? `${sig(c.years, 3)} years` : `${sig(c.years * 365, 3)} days`) : "…" },
       ]} />
     </Demo>
   );

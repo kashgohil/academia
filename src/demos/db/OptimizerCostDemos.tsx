@@ -1,11 +1,11 @@
 /** Demos for "Cost models": an access-path calculator, plan flips, and join methods vs outer rows. */
 import { useMemo } from "react";
-import { Demo, Param, Plot, Line, RuleX, RuleY, Dots, Legend, Stats, range, toggle, useParams, usePlot, pct } from "../../kit";
+import { Demo, Param, Plot, Line, RuleX, RuleY, Dots, Legend, Stats, range, toggle, useParams, usePlot, pct, Note, SectionLabel, fixed, int, mono, seg } from "../../kit";
 import {
   PG_DEFAULTS, TENK1, TENK1_UNIQUE1, EVENTS, EVENTS_TS, accessPaths, planFlips, limitedCost, PATH_LABEL, joinMethods, joinCrossover, JOIN_LABEL,
   type AccessPath, type CostParams, type PathCost, type JoinMethod,
 } from "../../sims/db/optimizer";
-import { seg, mono, Note, Caption, fx, num, int, logTicks, PATH_COLOR } from "./OptimizerUi";
+import { num, logTicks, PATH_COLOR } from "./OptimizerUi";
 
 const TABLES = {
   tenk1: { t: TENK1, idx: TENK1_UNIQUE1, pred: (n: number) => `unique1 < ${int(n)}` },
@@ -22,14 +22,14 @@ function PathCard({ id, c, best, limit }: { id: AccessPath; c: PathCost; best: b
     <div key={i} style={{ display: "contents" }}>
       <span className="muted" style={{ fontSize: 12 }}>{t.label}</span>
       <span style={{ ...mono, fontSize: 11.5, overflowWrap: "anywhere" }}>{t.expr}</span>
-      <span style={{ ...mono, fontSize: 12, textAlign: "right" }}>{fx(t.value, 2)}</span>
+      <span style={{ ...mono, fontSize: 12, textAlign: "right" }}>{fixed(t.value, 2)}</span>
     </div>
   );
   return (
     <div style={{ border: `1px solid ${best ? PATH_COLOR[id] : "var(--border)"}`, boxShadow: best ? `inset 4px 0 0 ${PATH_COLOR[id]}` : undefined, borderRadius: 6, padding: "8px 10px 8px 12px", minWidth: 0 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
         <b style={{ color: PATH_COLOR[id] }}>{PATH_LABEL[id]}{best ? "  ✓ cheapest" : ""}</b>
-        <span style={{ ...mono, fontSize: 12.5 }}>cost={fx(c.startup)}..{fx(c.total)} rows={c.rows}</span>
+        <span style={{ ...mono, fontSize: 12.5 }}>cost={fixed(c.startup)}..{fixed(c.total)} rows={c.rows}</span>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.1fr) minmax(0, 1.6fr) auto", gap: "2px 10px", marginTop: 6, alignItems: "baseline" }}>
         {startup.length > 0 && <span style={{ gridColumn: "1 / -1", fontSize: 11, fontWeight: 600 }} className="muted">startup (before the first row)</span>}
@@ -37,7 +37,7 @@ function PathCard({ id, c, best, limit }: { id: AccessPath; c: PathCost; best: b
         <span style={{ gridColumn: "1 / -1", fontSize: 11, fontWeight: 600 }} className="muted">run (to the last row)</span>
         {run.map(row)}
       </div>
-      {limit !== undefined && <div style={{ fontSize: 12.5, marginTop: 6 }}>first {limit} row{limit > 1 ? "s" : ""}: {fx(c.startup)} + ({fx(c.total)} − {fx(c.startup)}) × {limit}/{c.rows} = <b style={mono}>{fx(limitedCost(c, limit))}</b></div>}
+      {limit !== undefined && <div style={{ fontSize: 12.5, marginTop: 6 }}>first {limit} row{limit > 1 ? "s" : ""}: {fixed(c.startup)} + ({fixed(c.total)} − {fixed(c.startup)}) × {limit}/{c.rows} = <b style={mono}>{fixed(limitedCost(c, limit))}</b></div>}
     </div>
   );
 }
@@ -59,7 +59,7 @@ export function CostCalculatorDemo() {
   const { paths, best } = accessPaths(T.t, idx, v.sel, cp, limit);
   const rows = Math.max(1, Math.round(v.sel * T.t.rows));
   const w = paths[best];
-  const explain = `${best === "index" ? `Index Scan using ${idx.name} on ${T.t.name}` : `${PATH_LABEL[best]} on ${T.t.name}`}  (cost=${fx(w.startup)}..${fx(w.total)} rows=${w.rows} width=${T.t.width})`;
+  const explain = `${best === "index" ? `Index Scan using ${idx.name} on ${T.t.name}` : `${PATH_LABEL[best]} on ${T.t.name}`}  (cost=${fixed(w.startup)}..${fixed(w.total)} rows=${w.rows} width=${T.t.width})`;
   return (
     <Demo
       title={`SELECT * FROM ${T.t.name} WHERE ${T.pred(rows)}`}
@@ -78,7 +78,7 @@ export function CostCalculatorDemo() {
       <div style={{ display: "grid", gap: 8 }}>
         {PATHS.map((k) => <PathCard key={k} id={k} c={paths[k]} best={k === best} limit={limit} />)}
       </div>
-      <Caption>The planner keeps the cheapest path</Caption>
+      <SectionLabel>The planner keeps the cheapest path</SectionLabel>
       <pre style={{ ...mono, fontSize: 11.5, margin: 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{explain}</pre>
       <Note>Formulas from PostgreSQL's costsize.c and btcostestimate(). The index part charges random_page_cost per leaf page; the heap part interpolates between random fetches and an in-order read with correlation².</Note>
     </Demo>
@@ -149,13 +149,13 @@ export function PlanFlipDemo() {
         <Param spec={p.schema.ecs} value={v.ecs} onChange={(x) => p.set("ecs", x as string)} />
       </>}
     >
-      <Caption style={{ marginTop: 0 }}>Total cost against selectivity (random_page_cost {v.rpc.toFixed(1)})</Caption>
+      <SectionLabel style={{ marginTop: 0 }}>Total cost against selectivity (random_page_cost {v.rpc.toFixed(1)})</SectionLabel>
       <Plot x={[SEL_LO, 1]} y={[yMin, yMax]} logX logY height={220} xLabel="selectivity" yLabel="cost" xTicks={[1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1]} yTicks={logTicks(yMin, yMax)} xFormat={fmtSel} yFormat={(y) => num(y, 2)}>
         {PATHS.map((k) => <Line key={k} points={curves[k]} color={PATH_COLOR[k]} />)}
         {flips.map((f, i) => <RuleX key={i} at={f.sel} label={fmtSel(f.sel)} />)}
       </Plot>
       <Legend items={PATHS.map((k) => ({ label: PATH_LABEL[k], color: PATH_COLOR[k] }))} />
-      <Caption>Plan diagram: the cheapest scan for each selectivity and random_page_cost</Caption>
+      <SectionLabel>Plan diagram: the cheapest scan for each selectivity and random_page_cost</SectionLabel>
       <Plot x={[SEL_LO, 1]} y={[1, 8]} logX height={200} xLabel="selectivity" yLabel="random_page_cost" xTicks={[1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1]} xFormat={fmtSel} grid={false}>
         <Cells cells={cells} />
         <RuleY at={v.rpc} color="var(--fg)" />
@@ -212,9 +212,9 @@ export function JoinMethodDemo() {
       <Legend items={methods.map((m) => ({ label: JOIN_LABEL[m], color: JCOLOR[m] }))} />
       <Stats items={[
         { label: "chosen", value: <span style={{ color: JCOLOR[best] }}>{JOIN_LABEL[best]}</span> },
-        { label: "Nested Loop + Index Scan", value: fx(now.costs.indexnl.total, 0) },
-        { label: "Hash Join", value: fx(now.costs.hash.total, 0) },
-        { label: "one index probe (amortized)", value: fx(now.perLoop.total, 2) },
+        { label: "Nested Loop + Index Scan", value: fixed(now.costs.indexnl.total, 0) },
+        { label: "Hash Join", value: fixed(now.costs.hash.total, 0) },
+        { label: "one index probe (amortized)", value: fixed(now.perLoop.total, 2) },
         { label: "joined rows", value: int(now.outRows) },
       ]} />
       <Note>orders: 1,000,000 rows, 9,346 pages, 10 orders per customer, B-tree on customer_id. The hash join reads all of orders once. The nested loop probes the index once per customer; Mackert–Lohman lowers the cost of each probe when many probes share cached pages.</Note>

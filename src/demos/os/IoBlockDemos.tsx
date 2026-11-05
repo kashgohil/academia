@@ -1,12 +1,11 @@
 /** Demos for "the block layer and I/O schedulers": the elevator and merge stepper, and a latency against throughput plot. */
 import { useMemo, useState } from "react";
-import { Demo, Dots, Legend, Line, Param, Plot, Stats, range, si, toggle, useParams, useWidth } from "../../kit";
+import { Demo, Dots, Legend, Line, Param, Plot, Stats, range, si, toggle, useParams, useWidth, IndexButtons, IndexSlider, MiniTable, mono, seg, useChunked } from "../../kit";
 import {
   BLOCK_SCRIPTS, ELEVATOR_LABEL, SCHED_DEPTHS, SCHED_LABEL, SCHED_MODEL, runElevator, schedRun,
   type BlkRequest, type BlockSnap, type ElevatorPolicy, type SchedDevice, type SchedId, type SchedRun,
 } from "../../sims/os/io";
-import { MiniTable, useChunked } from "./SyncShared";
-import { Msg, StepButtons, StepSlider, mono, seg } from "./ProcessesUi";
+import { Msg } from "./ProcessesUi";
 
 // ---------------------------------------------------------------- the elevator
 
@@ -63,10 +62,10 @@ export function IoElevatorDemo() {
   return (
     <Demo
       title="Bios become requests, and the head moves"
-      actions={<StepButtons k={k} n={snaps.length} set={setK} />}
+      actions={<IndexButtons k={k} n={snaps.length} set={setK} />}
       controls={
         <>
-          <StepSlider k={k} n={snaps.length} set={setK} />
+          <IndexSlider k={k} n={snaps.length} set={setK} />
           <Param spec={EL.merge} value={merge} onChange={(v) => { p.set("merge", v as boolean); }} />
           <Param spec={EL.script} value={script} onChange={(v) => { p.set("script", v as never); setK(0); }} />
           <Param spec={EL.policy} value={policy} onChange={(v) => { p.set("policy", v as never); }} />
@@ -113,7 +112,7 @@ export function IoSchedPlotDemo() {
   const depths = SCHED_DEPTHS[device];
   const tasks = useMemo(() => SCHEDS.flatMap((sched) => depths.map((qd) => () => schedRun({ device, sched, qd, readShare }))), [device, readShare, depths]);
   const key = `${device}:${readShare}`;
-  const { results } = useChunked<SchedRun>(tasks, key);
+  const results = useChunked<SchedRun>(key, tasks);
   const get = (si_: number, di: number) => results[si_ * depths.length + di];
   const all = results.filter(Boolean) as SchedRun[];
   const maxX = all.length ? Math.max(...all.map((r) => r.iops)) * 1.08 : 1;

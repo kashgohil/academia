@@ -1,8 +1,7 @@
 /** Demos for /os/memory/mmap. */
 import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
-import { Demo, Stats, Param, Plot, Line, RuleX, Dots, Legend, range, useParams, bytes } from "../../kit";
+import { Demo, Stats, Param, Plot, Line, RuleX, Dots, Legend, range, useParams, bytes, SmallLabel, mono, seg, sig } from "../../kit";
 import { MappedFile, classifyAccess, readCost, mmapCost, MMAP_COSTS, shootdownNs, type MapMode, type AccessPattern, type ByteAccess } from "../../sims/os/memory";
-import { seg, mono, Caption, fx } from "../db/StorageUi";
 
 type Op =
   | { k: "load"; who: 0 | 1; page: number }
@@ -172,7 +171,7 @@ export function ReadVsMmapDemo() {
     read: SHARES.map((c) => [c, readCost({ ...base, cachedShare: c }).total] as const),
     mmap: SHARES.map((c) => [c, mmapCost({ ...base, cachedShare: c }).total] as const),
   }), [v.pattern, touches, cores]); // eslint-disable-line react-hooks/exhaustive-deps
-  const fmt = (ns: number) => (ns >= 1000 ? `${fx(ns / 1000, 3)} µs` : `${fx(ns, 3)} ns`);
+  const fmt = (ns: number) => (ns >= 1000 ? `${sig(ns / 1000, 3)} µs` : `${sig(ns, 3)} ns`);
   const parts = (b: ReturnType<typeof readCost>) => [
     { l: "kernel entry", v: b.kernelEntry, c: "var(--c1)" }, { l: "copy", v: b.copy, c: "var(--c2)" }, { l: "device", v: b.device, c: "var(--c5)" }, { l: "TLB misses", v: b.tlb, c: "var(--c3)" }, { l: "shootdowns", v: b.shootdown, c: "var(--c4)" },
   ];
@@ -192,7 +191,7 @@ export function ReadVsMmapDemo() {
       <Param spec={p.schema.cores} value={v.cores} onChange={(x) => p.set("cores", x as number)} />
       <Param spec={p.schema.pattern} value={v.pattern} onChange={(x) => p.set("pattern", x as AccessPattern)} />
     </>}>
-      <Plot x={[0, 1]} y={[10, 2e5]} logY height={220} xLabel="share of page visits that hit the page cache" yLabel="ns per access" xFormat={(x) => `${Math.round(x * 100)}%`} yTicks={[10, 100, 1000, 1e4, 1e5]} yFormat={(y) => fx(y, 1)} xTicks={[0, 0.25, 0.5, 0.75, 1]}>
+      <Plot x={[0, 1]} y={[10, 2e5]} logY height={220} xLabel="share of page visits that hit the page cache" yLabel="ns per access" xFormat={(x) => `${Math.round(x * 100)}%`} yTicks={[10, 100, 1000, 1e4, 1e5]} yFormat={(y) => sig(y, 1)} xTicks={[0, 0.25, 0.5, 0.75, 1]}>
         <Line points={lines.read} color="var(--c1)" />
         <Line points={lines.mmap} color="var(--c4)" />
         <RuleX at={v.cached} color="var(--fg)" />
@@ -205,7 +204,7 @@ export function ReadVsMmapDemo() {
         {breakdown("mmap", m)}
       </div>
       <Legend box items={parts(r).map((x) => ({ label: x.l, color: x.c }))} />
-      <Caption><span style={{ display: "block", marginTop: 8 }}>Model inputs, not measurements: syscall {MMAP_COSTS.syscallNs} ns; copy of 4 KiB {MMAP_COSTS.copy4kNs} ns; minor fault {MMAP_COSTS.minorFaultNs} ns; fault-around {MMAP_COSTS.faultAroundPages} pages at {MMAP_COSTS.faultAroundPerPageNs} ns each; TLB miss {MMAP_COSTS.tlbMissNs} ns; device read {fx(MMAP_COSTS.deviceReadNs / 1000, 2)} µs; readahead {MMAP_COSTS.readaheadPages} pages; shootdown {MMAP_COSTS.shootdownBaseNs} ns + {MMAP_COSTS.shootdownPerCoreNs} ns per other core ({fmt(shootdownNs(cores))} here).</span></Caption>
+      <SmallLabel><span style={{ display: "block", marginTop: 8 }}>Model inputs, not measurements: syscall {MMAP_COSTS.syscallNs} ns; copy of 4 KiB {MMAP_COSTS.copy4kNs} ns; minor fault {MMAP_COSTS.minorFaultNs} ns; fault-around {MMAP_COSTS.faultAroundPages} pages at {MMAP_COSTS.faultAroundPerPageNs} ns each; TLB miss {MMAP_COSTS.tlbMissNs} ns; device read {sig(MMAP_COSTS.deviceReadNs / 1000, 2)} µs; readahead {MMAP_COSTS.readaheadPages} pages; shootdown {MMAP_COSTS.shootdownBaseNs} ns + {MMAP_COSTS.shootdownPerCoreNs} ns per other core ({fmt(shootdownNs(cores))} here).</span></SmallLabel>
     </Demo>
   );
 }

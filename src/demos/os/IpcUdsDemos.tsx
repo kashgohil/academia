@@ -1,8 +1,7 @@
 /** Demos for "Unix domain sockets": SCM_RIGHTS with two fd tables, message boundaries, and loopback TCP against a Unix socket. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, bytes, range, si, toggle, useParams } from "../../kit";
+import { Demo, Param, Stats, bytes, range, si, toggle, useParams, Banner, MONO } from "../../kit";
 import { TCP_LAYERS, UNIX_LAYERS, UdsWorld, pathCost, type PathRow, type RecvResult } from "../../sims/os/ipc";
-import { Banner, MONO } from "./SyncShared";
 
 // ---------------------------------------------------------------- 1. SCM_RIGHTS
 

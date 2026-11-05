@@ -1,10 +1,10 @@
 /** Demos for "namespaces": nested PID namespaces, the uid_map translator, and a veth and bridge packet trace. */
 import { useMemo, useRef, useState } from "react";
-import { Demo, Param, range, useParams, useWidth } from "../../kit";
+import { Demo, Param, range, useParams, useWidth, Banner, Note, Panel, mono, seg, type Tone } from "../../kit";
 import {
   MAP_PRESETS, NetSim, OVERFLOW_UID, PidWorld, displayedInside, formatMap, parseMap, toOutside, validateMap, type Hop, type HopKind, type NsId, type PidNs, type Proc, type TraceResult,
 } from "../../sims/os/isolation";
-import { Badge, Card, Note, Scroll, Verdict, mono, seg, smallTable, td, th, twoCol, type Tone } from "./IsolationUi";
+import { Badge, Scroll, smallTable, td, th, twoCol } from "./IsolationUi";
 
 // ---------------- PID namespaces ----------------
 
@@ -99,25 +99,25 @@ export function IsolationPidNsDemo() {
           <Note>Click a process to select it. Click a box to look from that namespace. Dim boxes cannot be seen from there.</Note>
         </div>
         <div style={{ minWidth: 0, display: "grid", gap: 8, alignContent: "start", marginTop: 6 }}>
-          <Card title={<>ps from level {viewNs.level}: {visible.length} visible, {hiddenCount} hidden</>}>
+          <Panel title={<>ps from level {viewNs.level}: {visible.length} visible, {hiddenCount} hidden</>}>
             <Scroll style={{ maxHeight: 230, overflowY: "auto" }}>
               <table style={smallTable}>
                 <thead><tr><th style={th}>PID</th><th style={th}>name</th></tr></thead>
                 <tbody>{visible.map((p: Proc) => <tr key={p.id} style={{ fontWeight: p.id === sel ? 600 : 400 }}><td style={{ ...td, ...mono }}>{w.pidIn(p.id, view)}</td><td style={td}>{p.name}</td></tr>)}</tbody>
               </table>
             </Scroll>
-          </Card>
+          </Panel>
           {selected && alive && (
-            <Card title={<>struct pid of {selected.name}: one number per level</>}>
+            <Panel title={<>struct pid of {selected.name}: one number per level</>}>
               <table style={smallTable}><tbody>
                 {w.chain(selected.ns).map((s) => <tr key={s.id}><td style={{ ...td, color: levelColor(s.level) }}>level {s.level}</td><td style={{ ...td, ...mono, fontWeight: 600 }}>{selected.pids[s.level]}</td></tr>)}
                 <tr><td style={td}>getppid()</td><td style={{ ...td, ...mono }}>{w.getppid(sel)}{w.getppid(sel) === 0 ? " (parent is outside)" : ""}</td></tr>
               </tbody></table>
-            </Card>
+            </Panel>
           )}
         </div>
       </div>
-      {msg && <Verdict tone="info">{msg}</Verdict>}
+      {msg && <Banner tone="info">{msg}</Banner>}
     </Demo>
   );
 }
@@ -153,12 +153,12 @@ export function IsolationUidMapDemo() {
         <label style={{ minWidth: 0, display: "block" }}>
           <div className="muted" style={{ fontSize: 11.5, marginBottom: 4 }}>/proc/&lt;pid&gt;/uid_map: inside outside length</div>
           <textarea value={text} spellCheck={false} rows={3} onChange={(e) => { setText(e.target.value); setPreset(""); }} style={{ ...mono, width: "100%", boxSizing: "border-box", fontSize: 13, border: "1px solid var(--border)", borderRadius: 4, padding: 6, background: "var(--bg)", color: "var(--fg)" }} />
-          {err ? <Verdict tone="bad">write() fails with EINVAL. {err}</Verdict> : note && <Note>{note}</Note>}
+          {err ? <Banner tone="bad">write() fails with EINVAL. {err}</Banner> : note && <Note>{note}</Note>}
         </label>
-        <Card title="The chosen ID">
+        <Panel title="The chosen ID">
           <div style={{ ...mono, fontSize: 14 }}>inside {id} <span className="muted">→</span> <b style={{ color: host === null ? "var(--c4)" : "var(--c3)" }}>{host === null ? "no mapping" : `host ${host}`}</b></div>
           <Note>{host === null ? "A process cannot switch to this UID, and a file cannot be chowned to it." : host === 0 ? "This is real root on the host." : "On the host, this process is an ordinary user."}</Note>
-        </Card>
+        </Panel>
       </div>
       <div ref={svgRef} style={{ marginTop: 8 }}>
       <svg viewBox={`0 0 ${W} ${H}`} width={W} height={H} style={{ display: "block", maxWidth: "100%" }} role="img" aria-label="Map from container IDs to host IDs">
@@ -282,15 +282,15 @@ export function IsolationNetNsDemo() {
         })}
         {pos && <circle cx={pos.x + nodeW(pos) / 2} cy={pos.y - 14} r={7} fill="var(--c2)" style={{ transition: "cx .25s, cy .25s" }} />}
       </svg>
-      {cur ? <Verdict tone={HOP_TONE[cur.kind]}><Badge tone={HOP_TONE[cur.kind]}>{cur.kind}</Badge> {cur.text}</Verdict> : <Verdict tone="none">Press <b>Send packet</b>, then step through the hops.</Verdict>}
+      {cur ? <Banner tone={HOP_TONE[cur.kind]}><Badge tone={HOP_TONE[cur.kind]}>{cur.kind}</Badge> {cur.text}</Banner> : <Banner tone="none">Press <b>Send packet</b>, then step through the hops.</Banner>}
       {trace && at === hops.length - 1 && <Note>{trace.ok ? `Delivered in ${trace.deliveredIn}. The receiver sees source ${trace.seenSrc}.` : "The packet did not arrive."} ARP requests: {trace.arps}. Floods: {trace.floods}.</Note>}
       <div style={{ ...twoCol, marginTop: 8 }}>
-        <Card title="Bridge forwarding table (learned)">
+        <Panel title="Bridge forwarding table (learned)">
           {fdb.length === 0 ? <span className="muted" style={{ fontSize: 12 }}>empty: the first frame floods</span> : <table style={smallTable}><tbody>{fdb.map(([m, p]) => <tr key={m}><td style={{ ...td, ...mono }}>{m}</td><td style={{ ...td, ...mono }}>{p}</td></tr>)}</tbody></table>}
-        </Card>
-        <Card title="Neighbor table in the source namespace">
+        </Panel>
+        <Panel title="Neighbor table in the source namespace">
           {(() => { const t = [...sim.neigh.get(P.values.from)!.entries()]; return t.length === 0 ? <span className="muted" style={{ fontSize: 12 }}>empty: the first packet needs ARP</span> : <table style={smallTable}><tbody>{t.map(([i, m]) => <tr key={i}><td style={{ ...td, ...mono }}>{[24, 16, 8, 0].map((sh) => Math.floor(i / 2 ** sh) % 256).join(".")}</td><td style={{ ...td, ...mono }}>{m}</td></tr>)}</tbody></table>; })()}
-        </Card>
+        </Panel>
       </div>
     </Demo>
   );

@@ -1,13 +1,12 @@
 /** Demos for /os/memory/kernel-memory-allocators. */
 import { useMemo, useRef, useState, type ReactNode } from "react";
-import { Demo, Stats, Param, Legend, range, toggle, select, useParams, bytes, pct } from "../../kit";
+import { Demo, Stats, Param, Legend, range, toggle, select, useParams, bytes, pct, Meter, Note, SmallLabel, mono, sig } from "../../kit";
 import {
   SlubCache, PageAllocator, kmallocClass, classLabel, slabLayout, getOrder, runSlubWorkload, ALLOC_PATHS, PATH_LABEL, PATH_COST_NS, SLUB_WORKLOAD_LABEL,
   CONTEXT_LABEL, GFP_BITS, gfpOutcome, contextMaySleep, fragmentedZone, compactedZone, freePages, largestOrder, zoneWatermarkOk, MAX_PAGE_ORDER,
   type AllocPath, type FreePath, type ObjRef, type SlubWorkload, type GfpContext, type GfpBase, type GfpModifier, type GfpVerdict,
 } from "../../sims/os/memory";
 import { mulberry32 } from "../../sims/rng";
-import { mono, Note, Caption, Meter, fx } from "../db/StorageUi";
 
 const PATH_COLOR: Record<AllocPath, string> = { fast: "var(--c3)", "slab-freelist": "var(--c1)", "cpu-partial": "var(--c5)", "node-partial": "var(--c2)", "new-slab": "var(--c4)", fail: "var(--c4)" };
 
@@ -109,13 +108,13 @@ export function SlubPathDemo() {
           <Stats items={ALLOC_PATHS.map((x) => ({ label: PATH_LABEL[x], value: c.allocPaths[x] }))} />
         </>
       )}
-      <Caption><span style={{ display: "block", marginTop: 10 }}>Fixed workloads of 20,000 allocations in {classLabel(cls ?? 256)}, with path costs as model inputs ({ALLOC_PATHS.map((x) => `${PATH_COST_NS[x]}`).join(", ")} ns from fastest to slowest).</span></Caption>
+      <SmallLabel><span style={{ display: "block", marginTop: 10 }}>Fixed workloads of 20,000 allocations in {classLabel(cls ?? 256)}, with path costs as model inputs ({ALLOC_PATHS.map((x) => `${PATH_COST_NS[x]}`).join(", ")} ns from fastest to slowest).</span></SmallLabel>
       <div style={{ display: "grid", gap: 6 }}>
         {results.map(({ w, c: r }) => (
           <div key={w}>
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, gap: 8, flexWrap: "wrap" }}>
               <span>{SLUB_WORKLOAD_LABEL[w]}</span>
-              <span style={mono}>alloc fast {pct(r.fastShare(), 1)} · free fast {pct(r.freeFastShare(), 1)} · {fx(r.meanAllocNs(), 3)} ns per alloc</span>
+              <span style={mono}>alloc fast {pct(r.fastShare(), 1)} · free fast {pct(r.freeFastShare(), 1)} · {sig(r.meanAllocNs(), 3)} ns per alloc</span>
             </div>
             <div style={{ display: "flex", height: 12, borderRadius: 3, overflow: "hidden", border: "1px solid var(--border)" }}>
               {ALLOC_PATHS.map((x) => <div key={x} title={`${PATH_LABEL[x]}: ${r.allocPaths[x]}`} style={{ width: `${(r.allocPaths[x] / r.totalAllocs()) * 100}%`, background: PATH_COLOR[x] }} />)}
@@ -203,7 +202,7 @@ export function BuddyinfoDemo() {
       <div style={{ display: "grid", gridTemplateColumns: `repeat(${MAX_PAGE_ORDER + 1}, minmax(0, 1fr))`, gap: 2, ...mono, fontSize: 11, textAlign: "center", color: "var(--muted)" }}>
         {counts.map((_, k) => <div key={k}>{k}</div>)}
       </div>
-      <Caption><span style={{ display: "block", marginTop: 6 }}>Blocks per order (log height). Next row: can a request of this order pass the watermark check of {mark} pages?</span></Caption>
+      <SmallLabel><span style={{ display: "block", marginTop: 6 }}>Blocks per order (log height). Next row: can a request of this order pass the watermark check of {mark} pages?</span></SmallLabel>
       <div style={{ display: "grid", gridTemplateColumns: `repeat(${MAX_PAGE_ORDER + 1}, minmax(0, 1fr))`, gap: 2 }}>
         {counts.map((_, k) => { const ok = zoneWatermarkOk(counts, k, mark); return <div key={k} title={`order ${k}`} style={{ height: 14, borderRadius: 2, background: ok ? "var(--c3)" : "var(--c4)" }} />; })}
       </div>

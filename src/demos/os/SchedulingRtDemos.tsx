@@ -1,11 +1,10 @@
 /** Demos for "Real-time scheduling". */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Demo, Stats, Controls, Plot, Line, RuleX, range, toggle, useParams, useSim } from "../../kit";
+import { Demo, Stats, Controls, Plot, Line, RuleX, range, toggle, useParams, useSim, Note, SmallLabel, mono, seg, useChunked } from "../../kit";
 import {
   RT_PRESETS, edfSchedulable, hyperperiod, rmAcceptance, rmBound, responseTimes, rtPreset, simulateInversion, simulateRt, utilization,
   type RtResult, type RtTask,
 } from "../../sims/os/scheduling";
-import { Caption, Note, seg, useChunked, mono } from "../db/StorageUi";
 import { Gantt, NumCell, SmallTable, f1, f2, jobColor, type GanttMark, type GanttRow } from "./SchedulingGantt";
 
 // ------------------------------------------------------------------------------------------------
@@ -64,9 +63,9 @@ export function RtTimelineDemo() {
   return (
     <Demo title="A periodic task set under RM and EDF" controls={<Controls params={p} />}>
       <UtilBar u={u} bound={b} />
-      <Caption>Rate monotonic: the shorter period always wins. A triangle is a release. A red cross is a missed deadline.</Caption>
+      <SmallLabel>Rate monotonic: the shorter period always wins. A triangle is a release. A red cross is a missed deadline.</SmallLabel>
       <Gantt rows={a.rows} marks={a.marks} end={end} rowH={18} labelW={28} />
-      <Caption>Earliest deadline first: the nearest deadline always wins.</Caption>
+      <SmallLabel>Earliest deadline first: the nearest deadline always wins.</SmallLabel>
       <Gantt rows={e.rows} marks={e.marks} end={end} rowH={18} labelW={28} />
       <Stats items={[
         { label: `RM misses in ${f1(horizon)} ms`, value: rm.misses.length },
@@ -77,7 +76,7 @@ export function RtTimelineDemo() {
         { label: "passes the exact EDF test", value: edfOk ? "yes" : "no" },
       ]} />
       <div style={{ marginTop: 10 }}>
-        <Caption>C is the CPU time per job. T is the period, in ms. R is the response time.</Caption>
+        <SmallLabel>C is the CPU time per job. T is the period, in ms. R is the response time.</SmallLabel>
         <SmallTable
           head={["Task", "C", "T", "C/T", "Worst R (RM)", ""]}
           rows={tasks.map((t, i) => {
@@ -182,7 +181,7 @@ export function PriorityInversionDemo() {
       controls={<Controls params={p} />}
     >
       <Gantt rows={rows} end={Math.max(r.frames.length, other.frames.length)} cursor={cur} labelW={22} unit="" />
-      <Caption>Red means that the task holds the mutex and runs. A thin red line means that the task is blocked on the mutex.</Caption>
+      <SmallLabel>Red means that the task holds the mutex and runs. A thin red line means that the task is blocked on the mutex.</SmallLabel>
       <p style={{ fontSize: 13, minHeight: 36, margin: "6px 0" }}>{frame ? (frame.note || `${frame.running >= 0 ? r.tasks[frame.running]!.name : "Nothing"} runs.`) : "Press Step. L starts first, then H and M arrive."}</p>
       <SmallTable
         head={["Task", "Base priority", "Effective", "State"]}

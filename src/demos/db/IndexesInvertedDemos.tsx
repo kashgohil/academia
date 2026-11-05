@@ -1,11 +1,11 @@
 /** Demos for "Inverted indexes": build and query, posting-list compression, BM25 playground. */
 import { useEffect, useMemo, useState } from "react";
-import { Demo, Stats, Param, range, Plot, Line, RuleY, Legend, pct } from "../../kit";
+import { Demo, Stats, Param, range, Plot, Line, RuleY, Legend, pct, Meter, Note, SectionLabel, fixed, int, mono, seg } from "../../kit";
 import {
   buildIndex, postings, intersectMerge, intersectGallop, phrase, randomPostings, burstyPostings, compressionSizes, deltas, varintEncode,
   bitsFor, BLOCK, bm25Rank, bm25Term, idf, CORPUS, type WalkStep, type Posting,
 } from "../../sims/db/indexes/inverted";
-import { seg, mono, Note, Caption, fx, int, StepText, StepButtons, useFrames, Chip, Bar } from "./IndexesUi";
+import { StepText, FrameButtons, useFrames, Chip } from "./IndexesUi";
 
 const IX = buildIndex(CORPUS);
 
@@ -95,12 +95,12 @@ export function InvertedQueryDemo() {
           </div>
         ))}
       </div>
-      <Caption>Posting lists: doc id · positions</Caption>
+      <SectionLabel>Posting lists: doc id · positions</SectionLabel>
       {row(swapped ? q.terms[1] : q.terms[0], A, f && f.posDoc === undefined ? f.i : undefined, "var(--c1)")}
       {row(swapped ? q.terms[0] : q.terms[1], B, f && f.posDoc === undefined ? f.j : undefined, "var(--c2)")}
       <div style={{ ...mono, fontSize: 12, marginTop: 4 }}>result: [{(f?.out ?? []).join(", ")}]</div>
       <StepText>{f ? f.note : "Pick a query."}</StepText>
-      <StepButtons st={st} />
+      <FrameButtons st={st} />
       <div style={{ height: 8 }} />
       <Stats
         items={[
@@ -150,8 +150,8 @@ export function PostingCompressionDemo() {
         </>
       }
     >
-      {rows.map(([label, bytes, bits, color]) => <Bar key={label} label={label} value={bytes} max={sz.raw} color={color} text={`${int(bytes)} B · ${fx(bits, 1)} bits/id`} />)}
-      <Caption>The first ids, their gaps, and the gaps as varint bytes</Caption>
+      {rows.map(([label, bytes, bits, color]) => <Meter key={label} label={label} value={bytes} max={sz.raw} color={color} text={`${int(bytes)} B · ${fixed(bits, 1)} bits/id`} />)}
+      <SectionLabel>The first ids, their gaps, and the gaps as varint bytes</SectionLabel>
       <div style={{ overflowX: "auto" }}>
         <table style={{ borderCollapse: "collapse", fontSize: 12, ...mono, width: "100%" }}>
           <thead><tr className="muted" style={{ textAlign: "right" }}><th style={{ fontWeight: 500 }}>doc id</th><th style={{ fontWeight: 500 }}>gap</th><th style={{ fontWeight: 500, textAlign: "left", paddingLeft: 12 }}>varint bytes (continuation bit in red)</th></tr></thead>
@@ -209,8 +209,8 @@ export function Bm25Demo() {
       title="BM25: term frequency, rarity and document length"
       controls={
         <>
-          <Param spec={range({ label: "k1 (tf saturation)", min: 0, max: 3, step: 0.1, default: 1.2, format: (v) => fx(v, 1) })} value={k1} onChange={(v) => setK1(v as number)} />
-          <Param spec={range({ label: "b (length normalization)", min: 0, max: 1, step: 0.05, default: 0.75, format: (v) => fx(v, 2) })} value={b} onChange={(v) => setB(v as number)} />
+          <Param spec={range({ label: "k1 (tf saturation)", min: 0, max: 3, step: 0.1, default: 1.2, format: (v) => fixed(v, 1) })} value={k1} onChange={(v) => setK1(v as number)} />
+          <Param spec={range({ label: "b (length normalization)", min: 0, max: 1, step: 0.05, default: 0.75, format: (v) => fixed(v, 2) })} value={b} onChange={(v) => setB(v as number)} />
           <Param spec={seg<BQ>("Query", [["inverted index", "inverted index"], ["sorted runs", "sorted runs"], ["lsm merges", "lsm merges"], ["range scan", "range scan"]], "inverted index")} value={query} onChange={(v) => setQuery(v as BQ)} />
         </>
       }
@@ -221,25 +221,25 @@ export function Bm25Demo() {
             <b style={{ ...mono, color: i === 0 ? "var(--c3)" : "var(--muted)" }}>{r.doc}</b>
             <div style={{ minWidth: 0 }}>
               <div style={{ display: "flex", height: 12, borderRadius: 3, overflow: "hidden", background: "var(--subtle)", border: "1px solid var(--border)" }}>
-                {r.parts.map((p) => <div key={p.term} title={`${p.term}: tf ${p.tf}, idf ${fx(p.idf, 2)}, ${fx(p.score, 3)}`} style={{ width: `${(100 * p.score) / max}%`, background: TERM_COLORS[qterms.indexOf(p.term)] ?? "var(--c1)", transition: "width 0.25s" }} />)}
+                {r.parts.map((p) => <div key={p.term} title={`${p.term}: tf ${p.tf}, idf ${fixed(p.idf, 2)}, ${fixed(p.score, 3)}`} style={{ width: `${(100 * p.score) / max}%`, background: TERM_COLORS[qterms.indexOf(p.term)] ?? "var(--c1)", transition: "width 0.25s" }} />)}
               </div>
               <div className="muted" style={{ fontSize: 11, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{IX.docLen[r.doc]} terms · {r.parts.map((p) => `${p.term} tf ${p.tf}`).join(", ")}</div>
             </div>
-            <span style={{ ...mono, textAlign: "right" }}>{fx(r.score, 3)}</span>
+            <span style={{ ...mono, textAlign: "right" }}>{fixed(r.score, 3)}</span>
           </div>
         ))}
       </div>
-      <Legend items={qterms.map((t, i) => ({ label: `${t}: in ${postings(IX, t).length} of ${CORPUS.length} docs, idf ${fx(idf(CORPUS.length, postings(IX, t).length), 2)}`, color: TERM_COLORS[i]! }))} />
-      <Caption>One term's score against its frequency in a document (idf = 1)</Caption>
+      <Legend items={qterms.map((t, i) => ({ label: `${t}: in ${postings(IX, t).length} of ${CORPUS.length} docs, idf ${fixed(idf(CORPUS.length, postings(IX, t).length), 2)}`, color: TERM_COLORS[i]! }))} />
+      <SectionLabel>One term's score against its frequency in a document (idf = 1)</SectionLabel>
       <Plot x={[0, 10]} y={[0, Math.max(1.2, k1 + 1.2)]} height={190} xLabel="term frequency tf" yLabel="score">
-        <RuleY at={k1 + 1} label={`limit k1 + 1 = ${fx(k1 + 1, 1)}`} />
+        <RuleY at={k1 + 1} label={`limit k1 + 1 = ${fixed(k1 + 1, 1)}`} />
         <Line points={curve(0.5)} color="var(--c3)" />
         <Line points={curve(1)} color="var(--c1)" />
         <Line points={curve(2)} color="var(--c4)" />
       </Plot>
       <Legend items={[{ label: "short doc (half of average length)", color: "var(--c3)" }, { label: "average length", color: "var(--c1)" }, { label: "long doc (twice the average)", color: "var(--c4)" }]} />
       <div style={{ height: 6 }} />
-      <Stats items={[{ label: "documents", value: CORPUS.length }, { label: "average length (terms)", value: fx(IX.avgdl, 1) }, { label: "top document", value: ranked[0] ? `doc ${ranked[0].doc}` : "–" }]} />
+      <Stats items={[{ label: "documents", value: CORPUS.length }, { label: "average length (terms)", value: fixed(IX.avgdl, 1) }, { label: "top document", value: ranked[0] ? `doc ${ranked[0].doc}` : "–" }]} />
     </Demo>
   );
 }

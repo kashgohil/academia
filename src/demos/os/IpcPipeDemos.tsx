@@ -1,11 +1,10 @@
 /** Demos for "pipes": the ring with one writer and one reader, two writers and PIPE_BUF, and the throughput model. */
 import { useMemo, useState, type ReactNode } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleX, Stats, bytes, range, select, toggle, useParams } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleX, Stats, bytes, range, select, toggle, useParams, Banner, MONO } from "../../kit";
 import {
   PIPE_COST, PIPE_FACTS, Pipe, explorePipe, findSplit, pipeInterleaveModel, pipeThroughput, type InterleaveState, type Run, type WriteResult,
 } from "../../sims/os/ipc";
 import { replay } from "../../sims/os/sync/machine";
-import { Banner, MONO } from "./SyncShared";
 
 const WRITER_COLOR: Record<string, string> = { w: "var(--c1)", A: "var(--c1)", B: "var(--c2)", file: "var(--c5)" };
 

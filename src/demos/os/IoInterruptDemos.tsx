@@ -1,11 +1,11 @@
 /** Demos for "interrupts": the path of one interrupt, a CPU timeline, and goodput against packet rate. */
 import { useMemo, useState } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleX, Stats, pct, range, si, useParams, useWidth } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleX, Stats, pct, range, si, useParams, useWidth, IndexButtons, IndexSlider, Panel, mono, seg, tint } from "../../kit";
 import {
   IRQ_MODEL, IRQ_PATH, RX_DEFAULTS, RX_LABEL, irqShares, irqTimeline, rxGoodput,
   type CpuLane, type IrqTimelineResult, type RxMode,
 } from "../../sims/os/io";
-import { Msg, Panel, StepButtons, StepSlider, mono, seg, tint } from "./ProcessesUi";
+import { Msg } from "./ProcessesUi";
 
 // ---------------------------------------------------------------- the path of one interrupt
 
@@ -24,7 +24,7 @@ export function IoIrqPathDemo() {
   const [k, setK] = useState(0);
   const s = IRQ_PATH[k]!;
   return (
-    <Demo title="One interrupt, from the device to the task" actions={<StepButtons k={k} n={IRQ_PATH.length} set={setK} />} controls={<StepSlider k={k} n={IRQ_PATH.length} set={setK} />}>
+    <Demo title="One interrupt, from the device to the task" actions={<IndexButtons k={k} n={IRQ_PATH.length} set={setK} />} controls={<IndexSlider k={k} n={IRQ_PATH.length} set={setK} />}>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(62px, 1fr))", gap: 6, marginBottom: 12 }}>
         {STAGES.map((b, i) => {
           const on = i === k;

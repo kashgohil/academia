@@ -1,8 +1,8 @@
 /** Shared pieces for the kernel demos: bit grids, register cells, and small lists. */
 import type { CSSProperties, ReactNode } from "react";
-import { tint, mono } from "./ProcessesUi";
+import { tint, mono } from "../../kit";
 
-export { Cap, Msg, Note, Panel, StepButtons, StepSlider, ModeBar, mono, seg, tint } from "./ProcessesUi";
+export { Msg, ModeBar } from "./ProcessesUi";
 
 /** One register or value in a small box. A changed value has a red frame. */
 export function RegCell({ name, value, hot, color, style }: { name: string; value: ReactNode; hot?: boolean; color?: string; style?: CSSProperties }) {
@@ -18,12 +18,6 @@ export const RegGrid = ({ children, min = 112 }: { children: ReactNode; min?: nu
   <div style={{ display: "grid", gridTemplateColumns: `repeat(auto-fill, minmax(${min}px, 1fr))`, gap: 3 }}>{children}</div>
 );
 
-export function Verdict({ tone, children }: { tone: "good" | "bad" | "plain"; children: ReactNode }) {
-  const c = tone === "bad" ? "var(--c4)" : tone === "good" ? "var(--c3)" : "var(--border)";
-  return (
-    <div style={{ fontSize: 13, lineHeight: 1.45, padding: "6px 10px 6px 12px", marginTop: 10, background: "var(--subtle)", borderRadius: 6, border: "1px solid var(--border)", boxShadow: `inset 3px 0 0 ${c}` }}>{children}</div>
-  );
-}
 
 export function Chip({ children, color, faint }: { children: ReactNode; color?: string; faint?: boolean }) {
   return (

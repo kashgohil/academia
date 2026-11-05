@@ -1,13 +1,13 @@
 /** Demos for "Secondary and covering indexes": planner toy, selectivity sweep, clustered vs heap lookups. */
 import { useEffect, useMemo, useState } from "react";
-import { Demo, Stats, Param, range, select, toggle, Plot, Line, RuleX, Legend, pct } from "../../kit";
+import { Demo, Stats, Param, range, select, toggle, Plot, Line, RuleX, Legend, pct, Note, SectionLabel, fixed, int, mono, seg } from "../../kit";
 import {
   planQuery, pathCosts, crossover, ORDERS_MODEL, DEFAULT_COSTS, SSD_COSTS, TOY_PREDS, buildWorld, lookupTrace, scaleReads, USER_ROWS,
   HEAP_ROWS_PER_PAGE, type Col, type PredCol, type ToyQuery, type ToyPlan, type Engine, type LookupKind, type SweepPoint, type PageRead,
 } from "../../sims/db/indexes/secondary";
 import type { SnapNode } from "../../sims/db/btree";
 import { TreeView, type ViewNode } from "./BtreeView";
-import { seg, mono, Note, Caption, fx, int, StepText, StepButtons, useFrames, Chip } from "./IndexesUi";
+import { StepText, FrameButtons, useFrames, Chip } from "./IndexesUi";
 
 // ============================================================================
 // Planner toy
@@ -57,7 +57,7 @@ export function PlannerToyDemo() {
         <div className="muted">{ddl}</div>
         <div>{sql}</div>
       </div>
-      <Caption>Index columns, left to right</Caption>
+      <SectionLabel>Index columns, left to right</SectionLabel>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
         {key.length ? key.map((c, i) => (
           <span key={c} style={{ display: "inline-flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
@@ -67,9 +67,9 @@ export function PlannerToyDemo() {
         )) : <span className="muted" style={{ fontSize: 12.5 }}>no index</span>}
         {inc && key.length > 0 && <span style={{ display: "inline-flex", flexDirection: "column", alignItems: "center", gap: 2 }}><Chip>amount</Chip><span className="muted" style={{ fontSize: 10.5 }}>payload</span></span>}
       </div>
-      <Caption>Plan</Caption>
+      <SectionLabel>Plan</SectionLabel>
       <PlanText plan={plan} q={q} />
-      <Caption>Estimated cost of each access path (log scale)</Caption>
+      <SectionLabel>Estimated cost of each access path (log scale)</SectionLabel>
       <div style={{ display: "grid", gap: 4 }}>
         {plan.paths.map((p) => (
           <div key={p.name} style={{ display: "grid", gridTemplateColumns: "minmax(0, 9.5em) minmax(0, 1fr) 5.5em", gap: 8, alignItems: "center", fontSize: 12.5, opacity: p.available ? 1 : 0.45 }} title={p.why}>
@@ -150,7 +150,7 @@ export function SelectivityDemo() {
       controls={
         <>
           <Param spec={range({ label: "Selectivity (share of rows)", min: 1e-6, max: 1, log: true, default: 0.01, format: (v) => pct(v, v < 1e-3 ? 4 : v < 0.01 ? 2 : 1) })} value={s} onChange={(v) => setS(v as number)} />
-          <Param spec={range({ label: "Correlation: index order vs heap order", min: 0, max: 1, step: 0.05, default: 0, format: (v) => fx(v, 2) })} value={corr} onChange={(v) => setCorr(v as number)} />
+          <Param spec={range({ label: "Correlation: index order vs heap order", min: 0, max: 1, step: 0.05, default: 0, format: (v) => fixed(v, 2) })} value={corr} onChange={(v) => setCorr(v as number)} />
           <Param spec={seg<"hdd" | "ssd">("random_page_cost", [["hdd", "4 (default)"], ["ssd", "1.1 (SSD tuning)"]], "hdd")} value={disk} onChange={(v) => setDisk(v as "hdd" | "ssd")} />
           <Param spec={range({ label: "Heap pages all-visible (index-only scan)", min: 0, max: 1, step: 0.05, default: 1, format: (v) => pct(v, 0) })} value={vis} onChange={(v) => setVis(v as number)} />
         </>
@@ -238,25 +238,25 @@ export function ClusteredLookupDemo() {
     >
       {usesSec && (
         <>
-          <Caption>{engine === "innodb" ? "Secondary index on email: leaves hold the primary key" : "Index on email: leaves hold TIDs (page, slot)"}</Caption>
+          <SectionLabel>{engine === "innodb" ? "Secondary index on email: leaves hold the primary key" : "Index on email: leaves hold TIDs (page, slot)"}</SectionLabel>
           <TreeView root={secSnap} color={colorFor("secondary")} cell={26} />
         </>
       )}
       {engine === "innodb" && kind !== "email-id" && (
         <>
-          <Caption>Clustered index on id: the leaves are the rows</Caption>
+          <SectionLabel>Clustered index on id: the leaves are the rows</SectionLabel>
           <TreeView root={primSnap} color={colorFor("primary")} cell={22} />
         </>
       )}
       {engine === "postgres" && kind === "pk" && (
         <>
-          <Caption>Index on id (the primary key is an ordinary index)</Caption>
+          <SectionLabel>Index on id (the primary key is an ordinary index)</SectionLabel>
           <TreeView root={primSnap} color={colorFor("primary")} cell={22} />
         </>
       )}
       {engine === "postgres" && (
         <>
-          <Caption>Heap file: rows in insert order, {HEAP_ROWS_PER_PAGE} per page{kind === "email-id" ? " · visibility map" : ""}</Caption>
+          <SectionLabel>Heap file: rows in insert order, {HEAP_ROWS_PER_PAGE} per page{kind === "email-id" ? " · visibility map" : ""}</SectionLabel>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
             {Array.from({ length: pages }, (_, p) => {
               const on = heapRead.has(p), now = cur?.s === "heap" && cur.node === p;
@@ -279,7 +279,7 @@ export function ClusteredLookupDemo() {
         </>
       )}
       <StepText>{cur ? `Read ${n}: ${cur.note}.` : "Pick a query. Each page read plays in order."}</StepText>
-      <StepButtons st={st} />
+      <FrameButtons st={st} />
       <div style={{ height: 8 }} />
       <Stats
         items={[

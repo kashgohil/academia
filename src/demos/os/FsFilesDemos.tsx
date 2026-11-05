@@ -1,8 +1,8 @@
 /** Demos for "files, inodes and directories": a file tree over inodes, and the three tables of open files. */
 import { useMemo, useRef, useState } from "react";
-import { Demo, Param, Stats, select, useParams } from "../../kit";
+import { Demo, Param, Stats, select, useParams, Banner, MONO, Note, SmallLabel } from "../../kit";
 import { MemFs, OpenTables, TABLE_SCENARIOS, applyTableOp, type FsError } from "../../sims/os/fs/inodefs";
-import { Banner, Heading, MONO, Note, fileColor, smallBtn } from "./FsUi";
+import { fileColor, smallBtn } from "./FsUi";
 
 // ---------------------------------------------------------------- the inode tree
 
@@ -81,7 +81,7 @@ export function FsInodeTreeDemo() {
     >
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(250px, 1fr))", gap: 12 }}>
         <div>
-          <Heading>Names (directory entries)</Heading>
+          <SmallLabel>Names (directory entries)</SmallLabel>
           <div style={{ fontFamily: MONO, fontSize: 12.5, border: "1px solid var(--border)", borderRadius: 6, padding: 4, minHeight: 110 }}>
             {list.map((r) => {
               const on = r.path === sel;
@@ -96,7 +96,7 @@ export function FsInodeTreeDemo() {
           </div>
         </div>
         <div>
-          <Heading>Inode table</Heading>
+          <SmallLabel>Inode table</SmallLabel>
           <div style={{ overflowX: "auto" }}>
             <table style={{ borderCollapse: "collapse", width: "100%", fontFamily: MONO, fontSize: 12 }}>
               <thead>
@@ -119,7 +119,7 @@ export function FsInodeTreeDemo() {
       </div>
 
       <div style={{ marginTop: 10 }}>
-        <Heading>Data blocks, colored by owner inode</Heading>
+        <SmallLabel>Data blocks, colored by owner inode</SmallLabel>
         <svg viewBox={`0 0 ${GRID_COLS * 20} ${Math.ceil(fs.totalBlocks / GRID_COLS) * 20}`} style={{ width: "100%", maxWidth: 480, display: "block" }} role="img" aria-label="block bitmap">
           {Array.from(fs.owner).map((o, i) => (
             <g key={i} transform={`translate(${(i % GRID_COLS) * 20},${Math.floor(i / GRID_COLS) * 20})`}>
@@ -280,7 +280,7 @@ export function FsThreeTablesDemo() {
       </svg>
 
       <div style={{ marginTop: 8 }}>
-        <Heading>Where the writes landed in the file</Heading>
+        <SmallLabel>Where the writes landed in the file</SmallLabel>
         <svg viewBox="0 0 400 34" style={{ width: "100%", maxWidth: 640, display: "block" }} role="img" aria-label="write positions">
           <rect x={0} y={4} width={400} height={18} fill="var(--subtle)" />
           {writes.map((w, i) => (

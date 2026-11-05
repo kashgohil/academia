@@ -1,9 +1,9 @@
 /** Demos for "critical sections": an interleaving stepper and the Peterson litmus run. */
 import { useMemo } from "react";
-import { Demo, Param, Stats, select, useParams, toggle } from "../../kit";
+import { Demo, Param, Stats, select, useParams, toggle, Banner, MONO, MiniTable } from "../../kit";
 import { checkPeterson, counterProg, counterSchedules, petersonLitmus, petersonLitmusSrc, petersonProg, type CounterMode, type PetersonStores } from "../../sims/os/sync/critical";
 import { inCritical } from "../../sims/os/sync/machine";
-import { Banner, Cell, CellRow, MONO, MiniTable, SyncStepper } from "./SyncShared";
+import { Cell, CellRow, SyncStepper } from "./SyncShared";
 
 const SCHEMA = {
   scenario: select({

@@ -1,11 +1,11 @@
 /** Demos for "journaling": a crash explorer and a cost comparison of the three modes. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, bytes, range, select, useParams } from "../../kit";
+import { Demo, Param, Stats, bytes, range, select, useParams, Banner, MONO, MiniTable, Note, SmallLabel } from "../../kit";
 import {
   COMMIT_LABEL, COST_DEVICES, COST_INPUTS, COST_MODES, MODE_LABEL, OUTCOME_LABEL, OUTCOME_ORDER, WORKLOAD_LABEL, atomic, classify, dataOk, diskOrder, exploreCrashes, journalCost, metadataOk, orderMask, recover, writePlan,
   type BlockValue, type CommitPolicy, type CostDevice, type JWorkload, type JournalMode, type Outcome,
 } from "../../sims/os/fs/journal";
-import { Banner, HBar, Heading, MONO, MiniTable, Note } from "./FsUi";
+import { HBar } from "./FsUi";
 
 const MODES: JournalMode[] = ["none", "writeback", "ordered", "data"];
 
@@ -68,7 +68,7 @@ export function FsCrashExplorerDemo() {
         {mode !== "none" && <Param spec={J.commit} value={commit} onChange={(v) => { P.set("commit", v as never); reset(); }} />}
       </>}
     >
-      <Heading>The order in which this disk completes the writes. A bar is a flush.</Heading>
+      <SmallLabel>The order in which this disk completes the writes. A bar is a flush.</SmallLabel>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 3, alignItems: "center" }}>
         {order.map((idx, pos) => {
           const w = plan.writes[idx]!;
@@ -83,7 +83,7 @@ export function FsCrashExplorerDemo() {
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12, marginTop: 10 }}>
         <div style={{ border: "1px solid var(--border)", borderRadius: 6, padding: 8 }}>
-          <Heading>On disk at the crash</Heading>
+          <SmallLabel>On disk at the crash</SmallLabel>
           {journal.length > 0 && <>
             <div className="muted" style={{ fontSize: 11, marginBottom: 3 }}>journal</div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 8 }}>
@@ -96,7 +96,7 @@ export function FsCrashExplorerDemo() {
           </div>
         </div>
         <div style={{ border: "1px solid var(--border)", borderRadius: 6, padding: 8 }}>
-          <Heading>After recovery</Heading>
+          <SmallLabel>After recovery</SmallLabel>
           <div className="muted" style={{ fontSize: 11, marginBottom: 3 }}>home locations</div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 8 }}>
             {home.map((id) => <Block key={id} name={id} on={rec.home[id] !== "old"} color={valColor(rec.home[id]!)} sub={rec.home[id]} />)}
@@ -109,7 +109,7 @@ export function FsCrashExplorerDemo() {
       </Banner>
 
       <div style={{ marginTop: 12 }}>
-        <Heading>Every crash state of this configuration: {cases.length}</Heading>
+        <SmallLabel>Every crash state of this configuration: {cases.length}</SmallLabel>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 6 }}>
           {counts.map(({ o, n }) => (
             <button key={o} className="btn" title={OUTCOME_LABEL[o]} onClick={() => setFilter(filter === o ? null : o)} style={{ padding: "1px 7px", fontSize: 12, borderColor: OUT_COLOR[o], outline: filter === o ? `1.5px solid ${OUT_COLOR[o]}` : "none" }}>
@@ -158,7 +158,7 @@ export function FsJournalCostDemo() {
       <Param spec={C.entangled} value={entangled} onChange={(v) => P.set("entangled", v as number)} />
       <Param spec={C.device} value={device} onChange={(v) => P.set("device", v as never)} />
     </>}>
-      <Heading>Blocks written to the device: data in place, journal, checkpoint</Heading>
+      <SmallLabel>Blocks written to the device: data in place, journal, checkpoint</SmallLabel>
       {res.map((r) => (
         <HBar key={r.mode} label={MODE_LABEL[r.mode]} value={`${r.writeAmp.toFixed(r.writeAmp < 10 ? 2 : 1)} times the data`} parts={[
           { frac: r.dataInPlace / maxTotal, color: "var(--c1)", title: "data in place" },
@@ -171,7 +171,7 @@ export function FsJournalCostDemo() {
         <span style={{ ["--swatch" as string]: "var(--c2)" }}>journal</span>
         <span style={{ ["--swatch" as string]: "var(--c5)" }}>checkpoint</span>
       </div>
-      <Heading>Time for fsync to return</Heading>
+      <SmallLabel>Time for fsync to return</SmallLabel>
       {res.map((r) => <HBar key={r.mode} label={MODE_LABEL[r.mode]} value={`${r.fsyncMs.toFixed(r.fsyncMs < 10 ? 3 : 1)} ms`} frac={r.fsyncMs / maxLat} color={MODE_COLOR[r.mode]} />)}
       <div style={{ marginTop: 10 }}>
         <MiniTable

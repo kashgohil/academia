@@ -1,8 +1,7 @@
 /** Demos for the lesson on address spaces. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, toggle, useParams, useWidth } from "../../kit";
+import { Demo, Param, Stats, toggle, useParams, useWidth, Note, mono, seg } from "../../kit";
 import { addressMap, bandBytes, bandLog, fmtBytes, hexShort, hexVa, mapsText, procMaps, twoProcesses, type Band, type MapsLine, type ProcPage } from "../../sims/os/vm";
-import { Note, mono, seg } from "../db/StorageUi";
 
 // ---------------- the address map ----------------
 

@@ -1,11 +1,10 @@
 /** Demos for "FIFO, SJF and round-robin". */
 import { useMemo, useState } from "react";
-import { Demo, Stats, Controls, Plot, Line, RuleX, Dots, range, useParams } from "../../kit";
+import { Demo, Stats, Controls, Plot, Line, RuleX, Dots, range, useParams, Note, SmallLabel, seg } from "../../kit";
 import {
   CLASSIC_PRESETS, compareClassic, equalJobs, logSpace, meanTurnaroundOfOrder, orderExtremes, preset, quantumPoint, switchOverhead,
   type ClassicPolicy, type Job,
 } from "../../sims/os/scheduling";
-import { Note, Caption, seg } from "../db/StorageUi";
 import { Gantt, NumCell, SmallTable, cpuRow, f1, f2, jobColor } from "./SchedulingGantt";
 
 const POLICIES: ClassicPolicy[] = ["fifo", "sjf", "stcf", "rr"];
@@ -28,7 +27,7 @@ function JobEditor({ jobs, onChange }: { jobs: Job[]; onChange: (j: Job[]) => vo
   };
   return (
     <div style={{ marginTop: 10 }}>
-      <Caption>Jobs. Set "I/O after" to 0 for a job that never blocks. Press x to remove a job.</Caption>
+      <SmallLabel>Jobs. Set "I/O after" to 0 for a job that never blocks. Press x to remove a job.</SmallLabel>
       <SmallTable
         head={["Job", "Arrival", "CPU", "I/O after", "I/O wait", ""]}
         rows={jobs.map((j, i) => [
@@ -148,7 +147,7 @@ export function QuantumSweepDemo() {
     <Demo title="Round-robin: response and throughput against the quantum" controls={<Controls params={p} />}>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 14 }}>
         <div style={{ flex: "1 1 260px", minWidth: 0 }}>
-          <Caption>Mean response time (ms, log scale). Lower is better.</Caption>
+          <SmallLabel>Mean response time (ms, log scale). Lower is better.</SmallLabel>
           <Plot x={[0.1, 200]} y={[minR, maxR * 1.4]} logX logY height={200} xLabel="quantum (ms)" xTicks={xTicks} xFormat={(v) => String(v)} yFormat={(v) => String(v)} yTicks={[0.1, 1, 10, 100, 1000].filter((t) => t >= minR && t <= maxR * 1.4)}>
             <Line points={points.map((x) => [x.quantum, x.meanResponse] as [number, number])} color="var(--c1)" />
             <RuleX at={q} color="var(--c4)" dash="none" />
@@ -156,7 +155,7 @@ export function QuantumSweepDemo() {
           </Plot>
         </div>
         <div style={{ flex: "1 1 260px", minWidth: 0 }}>
-          <Caption>Throughput (jobs finished per second). Higher is better.</Caption>
+          <SmallLabel>Throughput (jobs finished per second). Higher is better.</SmallLabel>
           <Plot x={[0.1, 200]} y={[0, maxTh * 1.08]} logX height={200} xLabel="quantum (ms)" xTicks={xTicks} xFormat={(v) => String(v)}>
             <Line points={points.map((x) => [x.quantum, x.throughput] as [number, number])} color="var(--c3)" />
             <RuleX at={q} color="var(--c4)" dash="none" />

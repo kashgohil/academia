@@ -1,11 +1,11 @@
 /** Demos for "Cardinality estimation": histogram builder, correlated columns, error growth through joins. */
 import { useMemo } from "react";
-import { Demo, Param, Plot, Line, Bars, RuleX, RuleY, Legend, Stats, range, toggle, useParams, usePlot } from "../../kit";
+import { Demo, Param, Plot, Line, Bars, RuleX, RuleY, Legend, Stats, range, toggle, useParams, usePlot, Note, SectionLabel, fixed, int, mono, seg, useChunked } from "../../kit";
 import {
   skewedColumn, valueCounts, dataQueries, buildStats, estimateRange, trueRange, histErrors, qError,
   correlatedReport, MODE_LABEL, qErrorCurve, errorSamples, type EstMode,
 } from "../../sims/db/optimizer";
-import { seg, mono, Note, Caption, Code, fx, num, int, useChunked, once, LogBar, logTicks } from "./OptimizerUi";
+import { Code, num, once, LogBar, logTicks } from "./OptimizerUi";
 
 const column = () => once("opt-skewed", () => { const c = skewedColumn(); return { col: c, counts: valueCounts(c), queries: dataQueries(c) }; });
 
@@ -46,7 +46,7 @@ export function HistogramDemo() {
     return { trueBars: tb, estLine: el, yMax: m * 1.08 };
   }, [h, counts, view]);
   const jobs = useMemo(() => (["width", "depth"] as const).flatMap((kind) => SWEEP.map((b) => () => histErrors(buildStats(col, { ...setup, kind, buckets: b }), counts, queries).median)), [v.mcv, v.sample]); // eslint-disable-line react-hooks/exhaustive-deps
-  const sweep = useChunked(`hist:${v.mcv}:${v.sample}`, jobs);
+  const sweep = useChunked(`hist:${v.mcv}:${v.sample}`, jobs, { keep: true });
   const line = (k: number) => SWEEP.map((b, i) => [b, sweep[k * SWEEP.length + i]] as const).filter((x): x is readonly [number, number] => x[1] !== undefined);
   const q = qError(est, truth);
   return (
@@ -65,7 +65,7 @@ export function HistogramDemo() {
       <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 18px", alignItems: "baseline" }}>
         <span>true <b style={mono}>{int(truth)}</b> rows</span>
         <span>estimate <b style={{ ...mono, color: "var(--c1)" }}>{int(est)}</b> rows</span>
-        <span>q-error <b style={{ ...mono, color: q > 2 ? "var(--c4)" : "var(--fg)" }}>{fx(q, 2)}</b></span>
+        <span>q-error <b style={{ ...mono, color: q > 2 ? "var(--c4)" : "var(--fg)" }}>{fixed(q, 2)}</b></span>
       </div>
       <Plot x={[0, view]} y={[0, yMax]} height={220} xLabel="amount" yLabel="rows per value">
         <Shade lo={lo} hi={hi + 1} />
@@ -75,12 +75,12 @@ export function HistogramDemo() {
       </Plot>
       <Legend items={[{ label: "true rows per value", color: "var(--faint)" }, { label: "what the statistics say", color: "var(--c1)" }, ...(h.kind === "depth" ? [{ label: "bucket bounds", color: "var(--c2)" }] : [])]} />
       <Stats items={[
-        { label: "300 range queries: median q-error", value: fx(errs.median, 2) },
-        { label: "90th percentile", value: fx(errs.p90, 2) },
-        { label: "worst", value: fx(errs.max, 1) },
-        { label: "MCV values · their share", value: `${h.mcv.length} · ${fx((1 - h.histFrac) * 100, 1)}%` },
+        { label: "300 range queries: median q-error", value: fixed(errs.median, 2) },
+        { label: "90th percentile", value: fixed(errs.p90, 2) },
+        { label: "worst", value: fixed(errs.max, 1) },
+        { label: "MCV values · their share", value: `${h.mcv.length} · ${fixed((1 - h.histFrac) * 100, 1)}%` },
       ]} />
-      <Caption>Median q-error against the number of buckets (same MCV and sample setting)</Caption>
+      <SectionLabel>Median q-error against the number of buckets (same MCV and sample setting)</SectionLabel>
       <Plot x={[2, 100]} y={[1, 3]} logX height={170} xLabel="buckets" yLabel="median q-error" xTicks={[2, 5, 10, 20, 50, 100]}>
         <Line points={line(0)} color="var(--c3)" />
         <Line points={line(1)} color="var(--c1)" />
@@ -102,7 +102,7 @@ function EstCell({ est, truth }: { est: number; truth: number }) {
   const color = q >= 10 ? "var(--c4)" : q >= 2 ? "var(--c5)" : "var(--c3)";
   return (
     <div style={{ minWidth: 0 }}>
-      <div style={{ ...mono, fontSize: 13 }}>{int(Math.max(0, est))} <span style={{ color, fontSize: 11.5 }}>{q < 1.005 ? "exact" : `${est > truth ? "↑" : "↓"}${fx(q, q < 10 ? 1 : 0)}×`}</span></div>
+      <div style={{ ...mono, fontSize: 13 }}>{int(Math.max(0, est))} <span style={{ color, fontSize: 11.5 }}>{q < 1.005 ? "exact" : `${est > truth ? "↑" : "↓"}${fixed(q, q < 10 ? 1 : 0)}×`}</span></div>
       <LogBar value={Math.max(1, est)} lo={1} hi={1e5} color={color} height={7} />
     </div>
   );
@@ -149,12 +149,12 @@ export function CorrelatedDemo() {
         <div><span className="muted" style={{ fontSize: 11 }}>ndistinct:</span><EstCell est={rep.groups.ndistinct} truth={rep.groups.truth} /></div>
       </div>
       <Stats items={[
-        { label: "dependency degree zip ⇒ city", value: fx(rep.degree, 3) },
+        { label: "dependency degree zip ⇒ city", value: fixed(rep.degree, 3) },
         { label: "distinct (city, zip) pairs", value: int(rep.pairs) },
-        { label: "MCV items · rows they cover", value: `${rep.mcvItems} · ${fx(rep.mcvTotal * 100, 1)}%` },
+        { label: "MCV items · rows they cover", value: `${rep.mcvItems} · ${fixed(rep.mcvTotal * 100, 1)}%` },
         { label: "per-column: P(city) × P(zip)", value: `1/${v.cities} × 1/${v.cities * v.zpc}` },
       ]} />
-      <Caption>The fix in PostgreSQL 14 and later</Caption>
+      <SectionLabel>The fix in PostgreSQL 14 and later</SectionLabel>
       <Code>{`CREATE STATISTICS addr_geo (dependencies, ndistinct, mcv) ON city, zip FROM addresses;\nALTER STATISTICS addr_geo SET STATISTICS ${v.target};\nANALYZE addresses;`}</Code>
       <Note>"+ deps" adds dependencies statistics; "+ mcv" adds a multi-column MCV list. "↓20×" means the estimate is 20 times too small. The bars use a log scale from 1 to 100,000 rows. A true count of 0 is compared as 1 row, as the planner never estimates fewer than 1 row.</Note>
     </Demo>
@@ -197,14 +197,14 @@ export function ErrorGrowthDemo() {
         <RuleY at={10} label="10×" />
       </Plot>
       <Legend items={[{ label: "median", color: "var(--c1)" }, { label: "90th percentile", color: "var(--c5)" }, { label: "99th percentile", color: "var(--c4)" }]} />
-      <Caption>2,000 queries with {v.joins} join{v.joins === 1 ? "" : "s"}: log₁₀(estimate / true)</Caption>
+      <SectionLabel>2,000 queries with {v.joins} join{v.joins === 1 ? "" : "s"}: log₁₀(estimate / true)</SectionLabel>
       <Plot x={[-6, 6]} y={[0, Math.max(...hist.map((b) => b.y)) * 1.1]} height={150} xLabel="log₁₀(estimate / true)" xFormat={(x) => (x === 0 ? "exact" : x < 0 ? `÷10^${-x}` : `×10^${x}`)} xTicks={[-6, -4, -2, 0, 2, 4, 6]}>
         <Bars bins={hist} color="var(--c2)" />
         <RuleX at={0} color="var(--fg)" />
       </Plot>
       <Stats items={[
         { label: "estimates in the product", value: 2 * v.joins + 1 },
-        { label: "median q-error", value: fx(at.median, 1) },
+        { label: "median q-error", value: fixed(at.median, 1) },
         { label: "90th percentile", value: num(at.p90, 3) },
         { label: "under-estimates", value: `${Math.round(at.under * 100)}%` },
       ]} />

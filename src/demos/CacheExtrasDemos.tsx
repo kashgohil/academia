@@ -1,6 +1,6 @@
 /** Explainer demos for the Caches lessons: steppers and direct-manipulation views. */
 import { useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import { Demo, Stats, Param, Canvas2D, cssVar, Legend, SimButtons, useSim, range, select, bytes, pct } from "../kit";
+import { Demo, Stats, Param, Canvas2D, cssVar, Legend, SimButtons, useSim, range, select, bytes, pct, Note, mono, seg } from "../kit";
 import {
   splitAddress, SetCache, matrixWalk, loopHitRate, amat, reuseSteps, REUSE_TRACES, hitsAt, strideTraffic,
   loopIndex, innerLines, runTwoLevel, HIER_TRACES, hotMissShare, prefetchTimeline, cyclesPerLine, strideSteps, twoStreams,
@@ -16,12 +16,8 @@ function useStepper(len: number, perSec: number) {
   return { i: Math.min(i, len - 1), sim };
 }
 
-const seg = <T extends string>(label: string, options: [T, string][], def: T) =>
-  select<T>({ label, options: options.map(([value, l]) => ({ value, label: l })), default: def, segmented: true });
 
-const mono: CSSProperties = { fontVariantNumeric: "tabular-nums", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" };
 
-const Note = ({ children }: { children: ReactNode }) => <p className="muted" style={{ fontSize: 12.5, margin: "10px 0 0" }}>{children}</p>;
 
 const Box = ({ children, bg, fg, outline, title, style }: { children?: ReactNode; bg?: string; fg?: string; outline?: string; title?: string; style?: CSSProperties }) => (
   <div title={title} style={{ height: 24, borderRadius: 4, display: "grid", placeItems: "center", fontSize: 11, fontWeight: 600, background: bg ?? "var(--subtle)", color: fg ?? "var(--fg)", border: "1px solid var(--border)", outline: outline ? `2px solid ${outline}` : undefined, outlineOffset: 1, transition: "background 0.2s", minWidth: 0, ...style }}>

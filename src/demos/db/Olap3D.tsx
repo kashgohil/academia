@@ -3,9 +3,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
-import { Demo, Stats, Param, Legend, cssVar, pct } from "../../kit";
+import { Demo, Stats, Param, Legend, cssVar, pct, seg } from "../../kit";
 import { Layout, footprint, cellsOf, wideSchema, type LayoutKind } from "../../sims/db/olap";
-import { seg } from "./OlapShared";
 
 const COLS = 8, ROWS = 64, PAGE = 512; // 8-byte values: a page holds 64 values
 const CW = 1, RD = 0.25, H = 0.45, GAP = 0.4, MINI = 0.14, LIFT = 1.6;

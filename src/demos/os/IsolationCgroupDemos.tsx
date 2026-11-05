@@ -1,11 +1,11 @@
 /** Demos for "cgroups": cpu.max throttling and p99 latency, the cpu.weight tree, and the memory limits. */
 import { useMemo, useRef, useState } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleY, Dots, Stats, range, toggle, useParams } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleY, Dots, Stats, range, toggle, useParams, Banner, Note, Panel, mono, seg } from "../../kit";
 import {
   CPU_WEIGHT, EXAMPLE_TREE, LATENCY_WORKLOAD, Memcg, levelSums, simulateBandwidth, simulateLatency, throttleStall, weightShares, type CgNode, type MemEvent,
 } from "../../sims/os/isolation";
 import { Gantt } from "./SchedulingGantt";
-import { Card, Note, Verdict, mono, seg, twoCol } from "./IsolationUi";
+import { twoCol } from "./IsolationUi";
 
 // ---------------- cpu.max ----------------
 
@@ -206,7 +206,7 @@ export function IsolationMemcgDemo() {
       </div>
       <Legend items={[...seg2.map((s) => ({ label: `${s.label} ${s.value} MiB`, color: s.color })), ...(m.swap ? [{ label: `swap ${m.swap} MiB`, color: "var(--faint)" }] : [])]} />
       <div style={{ ...twoCol, marginTop: 8 }}>
-        <Card title="memory.events and friends">
+        <Panel title="memory.events and friends">
           <Stats items={[
             { label: "memory.current", value: `${m.current} MiB` },
             { label: "high", value: m.counters.high },
@@ -217,15 +217,15 @@ export function IsolationMemcgDemo() {
           <div style={{ marginTop: 8 }}>
             <Stats items={[{ label: "reclaimed in total", value: `${m.reclaimedMiB} MiB` }, { label: "sleep from memory.high (model)", value: `${(m.stallMs / 1000).toFixed(1)} s` }]} />
           </div>
-        </Card>
-        <Card title="What the kernel did">
+        </Panel>
+        <Panel title="What the kernel did">
           <div style={{ fontSize: 12.5, lineHeight: 1.45, maxHeight: 150, overflowY: "auto" }}>
             {m.events.length === 0 && <span className="muted">Nothing yet. sidecar holds 40 MiB.</span>}
             {m.events.slice(-6).map((e, i) => <div key={i} style={{ color: EV_COLOR[e.kind] }}>{e.text}</div>)}
           </div>
-        </Card>
+        </Panel>
       </div>
-      {!app.alive && <Verdict tone="bad">The app is dead. The container runtime reports OOMKilled, and the node may still have free memory.</Verdict>}
+      {!app.alive && <Banner tone="bad">The app is dead. The container runtime reports OOMKilled, and the node may still have free memory.</Banner>}
     </Demo>
   );
 }

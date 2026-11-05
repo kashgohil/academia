@@ -1,11 +1,10 @@
 /** Demos for "Multilevel feedback queues". */
 import { useEffect, useMemo, useState } from "react";
-import { Demo, Stats, Controls, Plot, Line, Legend, RuleX, range, useParams, useSim, useWidth, pct } from "../../kit";
+import { Demo, Stats, Controls, Plot, Line, Legend, RuleX, range, useParams, useSim, useWidth, pct, Note, SmallLabel, mono, seg } from "../../kit";
 import {
   MLFQ_MIX, MLFQ_STARVE, cpuShare, gamingRun, logSpace, simulateMlfq, snapshotAt, starveShare, summarize,
   type Accounting, type MlfqConfig, type MlfqSnapshot, type Job,
 } from "../../sims/os/scheduling";
-import { Caption, Note, seg, mono } from "../db/StorageUi";
 import { Gantt, cpuRow, jobColor, jobRows, f1 } from "./SchedulingGantt";
 
 const ACCOUNTING: [Accounting, string][] = [["allotment", "Rule 4: count all use"], ["slice", "Old 4a/4b: a yield clears the count"]];
@@ -137,9 +136,9 @@ export function MlfqGamingDemo() {
   const color = (id: number) => (id === 1 ? "var(--c4)" : "var(--c1)");
   return (
     <Demo title="A job yields just before its quantum ends" controls={<Controls params={p} />}>
-      <Caption>The first 90 ms. Hog is blue. Gamer is red. The quantum is 10 ms at every level.</Caption>
+      <SmallLabel>The first 90 ms. Hog is blue. Gamer is red. The quantum is 10 ms at every level.</SmallLabel>
       <Gantt rows={[cpuRow(old.trace, "4a/4b", 0, color), cpuRow(fix.trace, "Rule 4", 0, color)]} end={90} labelW={44} />
-      <Caption>Gamer's CPU share since time 0</Caption>
+      <SmallLabel>Gamer's CPU share since time 0</SmallLabel>
       <Plot x={[0, horizon]} y={[0, 100]} height={170} xLabel="time (ms)" yFormat={(v) => `${v}%`} yTicks={[0, 25, 50, 75, 100]}>
         <Line points={curve(old.trace)} color="var(--c4)" />
         <Line points={curve(fix.trace)} color="var(--c1)" />

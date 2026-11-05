@@ -1,11 +1,10 @@
 /** Demos for "Tuning an LSM tree": a tuning panel on the cost model, and B+ tree vs LSM. */
 import { useMemo, useState } from "react";
-import { Demo, Stats, Param, Legend, range, Plot, Line, RuleX, Dots, bytes, pct, si } from "../../kit";
+import { Demo, Stats, Param, Legend, range, Plot, Line, RuleX, Dots, bytes, pct, si, Note, SectionLabel, StackBar, fixed, mono, seg } from "../../kit";
 import {
   lsmCosts, lsmThroughput, compareEngines, crossover, EXAMPLE_DATA, WORKLOADS, ROCKSDB_DEFAULTS, dataBytes,
   type LsmConfig, type WorkloadName, type Strategy,
 } from "../../sims/db/lsm";
-import { seg, mono, Note, Caption, fx, StackBar } from "./LsmShared";
 
 const MiB = 2 ** 20, GiB = 2 ** 30, KiB = 1024;
 
@@ -64,22 +63,22 @@ export function TuningPanelDemo() {
         <span style={{ fontSize: 28, fontWeight: 700, ...mono }}>{si(tp.opsPerSec, "", 3)}</span>
         <span className="muted" style={{ fontSize: 13 }}>operations/s (model score) · RocksDB defaults: {si(ref, "", 3)} · {tp.opsPerSec >= ref ? "+" : ""}{pct(tp.opsPerSec / ref - 1, 0)}</span>
       </div>
-      <Caption>Where the time goes</Caption>
+      <SectionLabel>Where the time goes</SectionLabel>
       <StackBar parts={[{ value: tp.share.write, color: "var(--c1)", label: "writes" }, { value: tp.share.point, color: "var(--c3)", label: "point reads" }, { value: tp.share.range, color: "var(--c2)", label: "range scans" }]} />
       <div style={{ marginTop: 4 }}><Legend box items={[{ label: `writes ${pct(tp.share.write, 0)}`, color: "var(--c1)" }, { label: `point reads ${pct(tp.share.point, 0)}`, color: "var(--c3)" }, { label: `range scans ${pct(tp.share.range, 0)}`, color: "var(--c2)" }]} /></div>
       <Stats
         items={[
-          { label: "write amp", value: fx(k.writeAmp, 1) },
-          { label: `${style === "leveled" ? "levels below L0" : "tiers"} · sorted runs`, value: `${k.levels} · ${fx(k.runs, 1)}` },
-          { label: "block reads: hit · miss key", value: `${fx(k.pointIos, 3)} · ${fx(k.missIos, 3)}` },
-          { label: `block reads per ${w.scanLength}-row scan`, value: fx(k.rangeIos, 1) },
-          { label: "space amp (this workload)", value: fx(k.spaceAmp, 2) },
+          { label: "write amp", value: fixed(k.writeAmp, 1) },
+          { label: `${style === "leveled" ? "levels below L0" : "tiers"} · sorted runs`, value: `${k.levels} · ${fixed(k.runs, 1)}` },
+          { label: "block reads: hit · miss key", value: `${fixed(k.pointIos, 3)} · ${fixed(k.missIos, 3)}` },
+          { label: `block reads per ${w.scanLength}-row scan`, value: fixed(k.rangeIos, 1) },
+          { label: "space amp (this workload)", value: fixed(k.spaceAmp, 2) },
           { label: "block cache hit rate", value: pct(k.cacheHit, 1) },
           { label: "memory: total", value: bytes(k.memory.total) },
           { label: "filters · index", value: `${bytes(k.memory.filters)} · ${bytes(k.memory.index)}` },
         ]}
       />
-      <Caption>The same choices as RocksDB options (C++)</Caption>
+      <SectionLabel>The same choices as RocksDB options (C++)</SectionLabel>
       <pre style={{ ...mono, fontSize: 11.5, background: "var(--subtle)", border: "1px solid var(--border)", borderRadius: 6, padding: "8px 10px", margin: 0, overflowX: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{opts.join("\n")}</pre>
       <Note>Data: {bytes(dataBytes(EXAMPLE_DATA))} raw. The score is a model: NVMe-class disk (400k random reads/s, 2 GiB/s sequential), compaction reads and writes at sequential speed, uniform key access.</Note>
     </Demo>
@@ -104,11 +103,11 @@ export function BtreeVsLsmDemo() {
   const cross = useMemo(() => crossover(budget, pageBytes), [budget, pageBytes]);
   const yMax = Math.max(...curve.lsm.map((p) => p[1]), ...curve.bt.map((p) => p[1])) * 1.1;
   const rows: [string, string, string][] = [
-    ["bytes written per user byte", fx(r.btree.costs.writeAmp, 0), fx(r.lsm.costs.writeAmp, 1)],
-    ["block reads per point lookup", fx(r.btree.costs.pointIos, 2), fx(r.lsm.costs.pointIos * (1 - r.lsm.costs.cacheHit), 2)],
-    ["space amplification", fx(r.btree.costs.spaceAmp, 2), fx(r.lsm.costs.spaceAmp, 2)],
+    ["bytes written per user byte", fixed(r.btree.costs.writeAmp, 0), fixed(r.lsm.costs.writeAmp, 1)],
+    ["block reads per point lookup", fixed(r.btree.costs.pointIos, 2), fixed(r.lsm.costs.pointIos * (1 - r.lsm.costs.cacheHit), 2)],
+    ["space amplification", fixed(r.btree.costs.spaceAmp, 2), fixed(r.lsm.costs.spaceAmp, 2)],
     ["cache for data pages", bytes(budget), bytes(r.lsm.cfg.blockCacheBytes)],
-    ["throughput score (k ops/s)", fx(r.btree.opsPerSec / 1000, 0), fx(r.lsm.tput.opsPerSec / 1000, 0)],
+    ["throughput score (k ops/s)", fixed(r.btree.opsPerSec / 1000, 0), fixed(r.lsm.tput.opsPerSec / 1000, 0)],
   ];
   return (
     <Demo
@@ -133,7 +132,7 @@ export function BtreeVsLsmDemo() {
           </div>
         ))}
       </div>
-      <Caption style={{ marginTop: 14 }}>Throughput score against the share of writes</Caption>
+      <SectionLabel style={{ marginTop: 14 }}>Throughput score against the share of writes</SectionLabel>
       <Plot x={[0, 1]} y={[0, yMax]} height={220} xLabel="share of writes" yLabel="k ops/s" xFormat={(v) => pct(v, 0)}>
         <Line points={curve.bt} color="var(--c2)" />
         <Line points={curve.lsm} color="var(--c1)" />

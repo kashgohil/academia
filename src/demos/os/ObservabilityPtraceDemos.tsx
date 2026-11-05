@@ -1,11 +1,11 @@
 /** Lesson: ptrace and strace. A tracer and tracee stepper, a breakpoint stepper, and an overhead plot. */
 import { useMemo, useState } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleX, Stats, range, select, si, useParams } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleX, Stats, range, select, si, useParams, IndexButtons, IndexSlider, Note, Panel, SmallLabel, mono, seg, tint } from "../../kit";
 import {
   DEMO_PROGRAM, FN_ADDR, INT3, RFLAGS_BASE, TEXT_BASE, TF_BIT, TRACE_INPUTS, breakpointSteps, instructionList, slowdown, stopNs, straceSteps,
   type Mistake, type StraceStep, type UserRegs,
 } from "../../sims/os/observability";
-import { Cap, Msg, Note, Panel, StepButtons, StepSlider, mono, seg, tint } from "./ProcessesUi";
+import { Msg } from "./ProcessesUi";
 
 const hex = (n: number) => `0x${n.toString(16)}`;
 const hex2 = (n: number) => n.toString(16).padStart(2, "0");
@@ -48,9 +48,9 @@ export function PtraceStepperDemo() {
   return (
     <Demo
       title="Two processes, one CPU: each stop is a switch"
-      actions={<StepButtons k={kk} n={steps.length} set={setK} />}
+      actions={<IndexButtons k={kk} n={steps.length} set={setK} />}
       controls={<>
-        <StepSlider k={kk} n={steps.length} set={setK} />
+        <IndexSlider k={kk} n={steps.length} set={setK} />
         <Param spec={p.schema.mode} value={p.values.mode} onChange={(v) => { p.set("mode", v as "all"); setK(0); }} />
         <Param spec={p.schema.filter} value={p.values.filter} onChange={(v) => { p.set("filter", v as "all"); setK(0); }} />
       </>}
@@ -138,9 +138,9 @@ export function BreakpointStepperDemo() {
   return (
     <Demo
       title="A breakpoint: patch, trap, rewind, step, patch again"
-      actions={<StepButtons k={kk} n={steps.length} set={setK} />}
+      actions={<IndexButtons k={kk} n={steps.length} set={setK} />}
       controls={<>
-        <StepSlider k={kk} n={steps.length} set={setK} />
+        <IndexSlider k={kk} n={steps.length} set={setK} />
         <Param spec={p.schema.bp} value={p.values.bp} onChange={(v) => { p.set("bp", v as string); setK(0); }} />
         <Param spec={p.schema.mistake} value={p.values.mistake} onChange={(v) => { p.set("mistake", v as Mistake); setK(0); }} />
       </>}
@@ -204,7 +204,7 @@ export function TraceOverheadDemo() {
       <Param spec={p.schema.work} value={v.work} onChange={(x) => p.set("work", x as number)} />
       <Param spec={p.schema.share} value={v.share} onChange={(x) => p.set("share", x as number)} />
     </>}>
-      <Cap>One loop: user work, then one system call. Slowdown against the same loop with no tool. All costs are model inputs.</Cap>
+      <SmallLabel>One loop: user work, then one system call. Slowdown against the same loop with no tool. All costs are model inputs.</SmallLabel>
       <Plot x={[10, 1000000]} y={[1, 100]} logX logY height={250} xLabel="user work between calls (ns)" yLabel="slowdown (times)" xTicks={[10, 100, 1000, 10000, 100000, 1000000]} yTicks={[1, 2, 5, 10, 20, 50, 100]} xFormat={(t) => si(t)} yFormat={(t) => `${t}×`}>
         <Line points={line("strace")} color="var(--c4)" />
         <Line points={line("seccomp")} color="var(--c2)" />

@@ -6,7 +6,7 @@ import {
   cachedLevels, bstDepth, btreeLookupLines, LAB_KEYS, type InsertOrder, type SplitPolicy, type BulkStep,
 } from "../../sims/db/btree";
 import { mulberry32 } from "../../sims/rng";
-import { TreeView, type ViewNode, mono } from "./BtreeView";
+import { TreeView, type ViewNode, codeText } from "./BtreeView";
 
 const C = { path: "var(--c1)", changed: "var(--c3)", bad: "var(--c4)", added: "var(--c2)", donor: "var(--c5)" };
 
@@ -199,7 +199,7 @@ export function BTreeLabDemo() {
         keyColor={(_id, k) => (f?.mark && f.mark.key === k ? f.mark.color : undefined)}
         cell={order >= 7 ? 20 : 22}
       />
-      <div style={{ ...mono, minHeight: 44, marginTop: 10, padding: "8px 10px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--subtle)", lineHeight: 1.45 }}>
+      <div style={{ ...codeText, minHeight: 44, marginTop: 10, padding: "8px 10px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--subtle)", lineHeight: 1.45 }}>
         {f ? f.caption : "Pick a key and press Insert, Delete, Find or Scan. Every step of the operation plays here."}
       </div>
       <div className="row" style={{ justifyContent: "space-between", marginTop: 8 }}>
@@ -483,10 +483,10 @@ export function BulkLoadDemo() {
       <TreeView root={toView(built.snap)} faint={faint} color={color} cell={order >= 7 ? 19 : 22} />
       <div style={{ display: "flex", flexWrap: "wrap", gap: 2, marginTop: 10 }} aria-label="sorted input">
         {Array.from({ length: n }, (_, i) => (
-          <span key={i} style={{ ...mono, fontSize: 10.5, minWidth: 18, textAlign: "center", padding: "1px 0", borderRadius: 3, border: "1px solid var(--border)", color: i < consumed ? "var(--faint)" : "var(--fg)", background: i < consumed ? undefined : "var(--subtle)" }}>{i + 1}</span>
+          <span key={i} style={{ ...codeText, fontSize: 10.5, minWidth: 18, textAlign: "center", padding: "1px 0", borderRadius: 3, border: "1px solid var(--border)", color: i < consumed ? "var(--faint)" : "var(--fg)", background: i < consumed ? undefined : "var(--subtle)" }}>{i + 1}</span>
         ))}
       </div>
-      <div style={{ ...mono, minHeight: 40, marginTop: 10, lineHeight: 1.45 }}>{text}</div>
+      <div style={{ ...codeText, minHeight: 40, marginTop: 10, lineHeight: 1.45 }}>{text}</div>
       <div style={{ height: 8 }} />
       <Stats
         items={[

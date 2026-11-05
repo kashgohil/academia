@@ -1,11 +1,11 @@
 /** Lesson: threads. What clone flags share, a Go-style scheduler, and the memory of many tasks. */
 import { useMemo, useRef, useState } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleX, SimButtons, Stats, bytes, range, si, useParams, useSim } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleX, SimButtons, Stats, bytes, range, si, useParams, useSim, Note, Panel, mono, seg, tint } from "../../kit";
 import {
   ALWAYS_PRIVATE, CLONE, Gmp, PTHREAD_FLAGS, RESOURCES, SCENARIO_LABEL, SIGCHLD, STACK, asyncMemory, chdir, cloneError, exitGroup, goroutineMemory, newPair, openFd, scenario, sigaction, threadMemory, threadsAtMapLimit, writeX,
   type GmpScenario, type TaskPair,
 } from "../../sims/os/processes";
-import { Msg, Note, Panel, bigBytes, mono, seg, tint } from "./ProcessesUi";
+import { Msg, bigBytes } from "./ProcessesUi";
 
 const FLAG_LIST = RESOURCES.map((r) => ({ flag: r.flag, name: r.flagName }));
 

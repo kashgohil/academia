@@ -1,8 +1,8 @@
 /** Demos for "containers": assemble a container primitive by primitive, and step through overlayfs. */
 import { useMemo, useRef, useState } from "react";
-import { Demo, Stats, bytes } from "../../kit";
+import { Demo, Stats, bytes, Banner, Note, Panel, mono, type Tone } from "../../kit";
 import { ALL_PRIMITIVES, Overlay, PRIMITIVES, containerView, sampleImage, type ContainerView, type OverlayEvent, type PrimitiveId } from "../../sims/os/isolation";
-import { Badge, Card, Note, Scroll, Verdict, mono, smallTable, td, th, twoCol, type Tone } from "./IsolationUi";
+import { Badge, Scroll, smallTable, td, th, twoCol } from "./IsolationUi";
 
 const ROWS: { key: string; label: string; show: (v: ContainerView) => string }[] = [
   { key: "pid", label: "getpid()", show: (v) => String(v.pid) },
@@ -53,7 +53,7 @@ export function IsolationAssembleDemo() {
           })}
         </div>
         <div style={{ minWidth: 0 }}>
-          <Card title="What the process sees">
+          <Panel title="What the process sees">
             <table style={smallTable}><tbody>
               {ROWS.map((r) => {
                 const value = r.show(view);
@@ -66,16 +66,16 @@ export function IsolationAssembleDemo() {
                 );
               })}
             </tbody></table>
-          </Card>
+          </Panel>
         </div>
       </div>
       {view.exposed.length > 0
-        ? <Card title={`Exposed with this set: ${view.exposed.length} class${view.exposed.length === 1 ? "" : "es"} of risk`} style={{ marginTop: 10 }}>
+        ? <Panel title={`Exposed with this set: ${view.exposed.length} class${view.exposed.length === 1 ? "" : "es"} of risk`} style={{ marginTop: 10 }}>
             <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12.5, lineHeight: 1.45, maxHeight: 170, overflowY: "auto" }}>
               {view.exposed.map((e) => <li key={e}>{e}</li>)}
             </ul>
-          </Card>
-        : <Verdict tone="good">All primitives are on. The process still shares the kernel of the host: <span style={mono}>uname -r</span> did not change.</Verdict>}
+          </Panel>
+        : <Banner tone="good">All primitives are on. The process still shares the kernel of the host: <span style={mono}>uname -r</span> did not change.</Banner>}
       {done || <Note>Each toggle shows a class of exposure only, not a way to use it. Turn PID on with the mount namespace off: <span style={mono}>getpid()</span> is 1, yet <span style={mono}>ps</span> still reads the host's /proc.</Note>}
     </Demo>
   );
@@ -149,8 +149,8 @@ export function IsolationOverlayDemo() {
         ]} />
       </div>
       {last.length > 0
-        ? last.map((e, i) => <Verdict key={i} tone={EV_TONE[e.kind]}><Badge tone={EV_TONE[e.kind]}>{e.kind}</Badge> {e.text}</Verdict>)
-        : <Verdict tone="none">The orange outline shows the layer that serves a read of each path. Write 1 byte to <span style={mono}>/data/seed.db</span>.</Verdict>}
+        ? last.map((e, i) => <Banner key={i} tone={EV_TONE[e.kind]}><Badge tone={EV_TONE[e.kind]}>{e.kind}</Badge> {e.text}</Banner>)
+        : <Banner tone="none">The orange outline shows the layer that serves a read of each path. Write 1 byte to <span style={mono}>/data/seed.db</span>.</Banner>}
       <Note>The upper layer is writable, and the others are read-only. Layers fade below the outlined one, because a read never reaches them.</Note>
     </Demo>
   );

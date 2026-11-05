@@ -1,12 +1,10 @@
 /** Demos for "blocking, non-blocking and async I/O": server cost as N grows, level and edge triggering, and starvation. */
 import { useMemo, useState } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleX, Stats, bytes as fmtBytes, range, si, useParams } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleX, Stats, bytes as fmtBytes, range, si, useParams, Banner, MiniTable, Panel, SmallLabel, mono, seg } from "../../kit";
 import {
   EVENT_FACTS, EpollSocket, STARVE_MODEL, drainNeverEndsMBps, maxConnections, runReader, serverCost, starvationRun, threadsLimit,
   type ServerModel, type TriggerMode,
 } from "../../sims/os/io";
-import { Banner, MiniTable } from "./SyncShared";
-import { Cap, Panel, mono, seg } from "./ProcessesUi";
 
 // ---------------------------------------------------------------- server cost
 
@@ -42,7 +40,7 @@ export function IoServerCostDemo() {
     >
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12 }}>
         <div>
-          <Cap>Memory that grows with N</Cap>
+          <SmallLabel>Memory that grows with N</SmallLabel>
           <Plot x={[10, 1e6]} y={[2 ** 13, 2 ** 37]} logX logY height={190} xTicks={[10, 1e3, 1e5]} yTicks={[2 ** 14, 2 ** 20, 2 ** 26, 2 ** 32]} xFormat={(v) => si(v)} yFormat={(v) => fmtBytes(v)} xLabel="connections">
             {MODELS.map((m, i) => <Line key={m} points={series(i, (c) => Math.max(2 ** 13, c.memBytes))} color={COLOR[m]} />)}
             <RuleX at={n} />
@@ -50,7 +48,7 @@ export function IoServerCostDemo() {
           </Plot>
         </div>
         <div>
-          <Cap>CPU cores in use. An event loop has one core.</Cap>
+          <SmallLabel>CPU cores in use. An event loop has one core.</SmallLabel>
           <Plot x={[10, 1e6]} y={[1e-4, 100]} logX logY height={190} xTicks={[10, 1e3, 1e5]} yTicks={[1e-3, 1e-1, 1, 10]} xFormat={(v) => si(v)} yFormat={(v) => (v >= 1 ? String(v) : v.toString())} xLabel="connections">
             {MODELS.map((m, i) => <Line key={m} points={series(i, (c) => Math.max(1e-4, c.cores))} color={COLOR[m]} />)}
             <RuleX at={n} />

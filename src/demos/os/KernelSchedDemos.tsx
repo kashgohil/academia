@@ -1,8 +1,8 @@
 /** Lesson: a simple scheduler. Kernel threads at stack level, and the run queue against an interrupt. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, select, toggle } from "../../kit";
+import { Demo, Param, Stats, select, toggle, Banner, IndexButtons, IndexSlider, Note, SmallLabel, mono, seg, tint } from "../../kit";
 import { CALLEE, RACE_LABEL, queueOf, raceProg, raceReport, schedSnaps, type KRow, type RaceMode, type SchedMode, type SchedSnap } from "../../sims/os/kernel";
-import { Chip, Cap, Msg, Note, RegCell, StepButtons, StepSlider, Verdict, mono, seg, tint } from "./KernelUi";
+import { Chip, Msg, RegCell } from "./KernelUi";
 import { SyncStepper } from "./SyncShared";
 
 const TC: Record<string, string> = { A: "var(--c1)", B: "var(--c2)", C: "var(--c3)", idle: "var(--muted)" };
@@ -56,9 +56,9 @@ export function KernelSchedDemo() {
   return (
     <Demo
       title="Kernel threads on one CPU"
-      actions={<StepButtons k={kk} n={snaps.length} set={setK} />}
+      actions={<IndexButtons k={kk} n={snaps.length} set={setK} />}
       controls={<>
-        <StepSlider k={kk} n={snaps.length} set={setK} />
+        <IndexSlider k={kk} n={snaps.length} set={setK} />
         <Param spec={seg<SchedMode>("Kernel", [["preemptive", "preemptive"], ["cooperative", "cooperative"]], "preemptive")} value={mode} onChange={(v) => setMode(v as SchedMode)} />
         <Param spec={toggle({ label: "The trampoline runs sti", default: true })} value={sti} onChange={(v) => setSti(v as boolean)} />
         <Param spec={toggle({ label: "A calls yield() in its loop", default: false })} value={aYields} onChange={(v) => setAYields(v as boolean)} />
@@ -81,7 +81,7 @@ export function KernelSchedDemo() {
       <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
         {s.threads.map((t) => <ThreadStack key={t.name} t={t} s={s} />)}
       </div>
-      <Cap><span style={{ display: "block", marginTop: 8 }}>CPU. A red frame marks a change in this step.</span></Cap>
+      <SmallLabel><span style={{ display: "block", marginTop: 8 }}>CPU. A red frame marks a change in this step.</span></SmallLabel>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(84px, 1fr))", gap: 3 }}>
         <RegCell name="rip" value={s.rip.replace("thread_trampoline", "trampoline")} hot={s.rip !== prev.rip} style={{ gridColumn: "span 2" }} />
         <RegCell name="rsp" value={`…${s.rsp.toString(16).slice(-6)}`} hot={s.rsp !== prev.rsp} />
@@ -145,9 +145,9 @@ export function IrqRaceDemo() {
             { label: "deadlock", value: rep.deadlock },
             { label: "states searched", value: rep.explored.states },
           ]} />
-          <Verdict tone={rep.corrupt || rep.deadlock ? "bad" : "good"}>
+          <Banner tone={rep.corrupt || rep.deadlock ? "bad" : "good"}>
             {rep.corrupt ? "Exhaustive search finds a corrupt queue." : rep.deadlock ? "Exhaustive search finds a deadlock: the handler spins on a lock that the thread under it holds." : "Exhaustive search finds no bad schedule."}
-          </Verdict>
+          </Banner>
         </>
       }
     />

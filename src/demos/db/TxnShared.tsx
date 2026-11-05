@@ -1,96 +1,16 @@
 /** Shared pieces for the transaction demos: colors, a frame stepper with a slider, captions, a small digraph. */
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { Param, range } from "../../kit";
+import { Arrow } from "../../kit";
 
 /** Transaction colors: T1 blue, T2 orange, T3 purple, T4 grey. Green and red mean good and bad. */
 export const TC = ["var(--c1)", "var(--c2)", "var(--c5)", "var(--muted)"];
 export const tcol = (t: number) => TC[t % TC.length]!;
-export const GOOD = "var(--c3)";
-export const BAD = "var(--c4)";
-export const MONO = "ui-monospace, Menlo, monospace";
 
-/** Index into a list of frames, with play, back, step and a slider. */
-export function useStepper(n: number, fps = 1.5) {
-  const [i, setI] = useState(0);
-  const [running, setRunning] = useState(false);
-  const last = Math.max(0, n - 1);
-  const cur = Math.min(i, last);
-  const ref = useRef(cur);
-  ref.current = cur;
-  useEffect(() => {
-    if (!running) return;
-    const id = window.setInterval(() => {
-      if (ref.current >= last) { setRunning(false); return; }
-      setI(ref.current + 1);
-    }, 1000 / fps);
-    return () => window.clearInterval(id);
-  }, [running, last, fps]);
-  return {
-    i: cur,
-    n,
-    atEnd: cur >= last,
-    running,
-    go: (j: number) => { setRunning(false); setI(Math.max(0, Math.min(last, j))); },
-    toggle: () => { if (cur >= last && !running) setI(0); setRunning((r) => !r); },
-  };
-}
-export type Stepper = ReturnType<typeof useStepper>;
 
-export function StepButtons({ s }: { s: Stepper }) {
-  return (
-    <>
-      <button className="btn" onClick={s.toggle}>{s.running ? "Pause" : s.atEnd ? "Replay" : "Play"}</button>
-      <button className="btn" onClick={() => s.go(s.i - 1)} disabled={s.i === 0}>Back</button>
-      <button className="btn" onClick={() => s.go(s.i + 1)} disabled={s.atEnd}>Step</button>
-    </>
-  );
-}
 
-/** A range slider over the frames (also the control that the smoke test moves). */
-export function StepSlider({ s, label = "Step" }: { s: Stepper; label?: string }) {
-  return <Param spec={range({ label, min: 0, max: Math.max(1, s.n - 1), step: 1, default: 0, format: (v) => `${v} of ${s.n - 1}` })} value={s.i} onChange={(v) => s.go(v as number)} />;
-}
 
-export function Caption({ children, tone, label }: { children: ReactNode; tone?: "good" | "bad" | null; label?: ReactNode }) {
-  return (
-    <div style={{ fontSize: 13.5, lineHeight: 1.45, minHeight: 42, padding: "8px 10px 8px 13px", marginTop: 10, background: "var(--subtle)", borderRadius: 6, border: "1px solid var(--border)", boxShadow: `inset 3px 0 0 ${tone === "bad" ? BAD : tone === "good" ? GOOD : "var(--border)"}` }}>
-      {label !== undefined && <span className="muted" style={{ fontSize: 11.5, marginRight: 8, fontVariantNumeric: "tabular-nums" }}>{label}</span>}
-      {children}
-    </div>
-  );
-}
 
-export function Chip({ children, color = "var(--fg)", filled, dashed, strike, title, onClick, bold }: { children: ReactNode; color?: string; filled?: boolean; dashed?: boolean; strike?: boolean; title?: string; onClick?: () => void; bold?: boolean }) {
-  return (
-    <span
-      title={title}
-      onClick={onClick}
-      style={{
-        display: "inline-block", fontFamily: MONO, fontSize: 12, lineHeight: "18px", padding: "1px 6px", borderRadius: 4,
-        border: `1.5px ${dashed ? "dashed" : "solid"} ${color}`, background: filled ? color : "var(--bg)", color: filled ? "var(--bg)" : color,
-        textDecoration: strike ? "line-through" : undefined, cursor: onClick ? "pointer" : undefined, whiteSpace: "nowrap", fontWeight: bold ? 700 : 400,
-        transition: "background 0.2s, color 0.2s",
-      }}
-    >
-      {children}
-    </span>
-  );
-}
 
-export function Panel({ title, children, accent }: { title: ReactNode; children: ReactNode; accent?: string }) {
-  return (
-    <div style={{ border: "1px solid var(--border)", borderRadius: 6, padding: "8px 10px", boxShadow: accent ? `inset 0 3px 0 ${accent}` : undefined, minWidth: 0 }}>
-      <div className="muted" style={{ fontSize: 11.5, marginBottom: 6 }}>{title}</div>
-      {children}
-    </div>
-  );
-}
 
-export const Arrow = ({ id, color = "var(--muted)" }: { id: string; color?: string }) => (
-  <marker id={id} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-    <path d="M0 0L10 5L0 10z" fill={color} />
-  </marker>
-);
 
 export interface DNode { id: number; label: string; color: string; ring?: string; sub?: string; faded?: boolean }
 export interface DEdge { from: number; to: number; label?: string; color?: string; dash?: string; width?: number }
@@ -155,23 +75,3 @@ export function Digraph({ nodes, edges, id, size = 220, r = 20 }: { nodes: DNode
   );
 }
 
-/** Runs `work(i)` for i = 0..n-1 in small time slices, so a heavy sweep never blocks a render. */
-export function useChunked<T>(n: number, work: (i: number) => T, deps: unknown[]): (T | undefined)[] {
-  const [out, setOut] = useState<(T | undefined)[]>(() => Array(n).fill(undefined));
-  useEffect(() => {
-    let cancelled = false;
-    const acc: (T | undefined)[] = Array(n).fill(undefined);
-    setOut([...acc]);
-    let i = 0;
-    const tick = () => {
-      if (cancelled) return;
-      const t0 = performance.now();
-      while (i < n && performance.now() - t0 < 30) { acc[i] = work(i); i++; }
-      setOut([...acc]);
-      if (i < n) window.setTimeout(tick, 0);
-    };
-    const id = window.setTimeout(tick, 0);
-    return () => { cancelled = true; window.clearTimeout(id); };
-  }, deps); // eslint-disable-line react-hooks/exhaustive-deps
-  return out;
-}

@@ -1,6 +1,6 @@
 /** Demos for the recovery lessons: WAL, group commit, and the forms of logging. */
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
-import { Demo, Stats, Param, Plot, Line, Dots, Legend, range, select, toggle, useSim, useWidth, si, bytes } from "../../kit";
+import { Demo, Stats, Param, Plot, Line, Dots, Legend, range, toggle, useSim, useWidth, si, bytes, Banner, Note, SmallLabel, mono, seg } from "../../kit";
 import { Db } from "../../sims/db/recovery/core";
 import { pageName } from "../../sims/db/recovery/aries";
 import { TRANSFER, transferDb, crashReport } from "../../sims/db/recovery/scenarios";
@@ -8,10 +8,8 @@ import { policyCost, DEFAULT_WORKLOAD, type StealPolicy, type ForcePolicy } from
 import { pgLsnText, pgWalPlace, PG_WAL_SEGMENT, PG_WAL_PAGE } from "../../sims/db/recovery/pgwal";
 import { GroupCommitSim, gcSteady, DEVICES, CLIENT_COUNTS, type CommitMode, type GcSummary } from "../../sims/db/recovery/groupcommit";
 import * as LF from "../../sims/db/recovery/logforms";
-import { LogView, PageBox, Label, Note, Verdict, mono } from "./RecoveryUi";
+import { LogView, PageBox } from "./RecoveryUi";
 
-const seg = <T extends string>(label: string, options: [T, string][], def: T) =>
-  select<T>({ label, options: options.map(([value, l]) => ({ value, label: l })), default: def, segmented: true });
 
 // ============================================================================
 // Lesson 1: the WAL stepper
@@ -79,17 +77,17 @@ export function WalStepperDemo() {
       <p style={{ fontSize: 13, margin: "0 0 10px", minHeight: 38 }}>{msg}</p>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 16 }}>
         <div style={{ flex: "1 1 220px", minWidth: 0 }}>
-          <Label>Buffer pool (memory). A grey page has changes that are not on disk.</Label>
+          <SmallLabel>Buffer pool (memory). A grey page has changes that are not on disk.</SmallLabel>
           <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
             {pages.map((p) => <PageBox key={p.id} page={p} dirty={d.pool.get(p.id)?.dirty} />)}
           </div>
-          <Label>Disk</Label>
+          <SmallLabel>Disk</SmallLabel>
           <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
             {d.disk.map((p) => <PageBox key={p.id} page={p} tone={p.pageLSN > d.flushedLSN ? "bad" : undefined} note={p.pageLSN > d.flushedLSN ? <span style={{ color: "var(--c4)" }}>newer than the log</span> : undefined} />)}
           </div>
           {rec && (
             <>
-              <Label>After the crash and recovery</Label>
+              <SmallLabel>After the crash and recovery</SmallLabel>
               <div style={{ display: "flex", gap: 6 }}>
                 {rec.state().map((v, p) => <PageBox key={p} page={{ id: p, pageLSN: (rec.pool.get(p)?.page ?? rec.disk[p]!).pageLSN, slots: v }} tone={bad.has(pageName(p)) ? "bad" : "good"} />)}
               </div>
@@ -97,16 +95,16 @@ export function WalStepperDemo() {
           )}
         </div>
         <div style={{ flex: "1 1 220px", minWidth: 0 }}>
-          <Label>Log. A filled dot is durable; the red dashed line is the end of the durable log.</Label>
+          <SmallLabel>Log. A filled dot is durable; the red dashed line is the end of the durable log.</SmallLabel>
           <LogView log={d.log} flushedLSN={d.flushedLSN} />
         </div>
       </div>
       {crash && (
-        <Verdict ok={crash.problems.length === 0}>
+        <Banner ok={crash.problems.length === 0}>
           <div>Clients were told: {d.acked.map((v, p) => `${pageName(p)} = ${v[0]}`).join(", ")}. Total money: {d.acked.reduce((s, v) => s + v[0]!, 0)} (it must stay 170).</div>
           <div>Recovered: {rec!.state().map((v, p) => `${pageName(p)} = ${v[0]}`).join(", ")}. Total: {rec!.state().reduce((s, v) => s + v[0]!, 0)}. {crash.lostTail} log record(s) were lost in the crash.</div>
           {crash.problems.map((x) => <div key={x.page} style={{ color: "var(--c4)" }}>Page {x.page}: {x.actual}, should be {x.expected}. {x.why}</div>)}
-        </Verdict>
+        </Banner>
       )}
     </Demo>
   );
@@ -203,7 +201,7 @@ export function PgLsnDemo() {
         { label: "8 KiB WAL page", value: `${w.walPage} of ${pagesPerSeg}` },
       ]} />
       <div style={{ marginTop: 10 }}>
-        <Label>The segment file: {pagesPerSeg} WAL pages of 8 KiB</Label>
+        <SmallLabel>The segment file: {pagesPerSeg} WAL pages of 8 KiB</SmallLabel>
         <div style={{ position: "relative", height: 18, border: "1px solid var(--border)", borderRadius: 4, background: "var(--subtle)" }}>
           <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${(w.offsetInSegment / PG_WAL_SEGMENT) * 100}%`, background: "var(--c1)", opacity: 0.35, borderRadius: 3 }} />
           <div style={{ position: "absolute", top: -3, bottom: -3, width: 2, left: `calc(${(w.offsetInSegment / PG_WAL_SEGMENT) * 100}% - 1px)`, background: "var(--c1)" }} />
@@ -379,7 +377,7 @@ function ByteGrid({ page, changed, tornOld, label }: { page: LF.PageBytes; chang
   const ok = LF.checksumOk(page);
   return (
     <div style={{ minWidth: 0 }}>
-      {label && <Label>{label}</Label>}
+      {label && <SmallLabel>{label}</SmallLabel>}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(16, minmax(0, 1fr))", gap: 2, ...mono }}>
         {Array.from(page).map((b, i) => {
           const r = REGION(i, page);
@@ -427,7 +425,7 @@ export function LogFormsDemo() {
       <ByteGrid page={cur} changed={changed} label={`The page after operation ${k}: ${LF.OPS[k - 1]!.sql}. Orange outlines mark the ${changed.size} bytes that it changed.`} />
       <div style={{ marginTop: 6 }}><Legend box items={[{ label: "header: LSN, slots, free start, checksum", color: "var(--c1)" }, { label: "slot directory", color: "var(--c5)" }, { label: "records", color: "var(--c3)" }]} /></div>
       <div style={{ marginTop: 12 }}>
-        <Label>The {LF.FORMS.find((f) => f.id === form)!.label.toLowerCase()} log. The checkpoint is after LSN {LF.CHECKPOINT_AFTER}; replay reads only the records after it.</Label>
+        <SmallLabel>The {LF.FORMS.find((f) => f.id === form)!.label.toLowerCase()} log. The checkpoint is after LSN {LF.CHECKPOINT_AFTER}; replay reads only the records after it.</SmallLabel>
         <div style={{ border: "1px solid var(--border)", borderRadius: 6 }}>
           {log.map((e) => (
             <div key={e.lsn} style={{ display: "flex", gap: 8, padding: "3px 8px", fontSize: 12, alignItems: "baseline", background: e.lsn === k ? "var(--subtle)" : undefined, opacity: e.lsn <= LF.CHECKPOINT_AFTER ? 0.5 : 1, borderTop: e.lsn === LF.CHECKPOINT_AFTER + 1 ? "1px dashed var(--muted)" : undefined }}>
@@ -439,7 +437,7 @@ export function LogFormsDemo() {
         </div>
       </div>
       <div style={{ marginTop: 12 }}>
-        <Label>Log bytes that replay reads (LSN 3 to 5), toy encoding with a {LF.TOY_HEADER}-byte header</Label>
+        <SmallLabel>Log bytes that replay reads (LSN 3 to 5), toy encoding with a {LF.TOY_HEADER}-byte header</SmallLabel>
         {sizes.map((s) => (
           <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, margin: "3px 0" }}>
             <span style={{ width: 150, flex: "none", fontWeight: s.id === form ? 600 : 400 }}>{s.label}</span>
@@ -483,8 +481,8 @@ export function ReplayDemo() {
           <ByteGrid page={r.page} label={`After replay of LSN 3 to 5: ${r.applied} applied, ${r.skipped} skipped`} />
         </div>
       </div>
-      <Verdict ok={r.verdict === "correct"}><b style={{ color: V[r.verdict].c }}>{V[r.verdict].t}.</b> {r.note}</Verdict>
-      <Label>Every combination {check ? "with" : "without"} the pageLSN check (logical records cannot use it)</Label>
+      <Banner ok={r.verdict === "correct"}><b style={{ color: V[r.verdict].c }}>{V[r.verdict].t}.</b> {r.note}</Banner>
+      <SmallLabel>Every combination {check ? "with" : "without"} the pageLSN check (logical records cannot use it)</SmallLabel>
       <div style={{ overflowX: "auto" }}>
         <table style={{ borderCollapse: "collapse", fontSize: 12, width: "100%" }}>
           <thead>

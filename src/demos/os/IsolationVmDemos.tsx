@@ -1,11 +1,11 @@
 /** Demos for "virtual machines and hypervisors": trap and emulate, the VM exit stepper, the workload model and the nested walk grid. */
 import { useMemo, useState } from "react";
-import { Demo, Line, Dots, Legend, Param, Plot, Stats, range, select, useParams, useWidth } from "../../kit";
+import { Demo, Line, Dots, Legend, Param, Plot, Stats, range, select, useParams, useWidth, Banner, Meter, Note, Panel, mono, seg } from "../../kit";
 import {
   DEFAULT_FEATURES, EMULATED_WRITES_PER_PACKET, GUEST_OPS, VM_COST, WORKLOADS, X86_CLASSIC, lostFraction, nativeReads, nestedWalkReads, opById, opCost, popekGoldbergViolators, realNestedWalk, virtualizable, vtxBehaviour, workloadOverhead,
   type DeviceModel, type Lane, type NestedPageSize, type VmFeatures,
 } from "../../sims/os/isolation";
-import { Badge, Card, Meter, Note, Scroll, Verdict, mono, seg, smallTable, td, th, twoCol } from "./IsolationUi";
+import { Badge, Scroll, smallTable, td, th, twoCol } from "./IsolationUi";
 
 // ---------------- trap and emulate ----------------
 
@@ -39,12 +39,12 @@ export function IsolationTrapDemo() {
         </table>
       </Scroll>
       <div style={{ ...twoCol, marginTop: 8 }}>
-        <Card title={<>What the guest wants from <span style={mono}>{ins.name}</span></>}><span style={{ fontSize: 13 }}>{ins.ring0}</span></Card>
-        <Card title="What really happens"><span style={{ fontSize: 13 }}>{classic ? ins.ring3 : vtxBehaviour(ins)}</span></Card>
+        <Panel title={<>What the guest wants from <span style={mono}>{ins.name}</span></>}><span style={{ fontSize: 13 }}>{ins.ring0}</span></Panel>
+        <Panel title="What really happens"><span style={{ fontSize: 13 }}>{classic ? ins.ring3 : vtxBehaviour(ins)}</span></Panel>
       </div>
       {classic
-        ? <Verdict tone={silent ? "bad" : "none"}>{virtualizable(X86_CLASSIC) ? "" : `Sensitive is not a subset of privileged: ${violators.map((v) => v.name).join(", ")} run without a trap. So classic x86 fails the theorem.`}</Verdict>
-        : <Verdict tone="good">Non-root mode gives the guest kernel a real ring 0. The sensitive state belongs to the guest, or the instruction causes a VM exit.</Verdict>}
+        ? <Banner tone={silent ? "bad" : "none"}>{virtualizable(X86_CLASSIC) ? "" : `Sensitive is not a subset of privileged: ${violators.map((v) => v.name).join(", ")} run without a trap. So classic x86 fails the theorem.`}</Banner>
+        : <Banner tone="good">Non-root mode gives the guest kernel a real ring 0. The sensitive state belongs to the guest, or the instruction causes a VM exit.</Banner>}
     </Demo>
   );
 }
@@ -105,10 +105,10 @@ export function IsolationVmExitDemo() {
       </svg>
       </div>
       <Note>Widths use a log scale of each stage's time, so that short stages stay visible.</Note>
-      <Verdict tone={cost.exits ? (cost.toUserspace ? "bad" : "warn") : "good"}>
+      <Banner tone={cost.exits ? (cost.toUserspace ? "bad" : "warn") : "good"}>
         <b>{cost.exits ? (cost.toUserspace ? "VM exit, all the way to user space" : "VM exit, handled in the kernel") : "No VM exit"}</b>. {op.why(f)}
         {cur && <div style={{ ...mono, fontSize: 12, marginTop: 4 }}>{cur.label}: {ns(cur.ns)}</div>}
-      </Verdict>
+      </Banner>
       <div style={{ marginTop: 8 }}>
         <Stats items={[{ label: "total (model)", value: ns(cost.totalNs) }, { label: "same work with no VM (model)", value: ns(cost.nativeNs) }, { label: "ratio", value: cost.nativeNs > 0 ? `${cost.ratio < 10 ? cost.ratio.toFixed(1) : Math.round(cost.ratio)}×` : "–" }]} />
       </div>
@@ -228,9 +228,9 @@ export function IsolationNestedWalkDemo() {
         </div>
       </div>
       <Legend items={[{ label: "host table read (EPT)", color: "var(--c2)" }, { label: "guest table read", color: "var(--c1)" }]} />
-      <Verdict tone={focus ? "info" : "none"}>
+      <Banner tone={focus ? "info" : "none"}>
         {focus ? <><b>Read {focus.n}.</b> {focus.label}. <span style={mono}>hpa 0x{focus.hpa.toString(16)}</span></> : "Hover or tap a cell. The numbers give the order, and all earlier reads light up."}
-      </Verdict>
+      </Banner>
     </Demo>
   );
 }

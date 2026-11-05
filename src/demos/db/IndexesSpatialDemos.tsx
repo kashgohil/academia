@@ -1,9 +1,8 @@
 /** Demos for "Spatial indexes: R-trees": an interactive R-tree and Z-order vs Hilbert key ranges. */
 import { useMemo, useRef, useState, type PointerEvent as RPointerEvent } from "react";
-import { Demo, Stats, Param, range, Legend } from "../../kit";
+import { Demo, Stats, Param, range, Legend, Note, SectionLabel, fixed, mono, seg } from "../../kit";
 import { RTree, demoItems, RTREE_QUERY, type Item, type Rect, type RNode } from "../../sims/db/indexes/rtree";
 import { boxRanges, decode, meanRanges, CURVE_BOX, type Curve } from "../../sims/db/indexes/sfc";
-import { seg, mono, Note, Caption, fx } from "./IndexesUi";
 
 // ============================================================================
 // Interactive R-tree
@@ -108,7 +107,7 @@ export function RTreeDemo() {
         <div style={{ flex: "1 1 220px", minWidth: 0 }}>
           {levels.map((lv, i) => (
             <div key={i}>
-              <Caption style={{ marginTop: i ? 8 : 0 }}>{i === 0 ? "root" : i === h - 1 ? "leaves" : `level ${i}`}</Caption>
+              <SectionLabel style={{ marginTop: i ? 8 : 0 }}>{i === 0 ? "root" : i === h - 1 ? "leaves" : `level ${i}`}</SectionLabel>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
                 {lv.map((n) => {
                   const s = stroke(n);
@@ -126,7 +125,7 @@ export function RTreeDemo() {
           ? [
             { label: "nodes opened / all nodes", value: `${nn.visited.length} / ${total}` },
             { label: "3 nearest (ids)", value: nn.ids.join(", ") || "–" },
-            { label: "distance to the 3rd", value: nn.dists[2] !== undefined ? fx(nn.dists[2], 1) : "–" },
+            { label: "distance to the 3rd", value: nn.dists[2] !== undefined ? fixed(nn.dists[2], 1) : "–" },
             { label: "height", value: h },
           ]
           : [
@@ -157,7 +156,7 @@ function CurveGrid({ c, n, box, maxR }: { c: Curve; n: number; box: { x0: number
   const sw = 8 / n;
   return (
     <div style={{ flex: "1 1 240px", minWidth: 0, maxWidth: 400 }}>
-      <Caption>{c === "z" ? "Z-order (Morton)" : "Hilbert"}</Caption>
+      <SectionLabel>{c === "z" ? "Z-order (Morton)" : "Hilbert"}</SectionLabel>
       <svg viewBox={`0 0 ${n} ${n}`} style={{ width: "100%", aspectRatio: "1", display: "block", border: "1px solid var(--border)", borderRadius: 4 }}>
         {order.map(([x, y], d) => {
           const ib = inBox(x, y), fp = !ib && scanned.has(d);
@@ -213,7 +212,7 @@ export function CurveDemo() {
           { label: "cells in the box", value: z.cells },
           { label: "exact ranges: Z / Hilbert", value: `${z.ranges.length} / ${hi.ranges.length}` },
           { label: `false positives with ≤ ${maxR} ranges: Z / Hilbert`, value: `${z.falsePositives} / ${hi.falsePositives}` },
-          { label: `mean exact ranges, random ${bw} × ${bh} boxes: Z / Hilbert`, value: `${fx(mean.z, 1)} / ${fx(mean.h, 1)}` },
+          { label: `mean exact ranges, random ${bw} × ${bh} boxes: Z / Hilbert`, value: `${fixed(mean.z, 1)} / ${fixed(mean.h, 1)}` },
         ]}
       />
       <div style={{ marginTop: 6 }}><Legend items={[{ label: "cells in the box", color: "var(--c1)" }, { label: "scanned but outside: false positives", color: "var(--c4)" }, { label: "curve pieces that the scan reads", color: "var(--c3)" }]} /></div>

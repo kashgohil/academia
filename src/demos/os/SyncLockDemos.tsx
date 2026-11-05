@@ -1,11 +1,10 @@
 /** Demos for "locks and spinlocks": a spinlock race with coherence traffic, and spin versus block. */
 import { useMemo } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleX, Stats, range, select, si, useParams, usePlot } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleX, Stats, range, select, si, useParams, usePlot, MiniTable, useChunked } from "../../kit";
 import {
   SPIN_ALGOS, SPIN_CORES, SPIN_LABEL, SPIN_SWEEP_ACQ, simulateSpin, spinBlockCost, spinBlockCrossover,
   type SpinAlgo, type SpinResult,
 } from "../../sims/os/sync/spinlocks";
-import { MiniTable, useChunked } from "./SyncShared";
 
 const COLOR: Record<SpinAlgo, string> = { tas: "var(--c4)", ttas: "var(--c2)", backoff: "var(--c5)", ticket: "var(--c1)", mcs: "var(--c3)" };
 
@@ -38,7 +37,7 @@ export function SyncSpinRaceDemo() {
     () => SPIN_ALGOS.flatMap((algo) => SPIN_CORES.map((n) => () => simulateSpin({ algo, cores: n, cs, work, acquisitions: SPIN_SWEEP_ACQ }))),
     [cs, work],
   );
-  const { results } = useChunked<SpinResult>(tasks, `${cs}/${work}`);
+  const results = useChunked<SpinResult>(`${cs}/${work}`, tasks);
   const get = (a: SpinAlgo, n: number) => results[SPIN_ALGOS.indexOf(a) * SPIN_CORES.length + SPIN_CORES.indexOf(n)];
   const ready = (a: SpinAlgo) => SPIN_CORES.flatMap((n) => { const r = get(a, n); return r ? [[n, r.busPerAcq] as [number, number]] : []; });
   const maxY = Math.max(10, ...results.map((r) => r?.busPerAcq ?? 0));

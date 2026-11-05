@@ -1,11 +1,10 @@
 /** Demos for "CFS and EEVDF". */
 import { useMemo, useRef, useState } from "react";
-import { Demo, Stats, Controls, Param, Plot, Line, Legend, RuleX, range, toggle, useParams, useSim, useWidth, pct } from "../../kit";
+import { Demo, Stats, Controls, Param, Plot, Line, Legend, RuleX, range, toggle, useParams, useSim, useWidth, pct, Note, SmallLabel, mono, seg } from "../../kit";
 import {
   FairSim, SCHED_PRIO_TO_WEIGHT, expectedShares, fairStats, latencyScenario, niceToWeight, schedPeriod, sleeperScenario,
   type FairEntity, type FairTaskSpec, type VruntimeSample,
 } from "../../sims/os/scheduling";
-import { Caption, Note, seg, mono } from "../db/StorageUi";
 import { Gantt, SmallTable, cpuRow, f1, f2, jobColor } from "./SchedulingGantt";
 
 // ------------------------------------------------------------------------------------------------
@@ -31,7 +30,7 @@ export function NiceRatioDemo() {
         <div style={{ width: `${sa * 100}%`, background: "var(--c1)", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", whiteSpace: "nowrap", transition: "width .2s" }}>{sa > 0.14 ? `A ${pct(sa)}` : ""}</div>
         <div style={{ width: `${sb * 100}%`, background: "var(--c2)", display: "flex", alignItems: "center", justifyContent: "center", overflow: "hidden", whiteSpace: "nowrap", transition: "width .2s" }}>{sb > 0.14 ? `B ${pct(sb)}` : ""}</div>
       </div>
-      <Caption><span style={{ display: "block", marginTop: 10 }}>The weight table, on a log scale. Nice -20 is on the left, nice 19 on the right.</span></Caption>
+      <SmallLabel><span style={{ display: "block", marginTop: 10 }}>The weight table, on a log scale. Nice -20 is on the left, nice 19 on the right.</span></SmallLabel>
       <div ref={ref}>
         <svg width={w} height={68} style={{ display: "block" }}>
           {SCHED_PRIO_TO_WEIGHT.map((v, i) => {
@@ -171,15 +170,15 @@ export function CfsSimDemo() {
         </>
       }
     >
-      <Caption>vruntime number line. A dark ring marks the task on the CPU.</Caption>
+      <SmallLabel>vruntime number line. A dark ring marks the task on the CPU.</SmallLabel>
       <VruntimeLine sim={sim} />
       <div style={{ display: "flex", flexWrap: "wrap", gap: 14, marginTop: 8 }}>
         <div style={{ flex: "1 1 240px", minWidth: 0 }}>
-          <Caption>Red-black tree of waiting tasks. The running task is not in the tree. The green ring marks the leftmost node, which runs next.</Caption>
+          <SmallLabel>Red-black tree of waiting tasks. The running task is not in the tree. The green ring marks the leftmost node, which runs next.</SmallLabel>
           <TreeView sim={sim} />
         </div>
         <div style={{ flex: "1 1 260px", minWidth: 0 }}>
-          <Caption>CPU share against the weight share (dark tick)</Caption>
+          <SmallLabel>CPU share against the weight share (dark tick)</SmallLabel>
           {live.map((e, i) => {
             const got = total > 0 ? e.sumExec / total : 0;
             return (
@@ -314,7 +313,7 @@ export function CfsEevdfDemo() {
   const start = Math.max(0, Math.min(at - end / 2, SAMPLE_UNTIL + 1 - end));
   return (
     <Demo title="L asks for a short slice" controls={<Controls params={p} />}>
-      <Caption>The same tasks under each scheduler. L is red. The dark line is the moment below.</Caption>
+      <SmallLabel>The same tasks under each scheduler. L is red. The dark line is the moment below.</SmallLabel>
       <Gantt rows={[cpuRow(r.cfs.trace(), "CFS", 0, color), cpuRow(r.eevdf.trace(), "EEVDF", 0, color)]} start={start} end={start + end} cursor={at} labelW={46} />
       <SmallTable
         right
@@ -326,7 +325,7 @@ export function CfsEevdfDemo() {
       />
       <Note>The fair share with {hogs + 1} equal tasks is {pct(1 / (hogs + 1))}.</Note>
       <div style={{ marginTop: 10 }}>
-        <Caption>EEVDF virtual time at {f1(at)} ms. A dot is a task's vruntime. A tick is its virtual deadline. The thick line is the next pick: eligible, with the earliest deadline.</Caption>
+        <SmallLabel>EEVDF virtual time at {f1(at)} ms. A dot is a task's vruntime. A tick is its virtual deadline. The thick line is the next pick: eligible, with the earliest deadline.</SmallLabel>
         <VirtualTimeLine sample={sample} names={names} color={color} />
       </div>
     </Demo>

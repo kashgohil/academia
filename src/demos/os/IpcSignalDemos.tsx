@@ -1,12 +1,12 @@
 /** Demos for "signals": delivery with masks and the signal frame, a deadlock in a handler, and merging against queueing. */
 import { useMemo, useState, type ReactNode } from "react";
-import { Demo, Param, Stats, range, select, toggle, useParams } from "../../kit";
+import { Demo, Param, Stats, range, select, toggle, useParams, Banner, MONO } from "../../kit";
 import {
   FRAME_BYTES_MODEL, HANDLER_LINES, HANDLER_VARIANTS, MAIN_LINES, RESTORER_TEXT, SIG, SIGNAL_FACTS, SignalTask, coalesceRun, handlerAction, handlerProg, sigName, zombiesLeft,
   type HandlerVariant, type SigFrame,
 } from "../../sims/os/ipc";
 import { explore, machineModel } from "../../sims/os/sync/machine";
-import { Banner, MONO, SyncStepper } from "./SyncShared";
+import { SyncStepper } from "./SyncShared";
 
 const hex = (n: number) => `0x${n.toString(16)}`;
 

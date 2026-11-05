@@ -1,8 +1,8 @@
 /** Demos for "futexes": a mutex stepper with the lost wakeup, syscall counts, and the hash table. */
 import { useMemo, useState } from "react";
-import { Demo, Legend, Line, Param, Plot, Stats, range, select, toggle, useParams } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, Stats, range, select, toggle, useParams, Banner, MONO, useChunked } from "../../kit";
 import { FUTEX_FAST_SCHEDULE, FUTEX_SLOW_SCHEDULE, FutexTable, LOAD_DEFAULTS, LOAD_THREADS, checkFutexMutex, futexLoad, futexMutexProg, type FutexLoad, type MutexVariant } from "../../sims/os/sync/futex";
-import { Banner, Cell, CellRow, MONO, SyncStepper, TC, useChunked } from "./SyncShared";
+import { Cell, CellRow, SyncStepper, TC } from "./SyncShared";
 
 const SCHEMA = {
   variant: select({ label: "Mutex", options: [{ value: "three-state", label: "3-state (Drepper)" }, { value: "two-state", label: "2-state (naive)" }], default: "three-state", segmented: true }),
@@ -81,7 +81,7 @@ export function SyncFutexLoadDemo() {
     () => (["two-state", "three-state"] as MutexVariant[]).flatMap((v) => LOAD_THREADS.map((n) => () => futexLoad(v, n, { cs, work, syscall }))),
     [cs, work, syscall],
   );
-  const { results } = useChunked<FutexLoad>(tasks, `${cs}/${work}/${syscall}`);
+  const results = useChunked<FutexLoad>(`${cs}/${work}/${syscall}`, tasks);
   const line = (k: number) => LOAD_THREADS.flatMap((n, i) => { const r = results[k * LOAD_THREADS.length + i]; return r ? [[n, r.perPair] as [number, number]] : []; });
   const two = line(0);
   const three = line(1);

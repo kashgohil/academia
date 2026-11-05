@@ -1,8 +1,8 @@
 /** Lesson: context switching. A register-level stepper, and a cost model with cache refill. */
 import { useMemo, useState } from "react";
-import { Area, Demo, Legend, Line, Param, Plot, RuleX, Stats, bytes, pct, range, si, toggle, useParams } from "../../kit";
+import { Area, Demo, Legend, Line, Param, Plot, RuleX, Stats, bytes, pct, range, si, toggle, useParams, IndexButtons, IndexSlider, Note, SmallLabel, mono, tint } from "../../kit";
 import { SWITCH_INPUTS, USER_REGS, switchCost, switchSnaps, type SwitchCostInput, type TaskCtx } from "../../sims/os/processes";
-import { Cap, ModeBar, Msg, Note, StepButtons, StepSlider, mono, tint } from "./ProcessesUi";
+import { ModeBar, Msg } from "./ProcessesUi";
 
 const TASK_COLOR: Record<string, string> = { A: "var(--c1)", B: "var(--c2)" };
 
@@ -51,9 +51,9 @@ export function SwitchStepperDemo() {
   return (
     <Demo
       title="Task A to task B on a timer interrupt"
-      actions={<StepButtons k={kk} n={snaps.length} set={setK} />}
+      actions={<IndexButtons k={kk} n={snaps.length} set={setK} />}
       controls={<>
-        <StepSlider k={kk} n={snaps.length} set={setK} />
+        <IndexSlider k={kk} n={snaps.length} set={setK} />
         <Param spec={p.schema.same} value={p.values.same} onChange={(v) => p.set("same", v as boolean)} />
       </>}
     >
@@ -62,7 +62,7 @@ export function SwitchStepperDemo() {
       <Msg min={56}>{s.text}</Msg>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
         <div style={{ flex: "1 1 220px", minWidth: 0 }}>
-          <Cap>CPU</Cap>
+          <SmallLabel>CPU</SmallLabel>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 3 }}>
             {USER_REGS.map((n) => cell(n, r[n]))}
             {cell("cr3", s.cpu.cr3)}
@@ -104,7 +104,7 @@ export function SwitchCostDemo() {
       <Param spec={p.schema.same} value={v.same} onChange={(x) => p.set("same", x as boolean)} />
       <Param spec={p.schema.pcid} value={v.pcid} onChange={(x) => p.set("pcid", x as boolean)} />
     </>}>
-      <Cap>The curve is the share of CPU lost at this switch rate. The dashed line is the direct cost alone.</Cap>
+      <SmallLabel>The curve is the share of CPU lost at this switch rate. The dashed line is the direct cost alone.</SmallLabel>
       <Plot x={[4, 65536]} y={[0, 100]} logX height={240} xLabel="working set (KiB)" yLabel="CPU lost (%)" xTicks={[4, 64, 1024, 16384]} yTicks={[0, 25, 50, 75, 100]} xFormat={(t) => (t >= 1024 ? `${t / 1024} M` : `${t} K`)}>
         <Area points={lost} color="var(--c4)" opacity={0.12} />
         <Line points={lost} color="var(--c4)" />

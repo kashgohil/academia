@@ -1,8 +1,8 @@
 /** Lesson: fork and exec. A stepper for the shell pipeline, and a plot of fork time against memory. */
 import { useMemo, useState } from "react";
-import { Demo, Legend, Line, Param, Plot, RuleX, Stats, bytes, range, si, toggle, useParams } from "../../kit";
+import { Demo, Legend, Line, Param, Plot, RuleX, Stats, bytes, range, si, toggle, useParams, IndexButtons, IndexSlider, Note, SmallLabel, mono, tint } from "../../kit";
 import { FORK_INPUTS, PAGE_2M, PAGE_4K, cowUs, forkExecUs, forkUs, pageTables, pipeline, spawnUs, type FrameInfo, type Task } from "../../sims/os/processes";
-import { Cap, Msg, Note, StepButtons, StepSlider, bigBytes, mono, tint } from "./ProcessesUi";
+import { Msg, bigBytes } from "./ProcessesUi";
 
 const ACTOR_PID = { shell: 100, left: 101, right: 102 } as const;
 const fmtUs = (us: number) => (us >= 1000 ? `${(us / 1000).toPrecision(3)} ms` : `${us.toPrecision(3)} µs`);
@@ -59,9 +59,9 @@ export function ForkStepperDemo() {
   return (
     <Demo
       title="The shell runs: ls | wc"
-      actions={<StepButtons k={kk} n={steps.length} set={setK} />}
+      actions={<IndexButtons k={kk} n={steps.length} set={setK} />}
       controls={<>
-        <StepSlider k={kk} n={steps.length} set={setK} />
+        <IndexSlider k={kk} n={steps.length} set={setK} />
         <Param spec={p.schema.closeInParent} value={p.values.closeInParent} onChange={(v) => p.set("closeInParent", v as boolean)} />
         <Param spec={p.schema.cloexec} value={p.values.cloexec} onChange={(v) => p.set("cloexec", v as boolean)} />
       </>}
@@ -103,7 +103,7 @@ export function ForkCostDemo() {
       <Param spec={p.schema.rss} value={p.values.rss} onChange={(v) => p.set("rss", v as number)} />
       <Param spec={p.schema.share} value={p.values.share} onChange={(v) => p.set("share", v as number)} />
     </>}>
-      <Cap>All costs here are model inputs. The counts of page table entries are exact for a dense mapping.</Cap>
+      <SmallLabel>All costs here are model inputs. The counts of page table entries are exact for a dense mapping.</SmallLabel>
       <Plot x={[16, 1048576]} y={[10, 2e7]} logX logY height={260} xLabel="resident memory" yLabel="time (µs)" xTicks={[16, 256, 4096, 65536, 1048576]} yTicks={[10, 100, 1000, 1e4, 1e5, 1e6, 1e7]} xFormat={(t) => bigBytes(t * 1024 * 1024)} yFormat={(t) => si(t)}>
         <Line points={line((b) => forkUs(b))} color="var(--c1)" />
         <Line points={line((b) => forkExecUs(b))} color="var(--c1)" dash="4 3" />

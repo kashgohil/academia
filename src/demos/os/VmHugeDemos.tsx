@@ -1,10 +1,9 @@
 /** Demos for the lesson on huge pages. */
 import { useRef, useState } from "react";
-import { Canvas2D, Demo, Param, Plot, Dots, Legend, RuleY, Stats, cssVar, range, toggle, useParams, useWidth } from "../../kit";
+import { Canvas2D, Demo, Param, Plot, Dots, Legend, RuleY, Stats, cssVar, range, toggle, useParams, useWidth, Meter, Note, mono, seg } from "../../kit";
 import {
   FRAMES_PER_BLOCK, FREE, GiB, MiB, OTHER, PAGE_SIZE_LABEL, THP_COST, THP_DEFAULTS, ThpSim, UNMOVABLE, fmtBytes, reachRow, type PageSizeId, type ThpDefrag, type ThpEvent,
 } from "../../sims/os/vm";
-import { Meter, Note, mono, seg } from "../db/StorageUi";
 
 // ---------------- reach calculator ----------------
 

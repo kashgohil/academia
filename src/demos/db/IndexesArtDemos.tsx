@@ -1,11 +1,11 @@
 /** Demos for "Tries and adaptive radix trees": ART builder, key encoding, memory per key. */
 import { useMemo, useState } from "react";
-import { Demo, Stats, Param, range, Plot, Line, Dots, RuleX, Legend, pct } from "../../kit";
+import { Demo, Stats, Param, range, Plot, Line, Dots, RuleX, Legend, pct, Note, SectionLabel, fixed, int, mono, seg, useChunked } from "../../kit";
 import {
   ART, encodeU32, encodeString, encodeI32, encodeF64, rawI32LE, rawI32BE, concatBytes, compareBytes, hex, artKeys, btreeBytesPerKey, hashBytesPerKey,
   NODE_BYTES, ART_WORDS, type ArtEvent, type ArtInner, type NodeType,
 } from "../../sims/db/indexes/art";
-import { seg, mono, Note, Caption, fx, int, useChunked, Chip } from "./IndexesUi";
+import { Chip } from "./IndexesUi";
 
 const TYPE_COLOR: Record<NodeType, string> = { 4: "var(--c1)", 16: "var(--c2)", 48: "var(--c5)", 256: "var(--c4)" };
 
@@ -62,7 +62,7 @@ export function ArtBuilderDemo() {
       <div style={{ ...mono, fontSize: 12, lineHeight: 1.5 }}>
         {last ? <>Last key <b>{last.label}</b> = <span style={{ color: "var(--c3)" }}>{hex(last.bytes)}</span>. {evs.length ? `On this insert, ${evs.map(eventText).join("; ")}.` : "It went into a free slot of an existing node."}</> : "No keys."}
       </div>
-      <Caption>Inner nodes, breadth first{nodes.length > shown.length ? ` (first ${shown.length} of ${nodes.length})` : ""}</Caption>
+      <SectionLabel>Inner nodes, breadth first{nodes.length > shown.length ? ` (first ${shown.length} of ${nodes.length})` : ""}</SectionLabel>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "flex-start" }}>
         {shown.map(({ node, depth }) => <NodeCard key={node.id} n={node} depth={depth} words={words} onPath={path.has(node.id)} />)}
         {!nodes.length && <span className="muted" style={{ fontSize: 12.5 }}>One key: the root is just a leaf (lazy expansion).</span>}
@@ -73,8 +73,8 @@ export function ArtBuilderDemo() {
           { label: "keys", value: t.size },
           { label: "Node4 / 16 / 48 / 256", value: `${stats.counts[4]} / ${stats.counts[16]} / ${stats.counts[48]} / ${stats.counts[256]}` },
           { label: "inner node bytes", value: int(stats.bytes) },
-          { label: "bytes per key", value: fx(stats.bytesPerKey, 1) },
-          { label: "mean depth of a leaf", value: fx(stats.avgDepth, 2) },
+          { label: "bytes per key", value: fixed(stats.bytesPerKey, 1) },
+          { label: "mean depth of a leaf", value: fixed(stats.avgDepth, 2) },
         ]}
       />
       <div style={{ marginTop: 6 }}><Legend items={[{ label: "Node4 (52 B)", color: TYPE_COLOR[4] }, { label: "Node16 (160 B)", color: TYPE_COLOR[16] }, { label: "Node48 (656 B)", color: TYPE_COLOR[48] }, { label: "Node256 (2,064 B)", color: TYPE_COLOR[256] }]} /></div>
@@ -261,11 +261,11 @@ export function ArtMemoryDemo() {
       <div style={{ height: 8 }} />
       <Stats
         items={[
-          { label: `ART dense, ${int(n)} keys`, value: `${fx(here.dense.bytesPerKey, 1)} B` },
-          { label: "ART random", value: `${fx(here.random.bytesPerKey, 1)} B` },
+          { label: `ART dense, ${int(n)} keys`, value: `${fixed(here.dense.bytesPerKey, 1)} B` },
+          { label: "ART random", value: `${fixed(here.random.bytesPerKey, 1)} B` },
           { label: "random: Node4 / 16 / 48 / 256", value: `${here.random.counts[4]} / ${here.random.counts[16]} / ${here.random.counts[48]} / ${here.random.counts[256]}` },
-          { label: "B+ tree", value: `${fx(bt, 1)} B` },
-          { label: "hash table", value: `${fx(hashBytesPerKey(n, 4), 1)} B` },
+          { label: "B+ tree", value: `${fixed(bt, 1)} B` },
+          { label: "hash table", value: `${fixed(hashBytesPerKey(n, 4), 1)} B` },
         ]}
       />
       <Note>ART bytes are inner nodes only: a leaf is a tagged pointer in its parent's slot, and the key is read from the row to confirm a match. The B+ tree and the hash table store a copy of each key and an 8-byte value.</Note>

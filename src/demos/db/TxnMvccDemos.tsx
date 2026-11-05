@@ -1,11 +1,10 @@
 /** Demos for MVCC and its garbage collection: version chains, storage layouts, bloat and XID wraparound. */
 import { useMemo, useState } from "react";
-import { Demo, Stats, Param, Plot, Line, Area, RuleX, Legend, range, select, toggle, useParams, si } from "../../kit";
+import { Demo, Stats, Param, Plot, Line, Area, RuleX, Legend, range, select, toggle, useParams, si, Arrow, BAD, Chip, GOOD, MONO, Panel, StepButtons, StepCaption, StepSlider, useStepper } from "../../kit";
 import { runMvScript, MV_SCRIPT, mvText, pgVisible, LAYOUTS, chainCost, type Layout, type XidState } from "../../sims/db/txn/mvcc";
 import {
   bloatSim, DEFAULT_BLOAT, autovacuumTrigger, XID_SPACE, XID_HALF, FREEZE_MAX_AGE, WARN_REMAINING, rowLooksPast, daysToWraparound, daysToForcedVacuum,
 } from "../../sims/db/txn/gc";
-import { GOOD, BAD, MONO, useStepper, StepButtons, StepSlider, Caption, Chip, Panel, Arrow } from "./TxnShared";
 
 const XC: Record<XidState, string> = { committed: GOOD, aborted: BAD, "in progress": "var(--c2)" };
 const xidColor = (x: number, clog: Record<number, XidState>) => (x === 0 ? "var(--faint)" : XC[clog[x] ?? "in progress"]);
@@ -70,7 +69,7 @@ export function VersionChainDemo() {
           </div>
         </Panel>
       )}
-      <Caption label={`${s.i + 1}/${frames.length}`}>{f.text}</Caption>
+      <StepCaption label={`${s.i + 1}/${frames.length}`}>{f.text}</StepCaption>
     </Demo>
   );
 }
@@ -129,11 +128,11 @@ export function VersionLayoutDemo() {
         { label: `versions this reader checks to find v${j}`, value: cost.visits },
         { label: `versions a reader of the newest v${n} checks`, value: newest.visits },
       ]} />
-      <Caption>
+      <StepCaption>
         {layout === "pg-hot" && `The index points to the oldest tuple. Each reader walks the chain forward, so a new snapshot pays for every old version until pruning removes them.`}
         {layout === "pg" && `An indexed column changed, so every version got its own index entry. The index scan finds all ${n + 1} entries and checks each tuple.`}
         {layout === "innodb" && `The record in the clustered index is always the newest version. Only an old snapshot walks the undo chain, ${n - j} step${n - j === 1 ? "" : "s"} back here.`}
-      </Caption>
+      </StepCaption>
     </Demo>
   );
 }

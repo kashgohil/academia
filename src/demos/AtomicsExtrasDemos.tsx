@@ -1,5 +1,5 @@
 import { useMemo, useState, type ReactNode } from "react";
-import { Demo, Param, Stats, select, useWidth } from "../kit";
+import { Demo, Param, Stats, select, useWidth, MONO } from "../kit";
 import {
   completions, counterMachine, tearMachine, isTorn, replay, total, type Machine, type CounterMode,
   casInit, casStep, casDone, casAttempts, casAttemptRange, casApply, type CasFn, type CasState,
@@ -12,7 +12,6 @@ import {
 // ---------------- shared pieces ----------------
 
 const TC = ["var(--c1)", "var(--c2)", "var(--c5)", "var(--c3)"];
-const mono = "ui-monospace, Menlo, monospace";
 const card: React.CSSProperties = { border: "1px solid var(--border)", borderRadius: 8, padding: "8px 10px", background: "var(--bg)", minWidth: 0 };
 
 function Seg<T extends string>({ value, options, onChange, small }: { value: T; options: { value: T; label: string }[]; onChange: (v: T) => void; small?: boolean }) {
@@ -30,7 +29,7 @@ function Seg<T extends string>({ value, options, onChange, small }: { value: T; 
 /** One line of code. state: done (already run), now (runs next), todo. */
 function Code({ text, state, color, note }: { text: ReactNode; state: "done" | "now" | "todo"; color: string; note?: ReactNode }) {
   return (
-    <div style={{ display: "flex", gap: 6, alignItems: "baseline", fontFamily: mono, fontSize: 12.5, lineHeight: 1.7, color: state === "done" ? "var(--muted)" : "var(--fg)" }}>
+    <div style={{ display: "flex", gap: 6, alignItems: "baseline", fontFamily: MONO, fontSize: 12.5, lineHeight: 1.7, color: state === "done" ? "var(--muted)" : "var(--fg)" }}>
       <span style={{ width: 10, flex: "none", color, fontWeight: 700 }}>{state === "now" ? "▶" : state === "done" ? "✓" : ""}</span>
       <span style={{ minWidth: 0, overflowWrap: "anywhere", background: state === "now" ? "var(--subtle)" : undefined, borderRadius: 4, padding: "0 4px" }}>
         {text}
@@ -53,7 +52,7 @@ function MemBox({ name, value, hot, width }: { name: string; value: ReactNode; h
   return (
     <div style={{ border: `1.5px solid ${hot ? "var(--c1)" : "var(--border)"}`, borderRadius: 8, padding: "4px 12px", textAlign: "center", minWidth: width ?? 64, background: "var(--subtle)", transition: "border-color 0.2s" }}>
       <div className="muted" style={{ fontSize: 11 }}>{name}</div>
-      <div style={{ fontFamily: mono, fontSize: 18, fontWeight: 600 }}>{value}</div>
+      <div style={{ fontFamily: MONO, fontSize: 18, fontWeight: 600 }}>{value}</div>
     </div>
   );
 }
@@ -107,7 +106,7 @@ function InterleaveStepper<S>({ title, machine, names, memory, regs, result, con
               <button className="btn" style={{ padding: "2px 10px", fontSize: 12 }} disabled={!runnable[t]} onClick={() => setSched([...sched, t])}>Run next step</button>
             </ThreadHead>
             {th.map((l, i) => <Code key={i} text={l.label} color={TC[t]!} state={i < pcs[t]! ? "done" : i === pcs[t] ? "now" : "todo"} />)}
-            <div className="muted" style={{ fontSize: 12, marginTop: 4, fontFamily: mono, overflowWrap: "anywhere" }}>{regs(state, t)}</div>
+            <div className="muted" style={{ fontSize: 12, marginTop: 4, fontFamily: MONO, overflowWrap: "anywhere" }}>{regs(state, t)}</div>
           </div>
         ))}
       </div>
@@ -123,7 +122,7 @@ function InterleaveStepper<S>({ title, machine, names, memory, regs, result, con
           const c = r.bad ? "var(--c4)" : "var(--c3)";
           return (
             <div key={k} style={{ display: "grid", gridTemplateColumns: "minmax(0, 150px) 1fr auto", gap: 8, alignItems: "center", margin: "3px 0" }}>
-              <span style={{ fontFamily: mono, fontSize: 12, overflowWrap: "anywhere", color: finalKey === k ? c : "var(--fg)", fontWeight: finalKey === k ? 700 : 400 }}>{r.label}</span>
+              <span style={{ fontFamily: MONO, fontSize: 12, overflowWrap: "anywhere", color: finalKey === k ? c : "var(--fg)", fontWeight: finalKey === k ? 700 : 400 }}>{r.label}</span>
               <div style={{ position: "relative", height: 16, background: "var(--subtle)", borderRadius: 3 }}>
                 <div style={{ position: "absolute", inset: 0, width: `${(100 * a) / allN}%`, background: c, opacity: 0.25, borderRadius: 3 }} />
                 <div style={{ position: "absolute", inset: 0, width: `${(100 * n) / allN}%`, background: c, borderRadius: 3, transition: "width 0.25s" }} />
@@ -240,7 +239,7 @@ export function CasLoopDemo() {
             </ThreadHead>
             <Code text="cur = x.load()" color={TC[t]!} state={th.pc === 0 ? "now" : "done"} />
             <Code text={`CAS(x, cur, ${f("cur")})`} color={TC[t]!} state={th.pc === 1 ? "now" : th.pc === 2 ? "done" : "todo"} note="fails: cur = actual value, try again" />
-            <div style={{ fontFamily: mono, fontSize: 12, marginTop: 4, color: "var(--muted)" }}>
+            <div style={{ fontFamily: MONO, fontSize: 12, marginTop: 4, color: "var(--muted)" }}>
               cur = {th.cur ?? "—"} · tries {th.attempts}
               {th.fails > 0 && <span style={{ color: "var(--c4)" }}> · fails {th.fails}</span>}
               {th.pc === 2 && <span style={{ color: "var(--c3)" }}> · done</span>}
@@ -248,7 +247,7 @@ export function CasLoopDemo() {
           </div>
         ))}
       </div>
-      <div style={{ margin: "10px 0", minHeight: 20, fontFamily: mono, fontSize: 12 }}>
+      <div style={{ margin: "10px 0", minHeight: 20, fontFamily: MONO, fontSize: 12 }}>
         {cur.log.map((l, i) => <div key={hist.length - i} style={{ color: l.includes("fails") ? "var(--c4)" : l.includes("succeeds") ? "var(--c3)" : "var(--muted)", opacity: 1 - i * 0.17 }}>{l}</div>)}
       </div>
       <Stats items={[
@@ -266,7 +265,7 @@ export function CasLoopDemo() {
 
 function NodeBox({ n, freed, tag }: { n: string; freed: boolean; tag?: string }) {
   return (
-    <div style={{ border: `1.5px ${freed ? "dashed" : "solid"} ${freed ? "var(--c4)" : "var(--fg)"}`, borderRadius: 6, padding: "3px 10px", fontFamily: mono, fontSize: 14, fontWeight: 600, color: freed ? "var(--c4)" : "var(--fg)", textAlign: "center" }}>
+    <div style={{ border: `1.5px ${freed ? "dashed" : "solid"} ${freed ? "var(--c4)" : "var(--fg)"}`, borderRadius: 6, padding: "3px 10px", fontFamily: MONO, fontSize: 14, fontWeight: 600, color: freed ? "var(--c4)" : "var(--fg)", textAlign: "center" }}>
       {n}
       {tag && <div style={{ fontSize: 10, fontWeight: 400 }}>{tag}</div>}
     </div>
@@ -294,10 +293,10 @@ export function AbaDemo() {
       controls={<Param spec={select({ label: "top holds", options: [{ value: "plain", label: "a pointer only" }, { value: "tagged", label: "a pointer and a tag" }], default: "plain", segmented: true })} value={tagged ? "tagged" : "plain"} onChange={(v) => { setTagged(v === "tagged"); setSched([]); }} />}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap", justifyContent: "center", marginBottom: 6 }}>
-        <span style={{ fontFamily: mono, fontSize: 13 }}>top{tagged ? ` (tag ${s.tag})` : ""}</span>
+        <span style={{ fontFamily: MONO, fontSize: 13 }}>top{tagged ? ` (tag ${s.tag})` : ""}</span>
         {arrow}
         {list.map((n, i) => <span key={i} style={{ display: "contents" }}><NodeBox n={n} freed={s.freed.includes(n)} tag={s.freed.includes(n) ? "freed!" : undefined} />{arrow}</span>)}
-        <span className="muted" style={{ fontFamily: mono, fontSize: 13 }}>null</span>
+        <span className="muted" style={{ fontFamily: MONO, fontSize: 13 }}>null</span>
       </div>
       <div className="muted" style={{ textAlign: "center", fontSize: 12, marginBottom: 10 }}>
         Freed memory: {s.freed.length ? s.freed.join(", ") : "none"}
@@ -308,7 +307,7 @@ export function AbaDemo() {
             <button className="btn" style={{ padding: "2px 10px", fontSize: 12 }} disabled={t0Done} onClick={() => setSched([...sched, 0])}>Run</button>
           </ThreadHead>
           {ABA_T0.map((l, i) => <Code key={i} text={l} color={TC[0]!} state={t0Done || i < s.t0.pc ? "done" : i === s.t0.pc ? "now" : "todo"} note={i === 2 ? "fails: go back to line 1" : undefined} />)}
-          <div style={{ fontFamily: mono, fontSize: 12, marginTop: 4, color: "var(--muted)" }}>
+          <div style={{ fontFamily: MONO, fontSize: 12, marginTop: 4, color: "var(--muted)" }}>
             old = {s.t0.pc > 0 || t0Done || s.t0.fails ? `${s.t0.seenTop ?? "null"}${tagged ? ` (tag ${s.t0.seenTag})` : ""}` : "—"} · next = {s.t0.pc > 1 || t0Done ? s.t0.seenNext ?? "null" : "—"}
             {s.t0.fails > 0 && <span style={{ color: "var(--c4)" }}> · CAS failed {s.t0.fails}×</span>}
           </div>
@@ -318,7 +317,7 @@ export function AbaDemo() {
             <button className="btn" style={{ padding: "2px 10px", fontSize: 12 }} disabled={t1Done} onClick={() => setSched([...sched, 1])}>Run</button>
           </ThreadHead>
           {ABA_T1.map((_, i) => <Code key={i} text={t1Label(i)} color={TC[1]!} state={i < s.t1.pc ? "done" : i === s.t1.pc ? "now" : "todo"} />)}
-          <div className="muted" style={{ fontFamily: mono, fontSize: 12, marginTop: 4 }}>each line is one whole stack operation</div>
+          <div className="muted" style={{ fontFamily: MONO, fontSize: 12, marginTop: 4 }}>each line is one whole stack operation</div>
         </div>
       </div>
       {done && (broken
@@ -358,7 +357,7 @@ export function FencePlacementDemo() {
       <div style={{ margin: "3px 0 3px 16px" }}>
         <Seg small value={f} options={FENCE_OPTS} onChange={(v) => set(i, v)} />
         {f !== "none" && (
-          <div style={{ fontFamily: mono, fontSize: 12, color: "var(--c5)", marginTop: 2 }}>
+          <div style={{ fontFamily: MONO, fontSize: 12, color: "var(--c5)", marginTop: 2 }}>
             fence({f}) <span className="muted" style={{ fontSize: 11 }}>x86: {FENCE_ASM[f].x86} · ARM: {FENCE_ASM[f].arm}</span>
           </div>
         )}
@@ -387,7 +386,7 @@ export function FencePlacementDemo() {
         ))}
       </div>
       <div style={{ marginTop: 12, fontSize: 13 }}>
-        <div className="muted" style={{ fontSize: 12.5 }}>The outcome to forbid: <span style={{ fontFamily: mono, color: "var(--fg)" }}>{WEAK_TEXT[mode]}</span></div>
+        <div className="muted" style={{ fontSize: 12.5 }}>The outcome to forbid: <span style={{ fontFamily: MONO, color: "var(--fg)" }}>{WEAK_TEXT[mode]}</span></div>
         <div style={grid(150)}>
           {[{ name: "C++ memory model", weak: res.weakCxx }, { name: "x86 (TSO)", weak: res.weakTso }].map((m) => (
             <Verdict key={m.name} good={!m.weak}><b>{m.name}:</b> {m.weak ? "possible" : "forbidden"}</Verdict>
@@ -488,9 +487,9 @@ export function HappensBeforeDemo() {
             return (
               <g key={e.id} transform={`translate(${p.x - nodeW / 2},${p.y - nodeH / 2})`} onClick={() => setSel(e.id)} style={{ cursor: "pointer" }}>
                 <rect width={nodeW} height={nodeH} rx={7} fill={isBefore ? "var(--c1)" : "var(--bg)"} fillOpacity={isBefore ? 0.16 : 1} stroke={isSel ? "var(--fg)" : TC[e.t]} strokeWidth={isSel ? 2.5 : 1.5} />
-                <text x={nodeW / 2} y={17} textAnchor="middle" fontSize={fs} fontFamily={mono} fill="var(--fg)">{e.label}</text>
+                <text x={nodeW / 2} y={17} textAnchor="middle" fontSize={fs} fontFamily={MONO} fill="var(--fg)">{e.label}</text>
                 <text x={nodeW / 2} y={31} textAnchor="middle" fontSize={10.5} fill={strong ? "var(--c3)" : "var(--muted)"} fontWeight={strong ? 600 : 400}>{e.atomic ? ORD_SHORT[o] : "plain"}</text>
-                <text x={nodeW / 2} y={46} textAnchor="middle" fontSize={10} fontFamily={mono} fill="var(--muted)">clock [{a.vc[e.id]!.join(",")}]</text>
+                <text x={nodeW / 2} y={46} textAnchor="middle" fontSize={10} fontFamily={MONO} fill="var(--muted)">clock [{a.vc[e.id]!.join(",")}]</text>
               </g>
             );
           })}
@@ -499,7 +498,7 @@ export function HappensBeforeDemo() {
       <div style={{ display: "flex", flexWrap: "wrap", gap: "8px 16px", marginTop: 4 }}>
         {sc.events.filter((e) => e.choices.length).map((e) => (
           <div key={e.id} style={{ fontSize: 12 }}>
-            <div style={{ color: TC[e.t], fontFamily: mono, marginBottom: 2 }}>T{e.t}: {e.label}</div>
+            <div style={{ color: TC[e.t], fontFamily: MONO, marginBottom: 2 }}>T{e.t}: {e.label}</div>
             <Seg small value={ords[e.id]!} options={e.choices.map((c) => ({ value: c, label: c }))} onChange={(v) => setChosen({ ...chosen, [e.id]: v })} />
           </div>
         ))}
@@ -556,10 +555,10 @@ export function StoreBufferDemo() {
               <span className="muted">Store buffer (oldest first): </span>
               <span style={{ display: "inline-flex", gap: 4, flexWrap: "wrap", verticalAlign: "middle" }}>
                 {s.buf[t]!.length === 0 && <span className="muted">empty</span>}
-                {s.buf[t]!.map(([l, v], i) => <span key={i} style={{ fontFamily: mono, border: `1.5px solid ${TC[t]}`, borderRadius: 4, padding: "0 6px" }}>{l} = {v}</span>)}
+                {s.buf[t]!.map(([l, v], i) => <span key={i} style={{ fontFamily: MONO, border: `1.5px solid ${TC[t]}`, borderRadius: 4, padding: "0 6px" }}>{l} = {v}</span>)}
               </span>
             </div>
-            <div style={{ fontFamily: mono, fontSize: 12, marginTop: 4, color: "var(--muted)" }}>
+            <div style={{ fontFamily: MONO, fontSize: 12, marginTop: 4, color: "var(--muted)" }}>
               {ops.flatMap((op) => (op.k === "ld" ? [`${op.reg} = ${s.regs[op.reg] ?? "—"}`] : [])).join(" · ")}
             </div>
           </div>

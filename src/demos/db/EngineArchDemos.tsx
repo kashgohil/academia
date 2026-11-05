@@ -1,9 +1,9 @@
 /** Demos for "Architecture of an embedded engine": a live layer diagram and a design-choice explorer. */
 import { useMemo, useRef, useState } from "react";
-import { Demo, Stats, Param, range, useSim } from "../../kit";
+import { Demo, Stats, Param, range, useSim, Banner, Note, SmallLabel, mono, seg } from "../../kit";
 import { LAYERS, type Layer, type TinyKv } from "../../sims/db/engine/kv";
 import { archEngine, archKey, traceOp, LAYER_INFO, AXES, consequences, type OpTrace, type Choice } from "../../sims/db/engine/design";
-import { mono, seg, Note, Label, LAYER_COLOR, Verdict, fmt } from "./EngineShared";
+import { LAYER_COLOR, fmt } from "./EngineShared";
 
 // ============================================================================
 // The layers, lit by real work
@@ -85,7 +85,7 @@ export function ArchitectureDemo() {
           })}
         </div>
         <div style={{ flex: "1 1 260px", minWidth: 0 }}>
-          <Label>{tr ? `What happened, in order (${Math.min(shown, tr.events.length)} of ${tr.events.length} steps)` : "Press a button. Each step shows the layer that did it."}</Label>
+          <SmallLabel>{tr ? `What happened, in order (${Math.min(shown, tr.events.length)} of ${tr.events.length} steps)` : "Press a button. Each step shows the layer that did it."}</SmallLabel>
           <div style={{ border: "1px solid var(--border)", borderRadius: 6, maxHeight: 290, overflowY: "auto", fontSize: 11.5 }}>
             {tr?.events.slice(0, shown).map((x, i) => (
               <div key={i} style={{ display: "flex", gap: 6, padding: "2px 6px", background: i === shown - 1 ? "var(--subtle)" : undefined, borderBottom: "1px solid var(--border)" }}>
@@ -132,10 +132,10 @@ export function DesignExplorerDemo() {
       }
     >
       {!r.valid ? (
-        <Verdict ok={false}>
+        <Banner ok={false}>
           <b>This combination does not work.</b>
           {r.problems.map((p) => <div key={p}>{p}</div>)}
-        </Verdict>
+        </Banner>
       ) : (
         <>
           <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.2fr) minmax(0, 2fr)", gap: "5px 12px", fontSize: 13 }}>
@@ -158,7 +158,7 @@ export function DesignExplorerDemo() {
           <Bar wa={r.amp!.wa} />
         </>
       )}
-      <Label style={{ marginTop: 12 }}>{top[0]!.score === 5 ? "Real engines with exactly these choices" : `Closest real engines (${top[0]!.score} of 5 choices match)`}</Label>
+      <SmallLabel style={{ marginTop: 12 }}>{top[0]!.score === 5 ? "Real engines with exactly these choices" : `Closest real engines (${top[0]!.score} of 5 choices match)`}</SmallLabel>
       <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
         {top.map((m) => (
           <div key={m.engine.name} style={{ fontSize: 13 }}>
@@ -176,7 +176,7 @@ function Bar({ wa }: { wa: number }) {
   const x = (v: number) => (Math.log(v) / Math.log(300)) * 100;
   return (
     <div style={{ marginTop: 12 }}>
-      <Label>Write amplification on a log scale</Label>
+      <SmallLabel>Write amplification on a log scale</SmallLabel>
       <svg viewBox="0 0 100 9" preserveAspectRatio="none" style={{ width: "100%", height: 18, display: "block" }}>
         <rect x={0} y={1} width={100} height={7} fill="var(--subtle)" />
         <rect x={0} y={1} width={Math.max(0.5, x(wa))} height={7} fill="var(--c1)" />

@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
-import { Demo, Stats, Param, Plot, Line, RuleX, Legend, range, select, toggle, useSim, useWidth, pct } from "../kit";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Demo, Stats, Param, Plot, Line, RuleX, Legend, range, select, toggle, useSim, useWidth, pct, mono, Note } from "../kit";
 import {
   alignUp, bumpRun, structLayout, fieldsOf, C_TYPES, type BumpReq, type CType, type StructLayout,
   frameLoop, chunkWaste, PoolSim, type Handle, protectPtr, revealPtr, passesAlignCheck, forgedPassRate,
@@ -7,11 +7,10 @@ import {
   headerWord, headerSize, headerAllocated,
 } from "../sims/allocextrasA";
 
-const mono: CSSProperties = { fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12 };
+const codeText = { ...mono, fontSize: 12 };
 const HATCH = (c: string) => `repeating-linear-gradient(135deg, var(${c}) 0 2px, transparent 2px 5px)`;
 const hex2 = (n: number) => "0x" + n.toString(16).padStart(2, "0");
 const bin8 = (n: number) => (n & 0xff).toString(2).padStart(8, "0");
-const Note = ({ children }: { children: ReactNode }) => <p className="muted" style={{ fontSize: 12.5, margin: "10px 0 0" }}>{children}</p>;
 
 // ================================================================ bump pointer stepper
 
@@ -36,7 +35,7 @@ function ByteGrid({ cap, cols, cell }: { cap: number; cols: number; cell: (i: nu
 function FragmentRow({ i, cols, children }: { i: number; cols: number; children: ReactNode }) {
   return (
     <>
-      {i % cols === 0 && <div style={{ ...mono, fontSize: 9.5, color: "var(--muted)", alignSelf: "center" }}>{hex2(i)}</div>}
+      {i % cols === 0 && <div style={{ ...codeText, fontSize: 9.5, color: "var(--muted)", alignSelf: "center" }}>{hex2(i)}</div>}
       {children}
     </>
   );
@@ -105,7 +104,7 @@ export function BumpStepperDemo() {
         }}
       />
       <Legend items={[{ label: "block", color: "var(--c1)" }, { label: "alignment padding", color: "var(--c2)" }, { label: "top (next free byte)", color: "var(--c4)" }]} />
-      <div style={{ ...mono, marginTop: 10, lineHeight: 1.7, overflowX: "auto" }}>
+      <div style={{ ...codeText, marginTop: 10, lineHeight: 1.7, overflowX: "auto" }}>
         {last ? (
           <>
             <div>alloc({last.size}, align {last.align}) with top = {last.start}</div>
@@ -175,7 +174,7 @@ export function StructLayoutDemo() {
         ))}
         <button className="btn ghost" disabled={!types.length} onClick={() => setTypes(types.slice(0, -1))}>Remove last</button>
       </div>
-      <div style={{ ...mono, marginBottom: 12, overflowWrap: "anywhere" }}>struct {"{"} {fields.map((f) => f.label!.split(": ").reverse().join(" ")).join("; ")}{fields.length ? ";" : ""} {"}"}</div>
+      <div style={{ ...codeText, marginBottom: 12, overflowWrap: "anywhere" }}>struct {"{"} {fields.map((f) => f.label!.split(": ").reverse().join(" ")).join("; ")}{fields.length ? ";" : ""} {"}"}</div>
       {types.length ? (
         <div style={{ display: "flex", gap: 18, flexWrap: "wrap" }}>
           <LayoutStrip title="Declaration order (C, C++, Odin, Zig extern struct)" l={c} />
@@ -377,7 +376,7 @@ export function PoolFreeListDemo() {
           })}
         </svg>
       </div>
-      <div style={{ ...mono, display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center", margin: "6px 0 10px" }}>
+      <div style={{ ...codeText, display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center", margin: "6px 0 10px" }}>
         <span style={{ color: "var(--c4)", fontWeight: 600 }}>head</span>
         {order.map((i) => <span key={i}>→ <span style={{ padding: "1px 6px", borderRadius: 4, background: "var(--subtle)", border: "1px solid var(--border)" }}>{i}</span></span>)}
         <span>→ null</span>
@@ -389,7 +388,7 @@ export function PoolFreeListDemo() {
             {handles.map((h, k) => {
               const ok = p.valid(h);
               return (
-                <button key={k} className="btn" style={{ ...mono, borderColor: ok ? "var(--c3)" : "var(--c4)", color: ok ? "var(--c3)" : "var(--c4)" }}
+                <button key={k} className="btn" style={{ ...codeText, borderColor: ok ? "var(--c3)" : "var(--c4)", color: ok ? "var(--c3)" : "var(--c4)" }}
                   onClick={() => say(ok
                     ? `${h.name} = (${h.index}, ${h.gen}): generation matches, access allowed`
                     : `${h.name} = (${h.index}, ${h.gen}): slot ${h.index} has generation ${p.gen[h.index]} now → rejected. A raw pointer would read ${p.owner[h.index] ?? "a free slot"}.`)}>
@@ -400,7 +399,7 @@ export function PoolFreeListDemo() {
           </div>
         </div>
       )}
-      <div style={{ ...mono, color: "var(--muted)", minHeight: 18 * 3 }}>
+      <div style={{ ...codeText, color: "var(--muted)", minHeight: 18 * 3 }}>
         {log.length ? log.map((l, i) => <div key={i}>{l}</div>) : <div>Allocate, or click a live slot to free it.</div>}
       </div>
       <Stats items={[{ label: "free slots", value: order.length }, { label: "live slots", value: p.n - order.length }, { label: "head", value: p.head < 0 ? "null" : `slot ${p.head}` }]} />
@@ -428,7 +427,7 @@ export function SafeLinkingDemo() {
   );
   return (
     <Demo title="Safe-linking: glibc hides the next pointer" controls={<Param spec={attackSchema} value={attack} onChange={(v) => setAttack(v as string)} />}>
-      <div style={{ ...mono }}>
+      <div style={{ ...codeText }}>
         {row("slot address (pos)", hx(POS))}
         {row("real next pointer", hx(NEXT))}
         {row("key = pos >> 12", hx(POS >> 12n))}
@@ -549,7 +548,7 @@ export function FitSearchDemo() {
           );
         })}
       </div>
-      <div style={{ ...mono, color: "var(--muted)", minHeight: 18 * 2, marginTop: 10 }}>
+      <div style={{ ...codeText, color: "var(--muted)", minHeight: 18 * 2, marginTop: 10 }}>
         {log.length ? log.map((l, i) => <div key={i}>{l}</div>) : <div>Press Search. Click a blue block to free it.</div>}
       </div>
       <div style={{ overflowX: "auto", marginTop: 8 }}>
@@ -607,10 +606,10 @@ export function BlockHeaderDemo() {
         <div style={{ flex: `${sz - FL_HEADER - (alloc ? 0 : 8)} 0 0`, minWidth: 0, overflow: "hidden", whiteSpace: "nowrap", background: alloc ? "var(--c1)" : "var(--subtle)", color: alloc ? "#fff" : "var(--muted)", display: "grid", placeItems: "center" }}>{alloc ? `payload ${sz - FL_HEADER} B` : "free space"}</div>
         {!alloc && <div style={{ flex: "8 0 0", minWidth: 50, background: "var(--c5)", opacity: 0.7, color: "#fff", display: "grid", placeItems: "center" }}>footer</div>}
       </div>
-      <div className="muted" style={{ ...mono, fontSize: 11, display: "flex", justifyContent: "space-between", marginTop: 4 }}>
+      <div className="muted" style={{ ...codeText, fontSize: 11, display: "flex", justifyContent: "space-between", marginTop: 4 }}>
         <span>0x{base.toString(16)}</span><span>next header at 0x{(base + sz).toString(16)}</span>
       </div>
-      <div style={{ ...mono, marginTop: 12 }}>
+      <div style={{ ...codeText, marginTop: 12 }}>
         <div className="muted" style={{ marginBottom: 4 }}>header word (low 12 bits):</div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(12, minmax(0, 1fr))", gap: 2, maxWidth: 420 }}>
           {bits.map((b, i) => {

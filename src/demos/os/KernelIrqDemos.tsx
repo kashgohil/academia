@@ -1,11 +1,11 @@
 /** Lesson: interrupt handling. Stack-level entry stepper, gate encoder and a fault cascade explorer. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, select, toggle } from "../../kit";
+import { Demo, Param, Stats, select, toggle, Banner, IndexButtons, IndexSlider, Note, Panel, SmallLabel, mono, seg, tint } from "../../kit";
 import {
   ALL_TRIGGERS, GATE_INTERRUPT, GATE_TRAP, TRIGGER_LABEL, cascade, decodeGate, encodeGate, entrySnaps, hex64,
   type CascadeCfg, type StackRow, type Trigger,
 } from "../../sims/os/kernel";
-import { BitGrid, Cap, Msg, Note, Panel, RegCell, RegGrid, StepButtons, StepSlider, Verdict, mono, seg, tint } from "./KernelUi";
+import { BitGrid, Msg, RegCell, RegGrid } from "./KernelUi";
 
 const WHO_COLOR: Record<StackRow["who"], string> = { cpu: "var(--c1)", stub: "var(--c2)", pad: "var(--muted)" };
 
@@ -22,9 +22,9 @@ export function InterruptEntryDemo() {
   return (
     <Demo
       title="One interrupt, at stack level"
-      actions={<StepButtons k={kk} n={snaps.length} set={setK} />}
+      actions={<IndexButtons k={kk} n={snaps.length} set={setK} />}
       controls={<>
-        <StepSlider k={kk} n={snaps.length} set={setK} />
+        <IndexSlider k={kk} n={snaps.length} set={setK} />
         <Param spec={seg<"user" | "kernel">("Interrupted code", [["user", "ring 3"], ["kernel", "ring 0"]], "user")} value={from} onChange={(v) => setFrom(v as "user" | "kernel")} />
         <Param spec={toggle({ label: "Vector with an error code (#PF)", default: true })} value={err} onChange={(v) => setErr(v as boolean)} />
         <Param spec={seg<"interrupt" | "trap">("Gate type", [["interrupt", "interrupt"], ["trap", "trap"]], "interrupt")} value={gate} onChange={(v) => setGate(v as "interrupt" | "trap")} />
@@ -35,7 +35,7 @@ export function InterruptEntryDemo() {
       <Msg warn={s.bad} min={58}>{s.text}</Msg>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
         <div style={{ flex: "1 1 200px", minWidth: 0 }}>
-          <Cap>CPU</Cap>
+          <SmallLabel>CPU</SmallLabel>
           <RegGrid min={86}>
             <RegCell name="ring" value={s.ring} />
             <RegCell name="cs" value={s.cs} />
@@ -50,7 +50,7 @@ export function InterruptEntryDemo() {
           </div>
         </div>
         <div style={{ flex: "1 1 240px", minWidth: 0 }}>
-          <Cap>Kernel stack, newest entry on top: {s.stack.length * 8} bytes</Cap>
+          <SmallLabel>Kernel stack, newest entry on top: {s.stack.length * 8} bytes</SmallLabel>
           <div style={{ ...mono, fontSize: 10.5, lineHeight: 1.3, border: "1px solid var(--border)", borderRadius: 4, height: 306, overflow: "hidden", padding: 3 }}>
             {rows.length === 0 && <div className="muted" style={{ padding: 3 }}>(nothing pushed)</div>}
             {rows.map((r, i) => (
@@ -159,11 +159,11 @@ export function FaultCascadeDemo() {
         {CFG_FIELDS.map(([f, l]) => <Param key={f} spec={toggle({ label: l, default: true })} value={cfg[f]} onChange={(v) => setCfg({ ...cfg, [f]: v as boolean })} />)}
       </>}
     >
-      <Cap>What the CPU does, in order</Cap>
+      <SmallLabel>What the CPU does, in order</SmallLabel>
       <ol style={{ margin: 0, paddingLeft: 22, fontSize: 12.5, lineHeight: 1.5, minHeight: 170 }}>
         {r.events.map((e, i) => <li key={i} style={{ color: e.kind === "shutdown" ? "var(--c4)" : e.bad ? "var(--c2)" : e.kind === "handler" ? "var(--c3)" : undefined, fontWeight: e.kind === "shutdown" || e.kind === "handler" ? 600 : 400 }}>{e.text}</li>)}
       </ol>
-      <Verdict tone={tone}>{label}</Verdict>
+      <Banner tone={tone}>{label}</Banner>
       <Stats items={[
         { label: "CPU steps shown", value: r.events.length },
         { label: "handlers that ran", value: r.handlerRuns },

@@ -1,11 +1,11 @@
 /** Demos for "deadlock": resource allocation graph, lockdep-style checker, banker's algorithm. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, select, useParams } from "../../kit";
+import { Demo, Param, Stats, select, useParams, Banner, MONO, MiniTable } from "../../kit";
 import {
   BANK_EXAMPLE, LOCKDEP_TRACES, Lockdep, bankerRequest, bankerSafety, need, ragCycle, ragDeadlocked, ragFree, ragInit, ragRelease, ragRequest, realDeadlock,
   type Bank, type Rag,
 } from "../../sims/os/sync/deadlock";
-import { Banner, MONO, MiniTable, TC } from "./SyncShared";
+import { TC } from "./SyncShared";
 
 // ---------------------------------------------------------------- resource allocation graph
 

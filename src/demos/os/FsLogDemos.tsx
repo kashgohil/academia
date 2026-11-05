@@ -1,9 +1,9 @@
 /** Demos for "log-structured and copy-on-write file systems": an LFS with a cleaner, and a COW snapshot stepper. */
 import { useMemo, useRef, useState } from "react";
-import { Canvas2D, Demo, Dots, Legend, Line, Param, Plot, RuleX, SimButtons, Stats, cssVar, pct, range, select, useParams, useSim } from "../../kit";
+import { Canvas2D, Demo, Dots, Legend, Line, Param, Plot, RuleX, SimButtons, Stats, cssVar, pct, range, select, useParams, useSim, Banner, MONO, Note, SmallLabel, useChunked } from "../../kit";
 import { FFS_WRITE_COST, HOT_COLD, LFS_GEOMETRY, LFS_UTILS, Lfs, POLICY_NAME, lfsStream, runLfs, writeCostFormula, type CleanPolicy, type LfsWorkload } from "../../sims/os/fs/lfs";
 import { CowTree, type UpdateResult } from "../../sims/os/fs/cowtree";
-import { Banner, Heading, MONO, Note, smallBtn, useChunked } from "./FsUi";
+import { smallBtn } from "./FsUi";
 
 const L = {
   util: range({ label: "Disk utilization", min: 0.2, max: 0.8, step: 0.05, default: 0.7, format: (v) => pct(v, 0) }),
@@ -50,7 +50,7 @@ export function FsLfsDemo() {
   const { fs, hot } = ref.current.live;
 
   const tasks = useMemo(() => SERIES.flatMap((s) => LFS_UTILS.map((u) => () => runLfs({ util: u, workload: s.w, policy: s.p }))), []);
-  const { results } = useChunked(tasks, "lfs-sweep");
+  const results = useChunked("lfs-sweep", tasks);
   const line = (i: number) => LFS_UTILS.flatMap((u, j) => { const r = results[i * LFS_UTILS.length + j]; return r ? [[u, r.writeCost] as [number, number]] : []; });
 
   const draw = (ctx: CanvasRenderingContext2D, w: number, h: number) => {
@@ -79,7 +79,7 @@ export function FsLfsDemo() {
       <Param spec={L.workload} value={workload} onChange={(v) => P.set("workload", v as never)} />
       <Param spec={L.policy} value={policy} onChange={(v) => P.set("policy", v as never)} />
     </>}>
-      <Heading>Each column is a segment. A bold outline is the log head. A red outline is a segment that the cleaner just freed.</Heading>
+      <SmallLabel>Each column is a segment. A bold outline is the log head. A red outline is a segment that the cleaner just freed.</SmallLabel>
       <Canvas2D height={170} draw={draw} deps={[tick, key]} />
       <div className="legend" style={{ marginTop: 4 }}>
         <span style={{ ["--swatch" as string]: "var(--c1)" }}>live{workload === "hotcold" ? ", cold" : ""}</span>
@@ -97,7 +97,7 @@ export function FsLfsDemo() {
         ]} />
       </div>
       <div style={{ marginTop: 12 }}>
-        <Heading>Write cost against disk utilization: steady state on {LFS_GEOMETRY.segments} segments of {LFS_GEOMETRY.blocksPerSegment} blocks</Heading>
+        <SmallLabel>Write cost against disk utilization: steady state on {LFS_GEOMETRY.segments} segments of {LFS_GEOMETRY.blocksPerSegment} blocks</SmallLabel>
         <Plot x={[0.2, 0.9]} y={[0, 22]} height={230} xLabel="disk utilization" yLabel="write cost" xFormat={(v) => `${Math.round(v * 100)}%`} xTicks={[0.2, 0.4, 0.6, 0.8]} yTicks={[0, 4, 10, 20]}>
           <Line points={LFS_UTILS.map((u) => [u, writeCostFormula(u)])} color="var(--faint)" dash="4 3" />
           {SERIES.map((x, i) => <Line key={x.label} points={line(i)} color={x.color} />)}

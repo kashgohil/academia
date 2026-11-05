@@ -1,6 +1,6 @@
 /** New demos for the lock-free lessons: CAS race, ABA order, tag bits, hazard scan, epoch ring, M&S tail. */
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Demo, Stats, Param, Plot, Line, Bars, RuleX, Legend, range, select, toggle, useParams, useSim, pct } from "../kit";
+import { Demo, Stats, Param, Plot, Line, Bars, RuleX, Legend, range, select, toggle, useParams, useSim, pct, Arrow, MONO } from "../kit";
 import { nodeName, type Ptr } from "../sims/lockfree/machine";
 import {
   casRace, abaOrder, ABA_T1_OPS, tagWrap, tagLooksSame, hpBound, hpSim, ebrSim, msqFrames, msqLagStats, MSQ_SCENARIOS,
@@ -8,7 +8,6 @@ import {
 } from "../sims/lockfreeextras";
 
 const TC = ["var(--c1)", "var(--c2)", "var(--c3)", "var(--c5)", "var(--fg)", "var(--muted)"];
-const MONO = "ui-monospace, Menlo, monospace";
 const EASE = "transform 0.45s cubic-bezier(.4,.1,.2,1)";
 
 // ---------------------------------------------------------------- shared frame player
@@ -54,11 +53,6 @@ function Caption({ i, n, children, tone }: { i: number; n: number; children: Rea
   );
 }
 
-const Arrow = ({ id, color = "var(--muted)" }: { id: string; color?: string }) => (
-  <marker id={id} viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-    <path d="M0 0L10 5L0 10z" fill={color} />
-  </marker>
-);
 
 // ---------------------------------------------------------------- 1. CAS race on the stack head
 

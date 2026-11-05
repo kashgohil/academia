@@ -5,7 +5,7 @@ import {
   initLatchState, stepLatch, blockedBy, nextLabel, raceStates, rootContention, ROOT_PROTOCOLS, READ_KEY, WRITE_KEY,
   type LatchState, type Protocol, type Who, type LNode, type RootProtocol,
 } from "../../sims/db/btree-latch";
-import { mono } from "./BtreeView";
+import { codeText } from "./BtreeView";
 
 const TC: Record<Who, string> = { reader: "var(--c1)", writer: "var(--c2)" };
 const PROTOCOLS: { value: Protocol; label: string }[] = [
@@ -148,7 +148,7 @@ export function LatchStepperDemo() {
         <ThreadPanel s={s} who="reader" onStep={() => step("reader")} disabled={!!playing} />
         <ThreadPanel s={s} who="writer" onStep={() => step("writer")} disabled={!!playing} />
       </div>
-      <div style={{ ...mono, marginTop: 10, minHeight: 7 * 18, lineHeight: "18px" }}>
+      <div style={{ ...codeText, marginTop: 10, minHeight: 7 * 18, lineHeight: "18px" }}>
         {log.length === 0 && <div className="muted">Step the threads in any order, or press Play the race.</div>}
         {log.map((l, i) => (
           <div key={s.log.length - log.length + i} style={{ color: l.kind === "bad" ? "var(--c4)" : l.kind === "wait" ? "var(--muted)" : l.kind === "info" ? "var(--c3)" : "var(--fg)" }}>

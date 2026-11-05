@@ -1,8 +1,8 @@
 /** Demos for "path lookup and the VFS": a path walk stepper and a cost plot for stat. */
 import { useMemo, useRef, useState } from "react";
-import { Demo, Dots, Legend, Line, Param, Plot, RuleX, Stats, pct, range, select, si, useParams } from "../../kit";
+import { Demo, Dots, Legend, Line, Param, Plot, RuleX, Stats, pct, range, select, si, useParams, Banner, MONO, Note, SmallLabel } from "../../kit";
 import { Dcache, ROOT_CRED, STAT_COST_INPUTS, USER_CRED, deviceReadNs, demoNamespace, statCost, statsPerSecond, walkPath, type Namespace, type StatDevice, type StepKind, type VNode, type WalkResult } from "../../sims/os/fs/vfs";
-import { Banner, Heading, MONO, Note, smallBtn } from "./FsUi";
+import { smallBtn } from "./FsUi";
 
 const PATHS = [
   { value: "/home/kash/notes.txt", label: "/home/kash/notes.txt" },
@@ -105,7 +105,7 @@ export function FsPathWalkDemo() {
     >
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12 }}>
         <div>
-          <Heading>Mount tree</Heading>
+          <SmallLabel>Mount tree</SmallLabel>
           <div style={{ fontFamily: MONO, fontSize: 11.5, lineHeight: 1.45, border: "1px solid var(--border)", borderRadius: 6, padding: "4px 6px", maxHeight: 280, overflowY: "auto" }}>
             <div style={{ fontWeight: cur?.at === "/" ? 700 : 400, color: cur?.at === "/" ? "var(--c2)" : undefined }}>/ <span className="muted">ext4</span></div>
             {lines.map((l) => {
@@ -119,7 +119,7 @@ export function FsPathWalkDemo() {
           </div>
         </div>
         <div>
-          <Heading>Dcache: {entries.length} entries</Heading>
+          <SmallLabel>Dcache: {entries.length} entries</SmallLabel>
           <div style={{ fontFamily: MONO, fontSize: 11.5, lineHeight: 1.45, border: "1px solid var(--border)", borderRadius: 6, padding: "4px 6px", minHeight: 60, maxHeight: 280, overflowY: "auto" }}>
             {entries.length === 0 && <div className="muted">Empty. The first walk fills it.</div>}
             {entries.map((e) => {
@@ -135,7 +135,7 @@ export function FsPathWalkDemo() {
       </div>
 
       <div style={{ marginTop: 10 }}>
-        <Heading>Steps{cur ? `: mode ${cur.mode === "rcu" ? "RCU-walk" : "ref-walk"}` : ""}</Heading>
+        <SmallLabel>Steps{cur ? `: mode ${cur.mode === "rcu" ? "RCU-walk" : "ref-walk"}` : ""}</SmallLabel>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 3, minHeight: 22 }}>
           {steps.slice(0, shown).map((s, i) => (
             <button key={i} onClick={() => setShown(i + 1)} title={s.say} style={{ fontSize: 11, fontFamily: MONO, cursor: "pointer", border: `1px solid ${STEP_COLOR[s.kind]}`, color: i === shown - 1 ? "var(--bg)" : STEP_COLOR[s.kind], background: i === shown - 1 ? STEP_COLOR[s.kind] : "transparent", borderRadius: 3, padding: "0 4px" }}>
@@ -194,7 +194,7 @@ export function FsStatCostDemo() {
     </>}>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12 }}>
         <div>
-          <Heading>Against depth, at this hit rate</Heading>
+          <SmallLabel>Against depth, at this hit rate</SmallLabel>
           <Plot x={[1, 16]} y={[100, maxD * 1.3]} logY height={210} xLabel="components" yLabel="ns per stat" yTicks={yTicks(maxD)} yFormat={(v) => si(v, "", 2).replace(" ", "")} xTicks={[1, 4, 8, 12, 16]}>
             <Line points={byDepth.map((x) => [x.d, x.without])} color="var(--c4)" />
             <Line points={byDepth.map((x) => [x.d, x.withDcache])} color="var(--c3)" />
@@ -204,7 +204,7 @@ export function FsStatCostDemo() {
           </Plot>
         </div>
         <div>
-          <Heading>Against hit rate, at this depth</Heading>
+          <SmallLabel>Against hit rate, at this depth</SmallLabel>
           <Plot x={[0, 1]} y={[100, maxR * 1.3]} logY height={210} xLabel="hit rate" yLabel="ns per stat" yTicks={yTicks(maxR)} yFormat={(v) => si(v, "", 2).replace(" ", "")} xFormat={(v) => `${Math.round(v * 100)}%`} xTicks={[0, 0.25, 0.5, 0.75, 1]}>
             <Line points={byRate.map((x) => [x.h, x.without])} color="var(--c4)" />
             <Line points={byRate.map((x) => [x.h, x.withDcache])} color="var(--c3)" />

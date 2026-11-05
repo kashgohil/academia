@@ -1,24 +1,14 @@
 /** Shared pieces for the engine (capstone) demos. */
-import type { CSSProperties, ReactNode } from "react";
-import { select } from "../../kit";
+import { mono } from "../../kit";
 import type { Layer, PageImage, Version } from "../../sims/db/engine/kv";
 
-export const mono: CSSProperties = { fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", fontVariantNumeric: "tabular-nums" };
 
-export const seg = <T extends string>(label: string, options: [T, string][], def: T) =>
-  select<T>({ label, options: options.map(([value, l]) => ({ value, label: l })), default: def, segmented: true });
 
-export const Note = ({ children }: { children: ReactNode }) => <p className="muted" style={{ fontSize: 12.5, margin: "10px 0 0" }}>{children}</p>;
-export const Label = ({ children, style }: { children: ReactNode; style?: CSSProperties }) => <div className="muted" style={{ fontSize: 12, margin: "0 0 4px", ...style }}>{children}</div>;
 
 export const LAYER_COLOR: Record<Layer, string> = {
   api: "var(--fg)", txn: "var(--c5)", tree: "var(--c1)", pool: "var(--c2)", file: "var(--c3)", wal: "var(--c4)", os: "var(--muted)",
 };
 
-export function Verdict({ ok, children }: { ok: boolean | null; children: ReactNode }) {
-  const c = ok === null ? "var(--c2)" : ok ? "var(--c3)" : "var(--c4)";
-  return <div style={{ borderLeft: `3px solid ${c}`, padding: "4px 10px", fontSize: 13, margin: "8px 0", background: "var(--subtle)", borderRadius: "0 6px 6px 0" }}>{children}</div>;
-}
 
 /** A version chain as text: newest first, "T3:v1 T1:a5", with ✕ for a delete. */
 export const chainText = (c: Version[]) => c.map((v) => `T${v.t}:${v.v ?? "✕"}`).join(" ");

@@ -1,11 +1,10 @@
 /** Demos for "Multiprocessor scheduling". */
 import { useMemo, useRef } from "react";
-import { Demo, Stats, Controls, Plot, Line, Legend, range, toggle, useParams, useSim, pct } from "../../kit";
+import { Demo, Stats, Controls, Plot, Line, Legend, range, toggle, useParams, useSim, pct, Note, SmallLabel, mono, seg, useChunked } from "../../kit";
 import {
   BALANCE_SWEEP, COST_INPUTS, COST_WORKLOAD, DEMO_MC, Multicore, balancePoint, numaRemoteCost, resultOf,
   type McConfig, type QueueMode,
 } from "../../sims/os/scheduling";
-import { Caption, Note, seg, useChunked, mono } from "../db/StorageUi";
 import { f1, jobColor } from "./SchedulingGantt";
 
 // ------------------------------------------------------------------------------------------------
@@ -130,7 +129,7 @@ export function MigrationCostDemo() {
   const yMin = ys.length ? Math.floor(Math.min(...ys) / 5) * 5 : 0;
   return (
     <Demo title="More balancing, or less?" controls={<Controls params={p} />}>
-      <Caption>Useful CPU time, as a share of all CPU time. 8 CPUs on 2 nodes, 20 tasks. Each point is the mean of 3 runs.</Caption>
+      <SmallLabel>Useful CPU time, as a share of all CPU time. 8 CPUs on 2 nodes, 20 tasks. Each point is the mean of 3 runs.</SmallLabel>
       <Plot x={[1, 1024]} y={[yMin, 100]} logX height={230} xLabel="balancer period (ms)" xTicks={[1, 4, 16, 64, 256, 1024]} xFormat={(v) => String(v)} yFormat={(v) => `${v}%`}>
         <Line points={curve(0)} color="var(--c3)" />
         <Line points={curve(1)} color="var(--c2)" />

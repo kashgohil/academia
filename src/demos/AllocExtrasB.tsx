@@ -1,6 +1,6 @@
 /** New demos for the allocator lessons, group B: buddy, slab, fragmentation, general-purpose allocators. */
 import { useMemo, useRef, useState, type ReactNode } from "react";
-import { Demo, Stats, Param, Plot, Line, Area, Dots, RuleY, Legend, range, select, toggle, useSim, useWidth, pct } from "../kit";
+import { Demo, Stats, Param, Plot, Line, Area, Dots, RuleY, Legend, range, select, toggle, useSim, useWidth, pct, mono } from "../kit";
 import { mulberry32 } from "../sims/rng";
 import {
   BuddyHeap, type BuddyEvent, type SlabCache, slabDemo, slabFit, FragHeap, checkerboard, fillWith, type FragMode,
@@ -9,9 +9,9 @@ import {
 
 const hex = (n: number) => "0x" + n.toString(16).padStart(3, "0");
 const bin = (n: number, bits: number) => n.toString(2).padStart(bits, "0");
-const mono = { fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12 } as const;
+const codeText = { ...mono, fontSize: 12 };
 
-function Meter({ label, value, color, note }: { label: string; value: number; color: string; note: ReactNode }) {
+function FragMeter({ label, value, color, note }: { label: string; value: number; color: string; note: ReactNode }) {
   return (
     <div style={{ minWidth: 0 }}>
       <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: "var(--muted)" }}>
@@ -132,12 +132,12 @@ export function BuddyTreeDemo() {
         </svg>
       </div>
       <Legend box items={[{ label: "in use (dark part: requested bytes)", color: "var(--c1)" }, { label: "free block", color: "var(--c3)" }, { label: "split", color: "var(--border)" }, { label: "last operation", color: "var(--c4)" }]} />
-      <div style={{ ...mono, marginTop: 10, minHeight: 60, color: "var(--muted)" }}>
+      <div style={{ ...codeText, marginTop: 10, minHeight: 60, color: "var(--muted)" }}>
         {title ? <div style={{ color: "var(--fg)", marginBottom: 2 }}>{title}</div> : <div>Allocate, or click a block in use to free it.</div>}
         {events.map((e, i) => <div key={i}>{describe(e)}</div>)}
       </div>
       {xorEvent && (
-        <div style={{ ...mono, marginTop: 8, padding: "8px 10px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--subtle)", lineHeight: 1.5, overflowX: "auto" }}>
+        <div style={{ ...codeText, marginTop: 8, padding: "8px 10px", border: "1px solid var(--border)", borderRadius: 6, background: "var(--subtle)", lineHeight: 1.5, overflowX: "auto" }}>
           {(() => {
             const bits = Math.log2(h.total);
             const flip = Math.round(Math.log2(xorEvent.size));
@@ -368,10 +368,10 @@ export function FragExplorerDemo() {
         alloc({req}) needs one free block of {Number.isFinite(need) ? `${need} B` : "more than 1 KiB"}. The largest free block is {s.largestFree} B, so it {fits ? "fits" : "does not fit"}{!fits && s.free >= req ? `, although ${s.free} B are free in total` : ""}.
       </p>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 14 }}>
-        <Meter label="Internal fragmentation" value={s.internalFrac} color="var(--c2)" note={`${s.internal} B of ${s.allocated} B in blocks are not requested`} />
-        <Meter label="External fragmentation" value={s.external} color="var(--c4)" note={`${s.free - s.largestFree} B of ${s.free} B free are outside the largest free block`} />
+        <FragMeter label="Internal fragmentation" value={s.internalFrac} color="var(--c2)" note={`${s.internal} B of ${s.allocated} B in blocks are not requested`} />
+        <FragMeter label="External fragmentation" value={s.external} color="var(--c4)" note={`${s.free - s.largestFree} B of ${s.free} B free are outside the largest free block`} />
       </div>
-      <div style={{ ...mono, marginTop: 10, color: "var(--muted)", minHeight: 18 }}>{msg || "Click a block in use to free it."}</div>
+      <div style={{ ...codeText, marginTop: 10, color: "var(--muted)", minHeight: 18 }}>{msg || "Click a block in use to free it."}</div>
     </Demo>
   );
 }
@@ -458,7 +458,7 @@ export function MallocPathDemo() {
       }
     >
       <p className="muted" style={{ fontSize: 13, marginTop: 0 }}>{note} {res.steps.length} operations.</p>
-      <div style={{ ...mono, fontSize: 12.5, marginBottom: 8, minHeight: 18 }}>
+      <div style={{ ...codeText, fontSize: 12.5, marginBottom: 8, minHeight: 18 }}>
         #{i + 1}: {step.kind === "a" ? "malloc" : "free"}({step.size} B){wl === "prodcons" ? ` on thread ${step.thread + 1}` : ""} → <b style={{ color: TIER_COLOR[step.tier] }}>{TIER_NAMES[step.tier].toLowerCase()}</b>, cost {TIER_COST[step.tier]}
       </div>
       <div style={{ display: "grid", gap: 6 }}>

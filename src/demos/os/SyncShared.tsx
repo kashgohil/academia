@@ -1,24 +1,14 @@
 /** Shared parts of the synchronization demos: the thread stepper, status banners and chunked sweeps. */
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Demo } from "../../kit";
+import { Demo, Banner, MONO, type Tone } from "../../kit";
 import {
   allDone, canRun, clone, currentIns, drain, exec, initial, threadDone,
   type Ins, type MState, type Prog,
 } from "../../sims/os/sync/machine";
 
-export const MONO = "ui-monospace, Menlo, monospace";
 export const TC = ["var(--c1)", "var(--c2)", "var(--c5)", "var(--c3)", "var(--fg)", "var(--muted)"];
 
-export type Tone = "good" | "bad" | "plain";
 
-export function Banner({ tone = "plain", children }: { tone?: Tone; children: ReactNode }) {
-  const c = tone === "bad" ? "var(--c4)" : tone === "good" ? "var(--c3)" : "var(--border)";
-  return (
-    <div style={{ fontSize: 13.5, lineHeight: 1.45, minHeight: 22, padding: "7px 10px 7px 13px", marginTop: 10, background: "var(--subtle)", borderRadius: 6, border: "1px solid var(--border)", boxShadow: `inset 3px 0 0 ${c}` }}>
-      {children}
-    </div>
-  );
-}
 
 /** A labelled memory cell. */
 export function Cell({ name, value, hot, note, width }: { name: string; value: ReactNode; hot?: boolean; note?: string; width?: number }) {
@@ -35,32 +25,6 @@ export function CellRow({ children }: { children: ReactNode }) {
   return <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "flex-start" }}>{children}</div>;
 }
 
-/** Runs tasks one at a time with setTimeout, so a sweep never blocks a render. */
-export function useChunked<T>(tasks: (() => T)[], key: string): { results: (T | undefined)[]; done: boolean } {
-  const [state, setState] = useState<{ key: string; results: (T | undefined)[] }>({ key: "", results: [] });
-  const tasksRef = useRef(tasks);
-  tasksRef.current = tasks;
-  useEffect(() => {
-    let i = 0;
-    let timer = 0;
-    const list = tasksRef.current;
-    const results = new Array<T | undefined>(list.length).fill(undefined);
-    const run = () => {
-      const t0 = performance.now();
-      // Several cheap tasks can share one frame. A heavy task gets its own frame.
-      do {
-        results[i] = list[i]!();
-        i++;
-      } while (i < list.length && performance.now() - t0 < 12);
-      setState({ key, results: results.slice() });
-      if (i < list.length) timer = window.setTimeout(run, 0);
-    };
-    timer = window.setTimeout(run, 0);
-    return () => clearTimeout(timer);
-  }, [key]);
-  const results = state.key === key ? state.results : new Array<T | undefined>(tasks.length).fill(undefined);
-  return { results, done: results.every((r) => r !== undefined) };
-}
 
 // ---------------------------------------------------------------- the stepper
 
@@ -242,22 +206,3 @@ function ScheduleStrip({ log, names }: { log: LogLine[]; names?: string[] }) {
   );
 }
 
-/** A small table with monospaced numbers that fits a phone. */
-export function MiniTable({ head, rows, highlight }: { head: ReactNode[]; rows: ReactNode[][]; highlight?: (i: number) => boolean }) {
-  return (
-    <div style={{ overflowX: "auto" }}>
-      <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 12.5 }}>
-        <thead>
-          <tr>{head.map((h, i) => <th key={i} style={{ textAlign: i ? "right" : "left", fontWeight: 500, padding: "3px 6px", borderBottom: "1px solid var(--border)", verticalAlign: "bottom" }}>{h}</th>)}</tr>
-        </thead>
-        <tbody>
-          {rows.map((r, i) => (
-            <tr key={i} style={{ background: highlight?.(i) ? "var(--accent-soft, var(--subtle))" : undefined }}>
-              {r.map((c, j) => <td key={j} style={{ textAlign: j ? "right" : "left", padding: "3px 6px", fontVariantNumeric: "tabular-nums", borderBottom: "1px solid var(--border)" }}>{c}</td>)}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}

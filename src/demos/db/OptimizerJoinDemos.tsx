@@ -1,11 +1,11 @@
 /** Demos for "Join ordering": a join graph with strategies, the DP table stepper, search-space size. */
 import { useEffect, useMemo, useState } from "react";
-import { Demo, Param, Plot, Line, RuleX, Dots, Legend, Stats, range, toggle, useParams, useWidth } from "../../kit";
+import { Demo, Param, Plot, Line, RuleX, Dots, Legend, Stats, range, toggle, useParams, useWidth, Btn, Note, SectionLabel, fixed, mono, seg } from "../../kit";
 import {
   makeGraph, bushyExample, compareStrategies, STRATEGY_LABEL, planString, dp, GraphInfo, popcount, leftDeepCount, bushyCount, ccpCount, isLeftDeep,
   type JoinGraph, type Plan, type Shape, type Strategy,
 } from "../../sims/db/optimizer";
-import { seg, mono, Note, Caption, fx, num, LogBar, Btn } from "./OptimizerUi";
+import { num, LogBar } from "./OptimizerUi";
 
 type GraphId = Shape | "bushy";
 const GRAPH_OPTS: [GraphId, string][] = [["chain", "chain"], ["star", "star"], ["cycle", "cycle"], ["clique", "clique"], ["bushy", "bushy wins (fixed)"]];
@@ -124,13 +124,13 @@ export function JoinGraphDemo() {
             <span style={{ ...mono, fontSize: 11.5, overflowWrap: "anywhere", cursor: "pointer" }}>{planString(g, res[s])}</span>
             <span style={{ ...mono }}>{num(res[s].cost, 3)}</span>
             <div style={{ cursor: "pointer" }}>
-              <span style={mono}>{fx(res[s].cost / best, res[s].cost / best < 100 ? 2 : 0)}</span>
+              <span style={mono}>{fixed(res[s].cost / best, res[s].cost / best < 100 ? 2 : 0)}</span>
               <LogBar value={res[s].cost / best} lo={1} hi={hi} color={SCOLOR[s]} height={6} />
             </div>
           </div>
         ))}
       </div>
-      <Caption>{STRATEGY_LABEL[pick]}: {isLeftDeep(res[pick]) ? "a left-deep tree" : "a bushy tree"} (click a row to show another plan)</Caption>
+      <SectionLabel>{STRATEGY_LABEL[pick]}: {isLeftDeep(res[pick]) ? "a left-deep tree" : "a bushy tree"} (click a row to show another plan)</SectionLabel>
       <PlanTree g={g} p={res[pick]} />
       <Note>Greedy (GOO) joins the pair with the smallest result first. Random search keeps the best of 10 random left-deep orders that avoid cross products.</Note>
     </Demo>
@@ -192,7 +192,7 @@ export function DpTableDemo() {
           </div>
         </>}
       </div>
-      <Caption>The DP table (best plan for each subset so far)</Caption>
+      <SectionLabel>The DP table (best plan for each subset so far)</SectionLabel>
       <div style={{ maxHeight: 240, overflowY: "auto", border: "1px solid var(--border)", borderRadius: 6, padding: "4px 8px" }}>
         <div style={{ display: "grid", gridTemplateColumns: "auto minmax(0, 1fr) auto auto", gap: "2px 12px", fontSize: 12, alignItems: "baseline" }}>
           <b>subset</b><b>best plan</b><b>rows</b><b>C_out</b>

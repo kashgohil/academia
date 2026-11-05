@@ -1,12 +1,11 @@
 /** Demos for "Memtables and SSTables": the write/read path stepper, a skip list, and the block format. */
 import { useMemo, useRef, useState, type CSSProperties } from "react";
-import { Demo, Stats, Param, Legend, range, toggle, pct, bytes } from "../../kit";
+import { Demo, Stats, Param, Legend, range, toggle, pct, bytes, Btn, ButtonRow, Note, SectionLabel, StackBar, fixed, mono, seg } from "../../kit";
 import { mulberry32 } from "../../sims/rng";
 import {
   LsmTree, SkipList, expectedSearchCost, averageSearchCost, encodeBlock, layoutTable, stepperSeedTree, blockKeys, avgSeekCost,
   type Entry, type Probe, type GetResult, type SSTable, type Memtable, type KeySet,
 } from "../../sims/db/lsm";
-import { seg, mono, Note, Caption, Btn, ButtonRow, fx, StackBar } from "./LsmShared";
 
 // ================= the write and read path =================
 
@@ -138,7 +137,7 @@ export function LsmStepperDemo() {
       }
     >
       <p style={{ fontSize: 13, margin: "0 0 6px", minHeight: 38 }}>{msg}</p>
-      <Caption>WAL on disk: append only, one segment per memtable ({t.wal.length} records)</Caption>
+      <SectionLabel>WAL on disk: append only, one segment per memtable ({t.wal.length} records)</SectionLabel>
       <div style={{ ...mono, fontSize: 11, display: "flex", flexWrap: "wrap", gap: 4 }}>
         {t.wal.slice(-10).map((r) => (
           <span key={r.entry.seq} style={{ border: "1px solid var(--border)", borderRadius: 4, padding: "1px 5px", color: r.entry.kind === "del" ? "var(--c4)" : "var(--fg)" }}>
@@ -147,7 +146,7 @@ export function LsmStepperDemo() {
         ))}
         {t.wal.length === 0 && <span className="muted">empty: every write is in an SSTable</span>}
       </div>
-      <Caption>Memory: memtable (skip list, sorted) and immutable memtables</Caption>
+      <SectionLabel>Memory: memtable (skip list, sorted) and immutable memtables</SectionLabel>
       <div style={row}>
         <Card title="memtable" sub={`${t.mem.entries}/${limit}`} outcome={probe((p) => p.source === "memtable")}>
           <EntryRows entries={memEntries(t.mem)} hiKey={hiKey} hiSeq={hiSeq} />
@@ -158,7 +157,7 @@ export function LsmStepperDemo() {
           </Card>
         ))}
       </div>
-      <Caption>Disk, L0: one file per flush, newest first; files can overlap</Caption>
+      <SectionLabel>Disk, L0: one file per flush, newest first; files can overlap</SectionLabel>
       <div style={row}>
         {l0.map((r, i) => {
           const f = r.files[0]!;
@@ -170,7 +169,7 @@ export function LsmStepperDemo() {
         })}
         {l0.length === 0 && <span className="muted" style={{ fontSize: 12 }}>no files</span>}
       </div>
-      <Caption>Disk, L1: one sorted run; file ranges do not overlap</Caption>
+      <SectionLabel>Disk, L1: one sorted run; file ranges do not overlap</SectionLabel>
       <div style={row}>
         {l1.map((f) => (
           <Card key={f.id} title={`file ${f.id}`} sub={fileRange(f)} outcome={probe((p) => p.level === 1 && p.fileId === f.id)}>
@@ -303,9 +302,9 @@ export function SkipListDemo() {
       <Stats
         items={[
           { label: "comparisons, this search", value: search.comparisons },
-          { label: "average over all keys", value: fx(avg, 1) },
-          { label: "formula log₁/ₚ(n) / p", value: fx(expectedSearchCost(nodes.length, p), 1) },
-          { label: "pointers per node (expected 1/(1−p))", value: `${fx(nodes.reduce((s, x) => s + x.height, 0) / nodes.length, 2)} (${fx(1 / (1 - p), 2)})` },
+          { label: "average over all keys", value: fixed(avg, 1) },
+          { label: "formula log₁/ₚ(n) / p", value: fixed(expectedSearchCost(nodes.length, p), 1) },
+          { label: "pointers per node (expected 1/(1−p))", value: `${fixed(nodes.reduce((s, x) => s + x.height, 0) / nodes.length, 2)} (${fixed(1 / (1 - p), 2)})` },
         ]}
       />
       <div style={{ marginTop: 6 }}>
@@ -369,10 +368,10 @@ export function BlockLayoutDemo() {
           { label: "block, full keys", value: `${plain.bytes.length} B` },
           { label: "saved", value: pct(1 - b.bytes.length / plain.bytes.length) },
           { label: `restart array (${b.restarts.length} points)`, value: `${b.trailerBytes} B` },
-          { label: "seek: binary-search steps + entries scanned", value: `${fx(seek.probes, 1)} + ${fx(seek.scanned, 1)}` },
+          { label: "seek: binary-search steps + entries scanned", value: `${fixed(seek.probes, 1)} + ${fixed(seek.scanned, 1)}` },
         ]}
       />
-      <Caption style={{ marginTop: 14 }}>A whole SSTable of 1,000 such entries, 4 KiB blocks</Caption>
+      <SectionLabel style={{ marginTop: 14 }}>A whole SSTable of 1,000 such entries, 4 KiB blocks</SectionLabel>
       <StackBar
         height={22}
         parts={[

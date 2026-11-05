@@ -3,9 +3,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
-import { Demo, Stats, Param, range, useParams, useSim, cssVar, Legend } from "../../kit";
+import { Demo, Stats, Param, range, useParams, useSim, cssVar, Legend, StackBar, ms, seg } from "../../kit";
 import { HDDS, hddRun, rotationMs, type HddPattern, type HddSched, type HddServed } from "../../sims/db/storage";
-import { seg, StackBar, ms } from "./StorageUi";
 
 const VARS = ["--c1", "--c2", "--c3", "--c4", "--c5", "--fg", "--muted", "--faint", "--border", "--bg", "--subtle"] as const;
 type Theme = Record<(typeof VARS)[number], string>;

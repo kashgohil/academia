@@ -1,11 +1,11 @@
 /** Demos for "Hash indexes": extendible hashing stepper, linear hashing stepper, cost vs load factor. */
 import { useMemo, useRef, useState } from "react";
-import { Demo, Stats, Param, range, Plot, Line, Dots, RuleX, RuleY, Legend, pct, useWidth } from "../../kit";
+import { Demo, Stats, Param, range, Plot, Line, Dots, RuleX, RuleY, Legend, pct, useWidth, Note, fixed, mono, seg, useChunked } from "../../kit";
 import {
   ExtendibleHash, LinearHash, hashKey, lowBits, staticCost, linearCost, extendibleStats, openAddressingCost,
   linearProbingHit, linearProbingMiss, chainingHit, cuckooMaxLoad, EXT_START, EXT_SEQUENCE, LIN_START, LIN_SEQUENCE, type ExtSnapshot, type ExtEvent, type LinSnapshot, type LinEvent,
 } from "../../sims/db/indexes/hash";
-import { seg, mono, Note, fx, StepText, StepButtons, useFrames, useChunked } from "./IndexesUi";
+import { StepText, FrameButtons, useFrames } from "./IndexesUi";
 
 const C = { path: "var(--c1)", changed: "var(--c3)", added: "var(--c2)", bad: "var(--c4)", ptr: "var(--c5)" };
 
@@ -96,7 +96,7 @@ export function ExtendibleDemo() {
     >
       <ExtView snap={snap} f={f} cap={cap} />
       <StepText>{f ? f.caption : "Press Insert or Insert next key. Watch which hash bits pick the slot, and when a bucket splits or the directory doubles."}</StepText>
-      <StepButtons st={st} />
+      <FrameButtons st={st} />
       <div style={{ height: 8 }} />
       <Stats
         items={[
@@ -281,7 +281,7 @@ export function LinearHashDemo() {
         })}
       </div>
       <StepText>{f ? f.caption : "Press Insert next key. A full bucket gets an overflow page. A split happens only when the load factor passes the limit, and always at the split pointer."}</StepText>
-      <StepButtons st={st} />
+      <FrameButtons st={st} />
       <div style={{ height: 8 }} />
       <Stats
         items={[
@@ -369,16 +369,16 @@ export function HashCostDemo() {
       {disk ? (
         <Stats
           items={[
-            { label: `static at α ≈ ${pct(a, 0)}`, value: fx(pick(near(staticPts, DISK_ALPHAS)), 2) },
-            { label: `linear hashing at α ≈ ${pct(Math.min(a, 2), 0)}`, value: fx(pick(near(linPts, DISK_ALPHAS)), 2) },
+            { label: `static at α ≈ ${pct(a, 0)}`, value: fixed(pick(near(staticPts, DISK_ALPHAS)), 2) },
+            { label: `linear hashing at α ≈ ${pct(Math.min(a, 2), 0)}`, value: fixed(pick(near(linPts, DISK_ALPHAS)), 2) },
             { label: "extendible: directory slots / buckets", value: ext ? `${ext.capped ? "≥ " : ""}${ext.dirSlots.toLocaleString("en-US")} / ${ext.buckets.toLocaleString("en-US")}` : "…" },
           ]}
         />
       ) : (
         <Stats
           items={[
-            { label: `linear probing at α ≈ ${pct(a, 0)}`, value: fx(pick(near(lp, MEM_ALPHAS)), 2) },
-            { label: "Robin Hood", value: fx(pick(near(rh, MEM_ALPHAS)), 2) },
+            { label: `linear probing at α ≈ ${pct(a, 0)}`, value: fixed(pick(near(lp, MEM_ALPHAS)), 2) },
+            { label: "Robin Hood", value: fixed(pick(near(rh, MEM_ALPHAS)), 2) },
             { label: "longest probe: linear / Robin Hood", value: `${near(lp, MEM_ALPHAS)?.maxHit ?? "…"} / ${near(rh, MEM_ALPHAS)?.maxHit ?? "…"}` },
             { label: "cuckoo: first failed insert at α", value: pct(cuckoo, 1) },
           ]}

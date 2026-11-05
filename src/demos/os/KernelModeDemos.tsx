@@ -1,13 +1,13 @@
 /** Lesson: protected mode and long mode. A mode transition stepper, a GDT encoder and a higher-half table builder. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, toggle } from "../../kit";
+import { Demo, Param, Stats, toggle, Banner, Note, Panel, SmallLabel, mono, seg } from "../../kit";
 import { hexVa, isCanonical, parseVa, splitVa } from "../../sims/os/vm/addr";
 import {
   ACTION_INFO, CR0, CR4, DESC_FIELD_INFO, DFLAG, DIRECT_MAP, EFER, GOOD_ORDER, KERNEL_PHYS, KERNEL_VMA, MODE_LABEL,
   applyMode, buildBootTables, bytesLE, code32, code64, data32, decodeDesc, descFieldOfBit, describeDesc, encodeDesc, hex64, initialMode, testBit,
   type DescField, type ModeAction, type ModeState,
 } from "../../sims/os/kernel";
-import { BitGrid, Cap, FlagCell, Msg, Note, Panel, RegCell, RegGrid, Verdict, mono, seg } from "./KernelUi";
+import { BitGrid, FlagCell, Msg, RegCell, RegGrid } from "./KernelUi";
 
 const CR0_SHOWN: (keyof typeof CR0)[] = ["PG", "CD", "NW", "WP", "ET", "PE"];
 const CR4_SHOWN: (keyof typeof CR4)[] = ["SMAP", "SMEP", "PCIDE", "LA57", "PGE", "PAE", "PSE"];
@@ -58,7 +58,7 @@ export function ModeStepperDemo() {
       <Msg warn={dead} min={58}>{cur.text}</Msg>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
         <div style={{ flex: "1 1 240px", minWidth: 0 }}>
-          <Cap>Next instruction. Try any order.</Cap>
+          <SmallLabel>Next instruction. Try any order.</SmallLabel>
           <div style={{ display: "grid", gap: 3 }}>
             {(Object.keys(ACTION_INFO) as ModeAction[]).map((a) => {
               const used = hist.slice(1).some((h) => h.a === a);
@@ -73,7 +73,7 @@ export function ModeStepperDemo() {
           <button className="btn primary" style={{ marginTop: 6 }} onClick={runGood}>Run the usual order</button>
         </div>
         <div style={{ flex: "1 1 260px", minWidth: 0 }}>
-          <Cap>Control registers. A red frame marks a bit that this step changed.</Cap>
+          <SmallLabel>Control registers. A red frame marks a bit that this step changed.</SmallLabel>
           <RegisterRow name="CR0" value={s.cr0} prev={prev.cr0} bits={CR0} names={CR0_SHOWN} />
           <RegisterRow name="CR4" value={s.cr4} prev={prev.cr4} bits={CR4} names={CR4_SHOWN} />
           <RegisterRow name="EFER" value={s.efer} prev={prev.efer} bits={EFER} names={EFER_SHOWN} />
@@ -84,7 +84,7 @@ export function ModeStepperDemo() {
           </RegGrid>
         </div>
       </div>
-      {s.mode === "long" && <Verdict tone="good">64-bit mode. CR0 = {hex32(s.cr0)}, CR4 = {hex32(s.cr4)}, EFER = {hex32(s.efer)}. This took {hist.length - 1} instructions.</Verdict>}
+      {s.mode === "long" && <Banner tone="good">64-bit mode. CR0 = {hex32(s.cr0)}, CR4 = {hex32(s.cr4)}, EFER = {hex32(s.efer)}. This took {hist.length - 1} instructions.</Banner>}
     </Demo>
   );
 }
@@ -142,7 +142,7 @@ export function GdtEncoderDemo() {
           </RegGrid>
         </Panel>
       </div>
-      <Verdict tone={c.ok ? "good" : "bad"}><b style={{ fontWeight: 600 }}>{v === 0n ? "Null descriptor" : c.kind}.</b> {v === 0n ? "Index 0 must be null. A load of selector 0 into CS raises #GP." : c.problems.join(" ")}</Verdict>
+      <Banner tone={c.ok ? "good" : "bad"}><b style={{ fontWeight: 600 }}>{v === 0n ? "Null descriptor" : c.kind}.</b> {v === 0n ? "Index 0 must be null. A load of selector 0 into CS raises #GP." : c.problems.join(" ")}</Banner>
     </Demo>
   );
 }
@@ -176,7 +176,7 @@ export function HigherHalfDemo() {
         <Param spec={seg<"2m" | "4k">("Kernel pages", [["2m", "one 2 MiB leaf"], ["4k", "512 of 4 KiB"]], "2m")} value={page} onChange={(v) => setPage(v as "2m" | "4k")} />
       </>}
     >
-      <Cap>Walk this address, as the next fetch or load would.</Cap>
+      <SmallLabel>Walk this address, as the next fetch or load would.</SmallLabel>
       <div className="row" style={{ flexWrap: "wrap", gap: 4, marginBottom: 6 }}>
         {ADDRS.map(([n, a]) => <button key={n} className={`btn${a === addr ? " primary" : ""}`} style={{ padding: "1px 8px", fontSize: 12 }} onClick={() => setAddr(a)}>{n}</button>)}
       </div>
@@ -201,10 +201,10 @@ export function HigherHalfDemo() {
         { label: "canonical", value: isCanonical(addr) ? "yes" : "no" },
       ]} />
       {w.ok
-        ? <Verdict tone="good">Translated to physical 0x{w.pa!.toString(16)}{w.pageShift! > 12 ? `, in a ${w.pageShift === 21 ? "2 MiB" : "1 GiB"} leaf` : ""}.</Verdict>
+        ? <Banner tone="good">Translated to physical 0x{w.pa!.toString(16)}{w.pageShift! > 12 ? `, in a ${w.pageShift === 21 ? "2 MiB" : "1 GiB"} leaf` : ""}.</Banner>
         : w.fault!.reason === "non-canonical"
-          ? <Verdict tone="bad">Not canonical, so the CPU raises #GP without a walk. Page tables cannot help.</Verdict>
-          : <Verdict tone="bad">Not mapped: {w.fault!.level === 0 ? "the top table" : `the table at level ${w.fault!.level}`} has no entry. A fetch here raises #PF, and with no IDT that ends in a triple fault.</Verdict>}
+          ? <Banner tone="bad">Not canonical, so the CPU raises #GP without a walk. Page tables cannot help.</Banner>
+          : <Banner tone="bad">Not mapped: {w.fault!.level === 0 ? "the top table" : `the table at level ${w.fault!.level}`} has no entry. A fetch here raises #PF, and with no IDT that ends in a triple fault.</Banner>}
     </Demo>
   );
 }

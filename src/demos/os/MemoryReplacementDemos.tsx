@@ -1,12 +1,11 @@
 /** Demos for /os/memory/page-replacement. */
 import { useMemo } from "react";
-import { Demo, Stats, Param, Plot, Line, RuleX, RuleY, Dots, Legend, SimButtons, range, toggle, useParams, useSim, pct } from "../../kit";
+import { Demo, Stats, Param, Plot, Line, RuleX, RuleY, Dots, Legend, SimButtons, range, toggle, useParams, useSim, pct, Note, SmallLabel, mono, seg, useChunked } from "../../kit";
 import {
   simulate, countFaults, faultCurve, workload, workingSetSeries, phaseString, thrashCurve, thrashPeak, THRASH_DEFAULTS, THRASH_LOCALITY,
   BELADY_STRING, TEXTBOOK_STRING, LOOP_STRING, randomString, CURVE_FRAMES, REPL_LABEL, WORKLOAD_LABEL, WORKLOAD_NOTE,
   type ReplPolicy, type ReplStep, type WorkloadId,
 } from "../../sims/os/memory";
-import { seg, mono, Note, Caption, useChunked } from "../db/StorageUi";
 
 const STRINGS: Record<string, { label: string; refs: readonly number[] }> = {
   textbook: { label: "Textbook", refs: TEXTBOOK_STRING },
@@ -89,7 +88,7 @@ export function ReplacementStepperDemo() {
         {POLICIES.map((q) => <PolicyGrid key={q} policy={q} steps={steps[q]} upto={upto} frames={v.frames} />)}
       </div>
       <div style={{ marginTop: 8 }}><Legend items={[{ label: "fault: page loaded here", color: "var(--c4)" }, { label: "hit", color: "var(--c3)" }]} box /></div>
-      <Caption><span style={{ display: "block", marginTop: 10 }}>Faults over the whole string, by number of frames. A red number means more faults than with one frame less.</span></Caption>
+      <SmallLabel><span style={{ display: "block", marginTop: 10 }}>Faults over the whole string, by number of frames. A red number means more faults than with one frame less.</span></SmallLabel>
       <div style={{ overflowX: "auto" }}>
         <table style={{ borderCollapse: "collapse", fontSize: 12.5, width: "100%", ...mono }}>
           <thead>
@@ -135,7 +134,7 @@ export function FaultCurveDemo() {
       <Param spec={p.schema.frames} value={v.frames} onChange={(x) => p.set("frames", x as number)} />
       <Param spec={p.schema.wl} value={v.wl} onChange={(x) => p.set("wl", x as WorkloadId)} />
     </>}>
-      <Caption>{WORKLOAD_NOTE[v.wl]} Each run has {refs.length.toLocaleString("en-US")} references.</Caption>
+      <SmallLabel>{WORKLOAD_NOTE[v.wl]} Each run has {refs.length.toLocaleString("en-US")} references.</SmallLabel>
       <Plot x={[0, 96]} y={[0, 1]} height={240} xLabel="frames" yLabel="faults per reference" yFormat={(y) => `${Math.round(y * 100)}%`} xTicks={[0, 16, 32, 48, 64, 80, 96]}>
         {CURVE_POLICIES.map((q, i) => res[i] && <Line key={q} points={res[i]!} color={COLOR[q]} width={q === "min" ? 2.5 : 1.8} dash={q === "clock" ? "4 3" : undefined} />)}
         <RuleX at={v.frames} color="var(--fg)" />

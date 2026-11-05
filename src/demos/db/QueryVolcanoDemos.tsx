@@ -1,10 +1,10 @@
 /** Demos for the Volcano iterator model: next() calls flowing through a tree, and pipeline breakers over time. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, Plot, Line, RuleX, Legend, range, select } from "../../kit";
+import { Demo, Param, Stats, Plot, Line, RuleX, Legend, range, select, BAD, GOOD, MONO, Note, StepButtons, StepCaption, StepSlider, int, useStepper } from "../../kit";
 import { SAMPLE_DB, scaledDb, type Db, type Row } from "../../sims/db/query/relation";
 import { cmp } from "../../sims/db/query/expr";
 import { Ctx, Filter, HashAgg, HashJoin, Limit, Project, Scan, Sort, pipelines, runAll, callCounts, type Op } from "../../sims/db/query/iterator";
-import { ACC, ALT, BAD, Caption, GOOD, MONO, Note, OpTree, StepButtons, StepSlider, WARM, int, useStepper, type TreeNode } from "./QueryUi";
+import { ACC, ALT, OpTree, WARM, type TreeNode } from "./QueryUi";
 
 const scanOf = (ctx: Ctx, db: Db, t: string) => new Scan(ctx, t, db[t]!.rows, db[t]!.cols);
 
@@ -106,7 +106,7 @@ export function IteratorFlowDemo() {
         <span className="muted">Rows at the client: </span>
         <span style={{ fontFamily: MONO }}>{st.out.length ? st.out.join(" · ") : "none yet"}</span>
       </div>
-      <Caption label={`${s.i}/${run.ev.length}`}>{st.text}</Caption>
+      <StepCaption label={`${s.i}/${run.ev.length}`}>{st.text}</StepCaption>
       <div style={{ height: 10 }} />
       <Stats items={[
         { label: "next() calls so far", value: st.calls.reduce((a, b) => a + b, 0) },

@@ -1,10 +1,10 @@
 /** Demos for "seccomp and sandboxing": a filter builder with a real classic BPF run, and the system call surface. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, select, toggle, useParams } from "../../kit";
+import { Demo, Param, Stats, select, toggle, useParams, Banner, Note, Panel, mono, seg, type Tone } from "../../kit";
 import {
   AUDIT_ARCH, ERRNO, PROFILES, PROGRAMS, SYSCALLS, compile, disasm, nrOf, profileAllows, run, surfaceReport, validate, type ActionName, type Insn, type ProfileId, type RuleAction, type SeccompData, type SysGroup,
 } from "../../sims/os/isolation";
-import { Badge, Card, Note, Scroll, Verdict, mono, seg, smallTable, td, twoCol, type Tone } from "./IsolationUi";
+import { Badge, Scroll, smallTable, td, twoCol } from "./IsolationUi";
 
 interface UiRule { id: number; sys: string; action: ActionId; arg?: "none" | "notunix" | "newuser" }
 type ActionId = "allow" | "errno" | "trap" | "kill" | "notify" | "log";
@@ -90,7 +90,7 @@ export function IsolationFilterDemo() {
         {PRESETS.map((p) => <button key={p.id} className={preset === p.id ? "on" : ""} onClick={() => { setRules(p.rules.map((r) => ({ ...r, id: nextId++ }))); setFallback(p.fallback); setPreset(p.id); setStepAt(null); }}>{p.label}</button>)}
       </div>
       <div style={twoCol}>
-        <Card title="Rules: the first match wins">
+        <Panel title="Rules: the first match wins">
           {rules.map((r, i) => (
             <div key={r.id} className="row" style={{ gap: 4, marginBottom: 4, flexWrap: "wrap" }}>
               <select aria-label="system call" style={selStyle} value={r.sys} onChange={(e) => change(() => setRules(rules.map((x, j) => j === i ? { ...x, sys: e.target.value, arg: undefined } : x)))}>
@@ -112,8 +112,8 @@ export function IsolationFilterDemo() {
               </select>
             </label>
           </div>
-        </Card>
-        <Card title="The trace: click a call to step through it">
+        </Panel>
+        <Panel title="The trace: click a call to step through it">
           <Scroll style={{ maxHeight: 220, overflowY: "auto" }}>
             <table style={smallTable}><tbody>
               {TRACE.map((t, i) => {
@@ -128,10 +128,10 @@ export function IsolationFilterDemo() {
               })}
             </tbody></table>
           </Scroll>
-        </Card>
+        </Panel>
       </div>
       <div style={{ ...twoCol, marginTop: 10 }}>
-        <Card title={`Classic BPF: ${prog.length} instructions`}>
+        <Panel title={`Classic BPF: ${prog.length} instructions`}>
           <Scroll style={{ maxHeight: 240, overflowY: "auto" }}>
             {prog.map((ins, pc) => {
               const here = st?.pc === pc;
@@ -142,8 +142,8 @@ export function IsolationFilterDemo() {
               );
             })}
           </Scroll>
-        </Card>
-        <Card title="The run">
+        </Panel>
+        <Panel title="The run">
           <div style={{ ...mono, fontSize: 12, overflowWrap: "anywhere" }}>{c.label}</div>
           <div style={{ ...mono, fontSize: 11.5, marginTop: 4 }} className="muted">nr = {c.d.nr}, arch = 0x{(c.d.arch >>> 0).toString(16)}{c.d.args?.[0] !== undefined ? `, args[0] = 0x${c.d.args[0]!.toString(16)}` : ""}</div>
           {c.note && <Note>{c.note}</Note>}
@@ -153,8 +153,8 @@ export function IsolationFilterDemo() {
             <span className="muted" style={{ fontSize: 12 }}>{at + 1} of {steps.length}</span>
           </div>
           {st && <div style={{ ...mono, fontSize: 12 }}>pc = {st.pc}<br />A = 0x{(st.a >>> 0).toString(16)}, X = 0x{(st.x >>> 0).toString(16)}<br /><span className="muted">{st.note}</span></div>}
-          {cur && at === steps.length - 1 && <Verdict tone={VERDICT[cur.action].tone}>{VERDICT[cur.action].text}</Verdict>}
-        </Card>
+          {cur && at === steps.length - 1 && <Banner tone={VERDICT[cur.action].tone}>{VERDICT[cur.action].text}</Banner>}
+        </Panel>
       </div>
     </Demo>
   );
@@ -212,10 +212,10 @@ export function IsolationSurfaceDemo() {
           </div>
         ))}
       </div>
-      <Verdict tone={report.broken.length ? "bad" : "none"}>
+      <Banner tone={report.broken.length ? "bad" : "none"}>
         {f ? <><span style={mono}>{f.name}</span> (x86-64 number {f.nr}): {WORD[statusOf(f.name)]}.</> : "Hover or tap a square to see the call."}
         {report.broken.length > 0 && <> This profile breaks the program: {report.broken.slice(0, 5).join(", ")}{report.broken.length > 5 ? ", ..." : ""}.</>}
-      </Verdict>
+      </Banner>
       <Note>Green: needed and allowed. Blue: open but not used. Red: needed but stopped. Empty: removed. This table has {report.total} common calls, and the real table has more. The "needed" lists are sample lists for typical builds.</Note>
     </Demo>
   );

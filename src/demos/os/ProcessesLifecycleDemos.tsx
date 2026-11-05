@@ -1,8 +1,8 @@
 /** Lesson: what a process is. A state machine with one CPU, and a tree with exit, wait and re-parenting. */
 import { useRef, useState } from "react";
-import { Demo, Stats, useWidth } from "../../kit";
+import { Demo, Stats, useWidth, Note, SmallLabel, mono, tint } from "../../kit";
 import { ProcTable, stateMachineTable, treeTable, statLetter, type EventResult, type Proc } from "../../sims/os/processes";
-import { Cap, Msg, Note, mono, tint } from "./ProcessesUi";
+import { Msg } from "./ProcessesUi";
 
 const PROC_COLOR: Record<number, string> = { 100: "var(--c5)", 101: "var(--c1)", 102: "var(--c2)", 103: "var(--c3)" };
 const SHORT: Record<number, string> = { 100: "shell", 101: "A", 102: "B", 103: "C" };
@@ -126,7 +126,7 @@ export function ProcessStatesDemo() {
         </svg>
       </div>
       <div style={{ margin: "8px 0" }}>
-        <Cap>What ps would print. R covers both running and ready, because Linux has one state for both.</Cap>
+        <SmallLabel>What ps would print. R covers both running and ready, because Linux has one state for both.</SmallLabel>
         <table style={{ ...mono, fontSize: 12, borderCollapse: "collapse", width: "100%", maxWidth: 360 }}>
           <thead><tr style={{ color: "var(--muted)", textAlign: "left" }}><th style={{ fontWeight: 400 }}>PID</th><th style={{ fontWeight: 400 }}>PPID</th><th style={{ fontWeight: 400 }}>STAT</th><th style={{ fontWeight: 400 }}>CMD</th></tr></thead>
           <tbody>

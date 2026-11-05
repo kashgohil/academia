@@ -1,11 +1,10 @@
 /** Demos for "Late materialization": a plan stepper with position lists, and the early vs late crossover. */
 import { useMemo, useState, type CSSProperties } from "react";
-import { Demo, Stats, Param, Legend, range, toggle, Plot, Line, RuleX, Dots } from "../../kit";
+import { Demo, Stats, Param, Legend, range, toggle, Plot, Line, RuleX, Dots, Btn, ButtonRow, MiniTable, Note, SectionLabel, fixed, mono, seg } from "../../kit";
 import {
   stepperTable, runPlan, earlyCost, lateCost, crossover, STEPPER_ROWS,
   type Strategy, type ColName, type CostParams,
 } from "../../sims/db/olap";
-import { seg, mono, Note, Caption, Btn, ButtonRow, MiniTable, fx } from "./OlapShared";
 
 const COLS: ColName[] = ["id", "region", "qty", "price", "discount"];
 const STRAT: [Strategy, string][] = [["early", "early"], ["late", "late, position lists"], ["bitmap", "late, bitmaps"]];
@@ -66,7 +65,7 @@ export function PlanStepperDemo() {
       </div>
       {step.bitmaps.length > 0 && (
         <>
-          <Caption>Bitmaps, one bit per row</Caption>
+          <SectionLabel>Bitmaps, one bit per row</SectionLabel>
           <div style={{ ...mono, fontSize: 11.5, display: "grid", gap: 2 }}>
             {step.bitmaps.map((b) => (
               <div key={b.name} style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
@@ -77,11 +76,11 @@ export function PlanStepperDemo() {
           </div>
         </>
       )}
-      <Caption>{strategy === "early" ? "Surviving tuples (row numbers)" : "Position list passed to the next operator"}</Caption>
+      <SectionLabel>{strategy === "early" ? "Surviving tuples (row numbers)" : "Position list passed to the next operator"}</SectionLabel>
       <div style={{ ...mono, fontSize: 12, color: "var(--c3)", minHeight: 18 }}>{step.positions ? `[${step.positions.join(", ")}]` : "not built yet: the plan keeps bitmaps"}</div>
       {step.tuples.length > 0 && (
         <>
-          <Caption>Row tuples in memory ({step.tupleCols.join(", ")})</Caption>
+          <SectionLabel>Row tuples in memory ({step.tupleCols.join(", ")})</SectionLabel>
           <div style={{ ...mono, fontSize: 11, display: "flex", flexWrap: "wrap", gap: 4 }}>
             {step.tuples.map((x) => (
               <span key={x.row} style={{ border: "1px solid var(--border)", borderRadius: 3, padding: "0 4px", color: x.alive ? "var(--fg)" : "var(--faint)", textDecoration: x.alive ? undefined : "line-through" }}>
@@ -101,7 +100,7 @@ export function PlanStepperDemo() {
       <div style={{ marginTop: 6 }}>
         <Legend box items={[{ label: "read in this step", color: "var(--c1)" }, { label: "position in the current list", color: "var(--c3)" }]} />
       </div>
-      <Caption>All three plans at t = {threshold}, after the last step</Caption>
+      <SectionLabel>All three plans at t = {threshold}, after the last step</SectionLabel>
       <MiniTable head={["plan", "read", "copied", "checks"]} highlight={STRAT.findIndex(([s]) => s === strategy)} rows={STRAT.map(([, l], k) => [l, all[k]!.read, all[k]!.copied, all[k]!.checks])} />
     </Demo>
   );
@@ -128,7 +127,7 @@ export function CrossoverDemo() {
       title="Early vs late materialization as selectivity grows"
       controls={
         <>
-          <Param spec={range({ label: "Selectivity (rows that pass)", min: -4, max: 0, step: 0.05, default: -2, format: (v) => `${fx(100 * Math.pow(10, v), Math.pow(10, v) < 0.01 ? 2 : 1)}%` })} value={logS} onChange={(v) => setLogS(v as number)} />
+          <Param spec={range({ label: "Selectivity (rows that pass)", min: -4, max: 0, step: 0.05, default: -2, format: (v) => `${fixed(100 * Math.pow(10, v), Math.pow(10, v) < 0.01 ? 2 : 1)}%` })} value={logS} onChange={(v) => setLogS(v as number)} />
           <Param spec={range({ label: "Output columns", min: 1, max: 12, step: 1, default: 4 })} value={outputs} onChange={(v) => setOutputs(v as number)} />
           <Param spec={toggle({ label: "The predicate column is also an output", default: false })} value={reaccess} onChange={(v) => setReaccess(v as boolean)} />
           <Param spec={toggle({ label: "Predicate column is RLE-compressed (runs of 16)", default: false })} value={compressed} onChange={(v) => setCompressed(v as boolean)} />
@@ -144,10 +143,10 @@ export function CrossoverDemo() {
       <Legend items={[{ label: "early: build every tuple first", color: "var(--c2)" }, { label: "late: positions first, values last", color: "var(--c1)" }]} />
       <Stats
         items={[
-          { label: "early cost per row", value: fx(e, 2) },
-          { label: "late cost per row", value: fx(l, 2) },
-          { label: "late is", value: l < e ? `${fx(e / l, 1)}× cheaper` : `${fx(l / e, 2)}× dearer` },
-          { label: "crossover", value: cross === null ? "none: late always wins" : `${fx(cross * 100, 1)}%` },
+          { label: "early cost per row", value: fixed(e, 2) },
+          { label: "late cost per row", value: fixed(l, 2) },
+          { label: "late is", value: l < e ? `${fixed(e / l, 1)}× cheaper` : `${fixed(l / e, 2)}× dearer` },
+          { label: "crossover", value: cross === null ? "none: late always wins" : `${fixed(cross * 100, 1)}%` },
         ]}
       />
       <Note>Units: one value operation costs 1, one cache-line miss costs 4, a gather by position costs 2. Late pays per surviving row; early pays for every row.</Note>

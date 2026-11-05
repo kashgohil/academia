@@ -1,8 +1,8 @@
 /** Lesson: loading a program. ELF bytes with a loader, the initial stack, and lazy binding from the real bytes. */
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import { Demo, Param, Stats, range, toggle, useWidth } from "../../kit";
+import { Demo, Param, Stats, range, toggle, useWidth, IndexButtons, IndexSlider, Note, Panel, SmallLabel, mono, tint } from "../../kit";
 import { PIE_BASE, buildElf, hexAddr, initialStack, loaderSteps, randomBase, runPlt, stepsToPuts, EXIT, PUTS, RESOLVER, type ElfField, type ElfGroup, type PltRegion, type Vma } from "../../sims/os/processes";
-import { Cap, Msg, Note, Panel, StepButtons, StepSlider, mono, tint } from "./ProcessesUi";
+import { Msg } from "./ProcessesUi";
 
 const IMG = buildElf();
 
@@ -60,9 +60,9 @@ export function ElfLoaderDemo() {
   return (
     <Demo
       title={`A ${IMG.bytes.length}-byte ELF file`}
-      actions={<StepButtons k={k} n={steps.length} set={(v) => { setK(v); setPicked(null); }} />}
+      actions={<IndexButtons k={k} n={steps.length} set={(v) => { setK(v); setPicked(null); }} />}
       controls={<>
-        <StepSlider k={k} n={steps.length} set={(v) => { setK(v); setPicked(null); }} label="Loader step" />
+        <IndexSlider k={k} n={steps.length} set={(v) => { setK(v); setPicked(null); }} label="Loader step" />
         <Param spec={toggle({ label: "ASLR on (random load base)", default: false })} value={aslr} onChange={(v) => setAslr(v as boolean)} />
       </>}
     >
@@ -70,7 +70,7 @@ export function ElfLoaderDemo() {
       <Msg min={56}>{s.text}</Msg>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
         <div ref={wrapRef} style={{ flex: "1 1 340px", minWidth: 0 }}>
-          <Cap>The file. Click any byte.</Cap>
+          <SmallLabel>The file. Click any byte.</SmallLabel>
           <div ref={box} onClick={onClick} style={{ ...mono, fontSize: 11, lineHeight: "17px", height: 238, overflowY: "auto", overflowX: "hidden", border: "1px solid var(--border)", borderRadius: 4, padding: "2px 4px", whiteSpace: "nowrap" }}>
             {rows.map((o) => (
               <div key={o}>
@@ -91,7 +91,7 @@ export function ElfLoaderDemo() {
         </div>
         <div style={{ flex: "1 1 260px", minWidth: 0 }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
-            <Cap>The address space, high addresses first</Cap>
+            <SmallLabel>The address space, high addresses first</SmallLabel>
             {aslr && <button className="btn ghost" style={{ fontSize: 12, padding: "1px 6px" }} onClick={() => setSeed((x) => (x * 9301 + 0.49297) % 1)}>Run again</button>}
           </div>
           <div style={{ border: "1px solid var(--border)", borderRadius: 4, padding: 4, minHeight: 238 }}>
@@ -128,7 +128,7 @@ export function InitialStackDemo() {
       <Param spec={range({ label: "Arguments (argc)", min: 1, max: 4, step: 1, default: 2 })} value={argc} onChange={(v) => setArgc(v as number)} />
       <Param spec={range({ label: "Environment variables", min: 0, max: 3, step: 1, default: 2 })} value={envc} onChange={(v) => setEnvc(v as number)} />
     </>}>
-      <Cap>rsp points at the top row. Addresses grow downward on this page. The model has ASLR off.</Cap>
+      <SmallLabel>rsp points at the top row. Addresses grow downward on this page. The model has ASLR off.</SmallLabel>
       <div style={{ ...mono, fontSize: 11, lineHeight: 1.45, border: "1px solid var(--border)", borderRadius: 4, overflow: "hidden" }}>
         {rows.map((r) => (
           <div key={r.addr} style={{ display: "flex", gap: 8, padding: "1px 6px", borderLeft: `3px solid ${KIND_COLOR[r.kind]}`, background: r.addr === rsp ? tint("var(--c1)", 14) : undefined, flexWrap: "wrap" }}>
@@ -196,16 +196,16 @@ export function PltStepperDemo() {
   return (
     <Demo
       title="Two calls through the PLT"
-      actions={<StepButtons k={kk} n={run.steps.length} set={setK} />}
+      actions={<IndexButtons k={kk} n={run.steps.length} set={setK} />}
       controls={<>
-        <StepSlider k={kk} n={run.steps.length} set={setK} label="Instruction" />
+        <IndexSlider k={kk} n={run.steps.length} set={setK} label="Instruction" />
         <Param spec={toggle({ label: "Bind at load time (LD_BIND_NOW, -z now)", default: false })} value={bindNow} onChange={(v) => { setBindNow(v as boolean); setK(0); }} />
       </>}
     >
       <Msg min={56}><b style={{ ...mono, fontWeight: 600 }}>{s.asm}</b>: {s.text}</Msg>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
         <div style={{ flex: "1 1 280px", minWidth: 0 }}>
-          <Cap>Code. The bytes come from the ELF file.</Cap>
+          <SmallLabel>Code. The bytes come from the ELF file.</SmallLabel>
           <div style={{ ...mono, fontSize: 11.5, lineHeight: 1.5, border: "1px solid var(--border)", borderRadius: 4, padding: 4 }}>
             {rows.map((r) => {
               const on = r.addr === s.rip;

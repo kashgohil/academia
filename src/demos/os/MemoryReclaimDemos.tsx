@@ -1,11 +1,10 @@
 /** Demos for /os/memory/swapping-and-the-oom-killer. */
 import { useMemo, useState } from "react";
-import { Demo, Stats, Param, Plot, Area, RuleX, Legend, SimButtons, range, toggle, useParams, useSim, usePlot, pct, bytes } from "../../kit";
+import { Demo, Stats, Param, Plot, Area, RuleX, Legend, SimButtons, range, toggle, useParams, useSim, usePlot, pct, bytes, Meter, Note, SmallLabel, mono, seg } from "../../kit";
 import {
   runPressure, PHASE_LABEL, PRESSURE_DEFAULTS, VM_DEFAULTS, oomBadness, oomScore, pickVictim, globalTotalPages, k8sOomScoreAdj,
   overcommitCheck, commitLimit, touchOutcome, type PressureFrame, type PressurePhase, type OomProc, type OvercommitMode,
 } from "../../sims/os/memory";
-import { seg, mono, Note, Caption, Meter } from "../db/StorageUi";
 
 const PHASE_COLOR: Record<PressurePhase, string> = { ok: "var(--c3)", kswapd: "var(--c2)", direct: "var(--c4)", oom: "var(--c4)", recovered: "var(--muted)" };
 const C = { anon: "var(--c1)", zpool: "var(--c5)", hot: "var(--c2)", cold: "var(--faint)", free: "var(--c3)" };
@@ -82,7 +81,7 @@ export function PressureDemo() {
       <Param spec={p.schema.z} value={v.z} onChange={(x) => p.set("z", x as boolean)} />
     </>}>
       <div style={{ fontSize: 13.5, fontWeight: 600, color: PHASE_COLOR[f.phase], marginBottom: 6 }}>{PHASE_LABEL[f.phase]}</div>
-      <Caption>RAM at {f.t.toFixed(1)} s</Caption>
+      <SmallLabel>RAM at {f.t.toFixed(1)} s</SmallLabel>
       <Bar total={total} parts={[
         { label: "anonymous", value: f.anon, color: C.anon },
         { label: "zswap pool", value: f.zpool, color: C.zpool },
@@ -91,7 +90,7 @@ export function PressureDemo() {
         { label: "free", value: f.free, color: C.free },
       ]} />
       <div style={{ margin: "4px 0 8px" }}><Legend box items={[{ label: `anonymous ${Math.round(f.anon)}`, color: C.anon }, ...(v.z ? [{ label: `zswap pool ${Math.round(f.zpool)}`, color: C.zpool }] : []), { label: `hot file ${Math.round(f.fileHot)}`, color: C.hot }, { label: `cold file ${Math.round(f.fileCold)}`, color: C.cold }, { label: `free ${Math.round(f.free)} MiB`, color: C.free }]} /></div>
-      <Caption>Free memory, zoomed. Watermarks in MiB: min {Math.round(run.marks.min)}, low {Math.round(run.marks.low)}, high {Math.round(run.marks.high)}. kswapd is {f.kswapd ? "awake" : "asleep"}.</Caption>
+      <SmallLabel>Free memory, zoomed. Watermarks in MiB: min {Math.round(run.marks.min)}, low {Math.round(run.marks.low)}, high {Math.round(run.marks.high)}. kswapd is {f.kswapd ? "awake" : "asleep"}.</SmallLabel>
       <FreeGauge free={f.free} marks={run.marks} />
       <Meter label={`Swap used of ${bytes(Number(v.swap) * 2 ** 20) === "0 B" ? "no swap" : bytes(Number(v.swap) * 2 ** 20)}`} value={f.swapUsed} max={Math.max(1, Number(v.swap))} color="var(--c5)" text={`${Math.round(f.swapUsed)} MiB`} />
       <Meter label="Stall, averaged like PSI some avg10" value={f.psi} max={1} color="var(--c4)" text={pct(f.psi, 0)} />
@@ -207,7 +206,7 @@ export function OomPickerDemo() {
       </>}
       controls={<Param spec={p.schema.scope} value={scope} onChange={(x) => p.set("scope", x as string)} />}
     >
-      <Caption>Total pages for scoring: {total.toLocaleString("en-US")} ({scope === "node" ? "RAM + swap" : "the memory cgroup limit"}). Each row is one process. Drag oom_score_adj.</Caption>
+      <SmallLabel>Total pages for scoring: {total.toLocaleString("en-US")} ({scope === "node" ? "RAM + swap" : "the memory cgroup limit"}). Each row is one process. Drag oom_score_adj.</SmallLabel>
       <div style={{ display: "grid", gap: 8 }}>
         {rows.map((r) => {
           const out = !live.includes(r);
@@ -233,7 +232,7 @@ export function OomPickerDemo() {
         })}
       </div>
       <p style={{ fontSize: 13, margin: "10px 0 0" }}>{victim ? <>The kernel sends SIGKILL to <b>{victim.name}</b>.</> : "No process can be killed. The kernel panics if this is a node OOM."}</p>
-      <Caption><span style={{ display: "block", marginTop: 8 }}>Kubelet values on this 16 GiB node: Guaranteed {k8sOomScoreAdj("guaranteed")}, BestEffort {k8sOomScoreAdj("besteffort")}, Burstable with a 1 GiB request {k8sOomScoreAdj("burstable", 2 ** 30, 16 * 2 ** 30)}.</span></Caption>
+      <SmallLabel><span style={{ display: "block", marginTop: 8 }}>Kubelet values on this 16 GiB node: Guaranteed {k8sOomScoreAdj("guaranteed")}, BestEffort {k8sOomScoreAdj("besteffort")}, Burstable with a 1 GiB request {k8sOomScoreAdj("burstable", 2 ** 30, 16 * 2 ** 30)}.</span></SmallLabel>
     </Demo>
   );
 }

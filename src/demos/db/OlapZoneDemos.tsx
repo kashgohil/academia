@@ -1,11 +1,10 @@
 /** Demos for "Zone maps and data skipping": a block map with pruning, and blocks scanned vs predicate width. */
 import { useMemo, useState } from "react";
-import { Demo, Stats, Param, Legend, range, toggle, Plot, Line, RuleX, Canvas2D, cssVar } from "../../kit";
+import { Demo, Stats, Param, Legend, range, toggle, Plot, Line, RuleX, Canvas2D, cssVar, Note, SectionLabel, fixed, int, seg } from "../../kit";
 import {
   buildLayouts, prune, avgScanned, DOMAIN, BLOCK_ROWS, ZONE_ROWS, ZLAYOUTS,
   type ZLayout, type Pred, type PredOn,
 } from "../../sims/db/olap";
-import { seg, Note, Caption, int, fx } from "./OlapShared";
 
 const LAYOUT_LABEL: [ZLayout, string][] = [["unsorted", "unsorted"], ["a", "sorted by A"], ["z", "Z-order (A, B)"]];
 type Mode = PredOn | "point";
@@ -88,7 +87,7 @@ export function ZoneMapDemo() {
       </div>
       <div className="muted" style={{ fontSize: 11.5, marginBottom: 4 }}>Each row is a dot at (A, B). Each box is the zone map of one block: [min A, max A] × [min B, max B].</div>
       <Canvas2D height={(W) => Math.min(W, 360)} draw={draw} deps={[d, res, layout, mode, r[0], r[1]]} />
-      <Caption>The {d.zones.length} blocks in file order</Caption>
+      <SectionLabel>The {d.zones.length} blocks in file order</SectionLabel>
       <svg viewBox={`0 0 ${16 * 14} ${Math.ceil(d.zones.length / 16) * 14}`} style={{ width: "100%", maxWidth: 420, display: "block" }}>
         {d.zones.map((_, i) => {
           const x = (i % 16) * 14, y = Math.floor(i / 16) * 14;
@@ -143,7 +142,7 @@ export function PruningSweepDemo() {
         <RuleX at={wPct} />
       </Plot>
       <Legend items={LAYOUT_LABEL.map(([l, label]) => ({ label, color: colors[l] }))} />
-      <Stats items={LAYOUT_LABEL.map(([l, label]) => ({ label: `${label}, ${wPct}% wide`, value: fx(at(l), 1) }))} />
+      <Stats items={LAYOUT_LABEL.map(([l, label]) => ({ label: `${label}, ${wPct}% wide`, value: fixed(at(l), 1) }))} />
       <Note>Each point is the average over 32 positions of the predicate. With "A and B", both columns get a range of the same width.</Note>
     </Demo>
   );

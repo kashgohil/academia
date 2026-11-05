@@ -1,6 +1,6 @@
 /** Demos for the relational algebra lesson: a query-tree playground and a rewrite stepper. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, Plot, Label, range, select as selectSpec } from "../../kit";
+import { Demo, Param, Stats, Plot, Label, range, select as selectSpec, BAD, GOOD, MONO, StepButtons, StepCaption, StepSlider, int, useStepper } from "../../kit";
 import {
   SAMPLE_DB, scaledDb, displayNames, hasCol, colName, fmtValue, type Db, type Relation,
 } from "../../sims/db/query/relation";
@@ -9,7 +9,7 @@ import {
   children, evalPlan, label, planWork, rewriteSteps, schemaOf, scan, select, project, distinct, rename, natural, join, cross, setop, group,
   REWRITE_QUERY, sqlText, type Plan, type EvalResult,
 } from "../../sims/db/query/algebra";
-import { ACC, ALT, BAD, BaseBars, Caption, GOOD, MONO, OpTree, RowTable, StepButtons, StepSlider, WARM, int, useLater, useStepper, type TreeNode } from "./QueryUi";
+import { ACC, ALT, BaseBars, OpTree, RowTable, WARM, useLater, type TreeNode } from "./QueryUi";
 
 const opColor = (p: Plan) =>
   p.op === "scan" || p.op === "rename" ? "var(--muted)" : p.op === "select" ? ACC : p.op === "project" || p.op === "distinct" ? ALT : p.op === "join" ? WARM : p.op === "group" ? GOOD : BAD;
@@ -198,7 +198,7 @@ export function RewriteDemo() {
       <pre style={{ fontFamily: MONO, fontSize: 12, margin: "0 0 10px", padding: "6px 10px", background: "var(--subtle)", borderRadius: 6, overflowX: "auto" }}>{sqlText(REWRITE_QUERY)}</pre>
       <div style={{ fontSize: 12.5, marginBottom: 6 }} className="muted">emp {n} rows · dept 8 rows · proj 30 rows. The badge is the number of rows each operator outputs.</div>
       <OpTree root={planToTree(cur.plan, cur.r)} slot={150} />
-      <Caption label={`${s.i + 1}/6`}>{RULE_TEXT[cur.rule]}</Caption>
+      <StepCaption label={`${s.i + 1}/6`}>{RULE_TEXT[cur.rule]}</StepCaption>
       <div style={{ height: 10 }} />
       <Plot x={[-0.5, 5.5]} y={[1, Math.max(...data.map((d) => d.work.tuples)) * 3]} logY height={170} xTicks={[0, 1, 2, 3, 4, 5]} xFormat={(v) => String(v + 1)} yLabel="rows produced by all operators (log)" xLabel="rewrite step" yFormat={(v) => (v >= 1000 ? `${v / 1000}k` : String(v))}>
         <BaseBars base={1} bins={data.map((d, i) => ({ x0: i - 0.35, x1: i + 0.35, y: d.work.tuples, color: i === s.i ? ACC : "var(--faint)" }))} />

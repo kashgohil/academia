@@ -1,11 +1,11 @@
 /** Lesson: userspace. TinyOS, the composed capstone, and a register stepper for the syscall path. */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Demo, Param, Stats, range, toggle } from "../../kit";
+import { Demo, Param, Stats, range, toggle, Banner, IndexButtons, IndexSlider, Panel, SmallLabel, mono, tint } from "../../kit";
 import { hexShort, hexVa } from "../../sims/os/vm/addr";
 import { INJECT_LABEL, PROGRAMS, REG_ORDER, SYS_ENTRY_REGS, TINY_SFMASK, TINY_STAR, TinyOS, hexN, sysEntrySnaps, sysretSelectors, syscallSelectors, type FrameKind, type Inject, type LogLine, type Task } from "../../sims/os/kernel";
 import { UNMOVABLE, FREE } from "../../sims/os/vm/physmem";
 import { Gantt, jobColor } from "./SchedulingGantt";
-import { Cap, Chip, LogBox, Msg, ModeBar, Panel, RegCell, RegGrid, StepButtons, StepSlider, Verdict, mono, tint } from "./KernelUi";
+import { Chip, LogBox, Msg, ModeBar, RegCell, RegGrid } from "./KernelUi";
 
 const taskColor = (pid: number) => jobColor(pid - 1);
 const hx = (v: bigint) => `0x${hexShort(v)}`;
@@ -89,7 +89,7 @@ export function TinyOsDemo() {
         {os.sleepers.map((p) => <Chip key={p} color={taskColor(p)} faint>{p} until {os.tasks.get(p)!.wakeAt}</Chip>)}
       </div>
 
-      <Cap>Tasks. Click a row to select it.</Cap>
+      <SmallLabel>Tasks. Click a row to select it.</SmallLabel>
       <div style={{ overflowX: "auto" }}>
         <table style={{ borderCollapse: "collapse", fontSize: 12, width: "100%", ...mono }}>
           <thead><tr>{["pid", "name", "state", "instr", "bytes", "faults", "frames"].map((h) => <th key={h} style={{ textAlign: "left", fontWeight: 500, color: "var(--muted)", borderBottom: "1px solid var(--border)", padding: "1px 6px 1px 0" }}>{h}</th>)}</tr></thead>
@@ -111,19 +111,19 @@ export function TinyOsDemo() {
 
       <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
         <div style={{ flex: "1 1 280px", minWidth: 0 }}>
-          <Cap>Console (COM1)</Cap>
+          <SmallLabel>Console (COM1)</SmallLabel>
           <LogBox height={96}>
             {chunks.length === 0 && <span className="muted">no output</span>}
             {chunks.map((c, i) => <span key={i} style={{ color: c.pid ? taskColor(c.pid) : undefined }}>{c.text}</span>)}
           </LogBox>
-          <Cap><span style={{ display: "block", marginTop: 8 }}>System calls</span></Cap>
+          <SmallLabel><span style={{ display: "block", marginTop: 8 }}>System calls</span></SmallLabel>
           <LogBox height={210}>
             {os.syscalls.length === 0 && <span className="muted">none yet</span>}
             {os.syscalls.slice(-30).reverse().map((c, i) => <div key={i}><span style={{ color: taskColor(c.pid) }}>{c.pid}</span> {c.name}({c.args}) = <span style={{ color: c.ret.startsWith("-") ? "var(--c4)" : undefined }}>{c.ret}</span></div>)}
           </LogBox>
         </div>
         <div style={{ flex: "1 1 280px", minWidth: 0 }}>
-          <Cap>Page table of {t && t.state !== "dead" ? `pid ${t.pid}` : "the selected task"}</Cap>
+          <SmallLabel>Page table of {t && t.state !== "dead" ? `pid ${t.pid}` : "the selected task"}</SmallLabel>
           <div style={{ ...mono, fontSize: 11, lineHeight: 1.45, border: "1px solid var(--border)", borderRadius: 6, padding: "3px 6px", minHeight: 92 }}>
             {maps.length === 0 && <div className="muted">no task selected</div>}
             {maps.map((m) => <div key={m.va.toString()} style={{ display: "flex", justifyContent: "space-between", gap: 6, flexWrap: "wrap" }}><span>{hexVa(m.va).replace("0x0000_", "0x")}</span><span>{m.rights}</span><span>frame {m.pfn}</span><span className="muted">{m.name}</span></div>)}
@@ -132,7 +132,7 @@ export function TinyOsDemo() {
               <div className="muted">tables: {os.ownTables(t).join(", ")}</div>
             </>}
           </div>
-          <Cap><span style={{ display: "block", marginTop: 8 }}>Physical frames, {os.totalFrames} in all. {os.booted ? `${os.freeFrames} are free.` : ""}</span></Cap>
+          <SmallLabel><span style={{ display: "block", marginTop: 8 }}>Physical frames, {os.totalFrames} in all. {os.booted ? `${os.freeFrames} are free.` : ""}</span></SmallLabel>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(32, minmax(0, 1fr))", gap: 1 }} role="img" aria-label="Frame owners">
             {Array.from({ length: os.totalFrames }, (_, f) => <div key={f} title={`frame ${f}`} style={{ ...frameStyle(os, f), aspectRatio: "1" }} />)}
           </div>
@@ -140,7 +140,7 @@ export function TinyOsDemo() {
         </div>
       </div>
 
-      <Cap><span style={{ display: "block", marginTop: 10 }}>CPU registers and kernel state</span></Cap>
+      <SmallLabel><span style={{ display: "block", marginTop: 10 }}>CPU registers and kernel state</span></SmallLabel>
       <RegGrid min={136}>
         {REG_ORDER.map((r) => <RegCell key={r} name={r} value={hx(os.regs[r])} />)}
         <RegCell name="cs" value={hexN(os.cs)} />
@@ -150,10 +150,10 @@ export function TinyOsDemo() {
       </RegGrid>
 
       {rows.length > 0 && <>
-        <Cap><span style={{ display: "block", marginTop: 10 }}>Who had the CPU. Tall: user code. Thin: the kernel on its behalf. Last 180 steps.</span></Cap>
+        <SmallLabel><span style={{ display: "block", marginTop: 10 }}>Who had the CPU. Tall: user code. Thin: the kernel on its behalf. Last 180 steps.</span></SmallLabel>
         <Gantt rows={rows} start={windowStart} end={Math.max(os.cycle, windowStart + 1)} unit="" rowH={14} labelW={20} />
       </>}
-      <Cap><span style={{ display: "block", marginTop: 8 }}>Kernel log</span></Cap>
+      <SmallLabel><span style={{ display: "block", marginTop: 8 }}>Kernel log</span></SmallLabel>
       <LogBox height={110}>
         {recentLog.length === 0 && <span className="muted">empty</span>}
         {recentLog.map((l, i) => <div key={i} style={{ color: LOG_COLOR[l.kind] }}><span className="muted">{l.cycle} </span>{l.text}</div>)}
@@ -165,7 +165,7 @@ export function TinyOsDemo() {
         { label: "live tasks", value: os.live().length },
         { label: "dead tasks", value: tasks.length - os.live().length },
       ]} />
-      <Verdict tone={bad.length ? "bad" : "good"}>{bad.length ? `Invariant broken: ${bad[0]}` : "Invariants hold: each frame has one owner, no task can reach another task's frame, and the run queue holds only ready tasks."}</Verdict>
+      <Banner tone={bad.length ? "bad" : "good"}>{bad.length ? `Invariant broken: ${bad[0]}` : "Invariants hold: each frame has one owner, no task can reach another task's frame, and the run queue holds only ready tasks."}</Banner>
     </Demo>
   );
 }
@@ -183,9 +183,9 @@ export function SyscallEntryDemo() {
   return (
     <Demo
       title="syscall to sysretq, register by register"
-      actions={<StepButtons k={kk} n={snaps.length} set={setK} />}
+      actions={<IndexButtons k={kk} n={snaps.length} set={setK} />}
       controls={<>
-        <StepSlider k={kk} n={snaps.length} set={setK} />
+        <IndexSlider k={kk} n={snaps.length} set={setK} />
         <Param spec={toggle({ label: "Entry code runs swapgs", default: true })} value={swapgs} onChange={(v) => setSwapgs(v as boolean)} />
         <Param spec={toggle({ label: "SFMASK clears IF", default: true })} value={maskIf} onChange={(v) => setMaskIf(v as boolean)} />
       </>}

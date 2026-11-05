@@ -57,10 +57,9 @@ Some exceptions push an error code, and most do not. In this table, vectors 8, 1
 
 A handler cannot be a normal function. A function ends with `ret`, and it follows the calling convention, so it saves only some registers. So a small assembly **stub** runs first. It gives every vector one stack shape, saves all registers, and calls the Rust handler with a pointer to them.
 
-```rust
-#![no_std]
-use core::arch::{asm, global_asm};
+{/* source: kernels/rust/src/idt.rs#gate */}
 
+```rust
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 pub struct Gate {
@@ -125,6 +124,7 @@ isr\vec:
     STUB_ERR 13
     STUB_ERR 14
     STUB_NOERR 32
+    STUB_NOERR 255
 
 isr_common:
     push rax
@@ -165,7 +165,7 @@ isr_common:
 "#, handler = sym handle_trap);
 ```
 
-This sample compiled to an object file with rustc 1.96.1, but it was not run. The `cld` matters: the ABI requires a clear direction flag at a call, and user code can set it. The handler can change any value in `TrapFrame`, and `iretq` will load it. This is how a context switch and a return to user mode work in later lessons.
+This code ran in QEMU with rustc 1.96.1. The `cld` matters: the ABI requires a clear direction flag at a call, and user code can set it. The handler can change any value in `TrapFrame`, and `iretq` will load it. This is how a context switch and a return to user mode work in later lessons.
 
 ## The double fault, the IST and the triple fault
 
@@ -224,6 +224,8 @@ Modern kernels mask the PIC and use the **local APIC**, a per-CPU interrupt cont
 
 The CPU pushes an error code, and it puts the address that faulted in `CR2`. The error code bits are the ones from [page faults](/os/vm/page-faults-and-demand-paging). Bit 0 is present, bit 1 is write, bit 2 is user, and bit 4 is instruction fetch. Read `CR2` early. A nested fault would overwrite it, and interrupt gates keep other interrupts out until you read it.
 
+{/* source: kernels/rust/src/idt.rs#trap */}
+
 ```rust
 fn read_cr2() -> u64 {
     let v: u64;
@@ -231,14 +233,24 @@ fn read_cr2() -> u64 {
     v
 }
 
-const LAPIC_EOI: *mut u32 = 0xFFFF_8000_FEE0_00B0 as *mut u32; // through the direct map
-
 extern "C" fn handle_trap(f: &mut TrapFrame) {
+    let from_user = f.cs & 3 == 3;
     match f.vector {
         14 => page_fault(f, read_cr2()),
         32 => {
-            tick();
-            unsafe { LAPIC_EOI.write_volatile(0) };
+            // First the EOI: tick may switch to another thread, and that thread may run
+            // for a long time before this function continues.
+            cpu::eoi();
+            sched::tick();
+        }
+        255 => {} // a spurious interrupt needs no EOI
+        8 => {
+            println!("double fault: rsp {:#x}, on the IST stack", f as *mut TrapFrame as u64);
+            serial::qemu_exit(crate::EXIT_DOUBLE_FAULT);
+        }
+        v if from_user => {
+            println!("trap {} in user code at {:#x}: task killed", v, f.rip);
+            sched::kill_current();
         }
         v => panic!("trap {} at {:#x}, error {:#x}", v, f.rip, f.error),
     }
@@ -248,11 +260,19 @@ fn page_fault(f: &mut TrapFrame, addr: u64) {
     let present = f.error & 1 != 0;
     let write = f.error & 2 != 0;
     let user = f.error & 4 != 0;
+    if user {
+        println!("page fault in user code at {:#x}: present={} write={}: task killed", addr, present, write);
+        sched::kill_current();
+    }
     panic!("page fault at {:#x}: present={} write={} user={}", addr, present, write, user);
 }
 ```
 
-For now the handler only reports. In the [last lesson](/os/kernel/userspace), it decides between a demand page and killing a task. Linux splits this work in `exc_page_fault` and `handle_mm_fault`.
+A fault in ring 0 is a kernel bug, so the handler panics. A fault in ring 3 kills only that task, and the [last lesson](/os/kernel/userspace) adds that path. Linux splits this work in `exc_page_fault` and `handle_mm_fault`.
+
+The order of the two timer lines matters. Send the EOI before `tick`. `tick` can switch to another thread, and this function then does not continue until that thread gives up the CPU. A new thread never runs this line, so no EOI arrives and the timer stops. QEMU shows this hang if you swap the two lines.
+
+The kernel tests the fault rules too. With `test=double-fault`, it overflows its stack, and the handler runs on its IST stack. With `test=triple-fault`, it does the same with no IDT, and QEMU shuts the machine down.
 
 arm64 has one table of 16 handlers, at `VBAR_EL1`, and each slot holds 32 instructions. The CPU saves `pc` and flags in `ELR_EL1` and `SPSR_EL1`, not on a stack, and it pushes nothing. Software saves the registers. `ESR_EL1` holds the cause, and `FAR_EL1` holds the address. The interrupt controller is the GIC, and `eret` returns.
 

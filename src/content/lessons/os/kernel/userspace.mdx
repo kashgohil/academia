@@ -36,27 +36,33 @@ Things to try:
 
 Ring 3 is not a place that you can jump to. No `jmp` lowers the privilege. The CPU has only return instructions for this. So the kernel builds the frame of an interrupt that never happened, and it runs `iretq`.
 
+{/* source: kernels/rust/src/user.rs#enter-user */}
+
 ```rust
 /// Enters ring 3 for the first time: fabricate an interrupt frame, then iretq.
+/// GS base stays 0 for user code. init_syscall put the per-CPU pointer in KERNEL_GS_BASE,
+/// so this path must not run swapgs: the first syscall does that swap.
 pub unsafe fn enter_user(rip: u64, rsp: u64, cr3: u64) -> ! {
     unsafe {
         asm!(
             "mov cr3, {cr3}",
-            "push 0x1B",       // ss: user data, RPL 3
+            "push {ss}",       // ss: user data, RPL 3
             "push {rsp}",
             "push 0x202",      // rflags: IF = 1
-            "push 0x23",       // cs: user code, RPL 3
+            "push {cs}",       // cs: user code, RPL 3
             "push {rip}",
-            "swapgs",          // user GS base now active, kernel value in the MSR
             "iretq",
             cr3 = in(reg) cr3, rsp = in(reg) rsp, rip = in(reg) rip,
+            ss = const USER_SS, cs = const USER_CS,
             options(noreturn),
         )
     }
 }
 ```
 
-This is the same trick as the [fabricated thread stack](/os/kernel/a-simple-scheduler). All samples in this lesson compiled to an object file with rustc 1.96.1, but they were not run. The GDT needs user segments with DPL 3: `0x00AFFA000000FFFF` for code and `0x00CFF2000000FFFF` for data. Selector `0x23` is entry 4 with RPL 3, and `0x1B` is entry 3 with RPL 3.
+This is the same trick as the [fabricated thread stack](/os/kernel/a-simple-scheduler). All samples in this lesson ran in QEMU with rustc 1.96.1. The GDT needs user segments with DPL 3: `0x00AFFA000000FFFF` for code and `0x00CFF2000000FFFF` for data. Selector `0x23` is entry 4 with RPL 3, and `0x1B` is entry 3 with RPL 3.
+
+This path must not run `swapgs`. `init_syscall` puts the per-CPU pointer in `KERNEL_GS_BASE`, and the GS base stays 0 for user code. The first `syscall` swaps them. An extra `swapgs` here swaps them too early, so that `syscall` then writes to address 8 and faults.
 
 Once a task runs in ring 3, the next interrupt needs a kernel stack. The CPU takes it from **`TSS.RSP0`**. So the scheduler must write `RSP0` at each switch, to the top of the next task's kernel stack. If it forgets, one task's interrupt frames land on another task's stack. This is the only job left for the TSS in a simple kernel. Linux has a similar update in `__switch_to`, although KPTI adds a small trampoline stack in front.
 
@@ -113,8 +119,11 @@ Four MSRs set up this door.
 
 `STAR` has a hidden demand on your GDT. `syscall` sets CS to `STAR[47:32]` and SS to that plus 8. `sysretq` sets SS to `STAR[63:48] + 8` and CS to `STAR[63:48] + 16`, both with RPL 3. So kernel code must come right before kernel data, and user data must come right before user code. This is why the TinyOS GDT has that odd order, with base `0x10`. Linux writes `0x0023001000000000`, which gives its selectors `0x10`, `0x18`, `0x2B` and `0x33`.
 
+{/* source: kernels/rust/src/user.rs#syscall-entry */}
+
 ```rust
-pub unsafe fn init_syscall(percpu: *mut PerCpu) {
+pub unsafe fn init_syscall() {
+    let percpu = PERCPU.get() as *mut PerCpu;
     unsafe {
         wrmsr(EFER, rdmsr(EFER) | 1); // SCE
         wrmsr(STAR, (0x10u64 << 48) | (0x08u64 << 32));
@@ -122,6 +131,10 @@ pub unsafe fn init_syscall(percpu: *mut PerCpu) {
         wrmsr(SFMASK, 0x4_0700); // AC, DF, IF, TF
         wrmsr(KERNEL_GS_BASE, percpu as u64);
     }
+}
+
+unsafe extern "C" {
+    fn syscall_entry();
 }
 
 global_asm!(r#"
@@ -158,11 +171,15 @@ syscall_entry:
 "#, handler = sym handle_syscall);
 ```
 
-`swapgs` must also run on interrupt entry from ring 3, and it must not run on entry from ring 0. So an interrupt stub must check the saved CS. Getting this wrong is a classic bug, and Linux's entry code spends many lines on it, along with speculation fixes. This kernel's stub from the [interrupt lesson](/os/kernel/interrupt-handling) needs this check before user tasks can run. The `sysretq` has one trap of its own: a non-canonical `rcx` raises `#GP` in ring 0 on Intel CPUs, on the user's stack. Check it first, or return with `iretq`.
+`swapgs` must also run on interrupt entry from ring 3, and it must not run on entry from ring 0. So an interrupt stub must check the saved CS. Getting this wrong is a classic bug.
+
+Linux's entry code spends many lines on it, along with speculation fixes. The stub from the [interrupt lesson](/os/kernel/interrupt-handling) does not read `gs:`, so it needs no swap. A stub that uses per-CPU data must check the saved CS first. The `sysretq` has one trap of its own: a non-canonical `rcx` raises `#GP` in ring 0 on Intel CPUs, on the user's stack. Check it first, or return with `iretq`.
 
 ## write and exit
 
 A system call handler treats every register as hostile. The buffer pointer is the main risk: a task could ask `write` to print kernel memory. So check that the range is in the user half, and take care if it wraps. Linux calls this check `access_ok`. It then copies with `copy_from_user`, which also handles a page that faults. The [system calls lesson](/os/processes/system-calls) has the full path.
+
+{/* source: kernels/rust/src/user.rs#sys-write */}
 
 ```rust
 const USER_TOP: u64 = 1 << 47;
@@ -170,13 +187,19 @@ const USER_TOP: u64 = 1 << 47;
 extern "C" fn handle_syscall(f: &mut SyscallFrame) {
     // A non-canonical rcx would make sysretq raise #GP in ring 0 on Intel CPUs.
     if f.rcx >= USER_TOP {
-        kill_current();
+        exit_from_syscall();
     }
     f.rax = match f.rax {
         1 => sys_write(f.rdi, f.rsi, f.rdx),
-        60 => kill_current(),
+        60 => exit_from_syscall(),
         _ => -38i64 as u64, // -ENOSYS
     };
+}
+
+/// The other threads run with the GS state of user code, so undo the swapgs of syscall_entry.
+fn exit_from_syscall() -> ! {
+    unsafe { asm!("swapgs", options(nomem, nostack, preserves_flags)) };
+    sched::kill_current();
 }
 
 fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
@@ -186,12 +209,25 @@ fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
     if buf >= USER_TOP || len > USER_TOP - buf {
         return -14i64 as u64; // -EFAULT
     }
-    console_write(buf as *const u8, len as usize);
+    // The range check is not enough. An unmapped page below USER_TOP would fault here, in ring 0.
+    let cr3 = read_cr3();
+    let first = buf as usize & !(PAGE - 1);
+    let last = (buf + len).saturating_sub(1) as usize & !(PAGE - 1);
+    if len > 0 && !(first..=last).step_by(PAGE).all(|va| mem::user_readable(cr3, va)) {
+        return -14i64 as u64; // -EFAULT
+    }
+    for i in 0..len {
+        serial::putc(unsafe { ((buf + i) as *const u8).read() });
+    }
     len
 }
 ```
 
-`exit` must be careful about order. The task is still running on its own kernel stack and its own page table. So TinyOS loads the kernel's `CR3` before it frees the table frames. A kernel cannot free the table that the CPU is walking.
+The range check is not enough. A page below `USER_TOP` may be unmapped, so the copy would fault in ring 0, and any task could panic the kernel in this way. This code walks the page table first. Linux lets the copy fault, and a fix-up table turns that fault into `-EFAULT`.
+
+A task that ends in a system call needs one more step. `syscall_entry` ran `swapgs`, and the next thread expects the GS state of user code. So `exit_from_syscall` swaps back before it switches.
+
+The task is still running on its own kernel stack and its own page table. So TinyOS loads the kernel's `CR3` before it frees the table frames. A kernel cannot free the table that the CPU is walking.
 
 TinyOS uses the Linux numbers for `write` (1) and `exit` (60). Its number 35 is a simple `sleep` in ticks. On Linux, 35 is `nanosleep`, which takes a pointer.
 

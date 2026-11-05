@@ -43,6 +43,8 @@ This map gives 3,551 whole frames out of 4,096, and 3,550 after frame 0 is left 
 
 A **bitmap** uses one bit per frame. A set bit means used, so memory that the map never names stays used by default. It costs 1 bit per 4 KiB, which is 1/32,768 of RAM. That is 512 bytes here, 256 KiB for 8 GiB, and 2 MiB for 64 GiB. Allocation scans for a word that is not all ones, and it reads one word for each 64 frames. A hint avoids a repeat scan from the start.
 
+{/* source: kernels/rust/src/mem.rs#bitmap */}
+
 ```rust
 pub struct BitmapFrames {
     words: &'static mut [u64],
@@ -129,20 +131,17 @@ A second hazard is interrupts. If an interrupt handler allocates while `kmalloc`
 
 Rust's `alloc` crate gives you `Box` and `Vec` once you provide one global allocator. Its methods are `unsafe`, because a wrong answer breaks memory safety. Use the `Layout` for size and alignment, and return null on failure.
 
+{/* source: kernels/rust/src/heap.rs#heap */}
+
 ```rust
-#![no_std]
-extern crate alloc;
-use core::alloc::{GlobalAlloc, Layout};
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 pub const PAGE: usize = 4096;
+pub const HEAP_BASE: usize = 0xFFFF_C000_0000_0000;
 
-unsafe extern "Rust" {
-    // Takes frames from the frame allocator, never from the heap.
-    fn map_heap_page(va: usize) -> bool;
+// Takes frames from the frame allocator, never from the heap.
+fn map_heap_page(va: usize) -> bool {
+    let Some(frame) = mem::frames().alloc() else { return false };
+    mem::map_page(KERNEL_PML4.load(Ordering::Relaxed), va, frame * PAGE, P | W, &mut |_| {})
 }
-
-const HEAP_BASE: usize = 0xFFFF_C000_0000_0000;
 
 pub struct Bump {
     next: AtomicUsize,   // offset of the next free byte
@@ -152,11 +151,12 @@ pub struct Bump {
 // One CPU, and callers hold no lock that an interrupt handler also takes.
 unsafe impl GlobalAlloc for Bump {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let _irq = crate::sched::IrqGuard::new();
         let start = (self.next.load(Ordering::Relaxed) + l.align() - 1) & !(l.align() - 1);
         let end = start + l.size();
         while self.mapped.load(Ordering::Relaxed) < end {
             let va = HEAP_BASE + self.mapped.load(Ordering::Relaxed);
-            if !unsafe { map_heap_page(va) } {
+            if !map_heap_page(va) {
                 return core::ptr::null_mut();
             }
             self.mapped.fetch_add(PAGE, Ordering::Relaxed);
@@ -173,14 +173,13 @@ unsafe impl GlobalAlloc for Bump {
 static HEAP: Bump = Bump { next: AtomicUsize::new(0), mapped: AtomicUsize::new(0) };
 ```
 
-This compiled to an object file with rustc 1.96.1, with a panic handler added, but it was not run. A bump allocator is good for the first days of a kernel, because nothing can go wrong in it. Replace it with a free list once the kernel frees objects, and add a slab layer for hot sizes later. The `dealloc` argument gives you the size, so a Rust allocator does not need a size header.
+This code ran in QEMU with rustc 1.96.1. A bump allocator is good for the first days of a kernel, because nothing can go wrong in it. Replace it with a free list once the kernel frees objects, and add a slab layer for hot sizes later. The `dealloc` argument gives you the size, so a Rust allocator does not need a size header.
 
-Zig passes the allocator as a value, so a kernel can use different allocators for different jobs. No global registration is needed. This shape follows Zig 0.14, whose interface added `remap`, and it was not compiled.
+Zig passes the allocator as a value, so a kernel can use different allocators for different jobs. No global registration is needed. The kernel in `kernels/zig` uses this allocator, and it ran in QEMU with Zig 0.17.1. The interface changes between Zig versions: `remap` arrived in 0.14.
+
+{/* source: kernels/zig/kernel.zig#zig-bump */}
 
 ```zig
-const std = @import("std");
-const Alignment = std.mem.Alignment;
-
 const Bump = struct {
     next: usize = 0,
     mapped: usize = 0,

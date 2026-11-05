@@ -34,15 +34,16 @@ Things to try:
 
 A context switch is a function call that returns on a different stack. Since the compiler treats it as a call, the caller has already saved the caller-saved registers, if it needs them. Only the six callee-saved registers of the System V ABI must survive.
 
-```rust
-#![no_std]
-use core::arch::{asm, global_asm};
+{/* source: kernels/rust/src/sched.rs#thread */}
 
+```rust
 #[repr(C)]
 pub struct Thread {
     rsp: u64, // must stay at offset 0: switch_to uses it
-    stack_top: u64,
-    state: u8,
+    pub stack_top: u64,
+    pub state: State,
+    pub cr3: u64,
+    pub frames: Vec<usize>, // the frames to free when the thread is dead
 }
 
 global_asm!(r#"
@@ -76,13 +77,16 @@ thread_trampoline:
 "#);
 ```
 
-This sample compiled to an object file with rustc 1.96.1, with a panic handler added. It was not run. Compare it with `__switch_to_asm` in the [context switching](/os/processes/context-switching) lesson: Linux has the same six pushes. The floating point state needs no work here, because kernel code is compiled with no SSE. A kernel that runs user tasks must add it, on the user-task path.
+This code ran in QEMU with rustc 1.96.1. Compare it with `__switch_to_asm` in the [context switching](/os/processes/context-switching) lesson: Linux has the same six pushes. The floating point state needs no work here, because kernel code is compiled with no SSE. A kernel that runs user tasks must add it, on the user-task path.
 
 ## The fabricated first stack
 
 `fabricate` writes what `switch_to` will read. The order is the mirror of the pops, and the return address comes first because it is the deepest.
 
+{/* source: kernels/rust/src/sched.rs#fabricate */}
+
 ```rust
+#[allow(improper_ctypes)] // the assembly reads only the rsp field
 unsafe extern "C" {
     fn switch_to(prev: *mut Thread, next: *const Thread);
     fn thread_trampoline();
@@ -114,7 +118,7 @@ Linux does the same thing. `copy_thread` builds a `fork_frame` on the new kernel
 
 ## Cooperative, then preemptive
 
-Start with **cooperative** switching: a thread calls `yield_now`, which picks another thread and calls `switch_to`. No interrupt is involved. This is enough to test the switch, and bugs are easy to reproduce. Its weakness is that one loop that does not yield stops the machine.
+Start with **cooperative** switching: a thread calls `schedule`, which picks another thread and calls `switch_to`. No interrupt is involved. This is enough to test the switch, and bugs are easy to reproduce. Its weakness is that one loop that does not yield stops the machine.
 
 **Preemptive** switching adds one thing: the timer handler calls `schedule` too. It looks strange at first. The handler runs on the interrupted thread's stack, and it switches away in the middle of the handler. The frame stays there.
 
@@ -171,6 +175,8 @@ The demo runs the [interleaving machine](/os/sync/critical-sections) from the sy
 
 The rule follows from the table. Data that a handler touches needs both: disable local interrupts and take the lock. Linux names this `spin_lock_irqsave`. The save part matters, because the caller may already have interrupts off, and a plain `sti` at the end would turn them on too early. A Rust guard does this well.
 
+{/* source: kernels/rust/src/sched.rs#schedule */}
+
 ```rust
 /// Saves IF and turns interrupts off. The guard restores the old state.
 pub struct IrqGuard(u64);
@@ -189,19 +195,40 @@ impl Drop for IrqGuard {
     }
 }
 
-pub fn yield_now(rq: &mut RunQueue) {
+/// Picks the next thread. A running thread goes to the back of the queue. A dead thread does not.
+pub fn schedule() {
     let _irq = IrqGuard::new();
+    let rq = rq();
     let prev = rq.current;
-    rq.push(prev);
-    let next = rq.pop();
-    if next != prev {
-        rq.current = next;
-        unsafe { switch_to(prev, next) };
+    unsafe {
+        if (*prev).state == State::Running {
+            (*prev).state = State::Ready;
+            rq.push(prev);
+        }
+        let next = rq.pop();
+        (*next).state = State::Running;
+        if next != prev {
+            rq.current = next;
+            activate(next);
+            switch_to(prev, next);
+        }
+    }
+}
+
+/// Everything that the CPU reads from a place other than the kernel stack.
+unsafe fn activate(next: *mut Thread) {
+    unsafe {
+        let top = (*next).stack_top;
+        (*TSS.get()).rsp0 = top; //        for an interrupt that arrives in ring 3
+        user::set_kernel_stack(top); //    for the syscall instruction
+        if read_cr3() != (*next).cr3 {
+            write_cr3((*next).cr3);
+        }
     }
 }
 ```
 
-Read `yield_now` closely. The guard is alive during `switch_to`. The new thread runs, and the guard's `drop` runs only when this thread resumes. So the "unlock" happens long after, in another thread's turn.
+Read `schedule` closely. The guard is alive during `switch_to`. The new thread runs, and the guard's `drop` runs only when this thread resumes. So the "unlock" happens long after, in another thread's turn.
 
 In this design, `IF` stays off across the switch, and each thread restores its own state on return. That is why the trampoline needs `sti`: a new thread has no guard to drop. Linux's `finish_task_switch` handles the same problem for the runqueue lock.
 

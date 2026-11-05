@@ -71,32 +71,20 @@ Set the accessed bit in advance if the GDT is in read-only memory. The CPU write
 
 The instruction right after `mov cr0` still has a low address, and now the CPU translates it. So the page tables must map the running code at its own address. This is the job of the identity map. After that, `CS` still has `L = 0`, so a far jump to a descriptor with `L = 1` finishes the work.
 
-This Rust file holds the whole path as assembly. It starts in 32-bit mode, as Multiboot2 leaves the CPU. The linker must place this code at a low address. It compiled to an object file with rustc 1.96.1, but it was not run.
+This is the whole path, from `kernels/boot.s`. It starts in 32-bit mode, as Multiboot2 and PVH leave the CPU. It ran in QEMU, in both kernels. The linker places it at 1 MiB, so its 32-bit addresses are valid.
 
-```rust
-#![no_std]
-use core::arch::global_asm;
+{/* source: kernels/boot.s#boot32 */}
 
-// A flat GDT. These are the values that the demo encodes.
-#[repr(C, align(8))]
-pub struct Gdt(pub [u64; 4]);
-#[unsafe(no_mangle)]
-pub static BOOT_GDT: Gdt = Gdt([
-    0,
-    0x00CF_9A00_0000_FFFF, // 0x08: 32-bit code
-    0x00CF_9200_0000_FFFF, // 0x10: data
-    0x00AF_9A00_0000_FFFF, // 0x18: 64-bit code, L = 1
-]);
-
-global_asm!(r#"
-    .text
+```asm
+    .section .boot, "awx"
     .code32
     .globl boot32
 boot32:
     cli
+    mov esi, eax                  // the Multiboot2 magic, if GRUB started us
+    mov edi, ebx                  // the boot information
     mov esp, offset boot_stack_top
 
-    // Page tables are ready in .bss: PML4, PDPT and PD, with 2 MiB leaves.
     mov eax, cr4
     or  eax, 1 << 5               // CR4.PAE
     mov cr4, eax
@@ -124,14 +112,73 @@ boot64:
     mov ds, ax
     mov es, ax
     mov ss, ax
+    mov edi, edi                  // clear the high halves: they are undefined after the switch
+    mov esi, esi
     movabs rax, offset high_entry
     jmp rax
+```
 
-    .data
+A 32-bit instruction cannot hold a high address. So the stub, its GDT and its page tables all stay below 4 GiB. The GDT needs a 64-bit code descriptor at `0x18`, and that is the target of the far jump.
+
+{/* source: kernels/boot.s#gdt */}
+
+```asm
+    .align 8
+boot_gdt:
+    .quad 0
+    .quad 0x00CF9A000000FFFF      // 0x08: 32-bit code
+    .quad 0x00CF92000000FFFF      // 0x10: data
+    .quad 0x00AF9A000000FFFF      // 0x18: 64-bit code, L = 1
 gdt_ptr:
     .short 4 * 8 - 1
-    .long BOOT_GDT
-"#);
+    .long boot_gdt
+```
+
+The page tables are plain data in the file, so they need no code to build them. They hold three maps of the same physical memory.
+
+{/* source: kernels/boot.s#tables */}
+
+```asm
+    // Three maps of physical memory, with 2 MiB leaves:
+    //   entry 0   identity, 1 GiB: keeps the running code valid for now
+    //   entry 256 direct map at 0xFFFF800000000000, 4 GiB
+    //   entry 511 the kernel at 0xFFFFFFFF80000000, 1 GiB
+    .section .boot.tables, "aw"
+    .balign 4096
+    .globl boot_pml4
+boot_pml4:
+    .quad boot_pdpt_low + 3       // 3 = present, writable
+    .fill 255, 8, 0
+    .quad boot_pdpt_direct + 3
+    .fill 254, 8, 0
+    .quad boot_pdpt_high + 3
+boot_pdpt_low:
+    .quad boot_pd0 + 3
+    .fill 511, 8, 0
+boot_pdpt_direct:
+    .quad boot_pd0 + 3, boot_pd1 + 3, boot_pd2 + 3, boot_pd3 + 3
+    .fill 508, 8, 0
+boot_pdpt_high:
+    .fill 510, 8, 0
+    .quad boot_pd0 + 3
+    .quad 0
+
+    .macro PD gib
+    .set i, 0
+    .rept 512
+    .quad (\gib << 30) + (i << 21) + 0x83 // 0x83 = present, writable, 2 MiB
+    .set i, i + 1
+    .endr
+    .endm
+
+boot_pd0:
+    PD 0
+boot_pd1:
+    PD 1
+boot_pd2:
+    PD 2
+boot_pd3:
+    PD 3
 ```
 
 Why does a far jump matter so much? The CPU keeps a hidden copy of each segment descriptor. Writing `CR0` does not reload the copy in CS. Only a far jump, or an `iret` or `ret` of the far kind, loads CS. This is why "set PE" alone leaves the CPU decoding 16-bit code.

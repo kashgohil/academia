@@ -16,18 +16,13 @@ export default function LessonPage() {
   const done = useDone();
   if (!found) return <NotFound />;
 
-  const { lesson: l, module: m, track: t } = found;
+  const { lesson: l, module: m } = found;
   const Body = lessonComponent(l.path);
   const { prev, next } = neighbors(l.path);
   const isDone = done.has(l.path);
 
   return (
     <div className="page">
-      <div className="crumbs">
-        <Link to="/">Tracks</Link><span>/</span>
-        <Link to={`/${t.slug}`}>{t.title}</Link><span>/</span>
-        <span>{m.title}</span>
-      </div>
       <h1>{l.title}</h1>
       <div className="row" style={{ marginBottom: 28 }}>
         <span className="tag">{LEVELS[m.level]}</span>

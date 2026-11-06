@@ -14,7 +14,6 @@ export default function TrackPage() {
 
   return (
     <div className="page wide">
-      <div className="crumbs"><Link to="/">Tracks</Link><span>/</span></div>
       <h1>{track.title}</h1>
       <p className="lede">{track.blurb} {track.modules.length} modules, {total} lessons.</p>
 
@@ -25,7 +24,7 @@ export default function TrackPage() {
             <span className="tag">Level {lv}</span>
           </div>
           {track.modules.filter((m) => m.level === lv).map((m) => (
-            <div key={m.slug} className="module">
+            <div key={m.slug} id={m.slug} className="module">
               <h3>{m.title}</h3>
               <ul className="lesson-list">
                 {m.lessons.map((l) => (

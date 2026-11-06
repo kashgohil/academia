@@ -2,11 +2,12 @@ import { useEffect, useState } from "react";
 import { Outlet, useLocation } from "react-router";
 import Sidebar from "./Sidebar";
 import Search from "./Search";
+import Crumbs from "./Crumbs";
 
 export default function Layout() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [navOpen, setNavOpen] = useState(false);
-  const { pathname } = useLocation();
+  const { pathname, hash } = useLocation();
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -15,6 +16,7 @@ export default function Layout() {
         e.preventDefault();
         setSearchOpen(true);
       }
+      if (e.key === "Escape") setNavOpen(false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -22,16 +24,25 @@ export default function Layout() {
 
   useEffect(() => {
     setNavOpen(false);
-    window.scrollTo(0, 0);
-  }, [pathname]);
+    if (hash) document.getElementById(decodeURIComponent(hash.slice(1)))?.scrollIntoView();
+    else window.scrollTo(0, 0);
+  }, [pathname, hash]);
 
   return (
     <div className="shell">
-      <button className="btn menu-btn" onClick={() => setNavOpen((o) => !o)}>Menu</button>
       <Sidebar open={navOpen} onSearch={() => setSearchOpen(true)} />
-      <main className="main">
-        <Outlet />
-      </main>
+      {navOpen && <div className="scrim" onClick={() => setNavOpen(false)} />}
+      <div className="main-col">
+        <header className="topbar">
+          <button className="btn menu-btn" onClick={() => setNavOpen((o) => !o)} aria-expanded={navOpen} aria-label="Open the menu">
+            Menu
+          </button>
+          <Crumbs />
+        </header>
+        <main className="main">
+          <Outlet />
+        </main>
+      </div>
       {searchOpen && <Search onClose={() => setSearchOpen(false)} />}
     </div>
   );

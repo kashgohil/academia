@@ -1,0 +1,119 @@
+---
+summary: "Drop real time and you get sequential consistency; drop the single order and you get causal consistency. What each model forbids, checked on litmus histories, and how COPS makes causal order cheap."
+---
+import { LitmusMatrixDemo, CausalReplyDemo } from "@/demos/dist/ConsistencyModelsDemos";
+
+[Linearizability](/distributed/consistency/linearizability) costs a round trip to a quorum for every read. Weaker models remove parts of its promise, so that a replica can answer sooner. This lesson covers the two classic steps down. **Sequential consistency** keeps one order of all operations but drops real time. **Causal consistency** drops the single order and keeps only the order of cause and effect.
+
+To compare models, we use **litmus histories**. A litmus history is a small history that one model allows and a stronger model forbids. The demo checks each history against four models with the same search, so you can see where each model draws its line.
+
+<Predict
+  id="sb"
+  question="C1 writes x = 1, then reads y and gets 0. At the same time, C2 writes y = 1, then reads x and gets 0. Which is the strongest model that allows this?"
+  options={["Linearizability", "Sequential consistency", "Causal consistency", "Only eventual consistency"]}
+  answer={2}
+  explain="In any single order, one of the two writes comes first, and the read after the other write must see it. So no single order explains both zeros, and sequential consistency forbids it. Causal consistency allows it: the two writes are concurrent, and each client may see its own write before the other one."
+>
+<LitmusMatrixDemo />
+</Predict>
+
+1. Tap **Stale read**. Linearizability forbids it, but the other three models allow it. Sequential consistency may place the read before the write, because real time does not count.
+2. Tap **New, then old**. Again, only linearizability forbids it. The witness order for sequential consistency puts the read of 0 first.
+3. Tap **Store buffering** and **Two readers disagree**. Each client sees a legal order, but the clients do not agree on one order. Sequential consistency forbids this. Causal consistency allows it.
+4. Tap **Reply before question**. Here even causal consistency says no. C3 sees the reply a, which depends on the question q, but C3 does not see q.
+5. Tap **Value from nowhere**. Every model forbids it, but this is almost the only thing that eventual consistency forbids.
+
+## Sequential consistency
+
+Lamport defined it in "How to Make a Multiprocessor Computer That Correctly Executes Multiprocess Programs" (IEEE Transactions on Computers, 1979). He asks that the result of a run be "the same as if the operations of all the processors were executed in some sequential order". In that order, the operations of each processor must appear "in the order specified by its program".
+
+Compare this with the definition of linearizability. Both ask for one legal total order of all operations. Sequential consistency only asks that the order keeps each **program order**: the order of the operations of one process. It does not ask the order to respect real time between processes. So a process can read a value that is old in real time, as long as all processes agree on one story.
+
+Sequential consistency has a less obvious weakness: it is not **local**. In the store buffering history, the operations on x alone are sequentially consistent: put the read before the write. The operations on y alone are also sequentially consistent. But the whole history is not. So a system cannot get sequential consistency by giving it to each key separately. Linearizability does not have this problem, which is one reason why it is the usual choice.
+
+Where you meet it:
+
+- **Multiprocessors.** Lamport wrote about shared memory. In C++, a data-race-free program that uses only `seq_cst` atomics behaves as if it were sequentially consistent. Real hardware gives less: store buffering appears on x86.
+- **ZooKeeper.** Its list of guarantees starts with sequential consistency: the updates of a client are applied in the order that it sent them. Reads are served by the local server, so a client can see the past.
+
+## Causal consistency
+
+Ahamad, Neiger, Burns, Kohli and Hutto defined **causal memory** (Distributed Computing, 1995). It builds on the happens-before relation of Lamport clocks. An operation a is **causally before** b in three cases.
+
+1. a and b are in the same process, and a comes first.
+2. b is a read that returns the value that write a wrote.
+3. There is a c with a before c and c before b.
+
+Operations with no causal order between them are **concurrent**. A history is causally consistent if each process sees all writes in some legal order that keeps the causal order. Different processes may see concurrent writes in different orders. That is why **Two readers disagree** and **Concurrent writes, two orders** are allowed.
+
+What causal consistency forbids is the effect without its cause. If Bob reads Alice's question and then writes a reply, the reply depends on the question. Nobody may see the reply without the question. This is the anomaly that users notice, in comment threads, chat and access control. A classic case: remove your boss from a photo album, then upload a photo. If the upload overtakes the removal, your boss sees the photo.
+
+<Predict
+  id="reply"
+  question="Q goes from DC1 to DC3 over a slow link. Bob reads Q at DC2 and posts a reply R, which goes to DC3 over a fast link. Each data center shows each write as soon as it arrives. Can Carol at DC3 see R without Q?"
+  options={["No: Bob saw Q before he wrote R, so R cannot arrive first", "Yes: the network can deliver R before Q", "Only if DC3 crashes"]}
+  answer={1}
+  explain="The order in which Bob saw things says nothing about the order in which messages reach DC3. R can overtake Q. Without metadata, DC3 has no way to know that R depends on Q, so it shows R at once."
+>
+<CausalReplyDemo />
+</Predict>
+
+1. Read the chips under the diagram. For a while DC3 shows only the reply. The red bar on the DC3 line marks this window.
+2. Move the slider to 0 ms. Q now arrives first, and the anomaly disappears. The bug depends on timing, so tests on a fast network will not find it.
+3. Set the slider to 120 ms and turn on **Send dependencies with each write**. R now carries "after Q". DC3 holds R until Q arrives, shown by the green bar.
+4. Compare the time when R becomes visible at DC3, with and without dependencies. Causal order costs Carol some freshness, but no data center ever waits for a remote round trip.
+
+## Causal+ and COPS
+
+Lloyd, Freedman, Kaminsky and Andersen built COPS, a causal store for many data centers (SOSP 2011). They defined **causal+** consistency: causal consistency with **convergent conflict handling**. Two replicas that have seen the same writes must hold the same value, for example by last-writer-wins. Plain causal consistency allows replicas to disagree forever about concurrent writes. Causal+ does not.
+
+COPS works like the demo. A client library tracks the writes that the client has read or written. Each write that it sends carries these as dependencies. A remote data center makes the write visible only after it has the dependencies. COPS sends only the **nearest dependencies**, because the others follow by transitivity. Its variant COPS-GT keeps more metadata, so that it can also offer read-only **get transactions** without locks.
+
+```ts
+// A remote write becomes visible only after its dependencies (as in COPS).
+interface Write { key: string; version: number; value: string; deps: { key: string; version: number }[] }
+
+function receive(dc: DataCenter, w: Write) {
+  dc.waiting.push(w);
+  let progress = true;
+  while (progress) {
+    progress = false;
+    for (const x of [...dc.waiting]) {
+      if (x.deps.every((d) => (dc.visibleVersion.get(d.key) ?? 0) >= d.version)) {
+        dc.apply(x); // last-writer-wins on version: convergent conflict handling
+        dc.waiting.splice(dc.waiting.indexOf(x), 1);
+        progress = true;
+      }
+    }
+  }
+}
+```
+
+The local data center answers every read and write at once. Only the remote visibility waits. MongoDB offers a similar guarantee per client with **causally consistent sessions**, added in version 3.6. The driver sends `afterClusterTime` with each read. MongoDB documents that only reads with "majority" read concern and writes with "majority" write concern give all four session guarantees.
+
+## The ladder
+
+| Model | One order for all? | Real time? | Forbids, in addition to the model below |
+|---|---|---|---|
+| linearizable | yes | yes | stale reads, new-then-old |
+| sequential | yes | no | clients that disagree on the order (store buffering, IRIW) |
+| causal | no, one per process | no | an effect without its cause; time going back for one client |
+| eventual | no | no | (in a finite history) only values that nobody wrote |
+
+Each model allows everything that the model above it allows. The tests check this on random histories: a history that passes one row also passes every row below it.
+
+## Connect
+
+- [Lamport clocks](/distributed/time/lamport-clocks) and [vector clocks](/distributed/time/vector-clocks): the happens-before relation that causal consistency uses, and a way to track it.
+- [Memory orderings](/concurrency/atomics/memory-orderings-relaxed-acquire-release-seq-cst): store buffering and IRIW in hardware, and what `seq_cst` restores.
+- [Session guarantees](/distributed/consistency/session-guarantees): causal order for one client, piece by piece.
+- [Eventual consistency](/distributed/consistency/eventual-consistency): the bottom row of the ladder.
+
+<Recall cards={[
+  { q: "What does sequential consistency drop from linearizability?", a: "The real-time rule. There must still be one legal order of all operations that keeps each program order. But that order may put an operation before one that finished earlier." },
+  { q: "Why is sequential consistency not local? Give the example.", a: "Store buffering: C1 writes x then reads y = 0, C2 writes y then reads x = 0. Each register alone has a valid order, but no single order explains both reads." },
+  { q: "Name the three rules that make up the causal order.", a: "Program order within a process; a write is before every read that returns its value; and transitivity." },
+  { q: "Which anomaly does causal consistency forbid that eventual consistency allows? Give an example.", a: "An effect visible without its cause, such as a reply visible without the question it answers." },
+  { q: "What does causal+ add to causal consistency?", a: "Convergent conflict handling: replicas that have seen the same writes hold the same value, for example by last-writer-wins. Plain causal consistency lets them disagree about concurrent writes forever." },
+  { q: "How does COPS keep a remote write from overtaking its cause?", a: "Each write carries its nearest dependencies. A remote data center makes the write visible only after it has made those dependencies visible." },
+]} />

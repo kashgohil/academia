@@ -1,0 +1,118 @@
+---
+summary: "Read your writes, monotonic reads, writes follow reads and monotonic writes: four cheap promises to one client on top of weak replication, from Bayou, and how version vectors and LSN tokens keep them."
+---
+import { MobileSessionDemo, TokenDemo } from "@/demos/dist/ConsistencySessionDemos";
+
+An [eventually consistent](/distributed/consistency/eventual-consistency) store makes no promise about what a read returns. Users notice. They save a profile and see the old one. They see a comment, reload, and it is gone. Most of these complaints come from one client that talks to different replicas over time.
+
+Terry, Demers, Petersen, Spreitzer, Theimer and Welch addressed this in "Session Guarantees for Weakly Consistent Replicated Data" (PDIS 1994). The work was part of the Bayou project. A **session** is the sequence of reads and writes of one application, for example on one phone. A **session guarantee** is a promise about that sequence only. It costs much less than a global model, because the servers do not need to agree on anything new. The client carries what it has seen, and a server checks it.
+
+<Predict
+  id="wfr"
+  question="Alice reads Bob's post B1 at server S3. Then she writes a reply A1 at server S1, which has not received B1 yet. Later, Carol reads at S1 and sees the reply but not the post. Which guarantee did the system break?"
+  options={["Read your writes", "Monotonic reads", "Writes follow reads", "Monotonic writes"]}
+  answer={2}
+  explain="Alice's write A1 followed her read of B1, so every server must apply B1 before A1. S1 accepted A1 without B1. This is the reply-before-question anomaly again, caused by one session that switched servers."
+>
+<MobileSessionDemo />
+</Predict>
+
+1. Read the four boxes. With all guarantees off, this run breaks each one. Match each message to a step: step 3 misses A1, and S1 accepts A1 without B1.
+2. Turn on **Read your writes**. Step 3 now waits at S2 until anti-entropy brings A1. The bar on the S2 line shows the wait.
+3. Turn on all four. No violation is left, and the cost is the waiting time in the stats. Then set the anti-entropy period to 20 ms. The waits become short, because the servers catch up sooner.
+4. With all four off, tap the server of each step until all steps use S1. No violation remains. One server is a single copy, so a session that stays on it gets all four guarantees for free.
+5. Turn on only **Monotonic writes** and look at step 4. S2 must have A1 before it accepts A2, so it waits.
+
+## The four guarantees
+
+| Guarantee | Promise | Without it |
+|---|---|---|
+| read your writes (RYW) | a read sees every earlier write of the session | you save a setting, reload, and see the old setting |
+| monotonic reads (MR) | a read sees every write that an earlier read of the session saw | a new comment appears, then disappears on the next page |
+| writes follow reads (WFR) | a write of the session is ordered after every write that the session read before it | a reply appears without the post it answers |
+| monotonic writes (MW) | the writes of the session are applied in session order everywhere | a "delete" overtakes the "create", and the item comes back |
+
+The first two are about reads, and the last two are about writes. Each one is independent: you can have any subset. Together they keep cause before effect for everything that passes through one session. They do not say anything about two sessions that never read each other's writes.
+
+## How to implement them
+
+Bayou servers keep an ordered log of writes. Each write has an id: the server that accepted it and a sequence number. **Anti-entropy** sends the log to a peer, in order. So a server that has some write also has every write that its origin had before it. Bayou calls this the **prefix property**. With it, a **version vector** describes the contents of a log exactly: for each origin, the highest sequence number that the server has.
+
+The client keeps two vectors. The **write-set** covers the writes of the session. The **read-set** covers the writes that the session has read, which is the vector of each server it read from. Before a server serves a request, it checks that its own vector dominates the right set.
+
+```rust
+/// The checks of Terry et al. (1994). `server` is the vector of the server that got the request.
+fn may_serve(op: Op, server: &VersionVector, s: &Session) -> bool {
+    match op {
+        Op::Read => (!s.ryw || server.dominates(&s.write_set)) && (!s.mr || server.dominates(&s.read_set)),
+        Op::Write => (!s.wfr || server.dominates(&s.read_set)) && (!s.mw || server.dominates(&s.write_set)),
+    }
+}
+
+fn after_read(s: &mut Session, server: &VersionVector) {
+    s.read_set.merge(server); // everything this server had may have shaped the answer
+}
+
+fn after_write(s: &mut Session, id: WriteId) {
+    s.write_set.raise(id.origin, id.seq);
+}
+```
+
+If the check fails, there are two choices. The server can **wait** until anti-entropy brings the missing writes, which the demo does. Or the client can **try another server** that is far enough ahead. The client never needs to know where data lives. It only carries two vectors, of one number per server.
+
+The cost is availability. A session that has read from a fresh server and then reaches only stale servers must wait or fail. In the demo, turning on all four guarantees removed every violation, in all the runs that the tests try. The price was the time that requests spent waiting at servers.
+
+## Tokens in real systems
+
+Most production systems use one number instead of a vector. With a single primary, the write log is already one sequence. A **log sequence number** (LSN) names a point in it. The client keeps the LSN of its last write as a **token**, and a replica checks the token against its own replay position.
+
+<Predict
+  id="token"
+  question="A client writes at the primary, then reads at an asynchronous replica. It carries the LSN of its write. The replica has not replayed that LSN yet. Which response keeps read-your-writes and adds the least delay on average?"
+  options={["Answer at once from the replica", "Wait on the replica until it replays the LSN", "Tell the client to read from the primary"]}
+  answer={2}
+  explain="Answering at once breaks read-your-writes. Waiting is correct, but the delay is the whole replay lag, which can be long. Sending the read to the primary costs one extra round trip, which is usually shorter than the lag. Waiting avoids load on the primary, so both are used."
+>
+<TokenDemo />
+</Predict>
+
+1. With **no token**, count the red answers. A read is stale when the replica has not applied the client's LSN yet. In this run, 3 of 4 reads miss the client's own write.
+2. Select **replica waits**. No read is stale. Compare the slowest read with the mean replay delay: the wait is set by the lag, not by the network.
+3. Select **go to primary**. No read is stale, and the slow reads become one extra round trip. Count the reads that reached the primary: this is the load that the token moves back.
+4. Set the replay delay to 2 ms. Almost every read now finds the replica up to date, so the token costs nothing. Tokens are cheap when replicas keep up.
+
+Systems that use a token:
+
+- **PostgreSQL.** After a commit, the application reads `pg_current_wal_lsn()` on the primary. On a standby, `pg_last_wal_replay_lsn()` gives the replay position. Both names exist since PostgreSQL 10, which renamed the older xlog functions. The comparison is up to the application or the proxy.
+- **MongoDB.** A causally consistent session (since 3.6) tracks the `operationTime` of the last operation. The driver sends it as `afterClusterTime`, and a secondary waits until it has reached that time. All four guarantees need majority read and write concern.
+- **Azure Cosmos DB.** The default consistency level is **session**. The client caches a session token from each write and sends it with reads. A replica answers only if it has caught up to that token.
+
+```go
+// Read your writes on PostgreSQL with an LSN token. The standby waits a little, then gives up.
+func ReadAfter(ctx context.Context, standby, primary *sql.DB, token string, q string) (*sql.Rows, error) {
+	for i := 0; i < 5; i++ {
+		var ok bool
+		err := standby.QueryRowContext(ctx, `SELECT pg_last_wal_replay_lsn() >= $1::pg_lsn`, token).Scan(&ok)
+		if err == nil && ok {
+			return standby.QueryContext(ctx, q)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	return primary.QueryContext(ctx, q) // the standby is too far behind: go to the primary
+}
+```
+
+## Connect
+
+- [Replication lag and read your writes](/distributed/replication/replication-lag-and-read-your-writes): where the lag comes from in leader-follower systems.
+- [Vector clocks](/distributed/time/vector-clocks): the same per-node counters, used to order events.
+- [Sequential and causal consistency](/distributed/consistency/sequential-and-causal-consistency): the global model that these per-session promises approach.
+- [Leader-follower replication](/distributed/replication/leader-follower): the single log that makes one LSN enough.
+
+<Recall cards={[
+  { q: "Name the four session guarantees of Terry et al., and say which two are about reads.", a: "Read your writes, monotonic reads, writes follow reads and monotonic writes. Read your writes and monotonic reads constrain reads." },
+  { q: "What does the client keep, and what does a server check, for read your writes?", a: "The client keeps a write-set vector of its own writes. Before a read, the server checks that its version vector dominates the write-set." },
+  { q: "Which anomaly does writes follow reads prevent? Give an example.", a: "A write that appears somewhere before a write that its author had read. For example, a reply that appears on a server that does not have the post it answers." },
+  { q: "Why does the prefix property let a version vector describe a log exactly?", a: "Anti-entropy sends logs in order, so a server with write (origin, n) also has all earlier writes of that origin. The highest sequence number per origin then names the whole set." },
+  { q: "A replica is behind the client's LSN token. Name the two correct responses and their costs.", a: "Wait until the replica replays the LSN, which costs the replication lag. Or redirect the read to the primary, which costs a round trip and load on the primary." },
+]} />

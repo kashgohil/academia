@@ -1,0 +1,134 @@
+---
+summary: "Histories, linearization points and the real-time rule: what it means for a replicated object to act like one copy, how etcd and ZooKeeper give it, and what it costs."
+---
+import { HistoryEditorDemo, StaleFollowerDemo } from "@/demos/dist/ConsistencyLinDemos";
+
+A replicated register keeps one value on several machines. Clients only see the requests that they send and the answers that they get back. A **consistency model** is a rule that says which answers are allowed. **Linearizability** is the strongest common model for a single object. It says that the replicas must act as if there were only one copy.
+
+To state the rule, we record a **history**. Each operation in it has an **invocation** (the moment the client sends it) and a **response** (the moment the client gets the answer). Two operations are **concurrent** if their intervals overlap. If operation a returns before operation b starts, then a **precedes** b in real time.
+
+<Predict
+  id="inversion"
+  question="x starts at 0. C1 writes 1, and the write takes a long time. During the write, C2 reads 1. After that read returns, C3 reads 0, still during the write. Is this history linearizable?"
+  options={["Yes: every read overlaps the write, so any order is allowed", "No: once a read has returned 1, a later read must not return 0", "Only if C3 is on another replica"]}
+  answer={1}
+  explain="Each read overlaps the write, so each one alone could go either way. But the read by C2 returned before the read by C3 started. So C2 comes first in any valid order. C2 saw 1, so the write took effect before it. Then C3 must also see 1. This is the new-then-old inversion."
+>
+<HistoryEditorDemo />
+</Predict>
+
+1. Read the verdict for **New, then old**. The longest valid start is `w 1, r → 1`. After that, real time allows only `r → 0`, and the register holds 1.
+2. Drag the read of C3 to the left until it overlaps the read of C2. A linearization appears. The read of C3 now goes before the read of C2, and both fit inside the write.
+3. Select **Stale read**. The write of 1 returns before C2 starts its read, so the read of 0 is too late. Drag the end of the write past the start of that read. The history becomes linearizable.
+4. Select **Two writers**. Two writes overlap, so either order is allowed. C3 reads 2, then 1. The checker puts `w 2` first and `w 1` second, and the points show where each one took effect.
+5. Select an operation and press **Change read value**. Find a value that no order can explain, and watch the search report it.
+
+## The definition
+
+Herlihy and Wing defined linearizability in "Linearizability: A Correctness Condition for Concurrent Objects" (ACM TOPLAS, 1990). A history is linearizable if there is a total order of its operations with two properties.
+
+1. **Legal**: the order is a correct run of the sequential object. For a register, each read returns the value of the last write before it, or the initial value.
+2. **Real time**: if a precedes b in the history, then a comes before b in the order.
+
+An equivalent picture is the **linearization point**. Each operation takes effect at one instant between its invocation and its response. The dots in the demo are such points. If you can place one dot on each bar so that the dots, in time order, give a legal run, then the history is linearizable.
+
+Two details matter in practice. First, an operation can be **pending**: the client sent it but never got an answer, for example after a timeout. A pending write may take effect at any time after its invocation, or never. A checker must try both.
+
+Second, linearizability is **local**. Herlihy and Wing proved that a history is linearizable if and only if the history of each object is linearizable. So a store can check, or guarantee, each key on its own.
+
+## Why it is the "single copy" model
+
+With one copy and one lock, every operation does take effect at one instant. A client that gets an answer knows that every later operation, by anyone, will see its effect. Linearizability promises exactly this for a replicated object. So code that is correct against one machine stays correct against the cluster.
+
+This is why locks, leader election, fencing tokens and unique-ID counters need linearizable storage. A lock service that lets two clients each read "lock is free" after one of them took it is useless.
+
+## How replication breaks it
+
+<Predict
+  id="follower"
+  question="A leader commits each write on a majority and then answers the client. Followers learn the commit a little later. If any replica may answer a read from its own committed state, what can go wrong?"
+  options={["Nothing: every answer comes from committed data", "A read can return an old value after a newer write has returned", "A read can return a value that was never committed"]}
+  answer={1}
+  explain="Every value is committed, so there are no dirty reads. But a follower can lag behind the leader. A client can finish a write at the leader, then read from a follower that has not heard of the commit yet. The read returns the old value after the write returned, so real time is broken."
+>
+<StaleFollowerDemo />
+</Predict>
+
+1. With **any replica** and **Run** 9, find the red read in the history. Follow its arrows in the diagram to the follower that answered it.
+2. Select **leader + quorum**. Every run is now linearizable. Look for the extra orange round from the leader to the followers before each read answer.
+3. Select **leader only**. The reads are fast again and still linearizable. In this model the leader never changes, so it always knows the latest commit.
+4. Select **any replica** and **cut off f2**. Reads that reach f2 during the cut return an old value for the whole cut.
+5. Move **Run** and count how often the follower path fails. A stale read needs a read at a lagging replica right after a write, so it is common but not certain.
+
+The sim runs a fixed leader with three replicas, and each one-way delay is uniform in 4 to 16 ms (a model input). Over 40 runs, follower reads broke linearizability in 39 runs, with 51 stale reads out of 699 reads. The ReadIndex path and the leader path passed all 40 runs.
+
+## How real systems provide it
+
+| System | Writes | Default read | Weaker option |
+|---|---|---|---|
+| etcd | through the Raft log | linearizable, by a ReadIndex round | serializable read: `etcdctl get --consistency=s`, or `clientv3.WithSerializable()` |
+| ZooKeeper | linearizable (the paper calls it A-linearizable) | served by the local server, can be stale | call `sync` before a read to catch up with the leader |
+| Consul | through the Raft log | `default`: the leader answers, with a small stale window after a leader change | `consistent` confirms leadership with a quorum; `stale` lets any server answer |
+
+The etcd API guarantees page says that etcd gives linearizability for all operations except watch, by default. In the source, a linearizable range read waits on `linearizableReadNotify`, which sends a ReadIndex request through Raft. ZooKeeper is weaker by design. The paper (Hunt et al., USENIX ATC 2010) calls `sync` followed by a read a "slow read". The implementation does not send `sync` through the atomic broadcast, so even a slow read relies on timing assumptions.
+
+The ReadIndex read from the Raft thesis (Ongaro 2014) looks like this:
+
+```go
+// ReadIndex: a linearizable read without writing to the log.
+func (n *Node) LinearizableRead(ctx context.Context, key string) ([]byte, error) {
+	// 0. A new leader must first commit an entry of its own term (Raft commits a no-op).
+	//    Until then, commitIndex can miss writes that already returned.
+	if err := n.waitCurrentTermCommitted(ctx); err != nil {
+		return nil, err
+	}
+	readIndex := n.commitIndex // 1. note the commit index now
+	// 2. Prove that we are still the leader: a heartbeat round that a majority acknowledges.
+	//    A deposed leader cannot collect this majority, so it cannot serve a stale value.
+	if err := n.confirmLeadership(ctx); err != nil {
+		return nil, err
+	}
+	// 3. Wait until the state machine has applied everything up to readIndex.
+	if err := n.waitApplied(ctx, readIndex); err != nil {
+		return nil, err
+	}
+	return n.kv.Get(key), nil // 4. Any write that returned before step 1 is visible.
+}
+```
+
+## What it costs
+
+A linearizable read must rule out a newer write that it has not heard of. With a single leader, that means the leader must prove that it is still the leader. So it pays one round trip to a majority. In the sim, ReadIndex reads took 36.7 ms on average, against 20.2 ms for reads that the leader answered at once.
+
+The cost grows with distance. With replicas in three regions, the round trip to a majority is a cross-region round trip, often tens of milliseconds. The Raft thesis also describes a **lease** read. The leader skips the round trip while a lease is valid, but correctness then depends on a bound on clock drift. Answering at once without a lease, as **leader only** does here, is only safe while the leader cannot change. A deposed leader that does not know it has been replaced will serve stale data.
+
+Writes cost a round trip to a majority in any case. So linearizability mainly makes reads expensive. That is why many systems offer a weaker read as an option, and the next lessons describe what those weaker reads still promise.
+
+## Linearizability is not serializability
+
+The two words sound alike, but they describe different things.
+
+| | Linearizability | Serializability |
+|---|---|---|
+| unit | one operation on one object | a transaction over many objects |
+| real time | yes: the order must respect it | no: any serial order will do |
+| typical home | registers, locks, queues, key-value stores | databases |
+
+**Strict serializability** combines both: transactions in a serial order that respects real time. Spanner gives this with TrueTime. A database at plain SERIALIZABLE may legally order a read-only transaction before a write that committed earlier in real time.
+
+## Connect
+
+- [Isolation levels and anomalies](/databases/transactions/isolation-levels-and-anomalies): the anomalies of transactions. Here, each operation touches one object, and the new constraint is real time.
+- [Memory orderings](/concurrency/atomics/memory-orderings-relaxed-acquire-release-seq-cst): one atomic variable acts as a linearizable register. Orderings decide how operations on different variables appear.
+- [Raft log replication](/distributed/consensus/raft-log-replication): how the leader commits writes on a majority.
+- [Leases and fencing tokens](/distributed/coordination/leases-and-fencing-tokens): why a lock needs linearizable storage.
+- [Checking histories like Jepsen](/distributed/consistency/checking-histories-like-jepsen): the search that the demo runs, and its cost.
+
+<Recall cards={[
+  { q: "State the two conditions on the total order in the definition of linearizability.", a: "The order is a legal run of the sequential object. It also respects real time: if operation a returns before operation b starts, then a comes first." },
+  { q: "What is a linearization point?", a: "An instant between the invocation and the response of an operation at which it takes effect. A history is linearizable if points can be chosen so that, in time order, they give a legal sequential run." },
+  { q: "How must a checker treat a write that timed out?", a: "As pending: it may take effect at any time after its invocation, or never. The checker must try both." },
+  { q: "Why is linearizability called local, and why does it matter?", a: "Herlihy and Wing proved that a history is linearizable if and only if the history of each object is. So a system or a checker can handle each key on its own." },
+  { q: "Why must a leader do a round trip to a majority before a linearizable read, as in ReadIndex?", a: "To prove that it is still the leader. A deposed leader may not know about newer writes, so without the proof it could return a stale value." },
+  { q: "Name the main difference between linearizability and serializability.", a: "Linearizability is about single operations on single objects and respects real time. Serializability is about transactions over many objects and does not need to respect real time. Strict serializability is both." },
+]} />

@@ -1,0 +1,106 @@
+---
+summary: "What the CAP theorem really proves, stepped through on two replicas, why 'pick two of three' misleads, and PACELC: the latency-or-consistency choice that systems make every day, with no partition at all."
+---
+import { CapStepperDemo, PacelcDemo } from "@/demos/dist/ConsistencyCapDemos";
+
+Eric Brewer stated a conjecture in his keynote at PODC 2000, "Towards Robust Distributed Systems". A shared-data system can have at most two of three properties: consistency, availability and tolerance to network partitions. Seth Gilbert and Nancy Lynch turned it into a theorem in "Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services" (SIGACT News, 2002). The theorem is now called **CAP**. It is often quoted and often misread, so we start from the exact words of the proof.
+
+Gilbert and Lynch define the three properties precisely.
+
+- **Consistency** means atomic, or linearizable, consistency. There is a total order of all operations, and each operation looks as if it completed at a single instant. This is [linearizability](/distributed/consistency/linearizability).
+- **Availability** means that "every request received by a non-failing node in the system must result in a response". No time limit is given, but a node may not wait forever.
+- **Partition tolerance** means that the network may lose any number of messages between nodes.
+
+<Predict
+  id="cap"
+  question="Replicas A and B hold x = 0. The link between them fails. A client writes x = 1 at A, and A answers. Later another client reads x at B. What can B do and still be both consistent and available?"
+  options={["Answer 0, because the write has not reached B", "Wait for A, then answer 1", "Nothing: each option breaks one of the two"]}
+  answer={2}
+  explain="If B answers 0, the read returns an old value after the write returned: not linearizable. If B waits for A, it waits forever, because every message between them is lost: not available. A cannot help either: if A waits for B before it answers the write, the write is the request with no answer."
+>
+<CapStepperDemo />
+</Predict>
+
+1. Press **Step** four times with the defaults. Both replicas answer at once. The read returns 0 after the write returned, and the red answer marks it. The grid shows the cell: C fails, A holds.
+2. Select **wait for A** for the read. B asks A again and again, and every message is lost. The read never returns. The cell says C holds and A fails.
+3. Select **wait for B** for the write. Now the write never returns. The read at B returns 0, but that is still linearizable: the write did not finish, so it may take effect later.
+4. Read the whole grid. No cell has both checks. This grid is the proof.
+5. Select **at 120 ms** for the heal, with both waits. The waiting requests complete after the heal, and the history is linearizable. A system that waits is consistent, and it is available again once the network heals.
+
+## The proof
+
+The proof of Gilbert and Lynch needs only two groups of nodes and one write. The demo uses one node per group.
+
+<Steps>
+<div>Split the nodes into two non-empty groups, G1 and G2. Every message between G1 and G2 is lost. Partition tolerance says that the system must handle this case.</div>
+<div>A client writes a new value at a node in G1. Availability says that this node must answer. It cannot reach G2, so G2 learns nothing.</div>
+<div>Later, a client reads at a node in G2. Availability says that this node must answer. It has never heard of the write, so it answers the old value.</div>
+<div>The write returned before the read began, but the read missed it. No linearization exists. So no algorithm can be both available and consistent in this network.</div>
+</Steps>
+
+The proof is short because the definitions are strong. Consistency means linearizability, and availability means that every live node answers. Weaker versions of each one escape the theorem.
+
+## Why "pick two of three" misleads
+
+Brewer himself wrote about this in "CAP Twelve Years Later: How the 'Rules' Have Changed" (IEEE Computer, 2012). He says that "the '2 of 3' formulation was always misleading because it tended to oversimplify the tensions among properties."
+
+1. **Partitions are not optional.** A system that runs on more than one machine cannot choose to have no partitions. So "CA" is not a real third option. The real choice is what to do while a partition lasts.
+2. **The choice is only during a partition.** When the network works, a system can be both consistent and available. CAP says nothing about this normal case.
+3. **C and A are extreme.** A Raft cluster such as etcd is not "available" in this sense. The minority side cannot serve linearizable requests. But the majority side keeps working, which is good enough for most users.
+4. **Many systems give neither.** A store that reads from followers is neither linearizable nor waits for anything. CAP does not put it in any box, and it is not consistent even without a partition.
+5. **The choice can be per operation.** Consul and etcd let each read pick a mode. Cassandra lets each request pick a consistency level.
+
+So "CP" and "AP" are short names for what a system does in a partition. They do not describe a system completely.
+
+## PACELC: the choice without a partition
+
+Partitions are rare. A cost that a system pays on every request is more important in practice. Daniel Abadi wrote this down in "Consistency Tradeoffs in Modern Distributed Database System Design" (IEEE Computer, 2012). He called it **PACELC**: if there is a Partition, choose Availability or Consistency; Else, choose Latency or Consistency.
+
+The "else" half comes from replication. A consistent read must hear from enough replicas to know about the latest write. If some of those replicas are far away, every read pays for the distance, with or without a partition.
+
+<Predict
+  id="else"
+  question="No partition. The reader is next to replica 1, the writer next to replica 2, and the third replica is remote. Remote replicas are 30 ms away, one way. W = 1. Compare a read that waits for all three replicas (R = 3, never stale) with a read from one replica (R = 1). How much slower is the median of R = 3?"
+  options={["About 2 times", "About 30 times", "No slower: the replicas answer in parallel"]}
+  answer={1}
+  explain="R = 1 asks the local replica and gets an answer in about 2 ms. R = 3 must hear from the remote replicas, which costs a round trip of about 60 ms. The parallel requests do not help, because the read waits for the slowest replica that it needs."
+>
+<PacelcDemo />
+</Predict>
+
+1. Read the defaults. With R = 1, the median read takes 2.1 ms, and it is stale every time right after a write from the other site. With R = 3, it takes 62.4 ms and is never stale.
+2. Set **W** to 2. Now R = 2 is enough for R + W to be larger than N. A write must wait for two replicas, so part of the cost moves from reads to writes.
+3. Move the remote delay down to 2 ms. The gap almost disappears. The "else" cost is a cost of distance, so a single data center pays little for consistency.
+4. Select N = 5. More replicas give more durability, but a quorum must reach more remote sites.
+
+## Systems by their choices
+
+Abadi classified the default settings of several systems in 2012.
+
+| Class | Systems (Abadi 2012) | In a partition | Normal case |
+|---|---|---|---|
+| PA/EL | Dynamo, Cassandra, Riak | stay available | low latency, weaker reads |
+| PC/EC | VoltDB/H-Store, Megastore, BigTable, HBase | refuse some requests | pay latency for consistency |
+| PA/EC | MongoDB (with caveats in the paper) | stay available | consistent reads from the primary |
+| PC/EL | PNUTS | give up availability | low latency, weaker reads |
+
+Two warnings apply. First, the table describes defaults. Cassandra with `QUORUM` reads and writes behaves more like EC. Second, the systems have changed since 2012, and Abadi notes himself that MongoDB is not available in the strict CAP sense.
+
+The useful habit is to ask two questions of any store. What does a read do when it cannot reach a quorum? And how many round trips, to which sites, does a read pay when everything works?
+
+## Connect
+
+- [Linearizability](/distributed/consistency/linearizability): the C of CAP, and the round trip that it costs.
+- [Leaderless replication and quorums](/distributed/replication/leaderless-and-quorums): R and W in practice.
+- [The network model](/distributed/foundations/the-network-model-messages-delays-and-partitions): what a partition is in the shared network model.
+- [Spanner and TrueTime](/distributed/transactions/spanner-and-truetime): a PC/EC system that cuts the latency cost with clocks.
+- [Eventual consistency](/distributed/consistency/eventual-consistency): what an available system can still promise.
+
+<Recall cards={[
+  { q: "How do Gilbert and Lynch define consistency and availability in the CAP proof?", a: "Consistency is linearizability (atomic consistency). Availability: every request received by a non-failing node must result in a response." },
+  { q: "Sketch the proof of CAP in three steps.", a: "Partition the nodes into G1 and G2 and lose every message between them. A write at G1 must return, and G2 never hears of it. A later read at G2 must return, so it returns the old value: not linearizable." },
+  { q: "Give two reasons why 'pick two of three' misleads.", a: "Partitions are not optional, so CA is not a real choice. And the choice only applies during a partition; in the normal case a system can have both C and A." },
+  { q: "Is an etcd cluster available in the sense of CAP? Why?", a: "No. Nodes on the minority side of a partition are alive but cannot serve linearizable requests. The majority side keeps working." },
+  { q: "What does the 'ELC' in PACELC say, and where does the cost come from?", a: "Else (no partition), choose latency or consistency. A consistent read must hear from enough replicas to know the latest write, so it pays round trips to remote replicas on every request." },
+  { q: "How did Abadi classify Dynamo and Cassandra, and PNUTS?", a: "Dynamo and Cassandra (and Riak) by default are PA/EL. PNUTS is PC/EL." },
+]} />

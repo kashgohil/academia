@@ -1,0 +1,120 @@
+---
+summary: "The Jepsen method: run real clients, inject faults, record every invocation and response, and search for a valid order. How the linearizability checker works, why its cost explodes, and the bugs it found in etcd, Consul, MongoDB and Redis-Raft."
+---
+import { MiniJepsenDemo, CheckerCostDemo } from "@/demos/dist/ConsistencyJepsenDemos";
+
+A consistency model is a claim about histories. So you can test a system against it from the outside: run clients, record what they saw, and check the record. Kyle Kingsbury built **Jepsen** around this idea, starting in 2013. Jepsen has found consistency bugs in a long list of databases, often in systems whose documentation promised the opposite.
+
+A Jepsen test has four parts.
+
+1. A **generator** produces operations, for example reads, writes and compare-and-set on a few keys. Several client **processes** run them at the same time.
+2. A **nemesis** injects faults: network partitions, crashes, pauses, clock jumps.
+3. Every operation is recorded twice: when it is invoked, and when it completes. The result is a **history**.
+4. A **checker** decides if the history is allowed by the model, for example a linearizable register.
+
+<Predict
+  id="mini"
+  question="A store answers reads from any replica, which is a real bug: followers can be stale. You run a short test with no faults. Will the checker always report the bug?"
+  options={["Yes: every run of a buggy store gives a bad history", "No: the bug shows only when a read hits a lagging replica soon after a write", "No: the checker only finds bugs when there is a partition"]}
+  answer={1}
+  explain="The checker can only judge the history that the run produced. A stale read needs a particular timing. Faults make that timing much more likely, which is why Jepsen always runs a nemesis. A run with no bad history proves nothing."
+>
+<MiniJepsenDemo />
+</Predict>
+
+1. Press **Play** and watch the search. It places operations one at a time, green and numbered. When no candidate fits, it undoes the last one. Near the end, it reports the read that no order can place.
+2. Select the **fixed: ReadIndex** store with the same run and nemesis. The search goes straight through, because every read fits.
+3. Go back to the buggy store and set **Nemesis** to **none**. Run 3 now passes. The bug is still there, but this run did not expose it. Try a few other runs.
+4. Select **crash f1**. Writes still commit on the leader and f2, but reads that reach f1 time out. A timed-out read tells nothing, so the checker drops it.
+5. Drag **Checker step** to the end and back. The count of configurations is the search cost, which the second demo studies.
+
+## Recording a history
+
+Each completed operation has one of three outcomes. The outcome **ok** means that it happened, with this result. The outcome **fail** means that it certainly did not happen, for example a write that the leader rejected. The outcome **info** means that nobody knows, for example after a timeout. Only info needs care.
+
+A write that timed out may still take effect at any later time, or never. So the checker treats it as **pending**: its interval never ends. The client that issued it cannot know when it will finish, so it can no longer act as a sequential process. Jepsen gives the client a new process number and continues. The demo does the same: a timed-out client continues as a new process.
+
+```ts
+// One Jepsen-style client step. The history records the invocation before the request is sent.
+async function step(proc: Process, op: Op, history: HistoryOp[]) {
+  const h: HistoryOp = { process: proc.id, op, call: now(), ret: Infinity };
+  history.push(h);
+  try {
+    const result = await withTimeout(proc.client.run(op), 1000);
+    Object.assign(h, { ret: now(), result, type: "ok" });
+  } catch (e) {
+    if (isDefiniteFailure(e)) Object.assign(h, { ret: now(), type: "fail" }); // did not happen
+    else { h.type = "info"; proc.id += proc.concurrency; } // unknown: pending forever, new process
+  }
+}
+```
+
+## The checker
+
+The linearizability checker is the search from [the first lesson of this module](/distributed/consistency/linearizability). Wing and Gong described it in "Testing and Verifying Concurrent Objects" (Journal of Parallel and Distributed Computing, 1993). Checkers call this search **WGL**, with the improvement by Lowe that the last step describes.
+
+<Steps>
+<div>Keep a set of placed operations and the state of the model, starting with nothing placed and x = 0.</div>
+<div>A **candidate** is an operation that is not placed and that was invoked before every unplaced operation returned. Any other operation would break real time.</div>
+<div>Try each candidate in the model. If it is legal, place it, update the state and go deeper. If no candidate is legal, undo the last placement and try its next sibling.</div>
+<div>When every completed operation is placed, the order is a linearization. When the search has undone everything, there is none.</div>
+<div>Lowe ("Testing for Linearizability", 2017) added a cache. The pair (set of placed operations, model state) fully decides the rest of the search. If the search meets a pair that already failed, it can skip it.</div>
+</Steps>
+
+Knossos, the checker in Jepsen, is written in Clojure and offers this search as its `wgl` algorithm. Porcupine, by Anish Athalye, is a checker in Go. It uses the algorithm of Lowe with **P-compositionality** from Horn and Kroening ("Faster Linearizability Checking via P-Compositionality", FORTE 2015). For a key-value store, that means: split the history by key, and check each key alone. This is correct because linearizability is local.
+
+<Predict
+  id="cost"
+  question="Without a cache, the search explores about 107 configurations for a hard history of 17 operations from 2 clients. How many does it explore for 17 operations from 4 clients?"
+  options={["About 200: twice the clients, twice the work", "About 1,000", "More than 50,000"]}
+  answer={2}
+  explain="The number of possible orders grows with the number of operations that overlap. With 4 clients at once, each step has up to 4 candidates instead of 2. And the search must rule out every order before it can say no. The plain search passed the budget of 50,000 configurations on these histories."
+>
+<CheckerCostDemo />
+</Predict>
+
+1. Select **plain search**. The lines rise steeply, and for 4 and 6 clients they stop early: those checks passed the budget of 50,000 configurations.
+2. Select **with cache**. All lines now reach the right side. With 6 clients and 49 operations, the check needs about 1,100 configurations.
+3. Select **cache + split by key**. The same histories spread over 4 keys need about 51 configurations at 49 operations. Each key has fewer overlapping operations.
+4. Compare the lines for 2 and 6 clients at the same history length. Concurrency drives the cost much more than length.
+
+The hard histories here are valid except for one stale read at the very end. A checker can accept a valid history as soon as it finds one order. It can reject an invalid one only after it has ruled out every order, so invalid histories are the expensive case.
+
+In general, checking linearizability is NP-complete: Gibbons and Korach proved this in "Testing Shared Memories" (SIAM Journal on Computing, 1997). So no known checker is fast on every history. For one register and a fixed number of clients, the problem is polynomial.
+
+In practice, three things keep it usable. Tests use a few clients and short runs. The cache removes repeated work. And the history is split by key, which bounds the concurrency in each part. A checker with a budget must report "unknown" when the budget runs out, never "valid". The checker in this module returns null in that case.
+
+## What Jepsen found
+
+Every finding below comes from the published analysis on jepsen.io or on Kingsbury's blog.
+
+| Year | System | Finding |
+|---|---|---|
+| 2014 | etcd 0.4.1 and Consul | "consistent" reads did not go through the Raft log, so a leader that had been replaced could serve stale reads. Consul later added a mode that confirms leadership with a quorum; it is now called `consistent`. |
+| 2015 | MongoDB 2.6.7 | even with majority write concern and reads from the primary, reads could see old versions of documents, and dirty reads also appeared |
+| 2020 | etcd 3.4.3 | key-value operations appeared strict serializable, but etcd locks were unsafe: a test that updated a set under a lock lost acknowledged updates. The analysis also found a bug in lease validity. |
+| 2020 | Redis-Raft (development build) | 21 issues, including stale reads in a healthy cluster with no faults, split-brain with lost updates, and data loss on failover |
+
+The 2014 bug is the bug in the demo, in its real form. A Raft leader that answers reads alone is safe only while it is still the leader. The fix is the ReadIndex round, or a log entry per read, or a lease with a bound on clock drift.
+
+For transactions, the same idea needs a different checker. Elle, by Kingsbury and Alvaro (PVLDB, 2020), infers a dependency graph between transactions from the history and searches it for cycles. That finds isolation anomalies without trying every order.
+
+## Testing your own system
+
+You do not need the Jepsen framework to use the method. Record invocation and completion times on the client side. Make write values unique, so that each read names its write. Mark timeouts as unknown, never as failures. Inject faults that your system will meet: partitions, crashes and pauses. Then check the history with Porcupine, Knossos or the checker in this module, which `src/sims/dist/consistency` exports for the later modules.
+
+## Connect
+
+- [Linearizability](/distributed/consistency/linearizability): the model that the checker tests.
+- [Raft log replication](/distributed/consensus/raft-log-replication): the protocol that the buggy store skips for reads.
+- [Deterministic simulation testing](/distributed/capstone/deterministic-simulation-testing): the same checks inside a simulated network, where every failing run can be replayed.
+- [Isolation levels and anomalies](/databases/transactions/isolation-levels-and-anomalies): the anomalies that Elle looks for.
+
+<Recall cards={[
+  { q: "Name the four parts of a Jepsen test.", a: "A generator of operations for the clients, a nemesis that injects faults, a history of invocations and completions, and a checker for the history." },
+  { q: "How must a test record an operation that timed out, and what happens to its client?", a: "As info: unknown outcome. The checker treats it as pending forever, and the client continues as a new process, because it can no longer act as a sequential process." },
+  { q: "Which operations are candidates at a step of the WGL search?", a: "Unplaced operations that were invoked before every unplaced operation returned. Placing any other operation would break real time." },
+  { q: "What does Lowe's cache store, and why is it safe?", a: "The pairs (set of placed operations, model state) that have already failed. That pair fully decides the rest of the search, so it will fail again." },
+  { q: "Why is a history that is not linearizable the expensive case for the checker?", a: "A valid history is accepted as soon as one order is found. An invalid one is rejected only after every order has been ruled out." },
+  { q: "What did Jepsen find in etcd 0.4.1 and Consul in 2014?", a: "Their consistent reads did not go through the Raft log, so a replaced leader could serve stale reads." },
+]} />

@@ -1,0 +1,106 @@
+---
+summary: "The weakest useful promise: replicas agree once writes stop. Why that promise has no bound and no safety, how anti-entropy makes it true, and how PBS measures how stale reads really are."
+---
+import { ConvergenceDemo, PbsDemo } from "@/demos/dist/ConsistencyEventualDemos";
+
+Werner Vogels gave the common definition in "Eventually Consistent" (ACM Queue, 2008). The store guarantees that "if no new updates are made to the object, eventually all accesses will return the last updated value". Dynamo, Cassandra and Riak were built around this promise. It lets every replica accept reads and writes alone, even when the network is cut.
+
+Read the definition carefully, and note what it leaves out. It gives no **bound**: "eventually" can be one millisecond or one week. It gives no **safety**: while writes continue, it says nothing about what a read returns. And writes never stop in a busy system.
+
+So eventual consistency is a **liveness** property. Strictly, no finite history can break it. Real stores, and the checker in this module, also forbid a value that nobody wrote.
+
+<Predict
+  id="off"
+  question="Six replicas. Each write goes to one replica, which sends it once to the others. The network loses 20% of messages, and there is no anti-entropy. After the writes stop, do the replicas always agree?"
+  options={["Yes: every write was sent to every replica", "No: a replica that lost the last write keeps an old value forever", "Yes, but only after a timeout"]}
+  answer={1}
+  explain="One send per replica is not enough when messages can be lost. A replica that missed the copy of the last write has no reason to ask for it. Without a repair process, the store is not even eventually consistent."
+>
+<ConvergenceDemo />
+</Predict>
+
+1. Select **off**. Read the count of runs that never agreed. A large share of the 100 runs never converge, because nobody resends a lost copy.
+2. Select **push-pull** again, and drag **Anti-entropy period** from 60 ms down to 10 ms, then up to 400 ms. The time to agree follows the period. Anti-entropy turns lost messages into delay, not divergence.
+3. Set **Messages lost** to 0%. Most runs agree within one network delay, because the direct sends all arrive. Anti-entropy only matters for the messages that are lost.
+4. Compare **push** and **pull** with **push-pull** at 30% loss. Push-pull agrees sooner, because one exchange can repair both replicas.
+5. Watch the colors in the rows before the line. Each replica moves through values in its own order. A client that reads two replicas in a row can see time go back.
+
+## What convergence needs
+
+Two things make replicas converge, and a store needs both.
+
+1. **Every replica gets every write.** Direct sends are fast, but they can be lost. A background **anti-entropy** process compares replicas and copies what is missing. Cassandra has three layers: **hinted handoff** on the write path, **read repair** on the read path, and full anti-entropy **repair** that compares Merkle trees.
+2. **Replicas with the same writes hold the same value.** The merge must not depend on the order of delivery. The demo uses **last-writer-wins** (LWW): each value has a timestamp, and the larger timestamp wins. LWW converges, but it silently drops one of two concurrent writes.
+
+The second point has a name. Shapiro, Preguiça, Baquero and Zawirski defined **strong eventual consistency** (SSS 2011). Correct replicas that have delivered the same updates have equivalent state. This convergence condition is a safety property: it holds at every moment, not only "eventually". Conflict-free replicated data types (CRDTs) give it by construction.
+
+Many CRDTs, such as counters and add-wins sets, keep the effect of every concurrent update. An LWW register is also a CRDT, but it drops one of two concurrent writes.
+
+How fast does a write spread? With pure gossip, a new value doubles its reach in each period, roughly. So the time grows with the logarithm of the number of replicas. The sim measures one write that only anti-entropy spreads, with no loss and a 50 ms period (mean of 40 runs):
+
+| replicas | push | pull | push-pull |
+|---|---|---|---|
+| 4 | 121 ms | 118 ms | 66 ms |
+| 16 | 335 ms | 242 ms | 159 ms |
+| 64 | 473 ms | 368 ms | 226 ms |
+
+Sixteen times more replicas costs about 3.4 times more time with push-pull. Push is slow at the end, when most replicas already have the value and push to each other. Pull is slow at the start, when few replicas have something to give. Push-pull does well in both phases.
+
+## Measuring staleness: PBS
+
+"Eventually" has no bound in the definition, but a real system has a distribution. Bailis, Venkataraman, Franklin, Hellerstein and Stoica measured it in "Probabilistically Bounded Staleness for Practical Partial Quorums" (PVLDB, 2012).
+
+The setting is a Dynamo-style store with N replicas. A write goes to all N, and it returns after W replicas acknowledge it. A read asks all N, and it returns after R replicas answer. If R + W is larger than N, every read quorum meets every write quorum, so every read sees the latest write. If R + W is at most N, the store is a **partial quorum**, and reads can be stale.
+
+<Predict
+  id="pbs"
+  question="N = 3 and R = W = 1. The simple formula says that a read right after a write misses it with probability 2/3. With 5 ms network delays, is the real fraction of stale reads higher or lower?"
+  options={["Higher: the network adds more delay", "About the same", "Lower: the write keeps spreading to the other replicas while the read is on its way"]}
+  answer={2}
+  explain="The formula assumes that only the W replicas that acknowledged the write have it. But the write was sent to all three. By the time the read request arrives, the other replicas often have it too. In the sim, only 25.7% of reads are stale at t = 0."
+>
+<PbsDemo />
+</Predict>
+
+1. Read the starting values: 74.3% of reads see the write at t = 0, and 99.9% do after 27 ms. The closed form says 66.7% stale, which is far too pessimistic.
+2. Set **R** to 2. Now R + W is 3, which is not larger than N, but stale reads become rare. One more replica in the read quorum helps more than the formula suggests.
+3. Set **R** and **W** to 2. The line is flat at 100%. Now every read is fresh, and each read waits for the second-fastest replica.
+4. Raise the mean delay to 20 ms. The curve stretches to the right. The staleness window scales with the network delay, so a store in one rack and a store across regions behave very differently.
+5. Select N = 5 with R = W = 1. More replicas make each single read less likely to hit a fresh replica.
+
+The model behind the demo is **WARS**, after its four delays. W carries the write from the coordinator to a replica, and A carries the acknowledgement back. R carries the read request, and S carries the read response. PBS defines two measures. The **t-visibility** is the probability that a read that starts t ms after a write commits sees that write. The **k-staleness** is the probability that a read returns one of the last k versions.
+
+The delays in the demo are model inputs: exponential with the mean that you choose. The paper fit its model to production latency traces. For N = 3 and R = W = 1, it reports that 99.9% of reads were consistent 1.85 ms after the write with the LinkedIn SSD trace. With the Yammer trace, the same took 1364 ms. Same algorithm, same settings, very different staleness. You must measure your own system.
+
+## Eventual consistency in real systems
+
+In Cassandra, each request picks a **consistency level**. The `cqlsh` shell defaults to `ONE`, which is R = 1 for reads and W = 1 for writes. `QUORUM` on both sides gives R + W larger than N. Strict quorums alone still do not give linearizability. A read can see a write that has not finished, and a later read can miss it. The ABD algorithm fixes this: a reader writes the value back to a quorum before it returns.
+
+A common pattern is to pay for the strong level only where it matters:
+
+```go
+// Strong reads only where a stale value would do harm.
+q := session.Query(`SELECT balance FROM accounts WHERE id = ?`, id)
+if needFresh {
+	q = q.Consistency(gocql.Quorum) // with QUORUM writes: R + W > N
+} else {
+	q = q.Consistency(gocql.One) // fast, possibly stale
+}
+```
+
+## Connect
+
+- [Leaderless replication and quorums](/distributed/replication/leaderless-and-quorums): how N, R and W work in Dynamo.
+- [Anti-entropy and Merkle trees](/distributed/replication/anti-entropy-and-merkle-trees): how replicas find what they are missing without sending everything.
+- [State-based CRDTs](/distributed/crdts/state-based-crdts): merges that give strong eventual consistency.
+- [Gossip and SWIM](/distributed/data-systems/gossip-and-swim): the same epidemic spread, used for membership.
+- [Session guarantees](/distributed/consistency/session-guarantees): cheap promises to one client on top of an eventually consistent store.
+
+<Recall cards={[
+  { q: "Give Vogels' definition of eventual consistency, and name two things it does not promise.", a: "If no new updates are made, eventually all accesses return the last updated value. It gives no bound on the time, and no rule about what reads return while writes continue." },
+  { q: "Which two conditions make replicas converge?", a: "Every replica receives every write: direct sends, plus anti-entropy to repair losses. And replicas with the same writes hold the same value, by a merge that does not depend on order." },
+  { q: "What does strong eventual consistency add?", a: "A safety property: correct replicas that have delivered the same updates have equivalent state at every moment, not only eventually." },
+  { q: "Why does push-pull gossip spread a value faster than push or pull alone?", a: "Push is slow at the end, when most pushes reach replicas that already have the value. Pull is slow at the start, when few replicas have it to give. Push-pull is fast in both phases." },
+  { q: "What do t-visibility and k-staleness measure in PBS?", a: "The t-visibility is the probability that a read started t after a write commits sees it. The k-staleness is the probability that a read returns one of the last k versions." },
+  { q: "Why is the closed form C(N−W, R)/C(N, R) too pessimistic for the staleness of a read right after a write?", a: "It assumes that only the W replicas that acknowledged have the write. In practice, the write reaches the other replicas soon after, often before the read request does." },
+]} />

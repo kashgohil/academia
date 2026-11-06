@@ -1,0 +1,143 @@
+---
+summary: "Single-decree Paxos as in Lamport's Paxos Made Simple: proposers, acceptors and learners, ballots, prepare and accept, why a proposer must adopt the highest accepted value, a proof sketch, durable acceptor state, and duelling proposers."
+---
+import { ConsensusPaxosStepperDemo, ConsensusPaxosDuelDemo } from "@/demos/dist/ConsensusPaxosPaxosDemos";
+
+Paxos chooses one value among many proposals. It never chooses two values, whatever the order of messages, and whatever the losses, duplicates and crashes. It decides as soon as one proposer can talk to a majority without interference. Leslie Lamport first described it in "The Part-Time Parliament" (ACM TOCS, 1998). This lesson follows his short version, "Paxos Made Simple" (ACM SIGACT News, December 2001).
+
+## Roles and ballots
+
+- A **proposer** suggests a value. It drives the protocol.
+- An **acceptor** votes. The acceptors are the memory of the protocol: a value is **chosen** when a majority of acceptors accept the same proposal.
+- A **learner** finds out which value was chosen.
+
+One server usually plays all three roles. Each proposal has a **ballot number** (Lamport calls it the proposal number). Ballots must be unique and totally ordered. A common encoding is a pair (round, proposer id), compared by round first. In the demos, ballot 2.1 means round 2 of proposer P1.
+
+## The two phases
+
+<Steps>
+
+**Phase 1a: prepare.** The proposer picks a ballot b, higher than any it has seen. It sends `prepare(b)` to the acceptors.
+
+**Phase 1b: promise.** An acceptor that has not promised a higher ballot records the promise "I will not accept any ballot below b". It replies `promise(b)` with the highest-numbered proposal that it has accepted, if any.
+
+**Phase 2a: accept.** With promises from a majority, the proposer chooses the value. If any promise reports an accepted proposal, the value is the one with the highest ballot. Only if none does may the proposer use its own value. It sends `accept(b, v)`.
+
+**Phase 2b: accepted.** An acceptor accepts `(b, v)` unless it has promised a ballot higher than b. It tells the proposer and the learners. When a majority accepts ballot b, v is chosen.
+
+</Steps>
+
+An acceptor must store its promise and its accepted proposal on disk before it replies. Paxos Made Simple says that an acceptor must remember this information even if it fails and restarts. So each phase costs an fsync on a majority, as in [group commit](/databases/recovery/group-commit).
+
+<Predict
+  id="late"
+  question="Acceptors A1 and A2 accepted (1.1, X), so X is chosen. P2 now prepares ballot 1.2 with A2 and A3 and wants Y. What does P2 send in phase 2?"
+  options={[
+    "accept(1.2, Y): its own value, because its ballot is higher",
+    "accept(1.2, X): A2's promise reports (1.1, X), and P2 must adopt it",
+    "Nothing: A2 refuses the prepare because it already accepted a value",
+  ]}
+  answer={1}
+  explain="Any majority meets the majority that chose X. Here A2 is in both. Its promise carries (1.1, X), so P2 must propose X. A higher ballot changes who drives the protocol, never the value once it is chosen."
+>
+<ConsensusPaxosStepperDemo />
+</Predict>
+
+1. Click **One proposer**. Each arrow is a message that the preset delivered. X is chosen when A2 accepts, because 2 of 3 is a majority. The proposer learns it only when two `accepted` replies arrive.
+2. Click **A late proposer**. P2 runs ballot 1.2 with A2 and A3, finds (1.1, X) in A2's promise, and proposes X. A second ballot chooses the same value.
+3. Click **Reset** and play the network yourself. Start both proposers, deliver messages in any order, lose some with ×, and crash acceptors. Try to choose two values. With **Correct**, you cannot.
+4. Click **Bug: ignore old values**. P2 now proposes Y anyway, and both X and Y are chosen.
+5. Click **Bug: no fsync**. A2 crashes and restarts with no state. It forgets that it accepted X, so the same schedule chooses Y.
+
+## Why it is safe
+
+The proof rests on one invariant. Suppose a majority Q accepted ballot m with value v, so v is chosen. Then every proposal with a ballot $n > m$ carries v.
+
+Use induction on n. The proposer of ballot n got promises from a majority Q′. Q and Q′ share at least one acceptor, a. Acceptor a accepted ballot m before it promised n, because after the promise it would refuse m. So a's promise reports some accepted ballot $k \ge m$.
+
+The proposer takes the highest reported ballot, which is some $k$ with $m \le k < n$. By induction, the proposal of ballot k carries v. So the proposer also proposes v.
+
+The proof uses three facts, and each demo bug breaks one of them:
+
+| Fact | What breaks it |
+|---|---|
+| Any two majorities share an acceptor | a quorum smaller than a majority |
+| An acceptor never forgets a promise or an acceptance | no fsync, or a disk that loses writes |
+| A proposer adopts the highest accepted value | the "ignore old values" bug |
+
+The unit tests check safety in two ways. An exhaustive search with 2 proposers and 3 acceptors tries every order, loss and delay. With one ballot per proposer it visits 3,417 states, and with two ballots per proposer 414,605 states. It finds no state with two chosen values. The same search finds a bad schedule at once for each bug. Random runs on the network then add loss, duplicates and acceptor crashes, for 500 seeds.
+
+```rust
+// An acceptor. `persist` must reach the disk before any reply is sent.
+struct Acceptor { promised: Ballot, accepted: Option<(Ballot, Value)> }
+
+impl Acceptor {
+    fn on_prepare(&mut self, b: Ballot) -> Reply {
+        if b < self.promised { return Reply::Nack(self.promised); }
+        self.promised = b;
+        persist(&self);                        // fsync
+        Reply::Promise(b, self.accepted.clone())
+    }
+    fn on_accept(&mut self, b: Ballot, v: Value) -> Reply {
+        if b < self.promised { return Reply::Nack(self.promised); }
+        self.promised = b;
+        self.accepted = Some((b, v));
+        persist(&self);                        // fsync
+        Reply::Accepted(b)
+    }
+}
+```
+
+The `Nack` reply is an optimization from the paper. The acceptor tells the proposer to give up, so that the proposer does not wait for a timeout.
+
+## Liveness and duelling proposers
+
+Safety never depends on timing, but liveness does.
+
+Two proposers can preempt each other forever. P1 finishes phase 1 with ballot 1. P2 finishes phase 1 with ballot 2, so the acceptors refuse P1's accept. P1 retries with ballot 3, so they refuse P2's accept, and so on. Paxos Made Simple describes this case and gives the fix: choose a **distinguished proposer**, which is the only one that tries to propose.
+
+<Predict
+  id="duel"
+  question="Two proposers retry after a fixed 30 ms timer. Latency is a constant 10 ms, so one ballot needs 40 ms. P2 starts 15 ms after P1. When is a value chosen?"
+  options={[
+    "At about 40 ms, because P1 started first",
+    "Never in this run: each retry preempts the other proposer's phase 2",
+    "At about 80 ms, after one retry each",
+  ]}
+  answer={1}
+  explain="Each proposer retries before its rival's accept requests arrive. The new prepare raises the promises, so the acceptors refuse the old accept. The demo shows 27 ballots in 400 ms and no chosen value."
+>
+<ConsensusPaxosDuelDemo />
+</Predict>
+
+1. With **Fixed timer** at 30 ms, the proposers start 27 ballots in 400 ms, and no value is chosen. Safety still holds: nothing wrong is chosen either.
+2. Raise **Retry timer** to 40 ms or more. One ballot now completes, and a value is chosen at 45 ms.
+3. Select **Random backoff**. A random extra wait breaks the symmetry. A value is chosen at 45 ms after 4 ballots.
+4. Read the curves. Over 200 runs with varied start times, the fixed timer chooses a value within 400 ms in only 154 runs. Random backoff chooses in all 200 runs by 69 ms. One leader chooses in all runs by 32 ms.
+
+Real systems combine both fixes. They elect a leader, and they use random timeouts for the election itself. Raft does exactly this, as [Raft leader election](/distributed/consensus/raft-leader-election) shows. A leader election needs a failure detector, and FLP says that it can be wrong. When two nodes both think that they lead, Paxos stays safe and only slows down.
+
+## Paxos in real systems
+
+- **Chubby** (Burrows, OSDI 2006), Google's lock service, runs a cell of typically five replicas. They use Paxos to elect a master, which holds a master lease of a few seconds.
+- **Paxos Made Live** (Chandra, Griesemer and Redstone, PODC 2007) describes the Paxos log under Chubby. Its list of the gaps between the paper and production includes disk corruption, master leases, group membership and snapshots. A replica with a corrupted disk rejoins as a non-voting member. It votes again only after it sees one complete Paxos instance that started after it began to rebuild. A voter that forgot its votes would be the fsync bug above.
+- **Megastore** (Baker et al., CIDR 2011) uses Paxos to replicate user data across datacenters on every write.
+- **Cassandra** uses Paxos for lightweight transactions such as `INSERT ... IF NOT EXISTS`. The original protocol needs four round trips for a write: prepare, read, propose and commit. Since Cassandra 4.1, the optional `paxos_variant: v2` needs only two round trips for a write.
+
+Single-decree Paxos chooses one value. A log needs a value for each slot, and two round trips per slot are expensive. [Multi-Paxos](/distributed/consensus/multi-paxos) runs phase 1 once for many slots.
+
+## Connect
+
+- [The consensus problem](/distributed/consensus/the-consensus-problem) explains why majorities intersect.
+- [FLP impossibility](/distributed/consensus/flp-impossibility) explains why the duel cannot be ruled out by a deterministic rule.
+- [Leases and fencing tokens](/distributed/coordination/leases-and-fencing-tokens) uses ballot-like numbers to reject an old leader.
+- [Optimistic concurrency control](/databases/transactions/optimistic-concurrency-control) also rejects work that a newer version overtook.
+
+<Recall cards={[
+  { q: "What does an acceptor promise in phase 1b, and what does it report?", a: "It promises not to accept any ballot below b. It reports the highest-numbered proposal it has accepted, if any." },
+  { q: "Which value must a proposer send in phase 2a?", a: "The value of the highest-ballot proposal among the majority's promises. Only if no promise reports an accepted proposal may it use its own value." },
+  { q: "Sketch why a chosen value can never change.", a: "If a majority accepted (m, v), any later ballot's promise majority shares an acceptor with it. That acceptor reports a ballot of at least m, and by induction that proposal carries v. So the proposer proposes v." },
+  { q: "Why must an acceptor fsync before it replies?", a: "If it restarts with no state, it can promise or accept as if it never voted. A chosen value can then lose its majority, and a second value can be chosen." },
+  { q: "What is the duelling proposers problem, and how is it fixed?", a: "Two proposers keep preempting each other with higher ballots, so no accept succeeds. A distinguished proposer (a leader), plus random timeouts to elect it, fixes it in practice." },
+  { q: "How many acceptors does Paxos need to survive 2 crashes, and how many replies does each phase wait for?", a: "Five acceptors. Each phase waits for a majority: 3 replies." },
+]} />

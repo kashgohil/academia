@@ -222,7 +222,7 @@ export class SafetyMonitor {
       const key = entryKey(e);
       const prev = this.committed.get(i);
       if (prev === undefined) this.committed.set(i, key);
-      else if (prev !== key) this.flag("State Machine Safety", `two different entries committed at index ${i}`, `cc${i}`);
+      else if (prev !== key) this.flag("State Machine Safety", `two different entries committed at index ${i}, so two servers will apply different commands there`, `cc${i}`);
     }
   }
 

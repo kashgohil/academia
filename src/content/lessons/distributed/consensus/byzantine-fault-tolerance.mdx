@@ -1,0 +1,121 @@
+---
+summary: "Consensus when some nodes lie: the Byzantine generals, why 3f + 1 replicas, the PBFT normal case (pre-prepare, prepare, commit), view changes, the quadratic message cost, and linear protocols such as HotStuff."
+---
+import { ConsensusPaxosPbftDemo, ConsensusPaxosBftCountDemo } from "@/demos/dist/ConsensusPaxosBftDemos";
+
+Paxos and Raft assume that a node either follows the protocol or stops. A **Byzantine** fault is any other behavior. The node can send wrong values, send different values to different nodes, or stay silent at the worst moment. Causes include software bugs, corrupted memory or disks, and attackers who control a machine. A protocol that tolerates Byzantine faults pays for it with more replicas and more messages.
+
+## The Byzantine generals
+
+Lamport, Shostak and Pease named the problem in "The Byzantine Generals Problem" (ACM TOPLAS, July 1982). Generals surround a city and communicate only by messenger. Some generals are traitors. The loyal generals must agree on one plan, and if the commander is loyal, they must follow the commander's plan.
+
+With **oral messages**, a traitor can forge what others said. Then the problem is solvable if and only if more than two-thirds of the generals are loyal. So m traitors need at least $3m + 1$ generals. With three generals and one traitor, no solution exists. A lieutenant who hears "attack" from the commander and "the commander said retreat" from the other lieutenant cannot know who lies.
+
+With **signed messages** that nobody can forge, the paper solves the problem for any number of traitors. Signatures stop forged reports, but a traitor can still sign two different values.
+
+## Why 3f + 1
+
+The same bound follows from quorums. Up to f replicas may be silent, so a replica can wait for only $n - f$ replies. Two such quorums share at least $n - 2f$ replicas. Up to f of those may be traitors who vote for both values. So the overlap must contain at least one honest replica:
+
+$$
+n - 2f \ge f + 1 \quad\Longleftrightarrow\quad n \ge 3f + 1
+$$
+
+| Faults f | Replicas $3f + 1$ | Quorum $2f + 1$ | Crash-only replicas $2f + 1$ |
+|---|---|---|---|
+| 1 | 4 | 3 | 3 |
+| 2 | 7 | 5 | 5 |
+| 3 | 10 | 7 | 7 |
+
+## PBFT
+
+Castro and Liskov's "Practical Byzantine Fault Tolerance" (OSDI 1999) showed that BFT state machine replication can be fast enough for real services. It uses $n = 3f + 1$ replicas. One replica is the **primary** of the current **view**, and the others are **backups**.
+
+<Steps>
+
+**REQUEST.** The client sends its operation to the primary.
+
+**PRE-PREPARE.** The primary assigns a sequence number in the current view, and sends it with the request digest to the backups.
+
+**PREPARE.** A backup that accepts the pre-prepare sends PREPARE to all replicas. A replica is **prepared** when it has the pre-prepare and 2f matching PREPAREs from different backups. Now no honest replica can prepare a different request for that sequence number in this view.
+
+**COMMIT.** A prepared replica sends COMMIT to all replicas. It is **committed-local** when it has $2f + 1$ matching COMMITs, its own included. Then the request survives a view change, so the replica executes it.
+
+**REPLY.** Each replica sends the result to the client. The client waits for $f + 1$ matching replies, because at least one of them comes from an honest replica.
+
+</Steps>
+
+<Predict
+  id="pbft"
+  question="Four replicas, f = 1. The primary is a traitor: it sends value x to R1 and R2, value y to R3, and votes for both values. What do the honest replicas commit?"
+  options={[
+    "R1 and R2 commit x, R3 commits y",
+    "R1 and R2 commit x, R3 commits nothing",
+    "Nobody commits anything",
+  ]}
+  answer={1}
+  explain="R1 and R2 get matching prepares from each other, so they have 3 votes for x. R3 has only its own prepare for y, and the primary's votes do not count as prepares. R3 is stuck but never wrong, and a view change will replace the primary."
+>
+<ConsensusPaxosPbftDemo />
+</Predict>
+
+1. With 4 replicas and a lying primary, R1 and R2 commit x and R3 commits nothing. The client still gets x from $f + 1 = 2$ replies.
+2. Make R1, R2 or R3 the traitor. The honest primary sends one value, so the three honest replicas commit x. A lying backup cannot hurt them.
+3. Select **3** replicas with a lying primary. A quorum is now $n - f = 2$, and two quorums of 2 can share only the traitor. R1 commits x, and R2 commits y.
+4. Make the primary silent, or make it send garbage. No honest replica commits, and nothing wrong happens either. PBFT's backups would time out and start a view change.
+
+## View change
+
+A backup starts a timer when it receives a request. If the request does not execute in time, the backup suspects the primary.
+
+The backup sends VIEW-CHANGE for view $v + 1$, with proof of the requests that it has prepared. The primary of view $v + 1$ is replica $(v + 1) \bmod n$. When it has VIEW-CHANGE messages from 2f other replicas, it sends NEW-VIEW. NEW-VIEW repeats the pre-prepares for every request that may have committed, so a committed request keeps its sequence number. This is the role of phase 1 in Paxos.
+
+Replicas also take **checkpoints**. When $2f + 1$ replicas sign the same state digest at a sequence number, they can delete older log entries.
+
+The paper describes the protocol with signatures, but the implementation signs only VIEW-CHANGE and NEW-VIEW messages. All other messages use message authentication codes (MACs), which are much cheaper to compute. With this, the authors built BFS, a replicated NFS service. In the Andrew benchmark, it was only 3% slower than the standard NFS daemon of Digital Unix.
+
+## The cost: quadratic messages
+
+PREPARE and COMMIT go from every replica to every replica. So one request costs $O(n^2)$ messages:
+
+$$
+1 + (n - 1) + (n - 1)^2 + n(n - 1) + n
+$$
+
+That is the request, the pre-prepares, the prepares, the commits and the replies. A **linear** protocol sends each vote to the leader. The leader then forwards one certificate, a combination of $2f + 1$ signatures. Each phase then costs $O(n)$ messages.
+
+<ConsensusPaxosBftCountDemo />
+
+1. At f = 1, PBFT sends 29 messages and the linear pattern sends 20. The difference is small.
+2. Move f to 33, for n = 100. PBFT needs 19,901 messages per request, and the linear pattern needs 596.
+3. The last stat is a count from runs on the simulated network, for n up to 31. It matches the formulas.
+
+**HotStuff** is by Yin, Malkhi, Reiter, Golan Gueta and Abraham ("HotStuff: BFT Consensus with Linearity and Responsiveness", PODC 2019). It is linear in its normal case and in its view change. It uses threshold signatures, so a certificate is one signature, and a three-phase core. LibraBFT, the consensus of the Libra (later Diem) blockchain, is based on HotStuff. **Tendermint** (Buchman, Kwon and Milosevic, 2018) is inspired by PBFT and DLS. Its engine, Tendermint Core, continues as the fork CometBFT, which the Cosmos SDK uses.
+
+These permissioned protocols know the set of replicas, and they finalize a block once it commits. Bitcoin's proof of work solves a different problem: anyone can join, and a block becomes harder to reverse as more blocks follow it.
+
+| Protocol | Replicas | Normal-case messages | Main idea |
+|---|---|---|---|
+| Paxos and Raft | $2f + 1$ | $O(n)$ | crash faults only |
+| PBFT | $3f + 1$ | $O(n^2)$ | all-to-all prepare and commit; MACs |
+| HotStuff | $3f + 1$ | $O(n)$ | votes go to the leader; threshold signatures |
+
+## When to use BFT
+
+Most databases inside one company use crash fault tolerance. The replicas run the same code, so a software bug often hits all of them at once. BFT does not help against that, because it assumes at most f faulty replicas. BFT pays off when the replicas belong to parties that do not trust each other, as in blockchains. It also helps when one compromised machine must not corrupt the service.
+
+## Connect
+
+- [The consensus problem](/distributed/consensus/the-consensus-problem) has the same quorum argument with crash faults: $n \ge 2f + 1$.
+- [Multi-Paxos](/distributed/consensus/multi-paxos) has the same structure: a leader, a log, and a phase that recovers after a leader change.
+- [Checking histories like Jepsen](/distributed/consistency/checking-histories-like-jepsen) finds crash and partition bugs, which cause most real outages.
+- [Anti-entropy and Merkle trees](/distributed/replication/anti-entropy-and-merkle-trees) uses digests to compare state, as PBFT checkpoints do.
+
+<Recall cards={[
+  { q: "Why does BFT consensus need n ≥ 3f + 1 replicas?", a: "A replica can wait for only n − f replies. Two such quorums share n − 2f replicas, and f of them may lie. At least one honest replica must be in the overlap: n − 2f ≥ f + 1." },
+  { q: "Why can three generals not tolerate one traitor with oral messages?", a: "A loyal lieutenant gets one order from the commander and a different report from the other lieutenant. Either one may be the traitor, and the two cases look the same to it." },
+  { q: "When is a PBFT replica prepared, and when is it committed-local?", a: "Prepared: it has the pre-prepare and 2f matching PREPAREs from different backups. Committed-local: it is prepared and has 2f + 1 matching COMMITs, its own included." },
+  { q: "Why does a PBFT client wait for f + 1 matching replies?", a: "At most f replies can come from traitors, so f + 1 matching replies include at least one honest replica." },
+  { q: "What happens in PBFT when the primary is silent or equivocates?", a: "Honest replicas never commit two values, but some may not commit at all. Their timers expire, and they send VIEW-CHANGE. The next primary, (v + 1) mod n, sends NEW-VIEW and the protocol continues." },
+  { q: "Why is PBFT quadratic, and how does HotStuff become linear?", a: "PREPARE and COMMIT go from every replica to every replica. HotStuff sends votes to the leader, which combines them with a threshold signature into one certificate and broadcasts it." },
+]} />

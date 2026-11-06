@@ -1,0 +1,139 @@
+---
+summary: "The FLP result: in an asynchronous system, no deterministic protocol can guarantee consensus if one process may crash. Bivalent configurations, the proof idea, and the three ways out: partial synchrony, randomization and failure detectors."
+---
+import { ConsensusPaxosBivalenceDemo, ConsensusPaxosBenOrDemo } from "@/demos/dist/ConsensusPaxosFlpDemos";
+
+In [the consensus problem](/distributed/consensus/the-consensus-problem), each fix to the leader protocol broke either agreement or termination. Fischer, Lynch and Paterson proved that this is not bad luck. Their paper "Impossibility of Distributed Consensus with One Faulty Process" (Journal of the ACM, April 1985) shows that no deterministic protocol can always guarantee both. The paper received the Dijkstra Prize in 2001. It is the reason that every real consensus system has a timeout or a random choice in it.
+
+## The model
+
+The model is generous to the protocol. Only one thing is hard.
+
+- Messages are **reliable**: each message arrives exactly once, with no change. But there is no bound on the delay.
+- Processes are **deterministic** state machines. There is no bound on their relative speed, and there are no clocks.
+- At most **one** process may crash. A crash is a stop with no warning.
+- The task is weak: the inputs are 0 or 1, and only some process must decide.
+
+**Theorem.** No consensus protocol in this model is totally correct. Every protocol that never violates agreement and validity has an admissible run in which no process ever decides. An admissible run has at most one crash, and it delivers every message to every correct process in the end.
+
+## Configurations and valence
+
+A **configuration** is the state of every process plus the set of messages in flight. An **event** delivers one message m to one process p. The process takes one deterministic step and sends some messages. A **schedule** is a sequence of events.
+
+The key idea is the **valence** of a configuration: the set of decision values that some schedule can still reach.
+
+- A configuration is **0-valent** if every reachable decision is 0. The decision is already fixed, even if no process knows it yet.
+- It is **1-valent** for 1, in the same way.
+- It is **bivalent** if both 0 and 1 are still reachable. The outcome is still open.
+
+The proof has three steps.
+
+<Steps>
+
+**Commutativity (Lemma 1).** Two schedules that touch disjoint sets of processes give the same result in either order. Process p cannot see what q did until a message arrives.
+
+**A bivalent start (Lemma 2).** Put the input vectors in a chain where neighbors differ in one process: 000, 001, 011, 111. Validity makes 000 0-valent and 111 1-valent. So somewhere two neighbors have different valence, for example C0 and C1 that differ only in process p. Now take a run from C0 in which p crashes at once. The other processes must decide, and they cannot tell C0 from C1. So the same run decides the same value from both, which is a contradiction. Thus some initial configuration is bivalent.
+
+**Staying bivalent (Lemma 3).** Let C be bivalent and let e be any event that can be applied to C. Then some configuration that ends with e is still bivalent. The proof assumes that every such configuration is univalent. It then finds two neighbors that differ by one event and lead to different valences. If the two events are at different processes, they commute, which is a contradiction. If they are at the same process p, run the others while p is silent, and the same contradiction appears.
+
+</Steps>
+
+Now the adversary builds an endless run. Keep a queue of processes. Take the oldest message for the process at the front, and use Lemma 3 to deliver it while the configuration stays bivalent. Every message is delivered in the end, so the run is admissible. But no configuration on it is univalent, so no process decides.
+
+## Play the adversary
+
+The demo runs a tiny protocol with three processes. It is Ben-Or's protocol with the coin replaced by a fixed rule, so it is deterministic. In each round, a process sends its estimate x. With its own estimate and the first other one that arrives, it proposes x if they match, and ⊥ (no value) if not. Then it sends its proposal. Two equal proposals mean decide. One proposal means adopt it. No proposal means set x to the round number mod 2.
+
+The protocol is safe, and it decides when one process is dead from the start. An exhaustive search over every schedule computes the valence of each configuration, three rounds ahead.
+
+<Predict
+  id="biv"
+  question="P1 and P2 start with 0, and P3 starts with 1. The protocol is safe. Can a scheduler that only picks the order of deliveries keep it undecided forever, while it still delivers every message?"
+  options={[
+    "No: a safe protocol always decides once every message arrives",
+    "Yes: for this protocol and for every deterministic one that tolerates one crash, some fair order never decides",
+    "Only if the scheduler also crashes a process",
+  ]}
+  answer={1}
+  explain="This is the FLP theorem. The adversary needs no crash. It only picks which message arrives next. The crash is only a possibility in the proof. The protocol must be ready for it, and that keeps the bivalent states open."
+>
+<ConsensusPaxosBivalenceDemo />
+</Predict>
+
+1. Read the initial configurations. 000 is 0-valent, 001 is bivalent, and 011 is 1-valent. That is Lemma 2 on one chain.
+2. From 001, click messages. Each chip shows the valence after that delivery. Pick a bivalent one each time. Then pick a blue or purple one and watch a decision follow.
+3. Click **Adversary move** many times. It runs the proof's rule: take the oldest message, and find a schedule that delivers it and stays bivalent. In the unit tests, 200 deliveries reach round 34 with no decision.
+4. Crash one process. The other two must now hear each other, and they decide within two more rounds. A crash helps termination here, because it removes choices from the adversary.
+
+## What FLP does not say
+
+FLP is about guarantees, not about typical runs. In the demo, a random order of deliveries usually decides in a few rounds. The bad schedule needs an adversary that sees the full state and controls every delay. Real networks are not that clever, but no deterministic protocol can promise to decide.
+
+FLP also does not threaten safety. A good protocol gives up liveness in the bad runs and keeps safety in every run. Paxos and Raft never decide two values. They can only fail to decide while the network behaves badly.
+
+## Three ways out
+
+Each escape removes one assumption of the model.
+
+| Escape | What it adds | Result | Used by |
+|---|---|---|---|
+| Partial synchrony | Bounds that hold after an unknown global stabilization time (GST) | Dwork, Lynch and Stockmeyer (JACM, 1988): crash consensus iff $n \ge 2f + 1$ | Paxos and Raft: always safe, live after GST |
+| Randomization | A coin flip | Ben-Or (PODC, 1983): terminates with probability 1 | Ben-Or style protocols |
+| Failure detectors | A module that suspects crashed processes, with mistakes | Chandra and Toueg (JACM, 1996): consensus with $\Diamond S$ if $f < n/2$ | Leader election with heartbeats |
+
+Chandra, Hadzilacos and Toueg (JACM, 1996) studied systems in which a majority of processes are correct. They showed that the eventually weak detector $\Diamond W$ is the weakest one that solves consensus there. In the end, some correct process must suspect each crashed process. Also in the end, every correct process must stop suspecting one particular correct process. Before that, the detector may suspect correct processes. In practice that is a heartbeat timeout that grows after each false alarm.
+
+## Ben-Or: termination by coin
+
+Ben-Or's protocol has two phases per round, and each process waits for $n - f$ messages per phase. It tolerates $f < n/2$ crashes. A version for Byzantine faults needs $5f < n$.
+
+```ts
+// One round of Ben-Or for process i. send() goes to all; recv() waits for n − f messages of this phase.
+const reports = await recv({ phase: 1, round: r }); // includes our own x
+const v = majorityOf(reports, n);                    // a value held by more than n/2 of ALL n, or null
+broadcast({ phase: 2, round: r, v });
+const props = await recv({ phase: 2, round: r });
+const w = props.find((p) => p !== null) ?? null;     // all non-null proposals are equal
+if (w !== null && count(props, w) >= f + 1) decide(w);
+x = w !== null ? w : coinFlip();                     // the only random step
+```
+
+Safety never uses the coin. Two values cannot both have more than n/2 reports, so all proposals in a round carry the same value. If f + 1 proposals carry v, every process sees at least one of them among its $n - f$ messages, since $(f + 1) + (n - f) > n$. So every process adopts v, and the next round decides v.
+
+<Predict
+  id="benor"
+  question="Ben-Or with 5 processes, 2 inputs of 1 and 3 of 0, and random message delays. In 400 seeded runs, what do the rounds until the last live process decides look like?"
+  options={[
+    "Always 1 round: the majority input wins at once",
+    "A few rounds on average, with a tail that shrinks fast but has no fixed end",
+    "Hundreds of rounds, because the coins rarely agree",
+  ]}
+  answer={1}
+  explain="The mean is 3.73 rounds and the longest run takes 14. Each round decides with a probability bounded away from zero, so the chance to need more rounds shrinks geometrically. No bound holds for every run."
+>
+<ConsensusPaxosBenOrDemo />
+</Predict>
+
+1. Read the histogram. The mean is 3.73 rounds, and the longest of 400 runs takes 14. No run decides two values.
+2. Look at run 1 in the table. Rings mark values that a coin set. Once enough processes share a value, the next round decides.
+3. Move **Processes n** up and keep the inputs split. With split inputs, the mean grows: 2.67 rounds for n = 3, 7.62 for n = 9 and 10.73 for n = 11. Independent coins agree less often among more processes.
+4. Set all inputs to 0 or to 1. Every run decides in round 1. This is validity at work.
+5. Crash 2 processes. The others still decide, because each phase waits only for $n - f$ messages.
+
+Ben-Or's paper says that the expected number of rounds may be exponential when f grows with n. It is constant when $f = O(\sqrt{n})$, for processes that run synchronously. Later protocols use a **common coin**, which every process sees the same, to get a constant expected number of rounds.
+
+## Connect
+
+- [Paxos](/distributed/consensus/paxos) keeps safety in every run and gets liveness from a distinguished proposer, which is a failure detector in practice.
+- [Raft leader election](/distributed/consensus/raft-leader-election) uses random election timeouts to break ties. Its liveness still rests on partial synchrony, not on the coin alone.
+- [Failure detectors](/distributed/foundations/failure-detectors) explains the heartbeat detectors that real systems use.
+- [The network model](/distributed/foundations/the-network-model-messages-delays-and-partitions) defines asynchronous and partially synchronous networks.
+
+<Recall cards={[
+  { q: "State the FLP result and its model.", a: "In an asynchronous system with reliable messages and at most one crash, no deterministic consensus protocol is totally correct. Some admissible run never decides." },
+  { q: "What is a bivalent configuration?", a: "A configuration from which both decision values are still reachable by some schedule. A 0-valent or 1-valent one has its decision fixed, even if no process knows it yet." },
+  { q: "How does Lemma 2 show that a bivalent initial configuration exists?", a: "Chain the inputs from all 0 to all 1, one process at a time. Two neighbors must differ in valence. A run where the differing process crashes at once cannot tell them apart, so they cannot have different fixed decisions." },
+  { q: "How does the FLP adversary make an admissible run that never decides?", a: "It always takes the oldest pending message and uses Lemma 3 to deliver it while the configuration stays bivalent. Every message arrives in the end, but no decision does." },
+  { q: "Name the three escapes from FLP and the assumption each one adds.", a: "Partial synchrony: bounds hold after an unknown GST. Randomization: coin flips. Failure detectors: an oracle that suspects crashed processes and becomes accurate in the end." },
+  { q: "Why does Ben-Or's safety not depend on the coin?", a: "All proposals in a round carry one value, because two values cannot both exceed n/2 reports. If f + 1 proposals carry v, every process sees one, so all adopt v. The coin is used only when no process saw any proposal." },
+]} />

@@ -1,0 +1,146 @@
+---
+summary: "How Raft picks one leader per term: the three roles, RequestVote and its vote rules, randomized timeouts and split votes, the election restriction, and pre-vote and check-quorum as etcd uses them."
+---
+import { ConsensusRaftElectionDemo, ConsensusRaftTimeoutSweepDemo } from "@/demos/dist/ConsensusRaftElectionDemos";
+
+[Multi-Paxos](/distributed/consensus/multi-paxos) works best with one stable proposer, but the papers say little about how to choose it. **Raft** makes that choice the center of the design. Diego Ongaro and John Ousterhout published it as "In Search of an Understandable Consensus Algorithm" (USENIX ATC 2014). Ongaro's dissertation, "Consensus: Bridging Theory and Practice" (Stanford, 2014), adds the extensions that real systems use.
+
+Raft splits [consensus](/distributed/consensus/the-consensus-problem) into three parts: leader election, log replication and safety. This lesson is about the first part. A **leader** is the one server that accepts client commands and sends them to the others. All decisions flow from the leader to the followers, so the rest of the protocol stays simple.
+
+## Terms and roles
+
+Raft divides time into **terms**, numbered 1, 2, 3 and so on. Each term starts with an election, and each term has at most one leader. A term number works as a logical clock: every message carries the sender's term. A server that sees a higher term adopts it at once and becomes a follower. A server rejects any request that carries a lower term.
+
+A server is in one of three roles:
+
+- A **follower** answers requests and does nothing else. It keeps an **election timer**. A message from the current leader resets the timer.
+- A **candidate** is a follower whose timer expired. It increments its term, votes for itself and sends `RequestVote` to every other server.
+- A **leader** is a candidate that got votes from a majority. It sends `AppendEntries` at a fixed interval, even with no new entries. These empty messages are **heartbeats**, and they keep the followers' timers from expiring.
+
+Each server stores three values on disk before it answers any message: `currentTerm`, `votedFor` and the log. A server that forgets its vote after a crash could vote twice in one term. Then two candidates could each collect a majority.
+
+<Predict
+  id="no-spread"
+  question="The leader of five servers crashes. Every follower has an election timeout of exactly 150 ms, with no random spread. What happens next?"
+  options={["A new leader takes over about 150 ms later", "Several followers become candidates at almost the same time, split the votes, and do it again in the next term", "No follower becomes a candidate, because each one waits for the others"]}
+  answer={1}
+  explain="The followers last heard the same heartbeat, so their timers expire within a few milliseconds of each other. Each candidate votes for itself, and no one reaches 3 of 5. The candidates time out together again. Set the spread to 0 in the demo and crash the leader."
+>
+<ConsensusRaftElectionDemo />
+</Predict>
+
+1. Press **Play** and watch the first election. One timer (the orange arc) runs out first. That server sends `RV t1`, collects green vote arrows and becomes the leader. The heartbeats then reset every arc.
+2. Click **Crash the leader**. The arcs now run down. The first server to time out usually wins. Count the elections in the stats.
+3. Set the spread to 0 ms and crash the leader again. Several servers become candidates in the same term, and the term number climbs with no leader. Set the spread back to 150 ms, and a leader appears.
+4. Click **Cut off a follower**. Its arc runs out again and again, and its term climbs. Click **Heal**. Its high term forces the healthy leader to step down. Now turn on **Pre-vote** and repeat: the cut-off server keeps its term, and the leader stays.
+5. Click **Cut off a follower**, then **Write** a few times, then **Heal**. The follower that missed the writes may time out first, but it cannot win. The `log` number under each server shows why.
+
+## RequestVote and the vote rules
+
+A candidate sends `RequestVote(term, candidateId, lastLogIndex, lastLogTerm)`. The reply is `(term, voteGranted)`. A server grants its vote only if all three rules hold:
+
+| Rule | Why |
+|---|---|
+| The request's term is not lower than the voter's term | A stale candidate cannot win a term that has moved on |
+| The voter has not voted in this term, or voted for this candidate | One vote per term, so two majorities cannot form |
+| The candidate's log is at least as up to date as the voter's | A new leader holds every committed entry |
+
+"Up to date" compares the last entries. The log whose last term is higher is newer. If the last terms are equal, the longer log is newer. This is the **election restriction**.
+
+Why does it work? A committed entry is on a majority, and any winning candidate needs votes from a majority. These two sets overlap in at least one server, which refuses a candidate that lacks the entry. The [next lesson](/distributed/consensus/raft-log-replication) shows why this matters.
+
+```go
+func (r *Raft) handleRequestVote(m RequestVote) RequestVoteReply {
+	if m.Term > r.currentTerm {
+		r.currentTerm, r.votedFor = m.Term, None // a new term: step down, forget the old vote
+		r.becomeFollower()
+	}
+	upToDate := m.LastLogTerm > r.lastTerm() ||
+		(m.LastLogTerm == r.lastTerm() && m.LastLogIndex >= r.lastIndex())
+	grant := m.Term == r.currentTerm && (r.votedFor == None || r.votedFor == m.CandidateID) && upToDate
+	if grant {
+		r.votedFor = m.CandidateID
+		r.persist()            // write term and vote to disk before the reply leaves
+		r.resetElectionTimer() // a server that just voted gives the candidate time to win
+	}
+	return RequestVoteReply{Term: r.currentTerm, VoteGranted: grant}
+}
+```
+
+A candidate wins when it has votes from a majority. It loses when an `AppendEntries` from a leader of the same or a higher term arrives. If its timer runs out first, nobody won: it starts a new term and asks again.
+
+## Why the timeouts are random
+
+Two candidates in one term can split the votes, so that neither reaches a majority. Raft does not resolve a split. It avoids one: each server draws its timeout at random from a range, such as 150 to 300 ms in the paper. Usually one server times out alone and collects its votes before the next timer runs out.
+
+A short model shows how much spread is enough. Take $n$ timers drawn uniformly from a window of $S$ ms. The expected gap between the first and the second is
+
+$$
+\mathbb{E}[\text{gap}] = \frac{S}{n+1}
+$$
+
+With 4 followers and $S = 150$ ms, the gap is 30 ms. A vote round trip, with its disk write, takes about 0.5 to 20 ms by the paper's estimate, so the first candidate usually wins. With $S = 5$ ms, the gap is 1 ms, and a second candidate often starts before the first one's requests arrive.
+
+<Predict
+  id="spread"
+  question="The minimum timeout stays at 150 ms. You shrink the random spread from 150 ms to 5 ms. What happens to the time without a leader after a crash?"
+  options={["It shrinks a little, because the timers fire sooner", "It barely changes", "It grows more than tenfold, because of split votes"]}
+  answer={2}
+  explain="In this model the mean grows from 203 ms to about 3.1 s. Most of that time is spent in failed elections, not in waiting for the first timer."
+>
+<ConsensusRaftTimeoutSweepDemo />
+</Predict>
+
+1. Read the blue line from right to left. At 150 ms of spread, a failover takes 203 ms on average, with 1.05 elections. At 50 ms, it takes 233 ms, with 1.38 elections.
+2. Read the left end. At 25 ms of spread, the mean is 351 ms. At 5 ms, it is about 3.1 s. With no spread, most of the 40 runs hit the 10 s cut-off, after 59.6 elections on average.
+3. Move the minimum to 50 ms. The whole curve moves down, because each election round is shorter. The cliff on the left stays.
+
+The paper measured the same shape on real servers (section 9.3). With no randomness, an election took longer than 10 seconds. With 5 ms of randomness, the median downtime was 287 ms. With timeouts of 12 to 24 ms, a leader was elected in 35 ms on average. The exact values in the demo differ, because its network and heartbeats are model inputs, but the cliff is the same.
+
+The paper states the timing requirement as broadcastTime ≪ electionTimeout ≪ MTBF. The **broadcast time** is the time to send RPCs to every server and get the replies, including their disk writes. The paper puts it at 0.5 to 20 ms. The election timeout should be an order of magnitude longer, or followers start elections while the leader is healthy. It must also be much shorter than the mean time between failures (months), or the cluster spends too much time without a leader.
+
+## What real systems use
+
+| System | Heartbeat | Election timeout | Notes |
+|---|---|---|---|
+| etcd | `--heartbeat-interval` 100 ms | `--election-timeout` 1000 ms | the library draws from 1 to 2 times the timeout, in ticks |
+| hashicorp/raft (Consul, Nomad, Vault) | every 100 to 200 ms (`HeartbeatTimeout` / 10) | `HeartbeatTimeout` 1000 ms, for a follower | `ElectionTimeout` 1000 ms, for a candidate; `LeaderLeaseTimeout` 500 ms |
+| Kafka KRaft | none: followers fetch from the leader | `controller.quorum.fetch.timeout.ms` 2000 ms, for a follower | `controller.quorum.election.timeout.ms` 1000 ms, for a candidate |
+
+The etcd tuning guide gives the rules of thumb. Set the heartbeat near the round-trip time between members. Set the election timeout to at least 10 times the round-trip time. etcd rejects an election timeout above 50,000 ms. In the etcd raft library, `ElectionTick` and `HeartbeatTick` count logical ticks, and each election timeout is drawn from `[ElectionTick, 2 × ElectionTick)`.
+
+## Disruptive servers: pre-vote and check-quorum
+
+Step 4 of the first demo shows a weakness. A server cut off from the others times out again and again, and each time it increments its term. When the network heals, its high term reaches the leader, and the leader steps down. The cluster loses its leader for a full election, although nothing was wrong with it.
+
+**Pre-vote** (dissertation section 9.6) fixes this. Before it increments its term, a server asks the others whether they would vote for it in term $t+1$. A server answers yes only if the candidate's log is up to date and it has not heard from a leader within an election timeout. The pre-vote changes no state. A cut-off server never gets a majority of pre-votes, so its term never grows. When it returns, the others still hear the leader, so they refuse it.
+
+**Check-quorum** handles the opposite case. A leader steps down if it has not heard from a majority within an election timeout. So a leader in a minority cannot keep its clients. With check-quorum on, a follower also follows the rule of dissertation section 4.2.3. If it heard from a leader within the minimum election timeout, it ignores a `RequestVote` or pre-vote with a higher term.
+
+etcd calls this rule `inLease`. The etcd pre-vote checks only the log, so etcd needs `inLease` for the leader check.
+
+The etcd server always sets `CheckQuorum: true`. It added the `--pre-vote` flag in version 3.4 with the default false. Pre-vote has been on by default since version 3.5. hashicorp/raft added pre-vote in version 1.7.0 (2024), on by default.
+
+## Leadership transfer
+
+Sometimes an operator wants to move the leader, for example before a server restarts for an upgrade. The dissertation (section 3.10) gives a short protocol.
+
+The leader stops accepting new commands and brings the target's log up to date. Then it sends `TimeoutNow`. The target starts an election at once, without waiting for its timer. Its `RequestVote` carries a flag that lets it pass the lease rule above. In etcd this is `MsgTransferLeader`, and the flag is the `campaignTransfer` context.
+
+## Connect
+
+- [Failure detectors](/distributed/foundations/failure-detectors): an election timer is a failure detector, and its timeout trades speed of detection for false alarms.
+- [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency): random jitter breaks synchronized retries for the same reason that it breaks split votes.
+- [Paxos](/distributed/consensus/paxos): a Paxos proposer with a higher ballot can also interrupt another forever. Randomized backoff fixes that too.
+- [Raft log replication](/distributed/consensus/raft-log-replication): what the leader does after it wins, and why the election restriction keeps committed entries.
+- [Leases and fencing tokens](/distributed/coordination/leases-and-fencing-tokens): a term number is a fencing token for the leader's authority.
+- [ZooKeeper and etcd](/distributed/coordination/zookeeper-and-etcd): what is built on top of a Raft group.
+
+<Recall cards={[
+  { q: "Which three values must a Raft server write to disk before it replies, and why the vote?", a: "currentTerm, votedFor and the log. A server that forgot its vote after a crash could vote twice in one term, and two candidates could each get a majority." },
+  { q: "When is a candidate's log at least as up to date as the voter's?", a: "When its last entry has a higher term, or the same last term and an index at least as high. This is the election restriction." },
+  { q: "Why does Raft randomize election timeouts, and about how much spread is enough?", a: "To make split votes rare: one server should usually time out alone and collect its votes. The gap between the first two of n timers is about S/(n+1), so it must clearly exceed a vote round trip." },
+  { q: "What problem does pre-vote solve, and how?", a: "A cut-off server keeps raising its term, and on return it forces a healthy leader to step down. With pre-vote, it first asks whether a majority would vote for it, and it raises its term only if they would." },
+  { q: "What does check-quorum do in etcd?", a: "A leader steps down if it has not heard from a majority within an election timeout. A follower that heard from a leader recently ignores RequestVote with a higher term (the inLease rule)." },
+  { q: "Give etcd's default heartbeat interval and election timeout, and the tuning rule for the timeout.", a: "100 ms and 1000 ms. The election timeout should be at least 10 times the round-trip time between members." },
+]} />

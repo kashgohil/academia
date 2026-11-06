@@ -1,0 +1,105 @@
+---
+summary: "How a Raft cluster changes its own members without two leaders in one term (joint consensus, single-server changes and their 2015 bug fix, learners), and how snapshots and InstallSnapshot keep the log short."
+---
+import { ConsensusRaftMembershipDemo, ConsensusRaftSnapshotDemo } from "@/demos/dist/ConsensusRaftMembershipDemos";
+
+So far the set of servers was fixed. Real clusters change: a disk dies and the server is replaced, or a three-server cluster grows to five. A **configuration** is the set of servers that vote. Changing it while the cluster runs is the most delicate part of Raft. The second half of this lesson covers the other long-running problem: a log that grows forever.
+
+## Why a direct switch is dangerous
+
+Every safety argument in [the last two lessons](/distributed/consensus/raft-log-replication) used one fact: any two majorities share a server. That fact holds within one configuration. It fails when servers disagree about the configuration.
+
+Take the cluster `{S1,S2,S3}` that grows to `{S1,…,S5}`. The servers cannot all switch at the same moment. For a while, S1 and S2 still use the old set, while S3, S4 and S5 use the new one. Then `{S1,S2}` is a majority of the old set (2 of 3), and `{S3,S4,S5}` is a majority of the new set (3 of 5). These two majorities share no server.
+
+<Predict
+  id="direct"
+  question="The cluster {S1,S2,S3} switches straight to {S1,...,S5} while the network splits {S1,S2} from {S3,S4,S5}. Can two servers lead the same term?"
+  options={["No: Election Safety holds for any configuration", "Yes: each side has a majority of the configuration it uses", "Only if a server also crashes"]}
+  answer={1}
+  explain="S1 wins term 2 with S2: 2 of 3 under the old set. S4 wins term 2 with S3 and S5: 3 of 5 under the new set. S3 votes only once in term 2, but it votes for S4, not S1. In the demo both leaders then commit different entries at the same index."
+>
+<ConsensusRaftMembershipDemo />
+</Predict>
+
+1. Step through **direct switch**. At step 2, the new configuration commits on the side `{S3,S4,S5}` alone. At step 4, S4 also leads term 2, and the banner reports a broken Election Safety.
+2. Select **joint consensus** and step again. S4 gets 3 of 5 new voters, but it also needs 2 of the old `{S1,S2,S3}`. It has only S3, so it loses. After the network heals, S1 starts the change again, and it completes.
+3. Select **one at a time**. The first step adds only S4. S4 needs 3 of 4 votes and gets 2. Then S1 adds S4 and S5 in two separate changes.
+4. Select **2015 bug** with the rule off. Two single-server changes start in different terms, and the server that was removed overwrites committed entries. Turn the rule on: S2 must commit its own no-op first, so its change waits, and nothing committed is lost.
+
+## Joint consensus
+
+The Raft paper (section 6) and the dissertation (section 4.3) change the configuration in two steps through a **joint configuration** `C(old,new)`.
+
+1. The leader appends `C(old,new)` as a log entry. Every server uses the newest configuration in its log at once, even before it commits.
+2. While `C(old,new)` is in force, an election or a commit needs a majority of the old set **and** a majority of the new set.
+3. When `C(old,new)` commits, the leader appends `C(new)`. When that commits, the old servers can be shut down.
+
+No time exists at which the old and the new set can decide alone. Before `C(old,new)` commits, a leader uses either `C(old)` or `C(old,new)`, and both need an old majority. After it commits, any leader has `C(old,new)` in its log. A leader that is not in `C(new)` keeps managing the cluster until `C(new)` commits, without counting itself, and then steps down (section 4.2.2).
+
+etcd added joint consensus to its library as `ConfChangeV2`. The field `ConfChangeTransition` selects the mode. `ConfChangeTransitionAuto` makes a simple change when it can, and otherwise leaves the joint state automatically. `ConfChangeTransitionJointExplicit` stays joint until the application proposes a second, empty change.
+
+## Single-server changes
+
+The dissertation (section 4.1) recommends a simpler method: add or remove **one** voter at a time. A majority of $n$ voters has $\lfloor n/2 \rfloor + 1$ members. For $n$ and $n+1$ voters, two majorities together have at least $n + 2$ members, more than the $n + 1$ servers that exist, so they overlap.
+
+| Change | Old majority | New majority | Servers in total |
+|---|---|---|---|
+| 3 to 4 voters | 2 | 3 | 4 |
+| 4 to 5 voters | 3 | 3 | 5 |
+| 5 to 4 voters | 3 | 3 | 5 |
+
+In each row, the two majorities need more servers than exist, so they share one. A leader may start the next change only after the previous one commits.
+
+In July 2015, Ongaro posted "bug in single-server membership changes" to the raft-dev group. Two changes that start in different terms can each be based on a different configuration. Their majorities then need not overlap, and a committed entry can be lost. The fix is one rule: **a leader may not append a new configuration entry until it has committed an entry of its current term.** In practice, that entry is the no-op from the start of the term. The dissertation's errata link to the post.
+
+New servers start with an empty log. If a new voter joined at once, the cluster would need its vote before it had caught up, and commits could stall. So a new server first joins as a **non-voting member** (section 4.2.1). It receives the log but does not count in any majority. In etcd, such a server is a **learner**: `etcdctl member add --learner` adds one (since version 3.4), and `etcdctl member promote` makes it a voter.
+
+A removed server can also disturb the cluster. It no longer gets heartbeats, so it times out, raises its term and sends `RequestVote`. The rule from [leader election](/distributed/consensus/raft-leader-election) stops this: a server that heard from a leader within the minimum election timeout ignores such a request.
+
+## Snapshots and log compaction
+
+A log of every command ever made grows without limit. A restart would replay all of it, and a new server would need all of it. So each server periodically writes a **snapshot**: the state machine state at some index, and nothing before it. Then it deletes the log up to that index. A snapshot holds:
+
+- `lastIncludedIndex` and `lastIncludedTerm`, so that the consistency check still works for the first entry after it,
+- the newest configuration at that index,
+- the state machine state, including the client session table.
+
+Each server takes snapshots on its own schedule, only of committed and applied entries. No coordination is needed. For a large state, the server takes the snapshot in the background, for example with a copy-on-write `fork` or a [copy-on-write tree](/databases/btrees/copy-on-write-b-trees). An etcd server snapshots after a number of applied entries, set by `--snapshot-count`. The default was 100,000 from version 3.2 to 3.5 and is 10,000 in version 3.6.
+
+Sometimes a follower needs entries that the leader has already deleted, for example after a long partition. Then the leader sends its snapshot with `InstallSnapshot`. Figure 13 of the paper lists the arguments: `term`, `leaderId`, `lastIncludedIndex`, `lastIncludedTerm`, `offset`, `data[]` and `done`. A large snapshot goes in chunks: `offset` places each chunk, and `done` marks the last one.
+
+The follower keeps any log entries after the snapshot if its entry at `lastIncludedIndex` has the right term. If not, it discards its whole log. Then it loads the state machine from the snapshot.
+
+<Predict
+  id="install"
+  question="A follower was cut off for 700 ms. Meanwhile the leader took a snapshot every 20 entries and deleted those entries. How does the follower catch up?"
+  options={["The leader replays every missed entry from its log", "The leader sends its snapshot with InstallSnapshot, then the entries after it", "The follower copies the missing entries from another follower"]}
+  answer={1}
+  explain="The entries that the follower needs are no longer in the leader's log. The leader sends the snapshot in chunks, then continues with AppendEntries from the entry after the snapshot."
+>
+<ConsensusRaftSnapshotDemo />
+</Predict>
+
+1. With the defaults, each log grows to about 20 entries and drops back at each snapshot. S5's line stays flat while it is cut off. When it comes back, it receives 2 snapshots in 6 chunks, 476 bytes in all.
+2. Set the threshold to **never**. Each log grows to 199 entries. S5 now catches up with 4 `AppendEntries` that carry 7,150 bytes, 15 times more than the snapshots.
+3. Raise the chunk size to 300 bytes. Each snapshot now fits in one `InstallSnapshot`, and the catch-up takes fewer round trips.
+4. Move the return time. While S5 catches up, the leader takes a newer snapshot, and S5 needs a second one. A real system tunes the threshold, so that a snapshot transfer finishes before the log moves past it.
+
+The trade-off is between the size of the state and the length of the log. A small state with many updates, as in this demo, favors frequent snapshots. A large state with few updates favors a longer log. Each snapshot costs a full copy of the state, on disk and over the network.
+
+## Connect
+
+- [Raft log replication](/distributed/consensus/raft-log-replication): the commit rule and the no-op that the 2015 fix depends on.
+- [Quorums in leaderless replication](/distributed/replication/leaderless-and-quorums): the same overlap argument, with read and write quorums instead of two configurations.
+- [Rebalancing](/distributed/partitioning/rebalancing): systems such as CockroachDB and TiKV run many Raft groups and move replicas with these configuration changes.
+- [Checkpoints](/databases/recovery/checkpoints): a snapshot is a checkpoint that lets a log be cut.
+- [ZooKeeper and etcd](/distributed/coordination/zookeeper-and-etcd): learners and runtime reconfiguration in practice.
+
+<Recall cards={[
+  { q: "Why can a direct switch from {S1,S2,S3} to {S1,...,S5} give two leaders in one term?", a: "Servers switch at different times. Then {S1,S2} is a majority of the old set, and {S3,S4,S5} is a majority of the new set. They share no server." },
+  { q: "What does a decision need while the joint configuration C(old,new) is in force?", a: "A majority of the old voters and a majority of the new voters, both. After C(old,new) commits, the leader appends C(new)." },
+  { q: "Why do single-server changes keep majorities overlapping?", a: "Majorities of n and n+1 voters together have at least n+2 members, more than the n+1 servers, so they share one." },
+  { q: "What is the 2015 fix to single-server changes?", a: "A leader may not append a new configuration entry until it has committed an entry of its current term, in practice its no-op. Without it, two changes from different terms can have majorities that do not overlap." },
+  { q: "Why does a new server join as a learner first?", a: "It starts with an empty log. As a voter it would count in majorities before it caught up and could stall commits. A learner receives the log but does not vote." },
+  { q: "When does a leader send InstallSnapshot, and what does the follower do with its log?", a: "When the follower needs entries that the leader has compacted into its snapshot. The follower keeps the entries after lastIncludedIndex only if its entry there has lastIncludedTerm; otherwise it discards its log." },
+]} />

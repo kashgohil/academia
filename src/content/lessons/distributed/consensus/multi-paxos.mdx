@@ -1,0 +1,140 @@
+---
+summary: "From one value to a log: Multi-Paxos runs phase 1 once for all slots, so a stable leader needs one round trip per command. Leader change, gaps and no-ops, leases for local reads, Flexible Paxos quorums, EPaxos, and how Raft compares."
+---
+import { ConsensusPaxosLogDemo, ConsensusPaxosCountDemo } from "@/demos/dist/ConsensusPaxosMultiDemos";
+
+[Single-decree Paxos](/distributed/consensus/paxos) chooses one value. A replicated state machine needs a log: a sequence of slots, each with one chosen command. The obvious design runs one full Paxos instance per slot. That costs two round trips and two fsyncs on a majority for every command. **Multi-Paxos** removes most of that cost.
+
+## One phase 1 for all slots
+
+Phase 1 does two things. It makes the acceptors promise to refuse older ballots, and it reports what they accepted. Neither needs a separate run for each slot.
+
+So a new leader sends one `prepare(b)` that covers every slot. Each acceptor promises b for all slots, and it replies with all the proposals it has accepted. After that, the leader runs only phase 2 for each new command: `accept(b, slot, v)` and `accepted(b, slot)`. A command now costs one round trip to a majority.
+
+Paxos Made Live (Chandra, Griesemer and Redstone, PODC 2007) describes this for Chubby's log. Phase 1 messages may be omitted while the coordinator stays the same. The ballot works as a leader epoch, much like a term in Raft.
+
+## Leader change
+
+A new leader must finish the work of the old one before it adds commands. After its phase 1, it knows, for each slot, the accepted proposal with the highest ballot in its quorum. Then:
+
+- If a slot has an accepted value, the leader proposes that value again with its own ballot. It may have been chosen, so it must survive.
+- If a slot has no accepted value in the quorum, but a higher slot has one, the slot is a **gap**. No value can have been chosen in it, because a chosen value would appear in every majority. The leader fills it with a **no-op**.
+
+The state machine applies the log in slot order. A gap would block every later slot forever, so the no-op is required.
+
+<Predict
+  id="gap"
+  question="N1 led and crashed. Slot 4 has d only on N1 and N2. Slot 5 has e on N1, N2 and N3, so e is chosen. Slot 6 has f only on N1 and N4. N5 takes over and hears phase 1 from N3 and N4. What ends up in slots 4, 5 and 6?"
+  options={[
+    "d, e, f: a new leader always recovers every accepted value",
+    "no-op, e, f: d is invisible to this quorum, e must survive, and f was seen on N4",
+    "no-op, no-op, f: only values on the new quorum count",
+  ]}
+  answer={1}
+  explain="The quorum N3, N4, N5 sees e (on N3) and f (on N4), but not d. Slot 4 becomes a no-op. e was chosen, so every majority holds it: this one has N3. Choose N2 and N3 instead, and d survives while f disappears."
+>
+<ConsensusPaxosLogDemo />
+</Predict>
+
+1. Step through the run. Slots 1 to 3 need only phase 2: each command is one round trip from N1.
+2. At step 4, d reaches only N2. With N1, that is 2 of 5 nodes, so d is not chosen. Only N1 knows that e in slot 5 is chosen.
+3. At step 7, N5 hears from N3 and N4. Slot 4 becomes a no-op, e survives, and f is now chosen.
+4. Select N2 and N3 instead. Now d survives, and f disappears: N5's highest slot is 5, so g takes slot 6.
+5. Try every pair. e in slot 5 survives each time, because any two of N2, N3 and N4 include N2 or N3.
+
+## Leases for reads
+
+A leader can answer reads from its own state only if it is sure that no newer leader exists. Otherwise, as [the consensus problem](/distributed/consensus/the-consensus-problem) showed, it can return old data. One safe option sends each read through the log. A cheaper option checks leadership with one round of heartbeats to a majority.
+
+The cheapest option is a **lease**. While a majority grants the leader a lease, they promise not to support another leader. The leader then serves reads locally until the lease expires. This depends on bounded clock drift, as in [physical clocks and drift](/distributed/time/physical-clocks-and-drift).
+
+| System | Consensus | Detail |
+|---|---|---|
+| Chubby (OSDI 2006) | Paxos | five replicas typical; the master holds a lease of a few seconds |
+| Spanner (OSDI 2012) | Paxos, one group per tablet | leader leases of 10 seconds by default; the Paxos implementation is pipelined |
+| Megastore (CIDR 2011) | Paxos | replicates every write across datacenters |
+| etcd, CockroachDB, TiKV | Raft | a Raft group per cluster (etcd), per range (CockroachDB) or per region (TiKV) |
+| ZooKeeper | Zab | an atomic broadcast protocol, not Paxos |
+
+## Messages per command
+
+<Predict
+  id="count"
+  question="Five nodes. The leader is one of them. How many messages does each committed command need with basic Paxos, and with Multi-Paxos and a stable leader?"
+  options={["8 and 4", "16 and 8", "20 and 10"]}
+  answer={1}
+  explain="Basic Paxos sends prepare, promise, accept and accepted to and from 4 other nodes: 16. Multi-Paxos skips phase 1: 8."
+>
+<ConsensusPaxosCountDemo />
+</Predict>
+
+1. At n = 5, basic Paxos sends 16 messages per command, and Multi-Paxos sends 8. The rule is $4(n - 1)$ and $2(n - 1)$.
+2. Move the phase-2 quorum to 2 for the green line. A thrifty leader sends `accept` to only 1 other node, so 2 messages per command.
+3. Read the cost. With $q_2 = 2$ out of 5, a leader change needs $q_1 = 4$ promises, so it survives only 1 crash.
+4. Move **Nodes n** to 15. Multi-Paxos needs 28 messages, but the green line stays at 2.
+
+Flexible Paxos (Howard, Malkhi and Spiegelman, 2016) showed that majorities are not necessary. Only a phase-1 quorum and a phase-2 quorum must intersect:
+
+$$
+q_1 + q_2 > n
+$$
+
+Phase-2 quorums need not intersect each other. Commands are frequent and leader changes are rare, so a small $q_2$ often pays. The price is that a leader change needs a large $q_1$. A thrifty leader also has no spare replies: one slow node in its small quorum stalls every command.
+
+## Beyond one leader
+
+**EPaxos** (Moraru, Andersen and Kaminsky, SOSP 2013) has no fixed leader. Any replica leads its own commands. Commands that do not interfere commit in one round trip, with a fast quorum of $F + \lfloor (F + 1)/2 \rfloor$ replicas out of $N = 2F + 1$. Commands that conflict need a second round. The design removes the leader bottleneck, at the cost of a much harder recovery protocol.
+
+## Compared with Raft
+
+[Raft log replication](/distributed/consensus/raft-log-replication) is a Multi-Paxos design with stronger rules on the log.
+
+| Question | Multi-Paxos | Raft |
+|---|---|---|
+| Leader epoch | ballot number | term |
+| Who can become leader | any node; phase 1 brings in the missing values | only a node whose log is at least as up to date as that of each voter in a majority |
+| Holes in the log | possible; filled with no-ops after a leader change | impossible; a follower accepts entry i only if it matches entry i − 1 |
+| Old entries after a leader change | re-proposed with the new ballot | kept with their old term; a new leader commits a no-op of its own term first |
+| Specification | a family of variants, with many details left to the implementer | one precise algorithm |
+
+Raft's election rule means that a new leader already holds every committed entry, so it needs no phase 1 to learn values. The cost is less flexibility, for example in which node may lead.
+
+```go
+// The heart of a Multi-Paxos leader change: one value per slot, no-ops for gaps.
+func (l *Leader) recover(promises []Promise) {
+	best := map[uint64]Accepted{}
+	top := uint64(0)
+	for _, p := range promises {
+		for slot, a := range p.Accepted {
+			if cur, ok := best[slot]; !ok || a.Ballot > cur.Ballot {
+				best[slot] = a
+			}
+			top = max(top, slot)
+		}
+	}
+	for slot := l.commitIndex + 1; slot <= top; slot++ {
+		v := NoOp
+		if a, ok := best[slot]; ok {
+			v = a.Value // may have been chosen: it must survive
+		}
+		l.sendAccept(l.ballot, slot, v)
+	}
+	l.nextSlot = top + 1
+}
+```
+
+## Connect
+
+- [Raft leader election](/distributed/consensus/raft-leader-election) and [Raft membership changes and snapshots](/distributed/consensus/raft-membership-changes-and-snapshots) solve the same problems with one fixed design.
+- [Leases and fencing tokens](/distributed/coordination/leases-and-fencing-tokens) explains why a lease needs bounded drift, and how a token stops a stale leader.
+- [Spanner and TrueTime](/distributed/transactions/spanner-and-truetime) puts a Paxos group under each tablet.
+- [Group commit](/databases/recovery/group-commit) is how a leader amortizes the fsync of many commands.
+
+<Recall cards={[
+  { q: "Why can Multi-Paxos skip phase 1 for most commands?", a: "One prepare with ballot b covers every slot. Once a majority promised b and reported its accepted values, the leader needs only phase 2 per command, while its ballot stays the highest." },
+  { q: "What does a new Multi-Paxos leader do for a slot that has an accepted value in its quorum, and for a gap?", a: "It proposes the highest-ballot accepted value again with its own ballot, because it may have been chosen. It fills a gap with a no-op, because no value can have been chosen there." },
+  { q: "Why is a gap safe to fill with a no-op?", a: "A chosen value is accepted by a majority, and every majority meets the new leader's quorum. If no node in the quorum has a value for the slot, nothing was chosen there." },
+  { q: "How many messages does a command cost in basic Paxos and in Multi-Paxos with n nodes?", a: "4(n − 1) for basic Paxos, and 2(n − 1) for Multi-Paxos with a stable leader that is one of the n nodes." },
+  { q: "State the Flexible Paxos condition, and its cost.", a: "A phase-1 quorum and a phase-2 quorum must intersect: q1 + q2 > n. A small q2 makes commands cheap, but a leader change needs q1 = n − q2 + 1 nodes." },
+  { q: "Why does a leader lease need bounded clock drift?", a: "The leader serves reads until its lease expires by its own clock. If its clock runs slow, it may still serve after the others think the lease ended and a new leader exists." },
+]} />

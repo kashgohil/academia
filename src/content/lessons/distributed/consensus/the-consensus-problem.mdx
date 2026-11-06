@@ -1,0 +1,131 @@
+---
+summary: "What consensus must guarantee (agreement, validity, termination), why it is the core of state machine replication, why majorities, how it relates to atomic broadcast, and what it does not give you."
+---
+import { ConsensusPaxosQuorumDemo, ConsensusPaxosNaiveDemo } from "@/demos/dist/ConsensusPaxosProblemDemos";
+
+Several servers must hold the same data, and any of them can crash at any time. To stay the same, they must apply the same commands in the same order. So, for each position in the order, the servers must agree on one command. That agreement is the **consensus problem**. etcd, ZooKeeper, Spanner, CockroachDB and TiKV all solve it many times per second.
+
+## The problem
+
+Each process starts with an input value. Each process may **decide** one value, once. A protocol solves consensus if every run has these properties:
+
+- **Agreement**: no two processes decide different values.
+- **Validity**: a decided value is the input of some process. A protocol that always decides 0 is not useful.
+- **Termination**: every process that does not crash decides, after a finite time.
+
+Most real systems need **uniform agreement**: a process that decides and then crashes also counts. A crashed leader may have told a client "done" before it died. If the survivors decide differently, that client saw a value that the system later contradicts.
+
+Agreement and validity are **safety** properties: a bad thing never happens. Termination is a **liveness** property: a good thing happens in the end. It is easy to get one kind alone. The difficulty is to get both when processes crash and messages are late.
+
+## Why replication needs it
+
+Fred Schneider's tutorial "Implementing Fault-Tolerant Services Using the State Machine Approach" (ACM Computing Surveys, 1990) states the idea. Make the service a deterministic state machine. Give every replica the same sequence of commands. Then every replica goes through the same states and gives the same outputs.
+
+The hard part is the sequence. A replicated log is a list of slots, and each slot is one consensus instance. Its question is "which command is number 17?". The [leader-follower](/distributed/replication/leader-follower) design moves the problem to a different place. The leader orders the commands, but when the leader fails, the replicas must agree on a new leader and on the last command that counts.
+
+**Atomic broadcast** delivers the same messages, in the same order, to every correct process. Chandra and Toueg (JACM, 1996) proved that consensus and atomic broadcast are reducible to each other in asynchronous systems with crash failures. A log is atomic broadcast, so a replicated log and repeated consensus are the same problem.
+
+## Why a majority
+
+A protocol must make progress while some processes are down. So it cannot wait for all n replies. It waits for a **quorum**: a set of replies that it trusts. The quorums must have one property: any two of them share at least one process. That process carries the knowledge of the first quorum into the second.
+
+<Predict
+  id="quorum"
+  question="Five nodes. A protocol decides when 2 nodes agree, so that it can survive 3 crashes. Can two groups of 2 decide different values?"
+  options={[
+    "No: the nodes check with each other before they decide",
+    "Yes: two groups of 2 out of 5 can have no node in common",
+    "Only if the network drops a message",
+  ]}
+  answer={1}
+  explain="Two sets of 2 out of 5 cover only 4 nodes, so they can be disjoint. Each group decides alone, and neither can learn about the other. With groups of 3, any two groups share at least one node."
+>
+<ConsensusPaxosQuorumDemo />
+</Predict>
+
+1. Click nodes to change quorum A and quorum B. With n = 5 and two sets of 3, you cannot make them disjoint. Try.
+2. Click **Two minorities**. Two sets of 2 share no node.
+3. Read the table. For n = 5 and sets of size 2, 30 of 100 pairs share no node. For size 3, the count is 0.
+4. Move **Nodes** to 6. A majority is now 4, and the size-3 row has disjoint pairs.
+
+Two sets of sizes a and b, taken from n nodes, share at least $a + b - n$ nodes. For two majorities $q = \lfloor n/2 \rfloor + 1$, this is $2q - n \ge 1$. A majority quorum must not need the crashed nodes, so f crashes require $n - f \ge q$. That gives the rule:
+
+$$
+n \ge 2f + 1
+$$
+
+| Nodes n | Majority | Crashes survived f | Common choice |
+|---|---|---|---|
+| 3 | 2 | 1 | small etcd or ZooKeeper cluster |
+| 4 | 3 | 1 | no gain over 3, one more node to wait for |
+| 5 | 3 | 2 | Chubby cells are typically five replicas |
+| 7 | 4 | 3 | rare: each write waits for 4 nodes |
+
+An even n adds a node but no tolerance. A majority is not the only safe choice. [Flexible Paxos](/distributed/consensus/multi-paxos) shows that only the quorums of different phases must meet.
+
+## A protocol that breaks
+
+The simplest idea: one fixed leader decides its own input and tells the others. Agreement then holds, because only one process decides on its own. But if the leader crashes, nobody else can ever decide. So we add **failover**: a node that hears nothing for a while takes over.
+
+<Predict
+  id="naive"
+  question="N1 leads. With failover on, nothing crashes, and the network is not cut. One message from N1 to N3 is only slow. Can N1 and N3 decide different values?"
+  options={[
+    "No: nothing failed, so a takeover cannot start",
+    "Yes: N3 cannot tell a slow message from a dead leader, so it takes over",
+    "Only if the clocks of N1 and N3 drift",
+  ]}
+  answer={1}
+  explain="A timeout only measures time. N3 waits 80 ms, the message takes about 130 ms, and N3 decides its own value C. Then the message with A arrives too late."
+>
+<ConsensusPaxosNaiveDemo />
+</Predict>
+
+1. With **Cut off leader** and failover on, N1 decides A. N2 and N3 time out, and the other side decides B. Agreement is broken.
+2. Turn failover off. Agreement holds, but N2 and N3 wait forever. Termination is broken.
+3. Select **Leader crashes**. N1 decided A and then crashed. With failover, the survivors decide B. Only uniform agreement catches this case.
+4. Select **One slow message**. No node fails, but N3 decides C. Raise the timeout step to 70 ms. Now the message arrives first, and the run is correct. Another delay would break it again.
+
+Each fix trades one property for the other. The timeout is the problem: it guesses that a node is dead. The [failure detectors](/distributed/foundations/failure-detectors) lesson shows that no timeout is right in every run. A correct protocol must stay safe when the guess is wrong. Paxos and Raft do this: a guess can only cost time, never agreement.
+
+## What consensus does not give you
+
+- **Linearizable reads.** Consensus orders the writes in the log, but a read served from one replica's state can still be old. A leader that a partition cut off may not know that a new leader exists. The Raft paper (Ongaro and Ousterhout, 2014) says that a leader must check that it is still the leader before it answers. It can do this with a heartbeat round to a majority, or rely on a lease, which depends on bounded clock skew. See [linearizability](/distributed/consistency/linearizability).
+- **Exactly-once effects.** A client that retries a command after a timeout can get it into the log twice. The state machine must remove duplicates, as in [timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency).
+- **Progress during a partition.** The minority side stops. This is the C in [CAP](/distributed/consistency/cap-and-pacelc).
+- **Speed.** Each decision costs at least one round trip to a majority, and each acceptor writes to disk before it replies.
+
+```go
+// A replicated state machine: the log decides the order, the machine only applies it.
+type Replica struct {
+	log     ConsensusLog // Raft, Multi-Paxos or Zab
+	applied uint64
+	kv      map[string]string
+}
+
+func (r *Replica) Run() {
+	for entry := range r.log.Committed() { // in slot order, each slot once
+		if entry.Index != r.applied+1 {
+			panic("gap: a log must deliver slots in order")
+		}
+		r.kv[entry.Key] = entry.Value // deterministic, so every replica agrees
+		r.applied = entry.Index
+	}
+}
+```
+
+## Connect
+
+- [FLP impossibility](/distributed/consensus/flp-impossibility) proves that no deterministic protocol can guarantee termination in an asynchronous system with even one crash.
+- [Paxos](/distributed/consensus/paxos) and [Raft leader election](/distributed/consensus/raft-leader-election) are the two protocols that most systems use.
+- [Two-phase commit](/distributed/transactions/two-phase-commit) is an agreement protocol that blocks when its coordinator fails.
+- [Write-ahead logging](/databases/recovery/write-ahead-logging) is the single-node version of the same idea: a log makes the state recoverable.
+
+<Recall cards={[
+  { q: "State the three properties of consensus, and say which are safety properties.", a: "Agreement: no two processes decide differently. Validity: the decision is some process's input. Termination: every correct process decides. Agreement and validity are safety. Termination is liveness." },
+  { q: "Why does uniform agreement matter to a replicated service?", a: "A process that decides and then crashes may already have answered a client. If the survivors decide another value, the client saw a result that the system contradicts." },
+  { q: "Why must any two quorums intersect, and what is the smallest overlap of two majorities of n?", a: "The common node carries what the first quorum did into the second. Two majorities of size q share at least 2q − n nodes, which is at least 1." },
+  { q: "How many nodes do you need to survive f crashes with majority quorums, and why is an even n wasteful?", a: "n ≥ 2f + 1. With n = 4 the majority is 3, so it still survives only 1 crash, like n = 3, but waits for one more node." },
+  { q: "Why can a timeout-based failover break agreement even when no node fails?", a: "A timeout cannot tell a slow message from a dead node. A node that times out takes over, and the slow value arrives after it decided." },
+  { q: "Name one thing that a consensus log does not give you by itself.", a: "Linearizable reads: a replica or a deposed leader can serve old state. The leader must confirm its leadership with a majority, or use a lease, before it answers." },
+]} />

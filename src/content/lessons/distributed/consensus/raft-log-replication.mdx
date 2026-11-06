@@ -1,0 +1,142 @@
+---
+summary: "How a Raft leader copies its log: AppendEntries and its consistency check, repair by truncation, the commit rule and the Figure 8 trap, applying entries, client sessions, and batching and pipelining."
+---
+import { ConsensusRaftReplicationDemo, ConsensusRaftFigure8Demo, ConsensusRaftSessionDemo, ConsensusRaftThroughputDemo } from "@/demos/dist/ConsensusRaftLogDemos";
+
+A [leader election](/distributed/consensus/raft-leader-election) gives a term one leader. Now the leader must turn client commands into a **log**: a numbered list of entries that every server applies in the same order. Each entry holds a command and the term in which the leader received it. If every server applies the same log to the same deterministic state machine, every server reaches the same state. This is **state machine replication**, the same goal as [Multi-Paxos](/distributed/consensus/multi-paxos).
+
+## AppendEntries
+
+The leader appends a command to its own log and sends `AppendEntries` to every follower. Figure 2 of the Raft paper lists the fields:
+
+| Field | Meaning |
+|---|---|
+| `term` | the leader's term |
+| `leaderId` | so that followers can redirect clients |
+| `prevLogIndex`, `prevLogTerm` | the index and term of the entry just before the new ones |
+| `entries[]` | the new entries (empty for a heartbeat) |
+| `leaderCommit` | the leader's commit index |
+
+The reply is `(term, success)`. The leader keeps two numbers for each follower. `nextIndex` is the next entry to send. `matchIndex` is the highest entry known to be on that follower.
+
+The follower accepts the request only if its log has an entry at `prevLogIndex` with term `prevLogTerm`. This is the **consistency check**. If the check passes, the follower deletes any entry that conflicts with a new one (same index, different term) and everything after it. Then it appends the new entries that it does not have yet. If the check fails, it replies false, and the leader lowers `nextIndex` and tries again.
+
+The check gives the **Log Matching** property by induction. Suppose two logs have an entry with the same index and term. The leader created that entry once, so the two entries are equal. Each log also passed the check for the entry before it. That entry equals the one in the leader's log, and so on down to index 1. So the two logs are equal up to that index.
+
+<Predict
+  id="minority-leader"
+  question="The leader is cut off with one follower and keeps accepting writes. The other three servers elect a new leader and accept writes too. The network heals. What happens to the old leader's new entries?"
+  options={["They merge into the new leader's log", "They are deleted, because they never reached a majority and the new leader's log wins", "Both branches stay until an operator picks one"]}
+  answer={1}
+  explain="The old leader could never commit them: 2 of 5 is not a majority. When it hears the higher term, it becomes a follower. The new leader's AppendEntries fails the consistency check at the first conflicting index, and the old entries are deleted."
+>
+<ConsensusRaftReplicationDemo />
+</Predict>
+
+1. Watch a few writes. Each entry starts dashed on the leader, appears on the followers, and turns solid when the leader counts a majority. Followers turn solid one heartbeat later, because they learn the commit index from `leaderCommit`.
+2. Click **Cut the leader off with one follower**. The old leader keeps appending dashed entries that never commit. After an election timeout, the other three elect a leader and commit their own entries.
+3. Click **Heal**. The old leader sees the higher term and steps down. The new leader's `AppendEntries` is rejected (a red "reject"), and then the two servers delete their uncommitted entries. The deletion count goes up.
+4. Set **Messages lost** to 30%. Replication slows, because lost messages wait for a retransmission, but no committed entry ever changes.
+5. Crash two followers. Commits continue with 3 of 5. Crash a third: the leader keeps appending, but nothing commits.
+
+## Finding the point of agreement
+
+After an election, the leader sets every `nextIndex` to the end of its own log. A follower with a different suffix rejects the first `AppendEntries`, and the leader lowers `nextIndex` by one each time. This can take one round trip per entry. The paper (section 5.3) gives an optimization: the follower returns the term of the conflicting entry and the first index it holds for that term. Then the leader skips a whole term at a time. The authors add that they doubt it is needed in practice, since failures are rare. etcd sends a similar hint in its reject messages.
+
+## When an entry is committed
+
+An entry is **committed** when the leader knows it is safe to apply. For entries of its own term, the leader uses a simple rule: an entry is committed once a majority has it. It sets `commitIndex` to the highest such index. Followers apply up to `min(leaderCommit, index of their last new entry)`. A follower's entries after that index may still be old and wrong, so it must not apply them.
+
+A committed entry is never lost, because of the election restriction. The entry is on a majority. A winning candidate needs votes from a majority, and the two sets share at least one server. That server votes only for a candidate whose log is at least as up to date as its own.
+
+But this argument fails for an entry of an **older** term. A majority can hold such an entry while a server with a newer last term still wins an election. Figure 8 of the paper shows how.
+
+<Predict
+  id="figure-8"
+  question="S1 leads term 4. It finds that its entry from term 2 is on 3 of 5 servers. May it mark that entry committed?"
+  options={["Yes: a majority holds it", "No: S5, whose log ends in term 3, can still win an election and overwrite it", "Yes, but only after one more heartbeat"]}
+  answer={1}
+  explain="S2 and S3 hold the term 2 entry, and S5's last entry is from term 3. Term 3 is newer than term 2, so S2, S3 and S4 all vote for S5. S5 then overwrites index 2. If S1 had applied the entry, two servers would disagree forever."
+>
+<ConsensusRaftFigure8Demo />
+</Predict>
+
+1. Step through with the default settings. At step (c), index 2 is on S1, S2 and S3, but it stays dashed. At step (d), S5 wins and overwrites it. Nothing breaks, because the entry never committed.
+2. Turn on **Remove the current-term rule** and step again. At (c), S1 commits index 2 and applies `x=2` (the dot). At (d), S5 wins anyway, and the banner reports two broken properties.
+3. Select ending **(e)** with the rule on. S1 copies its term 4 entry to S2 and S3 before it crashes. That entry commits, and index 2 commits with it. S5 then loses every election: its last term 3 is older than term 4.
+
+So Raft has a second rule: a leader commits by counting replicas **only** entries of its current term. Older entries commit indirectly. When an entry of the current term commits, every entry before it commits too, by Log Matching.
+
+<Steps>
+<div>Take an entry E of term T committed by leader L. A majority holds E.</div>
+<div>Suppose a later leader U, of term U greater than T, is the first leader that lacks E. Some voter V of U also holds E, because the two majorities overlap.</div>
+<div>V voted for U, so U's log was at least as up to date as V's. If U's last term equals V's last term, U's log is at least as long, and by Log Matching it contains E.</div>
+<div>Otherwise U's last term is higher than V's. The leader of that newer term held E, because U is the first leader without it. U got that entry from that leader, and by Log Matching U holds E too. Both cases contradict the assumption.</div>
+<div>This argument needs E to be from term T of leader L, the leader that counted the majority. The current-term rule makes that true. This is the Leader Completeness proof of section 5.4.3, in short.</div>
+</Steps>
+
+There is a cost: a new leader cannot commit anything from earlier terms until a client sends a command. So a leader appends a **no-op** entry at the start of its term (dissertation section 6.4). The no-op commits within one round trip, and with it every older entry. It also tells the leader which entries are committed, which it needs before it can answer reads.
+
+## Applying, and what clients see
+
+Each server keeps `lastApplied` and applies entries from `lastApplied + 1` to `commitIndex` in order. The state machine must be deterministic. A command that reads the clock or a random number gives different results on different servers. Real systems put such values into the command itself.
+
+The leader replies to the client after it applies the entry. If the leader crashes before it replies, the client cannot know whether the command committed. So the client retries, often at a different server. For a command such as "add 1", a retry can apply it twice.
+
+<ConsensusRaftSessionDemo />
+
+1. Step through with the session turned off. The reply is lost, the client retries, and x ends at 2.
+2. Turn the session on and step again. The retry finds sequence number 1 in the leader's session table, and x stays at 1.
+
+The dissertation (section 6.3) gives the fix. Each client registers a **session** and numbers its commands. The state machine records, per client, the last sequence number it applied and its result. A duplicate gets the saved result and changes nothing. The session table is part of the replicated state, so every server has it and every snapshot contains it. Sessions must expire in the same way on every server, for example by log time, not by local clocks.
+
+```rust
+struct Session { last_seq: u64, last_result: Value }
+
+fn apply(&mut self, client: ClientId, seq: u64, cmd: Command) -> Value {
+    if let Some(s) = self.sessions.get(&client) {
+        if seq <= s.last_seq {
+            return s.last_result.clone(); // a retry: do not run it again
+        }
+    }
+    let result = self.state.execute(cmd);
+    self.sessions.insert(client, Session { last_seq: seq, last_result: result.clone() });
+    result
+}
+```
+
+## Throughput: batching and pipelining
+
+Each commit needs at least one round trip to a majority and one disk write on each of them. A leader that sends one entry and waits for the reply commits one entry per round trip. Two optimizations remove most of that limit (dissertation section 10.2.2).
+
+- **Batching** puts many entries into one `AppendEntries` and one disk write. It raises the throughput ceiling.
+- **Pipelining** sends the next `AppendEntries` before the previous reply arrives. The leader advances `nextIndex` optimistically. After a rejection, it goes back to probing one message at a time.
+
+The leader can also write to its own disk in parallel with the followers (section 10.2.1). It counts itself in the majority only after its own write finishes.
+
+<ConsensusRaftThroughputDemo />
+
+1. Read the red line. With 5 ms of one-way latency and a 2 ms disk write, a stop-and-wait leader commits 83 commands per second: one per 12 ms round. More clients only add queueing delay.
+2. Read the purple line (pipelining only). Latency stays near one round, but the throughput stops at 1,210 per second. The 16 messages in flight carry one entry each.
+3. Read the orange line (batching only). It reaches 3,638 per second, but its latency is 17.7 ms, because each batch waits for the previous reply.
+4. Read the blue line. With both, 64 clients get 4,756 commands per second at 13.4 ms. Raise the disk time to 8 ms and compare the lines again.
+
+etcd sets the library's `MaxSizePerMsg` to 1 MiB and `MaxInflightMsgs` to 512 for each follower. Its comment notes that 1 MiB per message is enough with a round trip near 10 ms.
+
+## Connect
+
+- [Raft leader election](/distributed/consensus/raft-leader-election): the election restriction that the commit rule depends on.
+- [Raft membership changes and snapshots](/distributed/consensus/raft-membership-changes-and-snapshots): how the log changes the cluster itself, and how it stays short.
+- [Write-ahead logging](/databases/recovery/write-ahead-logging) and [group commit](/databases/recovery/group-commit): a Raft log is a replicated write-ahead log, and batching is group commit across servers.
+- [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency): client sessions are idempotency keys built into the state machine.
+- [Linearizability](/distributed/consistency/linearizability): what Raft with sessions gives to clients, and why reads need care too.
+- [A Raft key-value store end to end](/distributed/capstone/a-raft-key-value-store-end-to-end): this log with a real state machine on top.
+
+<Recall cards={[
+  { q: "What does the AppendEntries consistency check compare, and which property does it give?", a: "The follower must hold an entry at prevLogIndex with term prevLogTerm. By induction it gives Log Matching: two logs with the same index and term at one entry are equal up to that entry." },
+  { q: "Why may a Raft leader not commit an entry of an older term by counting replicas?", a: "A majority may hold it while a server whose last entry has a newer term can still win an election and overwrite it (Figure 8). Only current-term entries commit by counting; older ones commit with them." },
+  { q: "Why does a new leader append a no-op entry?", a: "It cannot commit older entries by counting. The no-op is of its own term, so it commits in one round trip, and every earlier entry commits with it. Then the leader also knows its commit index for reads." },
+  { q: "Up to which index may a follower apply, given leaderCommit?", a: "min(leaderCommit, index of the last entry from this request). Entries after that may still conflict with the leader's log." },
+  { q: "How do client sessions stop duplicate commands?", a: "Each client numbers its commands. The state machine stores the last sequence number and result per client and returns the saved result for a retry. The table is replicated and in every snapshot." },
+  { q: "What do batching and pipelining each fix?", a: "Batching amortizes the per-message cost and disk write over many entries, so it raises the throughput ceiling. Pipelining keeps several AppendEntries in flight, so latency stays near one round trip under load." },
+]} />

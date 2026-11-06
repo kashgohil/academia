@@ -1,0 +1,134 @@
+---
+summary: "Locks on one server, on independent servers and on consensus. The Redlock algorithm, Kleppmann's critique and antirez's reply, efficiency locks versus correctness locks, and why a safe lock needs fencing on every access."
+---
+import { CoordRedlockDemo, CoordFencingCompareDemo } from "@/demos/dist/CoordLockDemos";
+
+A **distributed lock** lets one client at a time act on a shared resource: a file, a row, a job, a hardware device. The [previous lesson](/distributed/coordination/leases-and-fencing-tokens) showed that every such lock is a lease, because a holder can die. This lesson compares three ways to build one, and asks what "safe" must mean.
+
+First ask why you want the lock. Martin Kleppmann's post "How to do distributed locking" (8 February 2016) separates two cases:
+
+- An **efficiency lock** stops two clients from doing the same work twice. If it fails, a user may get the same email twice, or a job runs twice. That costs some money or time.
+- A **correctness lock** stops two clients from changing the same data at once. If it fails, the result can be a corrupt file, lost data or a permanent inconsistency.
+
+The two cases need different tools. For efficiency, a simple lock that is usually right is enough. For correctness, the lock alone is never enough, as this lesson shows.
+
+## Three designs
+
+| Design | Example | What breaks it |
+|---|---|---|
+| One server | Redis `SET key value NX PX ttl` on one instance | the server fails; with asynchronous replication, a failover can lose the lock |
+| Independent servers | Redlock on 5 Redis masters | clock jumps, restarts without persistence, process pauses |
+| Consensus | Chubby, ZooKeeper, etcd | process pauses of the holder: it still needs fencing |
+
+**One server.** The Redis documentation gives the single-instance lock as `SET resource_name my_random_value NX PX 30000`. `NX` sets the key only if it does not exist, and `PX` sets the expiry in milliseconds. The random value must be unique for each lock request. To release, the client deletes the key only if it still holds its own value.
+
+Redis 8.4 has `DELEX key IFEQ value` for this; older versions use a short Lua script. A plain `DEL` could delete a lock that another client took after this one expired.
+
+A replica does not make this safe. Redis replication is asynchronous, so a master can acknowledge the lock and crash before the replica has it. The promoted replica then gives the same lock to a second client.
+
+## Redlock
+
+**Redlock** is antirez's answer: use $N$ independent Redis masters, with no replication between them. The documentation uses $N = 5$. To acquire, a client does this:
+
+1. Read the current time in milliseconds.
+2. Send the `SET NX PX` command with the same key and random value to all $N$ instances in parallel. Use a short timeout for each one: for a 10 s TTL, 5 to 50 ms.
+3. Compute the elapsed time. The lock is held only if at least 3 of 5 instances said yes, and the elapsed time is less than the TTL.
+4. The **validity** is the TTL minus the elapsed time, minus a small allowance for drift.
+5. If the lock was not acquired, release it on all instances.
+
+The reference Ruby client, redlock-rb, sets the drift allowance to $\lfloor 0.01 \cdot \text{TTL} \rfloor + 2$ ms. For a TTL of 1000 ms that is 12 ms. A client that fails waits a random delay and tries again, so that clients do not keep splitting the votes.
+
+<Predict
+  id="redlock"
+  question="Client 1 holds the lock on A, B and C. D and E never saw its request. Then node C's clock jumps forward by one second. Client 2 can reach only C, D and E. Can it take the lock?"
+  options={[
+    "No: it needs 3 of 5, and C still holds client 1's key",
+    "Yes: the jump made the key on C expire, so client 2 gets C, D and E",
+    "Yes, but only after client 1's validity time has ended",
+  ]}
+  answer={1}
+  explain="C decides expiry by its own clock. The jump expires client 1's key at once, so C grants the lock again. Now both clients have a majority, and both believe they hold the lock. This is the first scenario in Kleppmann's post."
+>
+<CoordRedlockDemo />
+</Predict>
+
+The TTL is 1000 ms here, and the delays are 5 to 15 ms each way (model inputs). Client 2 starts to ask at 150 ms and retries after a random delay. A bar on a node is a key, in its owner's color.
+
+1. Read the default. Client 1 gets 3 of 5, because D and E are cut off. It waits for the 50 ms timeout, so its validity is $1000 - 50 - 12 = 938$ ms. Client 2 gets only 2 of 5 and keeps failing.
+2. Click **Clock jump on C**. Client 2 wins at once with C, D and E. Both clients hold the lock from 200 to 500 ms.
+3. Click **C restarts empty**. A Redis node with no persistence forgets the key after a restart, and the result is the same. Now select **restarts after one TTL**. Client 1's key has expired everywhere before C returns, so the lock is safe again.
+4. Click **GC pause**. There are no cuts: client 1 gets all 5, with validity 967 ms. It checks its lock, then stops for 1500 ms. The keys expire, client 2 takes the lock, and client 1 wakes and acts. Both hold it from 1,180 to 1,480 ms.
+5. Set the pause to 800 ms. Client 1 wakes with its keys still valid, and nothing breaks.
+
+## The critique
+
+Kleppmann's post makes these points against Redlock as a correctness lock:
+
+- **No fencing token.** Redlock's random value is unique but not ordered. So a storage service cannot tell an old holder from a new one. To produce a growing counter that survives failures, you would need consensus.
+- **Timing assumptions.** Redlock is safe only if nodes expire keys at about the right time. Network delay must also be small compared to the TTL, and pauses much shorter than the TTL. He calls this a synchronous system model with bounded delay, bounded pauses and bounded clock error.
+- **Clock jumps.** Step 2 is his first scenario. A wall-clock jump on one node gives two clients a majority.
+- **Pauses.** His second scenario is a GC pause while the replies are in flight. The keys expire, client 2 takes the lock, and client 1 then reads the old replies. Step 4 shows the case from the start of his post: a pause after the lock check.
+
+His advice: for efficiency, use one Redis node, not five. For correctness, use a consensus system such as ZooKeeper, and fence every access with a token. He calls Redlock "neither fish nor fowl": too heavy for efficiency, not safe enough for correctness.
+
+## The reply
+
+antirez replied in "Is Redlock safe?", which Kleppmann linked in an update on 9 February 2016. His points:
+
+- **Fencing.** If the storage can reject old tokens, it is already linearizable for that check, so it hardly needs a distributed lock. Without such a storage, the client can use the random value for a check-and-set on the resource instead of an ordered token.
+- **Pauses.** A pause after acquisition breaks every lock with automatic release, not only Redlock. Redlock reads the time before and after it acquires (steps 1 and 3), so a long delay during acquisition makes the lock invalid.
+- **Clocks.** Redlock needs a bound on drift, not synchronized clocks: it must count 10 seconds as, for example, 9.5 or 11.2. Operators must not step the clock, and NTP should slew it. He agreed that Redis should use the monotonic clock for this.
+
+His conclusion was that the post did not show a flaw in Redlock under its stated model. Both sides agree on one fact: a pause after the lock check can let an expired holder act. They disagree on whether bounded clocks and pauses are a reasonable model for a correctness lock. The Redis documentation now asks readers to consider both posts. It recommends fencing tokens, and it warns that Redis does not use a monotonic clock for TTL expiry.
+
+## What safe requires
+
+The second demo measures the claim directly. Three clients each increment a counter 12 times. Each increment takes a lease, reads the counter, checks the lease, sometimes pauses, and writes the counter plus one. The lease service gives a growing token, as a consensus-based service would.
+
+<CoordFencingCompareDemo />
+
+1. Read the table at a max pause of 600 ms, twice the TTL. Over 40 seeds, the lock alone acknowledged 1,440 increments, and 224 of them are not in the final values. Every seed lost something.
+2. Look at **token checked on writes only**. It lost 40 of 1,319 in 27 of 40 seeds. A paused client read the old value, and then the new holder read the same value. The paused client's write still passed, because the new holder had not yet written.
+3. Look at **token checked on every access**. It lost nothing. The storage rejected 180 late requests instead, and the clients knew those increments failed.
+4. Move the marker to 200 ms, below the TTL. No pause outlives a lease, and all three lose nothing.
+
+So "safe" needs more than a lock. The storage must take part:
+
+- Check the token on **every** read and write in the critical section, or
+- Make the write conditional on what was read: a compare-and-set on a version number, as in an etcd transaction, or
+- Make the operation idempotent, so that doing it twice does no harm.
+
+In etcd, the lock key's revision can be the token when the protected data is also in etcd. The write then compares the revision in the same transaction:
+
+```go
+// Write only while we still own the lock key we created.
+resp, err := cli.Txn(ctx).
+	If(clientv3.Compare(clientv3.CreateRevision(lockKey), "=", myRev)).
+	Then(clientv3.OpPut("/jobs/42/state", "done")).
+	Commit()
+if err == nil && !resp.Succeeded {
+	// The lock key is gone or was recreated: we are not the holder any more.
+}
+```
+
+## Lock services
+
+A **lock service** is a small consensus cluster that gives out locks with tokens. Chubby (Burrows, OSDI 2006) was built for coarse-grained locks, such as electing a primary that then works for hours or days. It gives sequencers and has a lock-delay. ZooKeeper has no lock primitive in the server: clients build locks from ephemeral sequential znodes. etcd builds its lock API on leases and revisions. The [next lesson](/distributed/coordination/zookeeper-and-etcd) shows both.
+
+Consensus makes the token correct, but it does not remove pauses. The etcd documentation says that its lock APIs "cannot be used as mutual exclusion mechanism by themselves". Jepsen's analysis of etcd 3.4.3 (Kyle Kingsbury, January 2020) found that its locks were "fundamentally unsafe". With 2-second TTLs and process pauses, a set protected by an etcd lock lost about 18% of acknowledged updates. The recommended fix is the one above: use the lock key's revision as a fencing token.
+
+## Connect
+
+- [Leases and fencing tokens](/distributed/coordination/leases-and-fencing-tokens): the pause and the margin, in one lease.
+- [Checking histories like Jepsen](/distributed/consistency/checking-histories-like-jepsen): how lost updates under locks are found.
+- [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency): the third way to make a late request harmless.
+- [Locks and spinlocks](/os/sync/locks-and-spinlocks): the same mutual exclusion inside one machine, where the hardware gives atomic instructions.
+
+<Recall cards={[
+  { q: "What is the difference between an efficiency lock and a correctness lock?", a: "If an efficiency lock fails, some work is done twice. If a correctness lock fails, data can be corrupted or lost. Only the second needs fencing." },
+  { q: "List Redlock's acquire steps.", a: "Read the time. Send SET NX PX to all N nodes in parallel, with a short timeout each. The lock is held if a majority said yes within the TTL. Validity is TTL − elapsed − drift. If it failed, release on all nodes." },
+  { q: "Why can Redlock not give a fencing token?", a: "Its value is random, not ordered. A growing counter that survives node failures would need consensus among the nodes, which Redlock does not have." },
+  { q: "Which point do Kleppmann and antirez agree on, and where do they disagree?", a: "Both agree that a pause after the lock check can let an expired holder act. They disagree on whether bounded clocks and pauses are an acceptable model for a lock that protects correctness." },
+  { q: "Why can fencing on writes only still lose an update in a read-modify-write?", a: "The old holder reads, pauses, and the new holder reads the same value. The old write still passes, because the storage has not seen the new token on a write yet. Then the new write overwrites it." },
+  { q: "What did Jepsen find for etcd 3.4.3 locks, and what fix did it suggest?", a: "Locks could be held by two processes at once; with 2 s TTLs and pauses, about 18% of acknowledged updates were lost. It suggested the lock key's revision as a fencing token." },
+]} />

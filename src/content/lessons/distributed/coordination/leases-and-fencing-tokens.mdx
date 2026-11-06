@@ -1,0 +1,144 @@
+---
+summary: "A lease is a lock with a timeout. Why process pauses and clock drift break it, the stale write of a paused client, fencing tokens that the storage checks, the safety margin a lease needs, and lease reads in Raft."
+---
+import { CoordLeaseTimelineDemo, CoordLeaseMarginDemo } from "@/demos/dist/CoordLeaseDemos";
+
+Many systems need one node to act alone: one primary for a database shard, one writer for a file, one worker for a job. A lock gives that right. But a lock in a distributed system has a problem that a mutex in one process does not have. The holder can crash, or a partition can cut it off. Then nobody can release the lock, and the system stops.
+
+A **lease** solves this with a timeout. A lease is a lock that is valid only for a fixed time, the **time to live** (TTL). The holder must **renew** the lease before the TTL runs out. If the holder crashes, it stops renewing, and the lease expires. Then the lock service can give it to another client. Cary Gray and David Cheriton described leases for file caches in "Leases: an efficient fault-tolerant mechanism for distributed file cache consistency" (SOSP 1989).
+
+The timeout fixes the crash case, but it adds a new one. A holder that is not dead, only slow, can still act after its lease expired. This lesson shows how that happens, and how a **fencing token** makes the damage impossible.
+
+<Predict
+  id="pause"
+  question="Client A holds a 600 ms lease. It checks the lease, and then a garbage-collection pause stops it for 900 ms before it sends a write. Meanwhile the lease expires and client B gets it. What does the storage do with A's write?"
+  options={[
+    "It rejects the write, because A's lease has expired",
+    "It accepts the write and replaces B's newer data",
+    "It never gets the write, because the lock service cancels it",
+  ]}
+  answer={1}
+  explain="The storage knows nothing about leases. A checked its lease before the pause, so A sends the write when it wakes. The storage accepts it, and B's data is lost. Only a check at the storage can stop this."
+>
+<CoordLeaseTimelineDemo />
+</Predict>
+
+The lock service, the clients and the storage run on the shared network model, with one-way delays of 5 to 15 ms. The TTL of 600 ms, the renewal every 200 ms and the write every 150 ms are model inputs.
+
+1. Read the default run. Lease 1 expires by the service's clock at 831 ms, during A's pause. B gets token 2 at 913 ms and writes twice. A wakes and sends write 103, which lands at 1,238 ms. The final value is 103, so B's data is gone. Both clients believed that they held the lease for 184 ms.
+2. Turn on **Storage checks fencing tokens**. The storage has seen token 2, so it rejects A's request with token 1. The final value stays 202.
+3. Move **Pause length** to 450 ms. A wakes in time to renew, and nothing goes wrong. At 600 ms, B gets the lease, but A's write still lands before B's first write. At 650 ms, the stale write comes after B's writes.
+4. Set the pause to start **before A checks**. A wakes, reads its clock, sees that the lease expired and stops. Now turn on **A's clock stops while A is paused**. The check passes, and the stale write lands at 1,245 ms.
+
+## Why a check cannot help
+
+A careful client checks its lease before each write. Step 1 shows why that is not enough. There is a gap between the check and the moment the write reaches the storage. Any delay in that gap can outlast the lease:
+
+- A stop-the-world **garbage-collection pause** in a JVM, Go or .NET process.
+- A **virtual machine** that the hypervisor stops, for example during a live migration. See [virtual machines and hypervisors](/os/isolation/virtual-machines-and-hypervisors).
+- A page fault that must read from a slow disk, or memory that the kernel has [swapped out](/os/memory/swapping-and-the-oom-killer).
+- A `SIGSTOP`, a debugger, or a busy CPU that does not run the thread.
+- A packet that waits in a queue or is sent again by TCP.
+
+None of these has a hard upper limit in a normal system. Martin Kleppmann's post "How to do distributed locking" (February 2016) describes this case, and notes that HBase used to have this problem. A check by the client moves the gap, but it cannot close it. The client cannot both check and act in one atomic step, because the check is local and the action is remote.
+
+## Two clocks
+
+The lease has two views of time. The service measures the TTL with its clock. The holder measures it with its own clock. Each must use a **monotonic clock**, which counts elapsed time and does not jump when NTP or an operator changes the time of day. See [physical clocks and drift](/distributed/time/physical-clocks-and-drift).
+
+Even a monotonic clock has a rate error, the **drift**. Quartz clocks in servers drift by tens of parts per million (ppm), and Spanner assumes a worst case of 200 ppm. The range of 1 to 100 ppm here is a model input. The holder also starts its timer before it sends the request. So its lease can only start earlier than the service's lease, which is the safe direction.
+
+Step 4 shows the worst case: a clock that stops. In this model, a paused VM resumes with its clock behind, and the guest corrects it only later. Then a check after the pause passes, although the lease has expired.
+
+Assume that each clock runs at most a fraction $\rho$ too fast or too slow. In the worst case the service clock is fast and the holder clock is slow. Assume also that the last request waits for a pause of at most $P$ and a network delay of at most $\delta$. The holder must stop a margin $m$ before its local TTL $T$ ends:
+
+$$
+\frac{T - m}{1 - \rho} + P + \delta \le \frac{T}{1 + \rho}
+\quad\Longrightarrow\quad
+m \ge T \cdot \frac{2\rho}{1 + \rho} + (1 - \rho)(P + \delta)
+$$
+
+<Predict
+  id="margin"
+  question="A lease lasts 10 s. Clocks drift by at most 100 ppm, and a message takes at most 10 ms. Which part of the safety margin is larger?"
+  options={[
+    "The drift part, because 10 s is a long time",
+    "The delay part: drift costs only about 2 ms of a 10 s lease",
+    "Both parts are about 1 s",
+  ]}
+  answer={1}
+  explain="The drift part is 10,000 ms × 2 × 0.0001 = 2 ms. The delay part is 10 ms. Realistic drift is cheap. Pauses and delays are the expensive part, and they have no hard bound."
+>
+<CoordLeaseMarginDemo />
+</Predict>
+
+1. Read the default: a 10 s lease, 100 ppm and 10 ms of delay need a margin of 12.0 ms. Only 2.0 ms of that comes from drift.
+2. Set **Max process pause** to 2000 ms. The margin becomes 2,012 ms, a fifth of the lease.
+3. Move the drift bound to 10,000 ppm (1%). The margin grows to 208 ms. Drift matters only for clocks that are badly broken.
+4. Set a short lease, such as 1 s, and a pause bound of 1 s. No usable lease is left.
+
+The margin has a real cost: the holder gives up that part of every lease. A system can pay it for drift and delay. It cannot pay it for pauses. A pause bound long enough for every GC, VM stall and swap storm is longer than any useful lease.
+
+## Fencing tokens
+
+So the protection must be at the resource itself. A **fencing token** is a number that the lock service increases on each grant. The client sends its token with every request to the storage. The storage remembers the highest token that it has seen, and it rejects any request with a lower token.
+
+```go
+// The storage side of fencing. It must run atomically with the write.
+func (s *Store) Write(token uint64, key string, value []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if token < s.maxToken {
+		return ErrStaleToken // an older holder woke up: refuse it
+	}
+	s.maxToken = token
+	s.data[key] = value
+	return nil
+}
+```
+
+The token turns a timing problem into an ordering problem. The storage does not need a clock, and the client does not need to know that it paused. A stale holder can still send a request, but the storage will refuse it after it has seen a newer token. Three rules make this work:
+
+- The token must grow with each grant, even across a crash of the lock service. So the service must store it durably, which in practice means consensus.
+- The storage must check the token and apply the request in one atomic step.
+- Every access in the critical section must carry the token. The next lesson shows that a check on writes only can still lose updates.
+
+Real systems call this by different names. Google's Chubby (Burrows, OSDI 2006) gives a **sequencer**: an opaque string with the lock name, the mode and a lock generation number. A server checks it against its Chubby cache, or against the most recent sequencer that it has seen.
+
+Chubby also has a **lock-delay** for servers that do not check sequencers. After a holder fails, nobody can take the lock for a time that the client chooses, up to one minute. Kleppmann points out that ZooKeeper's `zxid` or a znode version can serve as a token. The etcd documentation says that the revision number plays the same role.
+
+## Lease reads in Raft
+
+A Raft leader must prove that it is still the leader before it answers a read, as [linearizability](/distributed/consistency/linearizability) explains. The safe way is a round of heartbeats to a majority for each batch of reads. Ongaro's dissertation (section 6.4.1) describes a lease instead. When a majority acknowledges a heartbeat sent at time `start`, followers will not elect anyone for about an election timeout. So the leader may answer reads alone until:
+
+$$
+\text{start} + \frac{\text{election timeout}}{\text{drift bound}}
+$$
+
+Take an election timeout of 1000 ms, the etcd default, and a drift bound of 1.1. Then the leader may serve reads for 909 ms after it sent the heartbeat. The dissertation adds two warnings. The leader must let its lease expire before it transfers leadership. And scheduling, GC pauses and VM migration can break the drift bound. So the dissertation does not recommend this method unless performance needs it.
+
+etcd's Raft library has this as `ReadOnlyLeaseBased`. Its source comment says that it "can be affected by clock drift", and that `CheckQuorum` must be on. The default, `ReadOnlySafe`, uses the heartbeat round. A deposed leader that serves a lease read is the same bug as client A: an old holder that acts after a new one exists.
+
+| System | Lease | What stops a stale holder |
+|---|---|---|
+| Chubby | session lease, KeepAlive extends it by 12 s by default | sequencer checked by the server; lock-delay up to one minute |
+| ZooKeeper | session timeout, 2 to 20 times `tickTime` | `zxid` or znode version used as a token by the application |
+| etcd | lease with a TTL, kept alive by a stream | revision of the lock key, checked in a transaction |
+| Raft lease read | election timeout divided by the drift bound | `CheckQuorum`, and trust in the drift bound |
+
+## Connect
+
+- [Failure detectors](/distributed/foundations/failure-detectors): a lease is a failure detector with a contract. Expiry is a suspicion, not a proof of death.
+- [Physical clocks and drift](/distributed/time/physical-clocks-and-drift) and [NTP](/distributed/time/ntp-and-clock-synchronization): where the drift bound comes from.
+- [Raft leader election](/distributed/consensus/raft-leader-election): the term number is a fencing token for the leader's authority.
+- [Distributed locks](/distributed/coordination/distributed-locks): what fencing must check, and the Redlock debate.
+- [Futexes](/os/sync/futexes): inside one machine, the kernel checks the lock word atomically, so this problem does not arise.
+
+<Recall cards={[
+  { q: "Why does a lock in a distributed system need a timeout, and what new problem does the timeout add?", a: "Without it, a crashed or cut-off holder keeps the lock forever. With it, a holder that is only slow can act after the lease expired and another client holds it." },
+  { q: "Why can a client not protect itself by checking its lease before each write?", a: "A pause or a network delay can happen after the check and before the write reaches the storage. The check is local and the action is remote, so they are not one atomic step." },
+  { q: "What does the storage do with a fencing token?", a: "It remembers the highest token it has seen and rejects any request with a lower token, in the same atomic step as the operation." },
+  { q: "Which part of the safety margin of a lease cannot be bounded in practice?", a: "The process pause (GC, VM stall, swapping). Drift costs about 2 ms of a 10 s lease at 100 ppm; a pause bound long enough for all pauses leaves no usable lease." },
+  { q: "How long may a Raft leader serve lease reads, and what does it assume?", a: "Until start + election timeout / drift bound, where start is when it sent a heartbeat that a majority acknowledged. It assumes bounded clock drift; etcd requires CheckQuorum for this mode." },
+  { q: "What is Chubby's lock-delay, and why does it exist?", a: "After a holder fails, Chubby keeps the lock free for a delay of up to one minute. It protects servers that do not check sequencers from late requests of the old holder." },
+]} />

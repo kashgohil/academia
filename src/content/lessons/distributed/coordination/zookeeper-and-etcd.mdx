@@ -1,0 +1,158 @@
+---
+summary: "What a coordination service gives: a small store with linearizable writes, sessions or leases, ephemeral and sequential nodes, and watches. ZooKeeper's Zab and its read semantics, etcd's Raft, revisions and leases, and the recipes for leader election, service discovery and configuration."
+---
+import { CoordZkElectionDemo, CoordEtcdWatchDemo } from "@/demos/dist/CoordZkDemos";
+
+The last two lessons showed that locks and leases are hard to get right. Most systems do not build them from scratch. They use a **coordination service**: a small replicated store that a consensus protocol keeps consistent. Kafka used ZooKeeper for years, and Kubernetes keeps all API server data in etcd. The service gives a few primitives, and clients build leader election, locks, membership and configuration from them.
+
+The two common services are **ZooKeeper** and **etcd**. ZooKeeper is described in "ZooKeeper: Wait-free coordination for Internet-scale systems" (Hunt, Konar, Junqueira and Reed, USENIX ATC 2010). etcd runs [Raft](/distributed/consensus/raft-log-replication). They differ in details, but they give the same five things:
+
+| Primitive | ZooKeeper | etcd |
+|---|---|---|
+| Small store with ordered writes | znode tree, each change has a `zxid` | flat key space, each change has a revision |
+| Liveness of a client | session, with a session timeout | lease, with a TTL and keep-alives |
+| Data that dies with the client | ephemeral znode | key attached to a lease |
+| Unique ordered names | sequential znode | `create_revision` of a key |
+| Change notification | one-time watch (persistent since 3.6.0) | watch stream from any revision still in history |
+
+## ZooKeeper's data model
+
+ZooKeeper stores a tree of **znodes**, named like file paths. Each znode has a little data and a **stat** with counters. The **`zxid`** (ZooKeeper transaction id) orders every change in the whole service. `czxid` is the change that created the znode, `mzxid` the last one that modified it. `version` counts changes to its data, and `cversion` counts changes to its children.
+
+- An **ephemeral** znode lives only as long as the session that created it. It cannot have children.
+- A **sequential** znode gets a counter from its parent appended to its name. The format is `%010d`, ten digits with zero padding, so `n_` becomes `n_0000000007`. The counter is a signed 32-bit integer and wraps after 2147483647.
+- Version 3.5.3 added **container** znodes, which the server deletes when their last child goes, and **TTL** znodes, which are off by default.
+
+A **session** connects a client to the service. The client sends requests or heartbeats, and the cluster decides when the session has expired. The session timeout must be between 2 and 20 times `tickTime`. With the `tickTime=2000` of the sample configuration, that is 4 to 40 seconds. The paper says that the client library sends a heartbeat after a third of the timeout with no traffic. After two thirds with no answer, it moves to another server.
+
+A **watch** is a one-time trigger. A client sets one with `exists`, `getData` or `getChildren`, and the server sends one notification when that data changes. The server that the client talks to keeps the watch, so it is not replicated. ZooKeeper guarantees that a client sees the watch event before it sees the new data. Version 3.6.0 added persistent and recursive watches with `addWatch`, which do not clear after they fire.
+
+## Zab, and what a read sees
+
+All writes go to the ZooKeeper leader. The leader broadcasts each change with **Zab**, an atomic broadcast protocol with majority quorums. Zab delivers a leader's changes in the order it sent them. The paper states two guarantees:
+
+- **Linearizable writes**: all updates are serializable and respect precedence. The paper calls its version A-linearizability.
+- **FIFO client order**: the requests of one client run in the order the client sent them.
+
+Reads are different. Each server answers reads from its local copy, and Zab does not order them. That is why ZooKeeper reads scale with the number of servers. It is also why a read can be stale. The programmer's guide says that two clients may not see the same view at the same moment.
+
+For a fresh read, the client calls `sync` and then reads. The paper calls this a slow read: `sync` makes the server apply all pending writes before the read. As [linearizability](/distributed/consistency/linearizability) notes, `sync` does not go through the broadcast, so even this read rests on a timing assumption.
+
+## Leader election
+
+The ZooKeeper recipes page gives the standard election. Each candidate creates an ephemeral, sequential znode under `/election`, with a name like `guid-n_`. The smallest number is the leader. If the leader dies, its session expires, its znode goes away, and the next one takes over.
+
+<Predict
+  id="herd"
+  question="Five clients run the election, and each waiter watches the parent /election with getChildren. The leader dies. How many clients does ZooKeeper notify when its znode goes away?"
+  options={[
+    "One: the next in line",
+    "Four: every waiter, because each one watches the parent",
+    "None until the waiters poll again",
+  ]}
+  answer={1}
+  explain="A child watch on the parent fires for any change in its children. All four waiters wake up and list the children again, and three of them learn that they are still waiting. This is the herd effect."
+>
+<CoordZkElectionDemo />
+</Predict>
+
+The service here applies changes in `zxid` order on one server node, and the replication is left out. The tests also run the same tree as a state machine on the Raft cluster of the consensus module. The session timeout of 4000 ms is a model input, and the server checks for expired sessions every 100 ms.
+
+1. Click **Kill the leader**. Nothing happens for a few seconds: the service cannot tell a dead client from a slow one until the session times out. Then the znode goes away, and c2 becomes the leader.
+2. Look at the diagram. In predecessor mode, one notification goes to c2, which lists the children and sees that it is first.
+3. Select **the parent /election** and kill the leader again. Now 4 notifications go out, and 4 clients each list the children.
+4. Click c3 while it is not the leader. Its successor, c4, wakes up, lists the children and watches c2 instead. The leader does not change.
+5. Add clients and kill leaders one by one. Each change costs one notification in predecessor mode. In parent mode, the cost grows with the number of waiters.
+
+The recipe avoids the herd. Each client calls `getChildren` **without** a watch. If its znode is not the smallest, it calls `exists` with a watch on the znode just before its own. When that znode goes away, it lists the children again. It does not just assume that it leads, because the predecessor may have been a waiter that died, as in step 4.
+
+```go
+// The ZooKeeper election recipe, in outline.
+me, _ := conn.Create("/election/"+guid+"-n_", nil, zk.FlagEphemeral|zk.FlagSequence, acl)
+for {
+	kids, _, _ := conn.Children("/election") // no watch: avoid the herd
+	sort.Slice(kids, func(i, j int) bool { return seq(kids[i]) < seq(kids[j]) })
+	i := index(kids, path.Base(me)) // Children returns names, not paths
+	if i == 0 {
+		lead() // and still fence every action with a token
+		return
+	}
+	ok, _, ev, _ := conn.ExistsW("/election/" + kids[i-1]) // watch only the predecessor
+	if ok {
+		<-ev // NodeDeleted: check again, the predecessor may not have been the leader
+	}
+}
+```
+
+With 8 clients and 7 leaders killed one after another, the sim sends 7 notifications in predecessor mode and 35 in parent mode. Counting every request and reply except pings, that is 69 against 133 messages. In parent mode the total grows as $O(n^2)$. The `guid` in the name handles a lost reply to `create`. After a reconnect, the client lists the children and looks for its guid, so it does not create a second znode.
+
+Election does not remove the need for fencing. A leader that pauses for longer than its session timeout is replaced, but it may still act when it wakes. In the default run, the new leader took over 3,525 ms after the kill. That is less than the 4,000 ms timeout, because the dead client's last heartbeat came before the kill. The new leader should pass its znode's `czxid`, or another growing number, as a [fencing token](/distributed/coordination/leases-and-fencing-tokens).
+
+## etcd
+
+etcd is a key-value store on Raft. Every change gets the next value of one **revision** counter, a 64-bit number for the whole cluster. Each key keeps its `create_revision`, its `mod_revision`, and a `version` that counts changes since its creation. A transaction gets one revision for all the keys it changes. The store keeps old versions, as in [MVCC](/databases/transactions/mvcc). A **compaction** removes the history below some revision.
+
+Reads are linearizable by default: the leader confirms its role with a ReadIndex round. A client can ask for a serializable read, which a member answers from its local state and which may be stale. The API guarantees page says that watches are not linearizable.
+
+A **lease** replaces the session. A client grants a lease with a TTL in seconds, attaches keys to it, and refreshes it on a keep-alive stream. If no keep-alive arrives within the TTL, the lease expires, and etcd deletes every attached key.
+
+The source of etcd's lessor says that a newly elected leader renews the TTL of all leases. So a leader change does not expire them early. The leader can also save the remaining TTL with a checkpoint, so that a new leader does not reset it. In version 3.6 this is still an opt-in alpha feature, `LeaseCheckpoint`.
+
+A **watch** can start at any revision that is still in the history. `start_revision` is inclusive. The API guarantees page lists these properties of a watch:
+
+| Property | Meaning |
+|---|---|
+| Ordered | events come in revision order |
+| Unique | an event never comes twice on the same watch |
+| Reliable | no event is dropped inside the history window |
+| Atomic | the events of one revision come together |
+| Resumable | a broken watch can restart from its last revision, if that is still in history |
+| Bookmarkable | progress notifications say how far the watch has caught up |
+
+If the start revision has been compacted, the server cancels the watch and sets `compact_revision`. The client must then read the current state and watch from there.
+
+<Predict
+  id="resume"
+  question="A watcher received events up to revision 8. Then its connection broke for 400 ms, and the writer made 12 more changes. It reconnects with start_revision = 8. What happens?"
+  options={[
+    "It gets revisions 9 to 20 exactly once",
+    "It gets revision 8 again, then 9 to 20",
+    "It gets only the changes after the reconnect",
+  ]}
+  answer={1}
+  explain="start_revision is inclusive, so revision 8 comes again. A client must resume from its last revision + 1. Then the server replays exactly what was missed."
+>
+<CoordEtcdWatchDemo />
+</Predict>
+
+The writer changes 12 keys in turn, one change every 40 ms, for 30 changes. The server sends a progress message every 50 ms. The watcher counts the stream as broken after 150 ms of silence, or when a message of the stream is missing.
+
+1. Read the default: the cut lasts 400 ms, and the watcher resumes from its last revision + 1. All 30 revisions arrive once, in order.
+2. Select **last revision**. Revision 8 arrives twice.
+3. Select **now**. The new watch starts at the current revision, and 12 revisions are missing. Some keys in the watcher's copy now hold old values.
+4. Select **last revision + 1** and **the last 5 revisions**. The gap is compacted, so the watch is cancelled. The watcher reads the whole state again: it skips 12 events, but its copy is correct.
+
+etcd's election, in the `concurrency` package of the Go client, follows the ZooKeeper recipe. `Campaign` puts a key named after the election prefix and the session's lease ID, if that key does not exist. Then it waits until every key under the prefix with a smaller `create_revision` is deleted. It watches only the key with the largest such revision, from the revision of its read, so it misses no delete.
+
+## Recipes
+
+- **Service discovery.** Each instance creates an ephemeral znode, or a key with a lease, under `/services/name`. Clients list the directory and watch it. A crashed instance disappears when its session or lease ends.
+- **Configuration.** The paper's example uses a `ready` znode. A new leader deletes `ready`, changes the configuration znodes, then creates `ready` again. FIFO order and watch order mean that a client that sees `ready` also sees all the changes. The writes can be sent without waiting. The paper says that 5000 changes of about 2 ms each would take 10 seconds one after another, but under a second when pipelined.
+- **Locks and barriers.** The lock recipe is the election recipe, with an explicit delete to release. Barriers and queues also use sequential children and watches.
+
+## Connect
+
+- [Distributed locks](/distributed/coordination/distributed-locks): why the elected leader still needs fencing.
+- [Raft log replication](/distributed/consensus/raft-log-replication): the log under etcd.
+- [Linearizability](/distributed/consistency/linearizability): ReadIndex in etcd, and `sync` in ZooKeeper.
+- [Failure detectors](/distributed/foundations/failure-detectors): a session timeout is a fixed-timeout detector.
+- [Raft key-value store end to end](/distributed/capstone/a-raft-key-value-store-end-to-end): the capstone builds a store with these pieces.
+
+<Recall cards={[
+  { q: "What happens to an ephemeral znode, and to a key attached to an etcd lease, when the client dies?", a: "The service deletes it when the session times out or the lease TTL passes with no keep-alive. Watchers see a delete event." },
+  { q: "How does the election recipe avoid the herd effect?", a: "Each client lists the children without a watch, and watches only the znode just before its own. A deletion then wakes one client, not all of them." },
+  { q: "Why must a client re-list the children after its predecessor's znode goes away?", a: "The predecessor may have been a waiter that died, not the leader. A smaller znode may still exist, so the client must check before it leads." },
+  { q: "Are ZooKeeper reads linearizable? How does a client get a fresh read?", a: "No. Each server answers reads locally, so they can be stale. The client calls sync and then reads: the server applies pending writes first." },
+  { q: "A watcher saw revision r last. From which revision must it resume, and why?", a: "From r + 1, because start_revision is inclusive. From r it gets one event twice; from now it misses the gap." },
+  { q: "What must an etcd watcher do if its start revision was compacted?", a: "The server cancels the watch and sets compact_revision. The watcher reads the current state and starts a new watch after that read's revision." },
+]} />

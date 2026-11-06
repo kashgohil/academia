@@ -68,7 +68,9 @@ These are first-order models. Real engines add compression, which divides SA. Th
 
 The engine's WA is not the end. The file system can add its own (a journal, metadata updates), and the SSD adds device WA from garbage collection, as the [disks lesson](/databases/storage/disks-vs-ssds) showed. The factors multiply:
 
-$$\text{NAND bytes} = \text{user bytes} \times WA_{engine} \times WA_{fs} \times WA_{device}$$
+$$
+\text{NAND bytes} = \text{user bytes} \times WA_{engine} \times WA_{fs} \times WA_{device}
+$$
 
 The device factor depends on the *pattern* of the engine's writes. A B+ tree writes 4 KiB pages at random addresses, so each erase block holds a mix of live and dead pages. An LSM tree writes large files and deletes whole files. With TRIM, whole erase blocks become invalid together, and the device WA stays near 1.
 

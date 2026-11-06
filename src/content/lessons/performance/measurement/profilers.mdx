@@ -37,7 +37,9 @@ A **profiler** shows where a program spends its time. There are two types:
 
 Each sample is independent. A function that takes a fraction p of the time gets a share of samples with this standard error:
 
-$$\text{SE} = \sqrt{\frac{p(1-p)}{n}}$$
+$$
+\text{SE} = \sqrt{\frac{p(1-p)}{n}}
+$$
 
 With 1000 samples, a 25% function is correct within about ±2.7 points. Collect a few thousand samples in the code that you study. Ignore functions with only a few samples.
 

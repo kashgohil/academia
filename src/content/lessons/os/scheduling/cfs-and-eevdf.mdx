@@ -45,7 +45,9 @@ Each step is a factor of about 1.25. So a share depends only on the difference o
 
 The ideal processor gives each task time in proportion to its weight. So CFS scales the real run time of a task by the inverse of its weight. The result is **vruntime** (virtual runtime):
 
-$$\Delta v = \Delta t \cdot \frac{1024}{w}$$
+$$
+\Delta v = \Delta t \cdot \frac{1024}{w}
+$$
 
 A nice 0 task has a vruntime that follows real time. A task with a higher weight has a slower clock. If every task has the same vruntime, each task has received exactly its share. So the rule is simple: **run the task with the smallest vruntime**.
 
@@ -85,7 +87,9 @@ The kernel avoids a division here. `sched_prio_to_wmult` holds $2^{32} / w$ for 
 
 CFS did not use a fixed quantum. It tried to run every task once in each **period**, and it gave each task a part of the period in proportion to its weight:
 
-$$\text{slice}_i = \text{period} \cdot \frac{w_i}{\sum w}$$
+$$
+\text{slice}_i = \text{period} \cdot \frac{w_i}{\sum w}
+$$
 
 | Tunable | Base | On 8 or more CPUs | Meaning |
 |---|---|---|---|

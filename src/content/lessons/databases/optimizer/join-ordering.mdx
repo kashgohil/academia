@@ -40,7 +40,9 @@ Things to try:
 
 A **left-deep** tree joins one new base table at each step: $((A \bowtie B) \bowtie C) \bowtie D$. There are $n!$ of them, one for each order of the tables. A **bushy** tree may join two intermediate results. The number of binary tree shapes with $n$ leaves is the Catalan number $C_{n-1}$, and each shape can hold the tables in $n!$ orders:
 
-$$\text{bushy}(n) = C_{n-1} \cdot n! = \frac{(2n-2)!}{(n-1)!}$$
+$$
+\text{bushy}(n) = C_{n-1} \cdot n! = \frac{(2n-2)!}{(n-1)!}
+$$
 
 | Tables | Left-deep ($n!$) | Bushy ($C_{n-1} \cdot n!$) |
 |---|---|---|

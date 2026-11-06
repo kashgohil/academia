@@ -60,7 +60,9 @@ Redis uses this behaviour on purpose. `BGSAVE` forks a child. The child writes a
 
 Let $D$ be the number of pages and $w$ the writes during the snapshot, and assume that each write hits a random page. The expected number of copied pages is
 
-$$D\left(1 - \left(1 - \tfrac{1}{D}\right)^{w}\right) \approx D\left(1 - e^{-w/D}\right)$$
+$$
+D\left(1 - \left(1 - \tfrac{1}{D}\right)^{w}\right) \approx D\left(1 - e^{-w/D}\right)
+$$
 
 <SnapshotDemo />
 

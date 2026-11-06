@@ -52,7 +52,9 @@ The q-error in the demo is the standard measure of estimation error. For an esti
 
 `n_distinct` drives equality estimates (`col = const` for a value that is not an MCV) and the number of groups of a `GROUP BY`. ANALYZE estimates it from the sample with the **Duj1** estimator of Haas and Stokes:
 
-$$\hat D = \frac{n\,d}{n - f_1 + f_1\,n/N}$$
+$$
+\hat D = \frac{n\,d}{n - f_1 + f_1\,n/N}
+$$
 
 Here $n$ is the sample size, $d$ the distinct values in the sample, $f_1$ the values seen exactly once, and $N$ the table rows. A sample sees few of the rare values in a skewed column, so the estimate is often far too low. For a Zipf-distributed column of 1,000,000 rows with 120,613 distinct values, a 30,000-row sample gives 15,658. If you know better, set it: `ALTER TABLE t ALTER COLUMN c SET (n_distinct = 120000)`.
 

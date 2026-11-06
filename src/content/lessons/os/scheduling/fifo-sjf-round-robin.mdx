@@ -65,7 +65,9 @@ SJF has three problems. The kernel does not know burst lengths. A stream of shor
 
 For $n$ equal jobs that arrive together, the $i$-th job first runs after $i$ quanta and $i$ switches. With quantum $q$ and switch cost $c$:
 
-$$\bar{T}_{response} = \frac{(n-1)(q+c)}{2} \qquad \text{CPU lost to switches} = \frac{c}{q+c}$$
+$$
+\bar{T}_{response} = \frac{(n-1)(q+c)}{2} \qquad \text{CPU lost to switches} = \frac{c}{q+c}
+$$
 
 Both terms use $q + c$, so a smaller quantum helps response only while $q$ is larger than $c$.
 

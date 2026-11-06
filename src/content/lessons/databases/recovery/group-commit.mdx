@@ -30,7 +30,9 @@ Things to try:
 
 Let $F$ be the time of one flush. If each commit needs its own flush and flushes run one at a time, then:
 
-$$\text{commits/s} \le \frac{1}{F}, \qquad \text{latency} \approx F \times (\text{commits in the queue} + 1)$$
+$$
+\text{commits/s} \le \frac{1}{F}, \qquad \text{latency} \approx F \times (\text{commits in the queue} + 1)
+$$
 
 | Device | Flush time F | Limit of 1/F |
 |---|---|---|
@@ -90,11 +92,15 @@ In the demo, 8 clients give batches of 4, not 8. Assume that the CPU work of a t
 
 So the two cohorts take turns, and each flush carries $N/2$ commits:
 
-$$\text{commits/s} \approx \frac{N}{2F}, \qquad \text{latency} \approx 2F$$
+$$
+\text{commits/s} \approx \frac{N}{2F}, \qquad \text{latency} \approx 2F
+$$
 
 With 32 clients and $F = 8.33$ ms, this gives 1,920 commits/s, which is what the simulation shows. A **commit delay** $d$ breaks the pattern. The leader waits for $d$, so the other cohort joins the same flush:
 
-$$\text{commits/s} \approx \frac{N}{F + d + t_{cpu}}$$
+$$
+\text{commits/s} \approx \frac{N}{F + d + t_{cpu}}
+$$
 
 With $d$ = 1 ms, the simulation gives 3,384 commits/s and a latency of 9.0 ms. The delay makes commits faster, because each commit now waits for one flush, not two.
 

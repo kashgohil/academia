@@ -57,7 +57,9 @@ Things to try:
 
 A parser and a binder turn the SQL text into a tree. The direct translation of a `SELECT-FROM-WHERE` block is the **canonical form**. Take the cross product of the FROM tables, apply one selection with the whole WHERE clause, and put a projection on top.
 
-$$\pi_{e.name,\,p.pname}\big(\sigma_{e.did = d.did \,\wedge\, p.did = d.did \,\wedge\, d.city = \text{Berlin} \,\wedge\, p.budget > 100}((E \times D) \times P)\big)$$
+$$
+\pi_{e.name,\,p.pname}\big(\sigma_{e.did = d.did \,\wedge\, p.did = d.did \,\wedge\, d.city = \text{Berlin} \,\wedge\, p.budget > 100}((E \times D) \times P)\big)
+$$
 
 `GROUP BY` adds a γ above the selection, and `HAVING` adds a σ above the γ. `DISTINCT` adds a δ at the top. A correlated subquery becomes a **semi-join** (for `EXISTS` or `IN`) or an **anti-join** (for `NOT EXISTS`), when the engine can unnest it.
 

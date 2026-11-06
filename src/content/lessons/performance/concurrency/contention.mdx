@@ -28,7 +28,9 @@ Do these steps:
 
 Work inside a lock occurs one thread at a time. That part is **serial**. Amdahl's law gives the maximum speedup on n cores:
 
-$$\text{speedup} = \frac{1}{s + (1 - s)/n}$$
+$$
+\text{speedup} = \frac{1}{s + (1 - s)/n}
+$$
 
 Here, s is the serial part of the work.
 

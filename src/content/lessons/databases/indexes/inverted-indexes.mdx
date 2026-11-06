@@ -89,9 +89,13 @@ Lucene encodes doc id gaps in blocks of 128 with bit packing, and it encodes the
 
 A Boolean query returns a set. A search engine returns the best documents first. **BM25** (Robertson and others, 1990s) is the standard ranking function. It is the default in Lucene since version 6, and so in Elasticsearch and Solr. For a query with terms $t$, document $d$ of length $|d|$ and mean document length $\text{avgdl}$:
 
-$$\text{score}(d) = \sum_{t} \text{idf}(t) \cdot \frac{\text{tf}(t, d) \cdot (k_1 + 1)}{\text{tf}(t, d) + k_1 \left(1 - b + b \cdot \frac{|d|}{\text{avgdl}}\right)}$$
+$$
+\text{score}(d) = \sum_{t} \text{idf}(t) \cdot \frac{\text{tf}(t, d) \cdot (k_1 + 1)}{\text{tf}(t, d) + k_1 \left(1 - b + b \cdot \frac{|d|}{\text{avgdl}}\right)}
+$$
 
-$$\text{idf}(t) = \ln\left(1 + \frac{N - n_t + 0.5}{n_t + 0.5}\right)$$
+$$
+\text{idf}(t) = \ln\left(1 + \frac{N - n_t + 0.5}{n_t + 0.5}\right)
+$$
 
 Here $N$ is the number of documents and $n_t$ the number that contain $t$. Each part has a job:
 

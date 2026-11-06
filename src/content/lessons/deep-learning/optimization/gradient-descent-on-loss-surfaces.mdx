@@ -7,7 +7,9 @@ import { Tex } from "@/kit";
 
 To train a model, you make its **loss** small. The loss is one number that measures the error of the model. The model has parameters $\theta$. The **gradient** $\nabla L(\theta)$ points in the direction where the loss increases fastest. Gradient descent moves a small step in the opposite direction:
 
-$$\theta \leftarrow \theta - \eta\,\nabla L(\theta)$$
+$$
+\theta \leftarrow \theta - \eta\,\nabla L(\theta)
+$$
 
 The **learning rate** $\eta$ sets the size of each step. Real models have millions of parameters. But almost all problems of this update also occur with two parameters. These problems are oscillation, divergence, slow progress in flat directions, saddle points, and different end points. This lesson shows each problem in 2D. Then it calculates the numbers that are also true in high dimensions.
 

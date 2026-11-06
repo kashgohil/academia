@@ -17,7 +17,9 @@ The **tuple nested-loop join** is the definition, run directly. For each tuple o
 
 The **block nested-loop join** uses the memory. It fills B − 2 frames with a block of R pages. One frame reads S and one holds the output. S is scanned once per block:
 
-$$\text{cost} = M + \left\lceil \frac{M}{B - 2} \right\rceil \cdot N$$
+$$
+\text{cost} = M + \left\lceil \frac{M}{B - 2} \right\rceil \cdot N
+$$
 
 With B = 100, this is 6,500 I/Os. Put the smaller table outside: with B = 102, R outside costs 6,000 I/Os and S outside costs 5,500. When the whole smaller table fits in memory, the cost is M + N, and no algorithm can do better. MySQL used this algorithm, with a join buffer of `join_buffer_size` (256 KiB by default), until version 8.0.18 added hash joins.
 
@@ -49,7 +51,9 @@ But index nested loops win when the outer input is small. If a filter leaves 10 
 
 The **sort-merge join** sorts both inputs on the join key, then merges them. Two cursors start at the first tuples. If the keys differ, the cursor with the smaller key moves. If they are equal, the join outputs all pairs of the two groups with that key.
 
-$$\text{cost} = \text{sort}(M) + \text{sort}(N) + M + N, \qquad \text{sort}(X) = 2X \cdot \left(1 + \left\lceil \log_{B-1} \lceil X/B \rceil \right\rceil\right)$$
+$$
+\text{cost} = \text{sort}(M) + \text{sort}(N) + M + N, \qquad \text{sort}(X) = 2X \cdot \left(1 + \left\lceil \log_{B-1} \lceil X/B \rceil \right\rceil\right)
+$$
 
 With B = 100, each sort needs 2 passes, so the cost is 4,000 + 2,000 + 1,500 = 7,500 I/Os. An engine can merge the last sort runs inside the join, without writing the sorted tables. Then the cost drops to 3(M + N) = 4,500, if B is larger than the square root of the larger table. The [external sorting lesson](/databases/query/external-sorting-and-aggregation) derives the sort cost.
 
@@ -101,7 +105,9 @@ Each page is read, written and read again, so the cost is about 3(M + N) = 4,500
 
 Grace writes every partition to disk, even when memory has room for more. The **hybrid hash join** (DeWitt and others, 1984) keeps partition 0 of R in memory as a hash table. It writes only the other k partitions. Tuples of S that hash to partition 0 probe the table at once, and the join never writes them. The cost is
 
-$$M + N + 2(M - M_0) + 2(N - N_0)$$
+$$
+M + N + 2(M - M_0) + 2(N - N_0)
+$$
 
 where $M_0$ pages of R stay in memory, and $N_0$ is the share of S that matches them. With B = 100, the plan keeps 89 pages of R in memory, spills 10 partitions, and costs 4,234 I/Os. When R almost fits, hybrid hash costs almost M + N. Grace would still cost 3(M + N).
 

@@ -78,7 +78,9 @@ The price is space. With 100-byte rows, a page holds 75 rows at fill factor 100%
 
 A **sequential scan** reads every page of the heap in order and checks every row version on it. PostgreSQL estimates its cost as:
 
-$$\text{cost} = \text{pages} \times \texttt{seq\_page\_cost} + \text{versions} \times \texttt{cpu\_tuple\_cost}$$
+$$
+\text{cost} = \text{pages} \times \texttt{seq\_page\_cost} + \text{versions} \times \texttt{cpu\_tuple\_cost}
+$$
 
 The defaults are 1.0 per page and 0.01 per row version, plus 0.0025 per operator in the `WHERE` clause. The unit is "one sequential page read", so a random page read costs 4.0 by default.
 

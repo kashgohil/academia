@@ -33,7 +33,9 @@ The PostgreSQL documentation uses a table `tenk1` with 10,000 rows of 244 bytes 
 
 A **sequential scan** reads every page in order and checks every row:
 
-$$\text{cost} = \text{pages} \times \texttt{seq\_page\_cost} + \text{rows} \times (\texttt{cpu\_tuple\_cost} + n_\text{quals} \times \texttt{cpu\_operator\_cost})$$
+$$
+\text{cost} = \text{pages} \times \texttt{seq\_page\_cost} + \text{rows} \times (\texttt{cpu\_tuple\_cost} + n_\text{quals} \times \texttt{cpu\_operator\_cost})
+$$
 
 With no filter, that is $345 + 10{,}000 \times 0.01 = 445.00$. With one filter it is 470.00. These are the numbers that `EXPLAIN` prints in the documentation, and our model gives them exactly.
 

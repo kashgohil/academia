@@ -29,7 +29,9 @@ The rules of a B+ tree only say that pages are between half full and full. Where
 
 **Why $\ln 2$ for random keys?** A split makes two half-full pages. A page with more keys covers a wider key range, so it receives random inserts faster, and it fills and splits sooner. So pages spend more time near half full than near full. For a large order, the share of pages at fill x is proportional to $1/x^2$ on $[\tfrac12, 1]$. The mean fill is then
 
-$$\bar f = \frac{\int_{1/2}^{1} x \cdot x^{-2}\,dx}{\int_{1/2}^{1} x^{-2}\,dx} = \frac{\ln 2}{1} \approx 0.693.$$
+$$
+\bar f = \frac{\int_{1/2}^{1} x \cdot x^{-2}\,dx}{\int_{1/2}^{1} x^{-2}\,dx} = \frac{\ln 2}{1} \approx 0.693.
+$$
 
 Andrew Yao published this analysis of random B-trees in 1978. In the sim, 200,000 random keys into leaves of 100 keys give a mean fill of 69%.
 

@@ -34,7 +34,9 @@ The throughputs in this demo are model inputs, and the demo widens the watermark
 
 Each memory zone has three watermarks: **min**, **low** and **high**. The kernel computes them from two sysctls. `vm.min_free_kbytes` defaults to $\sqrt{16 \cdot \text{lowmem\_kB}}$, and it sets min. `vm.watermark_scale_factor` (default 10, which means 0.1% of memory) sets the gaps:
 
-$$\text{gap} = \max\left(\frac{\text{min}}{4},\ \frac{\text{managed} \times \text{scale}}{10000}\right), \quad \text{low} = \text{min} + \text{gap}, \quad \text{high} = \text{min} + 2\,\text{gap}$$
+$$
+\text{gap} = \max\left(\frac{\text{min}}{4},\ \frac{\text{managed} \times \text{scale}}{10000}\right), \quad \text{low} = \text{min} + \text{gap}, \quad \text{high} = \text{min} + 2\,\text{gap}
+$$
 
 On a 16 GiB machine with one zone, min is 16,384 kB, low is 33,161 kB and high is 49,938 kB. The whole band is about 0.3% of memory. Read the real values in `/proc/zoneinfo`.
 
@@ -48,7 +50,9 @@ Direct reclaim is not an error. It is backpressure: the allocator slows the task
 
 `get_scan_count()` in `mm/vmscan.c` decides how much to scan from each list. If the inactive file list is large, it scans only file pages. Otherwise, it splits the work using `vm.swappiness` (default 60, range 0 to 200):
 
-$$\text{anon share} : \text{file share} = \text{swappiness} : (200 - \text{swappiness})$$
+$$
+\text{anon share} : \text{file share} = \text{swappiness} : (200 - \text{swappiness})
+$$
 
 The kernel also weights this split by the recent cost of refaults. A value of 100 means that a swap I/O costs the same as a file I/O. A value of 0 does not disable swap: if the file cache is tiny, the kernel still swaps. A fast SSD or zswap makes a higher value sensible. Swap is useful even on a large machine, because it lets idle anonymous pages leave, and this leaves more room for file cache.
 

@@ -13,7 +13,9 @@ import { FragExplorerDemo } from "@/demos/AllocExtrasB";
 
 The demo measures external fragmentation as the part of free memory that is outside the largest free block:
 
-$$\text{external} = 1 - \frac{\text{largest free block}}{\text{total free memory}}$$
+$$
+\text{external} = 1 - \frac{\text{largest free block}}{\text{total free memory}}
+$$
 
 When this value is high, a large request can fail although much memory is free.
 

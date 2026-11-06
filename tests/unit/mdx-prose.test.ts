@@ -69,3 +69,14 @@ test("every pipe table parses, and every row has the same cell count as its head
   }
   expect(problems, problems.join("\n")).toEqual([]);
 }, 60_000);
+
+test("display math puts $$ on lines of its own, so that it renders as a block", () => {
+  // remark-math reads $$...$$ on one line as inline math: it then sits in the text and cannot scroll on a phone.
+  const problems = files(root).flatMap((f) =>
+    readFileSync(f, "utf8")
+      .replace(/```[\s\S]*?```/g, "")
+      .split("\n")
+      .flatMap((line, i) => (/^\s*\$\$.+\$\$\s*$/.test(line) ? [`${relative(root, f)} line ${i + 1}`] : [])),
+  );
+  expect(problems, problems.join("\n")).toEqual([]);
+});

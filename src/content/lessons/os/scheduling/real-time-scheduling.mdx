@@ -40,7 +40,9 @@ Suppose that EDF misses a deadline at time $t$. Go back to the last time $t_0$ w
 
 **RM: a lower bound.** Fixed priorities waste some capacity when the periods do not divide each other. The bound is sufficient for $n$ tasks, but it is not necessary:
 
-$$U \le n\left(2^{1/n} - 1\right)$$
+$$
+U \le n\left(2^{1/n} - 1\right)
+$$
 
 | $n$ | 1 | 2 | 3 | 4 | 5 | 10 | limit |
 |---|---|---|---|---|---|---|---|
@@ -48,7 +50,9 @@ $$U \le n\left(2^{1/n} - 1\right)$$
 
 The **exact** test is **response-time analysis** (Joseph and Pandya, 1986). The worst case is when all tasks release together. Iterate this to a fixed point, and compare the result with the deadline:
 
-$$R = C_i + \sum_{j \in hp(i)} \left\lceil \frac{R}{T_j} \right\rceil C_j$$
+$$
+R = C_i + \sum_{j \in hp(i)} \left\lceil \frac{R}{T_j} \right\rceil C_j
+$$
 
 For T2 in the default set, $R$ goes 4, 6, 8, 8. Since 8 is more than 7, T2 is late.
 

@@ -52,7 +52,9 @@ The weak point is the directory. Keys whose hashes share many low bits force man
 
 **Linear hashing** (Witold Litwin, 1980) has no directory. It keeps a **split pointer** `next` and a round number $L$. With $N_0$ starting buckets, a round has $M = N_0 \cdot 2^L$ buckets. The address of a key with hash $h$ is:
 
-$$a = h \bmod M, \quad \text{and if } a < \text{next}: \quad a = h \bmod 2M.$$
+$$
+a = h \bmod M, \quad \text{and if } a < \text{next}: \quad a = h \bmod 2M.
+$$
 
 Buckets before `next` have already split in this round, so they use the finer function. When the load factor passes a limit, the bucket at `next` splits, and `next` moves one step. The split bucket is usually not the bucket that overflowed. That bucket keeps its overflow page until the pointer reaches it. When `next` reaches $M$, the round ends, $L$ grows by one, and `next` goes back to 0.
 

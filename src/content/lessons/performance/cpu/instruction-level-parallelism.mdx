@@ -39,7 +39,9 @@ A loop runs at the slower of the two limits. Many simple loops are limited by la
 
 The number of independent chains that you need is:
 
-$$\text{chains} = \text{latency} \times \text{throughput} = 4 \times 2 = 8$$
+$$
+\text{chains} = \text{latency} \times \text{throughput} = 4 \times 2 = 8
+$$
 
 This is Little's law inside the core. To keep 2 adds per cycle running for 4 cycles each, 8 adds must be in progress at the same time.
 

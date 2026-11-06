@@ -36,14 +36,16 @@ export default function LessonPage() {
       {Body ? (
         <LessonContext.Provider value={{ path: l.path }}>
           <MDXProvider components={mdxComponents}>
-            <Suspense fallback={<p className="muted">Loading…</p>}>
-              <Body />
-            </Suspense>
+            <div className="prose">
+              <Suspense fallback={<p className="muted">Loading…</p>}>
+                <Body />
+              </Suspense>
+            </div>
           </MDXProvider>
         </LessonContext.Provider>
       ) : (
         <div className="empty">
-          <p style={{ marginTop: 0 }}>This lesson isn't written yet. It's part of <b>{m.title}</b>, which covers:</p>
+          <p style={{ marginTop: 0 }}>This lesson is not written yet. It is part of <b>{m.title}</b>, which covers:</p>
           <ul>
             {m.lessons.map((x) => <li key={x.slug} style={x.slug === l.slug ? { color: "var(--fg)" } : undefined}>{x.title}</li>)}
           </ul>

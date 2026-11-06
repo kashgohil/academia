@@ -33,6 +33,7 @@
   "devDependencies": {
     "@mdx-js/mdx": "3.1.1",
     "@mdx-js/rollup": "^3.1.1",
+    "@shikijs/rehype": "^4.6.0",
     "@types/d3-contour": "^3.0.6",
     "@types/d3-scale": "^4.0.9",
     "@types/d3-shape": "^3.2.0",
@@ -48,6 +49,7 @@
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0",
     "remark-mdx-frontmatter": "^6.0.0",
+    "shiki": "^4.6.0",
     "typescript": "^7.0.2",
     "vite": "^8.3.5",
     "vitest": "^5.1.0"

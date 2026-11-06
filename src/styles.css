@@ -95,7 +95,7 @@ h1, h2, h3, [id] { scroll-margin-top: 64px; }
 .count { font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
 
 .main { min-width: 0; padding: 32px 48px 96px; }
-.page { max-width: var(--measure); margin: 0 auto; }
+.page { max-width: var(--measure); margin: 0; }
 .page.wide { max-width: 960px; }
 
 .btn.menu-btn { display: none; flex: none; }
@@ -137,7 +137,14 @@ b .katex, strong .katex, .predict-q .katex, .stats b .katex { font-weight: bold;
 .katex-display { overflow-x: auto; overflow-y: hidden; padding: 6px 0 6px 1.5em; margin: 14px 0 18px; text-align: left; }
 .katex-display > .katex { text-align: left; }
 .tex-pending { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.88em; color: var(--muted); }
-.page pre { overflow-x: auto; max-width: 100%; }
+/* Code blocks. Shiki colors them at build time; these rules give the frame and pick the theme's colors. */
+.prose pre { overflow-x: auto; max-width: 100%; margin: 0 0 18px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--subtle) !important; font-size: 13px; line-height: 1.55; tab-size: 4; }
+.prose pre code { background: none; padding: 0; border-radius: 0; font-size: inherit; }
+.prose .shiki, .prose .shiki span { color: var(--shiki-light); }
+:root[data-theme="dark"] .prose .shiki, :root[data-theme="dark"] .prose .shiki span { color: var(--shiki-dark); }
+/* 3. Links in lesson text must look like links. */
+.prose a:not(.btn) { text-decoration: underline; text-decoration-color: var(--faint); text-underline-offset: 3px; text-decoration-thickness: 1px; }
+.prose a:not(.btn):hover { text-decoration-color: var(--fg); }
 /* Lesson tables only: demos style their own tables. display:block lets a wide table scroll inside the page. */
 .page table:not(.demo table) { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 0 0 18px; font-size: 14px; line-height: 1.45; font-variant-numeric: tabular-nums; }
 .page table:not(.demo table) th, .page table:not(.demo table) td { padding: 6px 14px 6px 0; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
@@ -187,8 +194,9 @@ b .katex, strong .katex, .predict-q .katex, .stats b .katex { font-weight: bold;
 
 /* ---------- demo kit ---------- */
 .demo { border: 1px solid var(--border); border-radius: var(--radius); margin: 24px 0; overflow: hidden; }
-.demo-head { display: flex; justify-content: space-between; align-items: center; padding: 8px 14px; border-bottom: 1px solid var(--border); font-size: 13px; }
-.demo-title { font-weight: 550; }
+.demo-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 6px 12px; padding: 8px 14px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.demo-head > .row { flex-wrap: wrap; gap: 6px; }
+.demo-title { font-weight: 550; flex: 1 1 220px; min-width: 0; }
 .demo-body { padding: 14px; }
 .demo-controls { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px 20px; padding: 12px 14px; border-top: 1px solid var(--border); background: var(--subtle); }
 .param { display: flex; flex-direction: column; gap: 3px; font-size: 12.5px; min-width: 0; }
@@ -254,3 +262,10 @@ b .katex, strong .katex, .predict-q .katex, .stats b .katex { font-weight: bold;
 .lesson-foot a:hover { color: var(--fg); }
 .lesson-foot small { display: block; color: var(--faint); font-size: 12px; }
 .empty { border: 1px dashed var(--border); border-radius: var(--radius); padding: 24px; color: var(--muted); }
+
+/* ---------- home ---------- */
+.start-list { list-style: none; margin: 0 0 32px; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.start-list a { display: block; background: var(--bg); padding: 12px 16px; height: 100%; }
+.start-list a:hover { background: var(--subtle); }
+.start-list b { display: block; font-weight: 550; }
+.start-list span { display: block; color: var(--muted); font-size: 13.5px; }

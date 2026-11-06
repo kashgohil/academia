@@ -6,6 +6,12 @@ export default function Home() {
   const done = useDone();
   const lessons = allLessons();
   const live = lessons.filter((l) => l.status === "live");
+  // One entry per track that has written lessons: its first written lesson, in curriculum order.
+  const started = TRACKS.flatMap((track) => {
+    const all = track.modules.flatMap((m) => m.lessons);
+    const written = all.filter((l) => l.status === "live");
+    return written.length ? [{ track, first: written[0]!, written: written.length, total: all.length }] : [];
+  });
 
   return (
     <div className="page wide">
@@ -15,15 +21,16 @@ export default function Home() {
         predict → play → explain → recall.
       </p>
 
-      {live.length > 0 && (
+      {started.length > 0 && (
         <>
           <h2 style={{ marginTop: 0 }}>Start here</h2>
-          <ul className="lesson-list" style={{ marginBottom: 32 }}>
-            {live.map((l) => (
-              <li key={l.path}>
-                <span className={`dot ${done.has(l.path) ? "done" : "live"}`} />
-                <Link to={`/${l.path}`} className="live">{l.title}</Link>
-                <span className="count">{l.track.title}</span>
+          <ul className="start-list">
+            {started.map(({ track: t, first, written, total }) => (
+              <li key={t.slug}>
+                <Link to={`/${first.path}`}>
+                  <b>{t.title}</b>
+                  <span>{written} of {total} lessons written · begins with {first.title}</span>
+                </Link>
               </li>
             ))}
           </ul>

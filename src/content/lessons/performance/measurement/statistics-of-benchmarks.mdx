@@ -51,7 +51,7 @@ With 40 benchmarks and a 5% false-positive rate, you can expect about 2 false "c
 <Recall cards={[
   { q: "Why compare medians and not means for timings?", a: "Timing noise has a long slow tail. A few slow outliers move the mean much more than the median." },
   { q: "How does a bootstrap interval for a speedup work?", a: "Resample both sets of timings many times, calculate the median ratio each time, and use the middle 95% of the ratios." },
-  { q: "How many more samples do you need to see half the effect?", a: "About 4 times as many, because the error decreases as 1/√n." },
+  { q: "How many more samples do you need to see half the effect?", a: "About 4 times as many, because the error decreases as $1/\\sqrt{n}$." },
   { q: "Why run A and B in turns?", a: "Slow changes in the machine (temperature, background load) then affect both versions equally." },
   { q: "40 benchmarks with a 5% false-positive rate: how many false changes?", a: "About 2." },
 ]} />

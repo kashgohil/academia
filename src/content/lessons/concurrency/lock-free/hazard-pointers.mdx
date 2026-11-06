@@ -57,9 +57,9 @@ The last two lessons showed the problem. A thread holds the address of a node, a
 <StressDemo configs={STRESS_HP} />
 
 - **Correct**: the stress test finds no violations for the stack or the queue. Hazard pointers also solve ABA, because nobody can free and reuse a protected node.
-- **Bounded memory**: at most H × T nodes are protected, with H slots for each of T threads. So the retired list of each thread stays below about R + H·T, *even if another thread stalls forever*. This is the main advantage over epoch-based reclamation (next lesson).
+- **Bounded memory**: at most $H \times T$ nodes are protected, with $H$ slots for each of $T$ threads. So the retired list of each thread stays below about $R + H \cdot T$, *even if another thread stalls forever*. This is the main advantage over epoch-based reclamation (next lesson).
 - **Cost for each access**: each protected pointer needs a store, a full fence and a second load. This is acceptable for occasional accesses. It is expensive when a thread walks a long list node by node.
-- **Scan cost**: if R is proportional to H·T, a scan costs O(1) per retired node on average. For example, R = 2·H·T gives at most 1 slot read for each freed node. Real scans sort or hash the set of hazard pointers to look up nodes fast.
+- **Scan cost**: if $R$ is proportional to $H \cdot T$, a scan costs $O(1)$ per retired node on average. For example, $R = 2 \cdot H \cdot T$ gives at most 1 slot read for each freed node. Real scans sort or hash the set of hazard pointers to look up nodes fast.
 
 C++26 adds `std::hazard_pointer`, based on the Folly library of Meta. Rust has the `haphazard` crate.
 

@@ -1,6 +1,6 @@
 /** Demos for the join algorithms lesson: a join stepper, an I/O cost plot, and Grace / hybrid hash partitioning. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, Plot, Line, RuleX, Legend, range, select, toggle, si, BAD, GOOD, MONO, Note, StepButtons, StepCaption, StepSlider, int, useStepper } from "../../kit";
+import { Demo, Param, Stats, Plot, Line, RuleX, Legend, range, select, toggle, si, BAD, GOOD, MONO, Note, StepButtons, StepCaption, StepSlider, int, useStepper, Tex, rich } from "../../kit";
 import {
   paged, nestedLoopJoin, blockNlj, indexNlj, sortMergeJoin, hashJoin, graceHashJoin, hybridHashJoin, hash32, joinCost, hybridPlan,
   uniformKeys, zipfKeys, type JoinEvent, type JoinResult, type JTuple, type JoinAlgo, type PagedRel,
@@ -293,9 +293,9 @@ export function GracePartitionDemo() {
   const textNow = s.i === 0
     ? `R has ${M} pages and S has ${N}, with B = ${B} frames. Press Play to hash every tuple into a partition.`
     : phase2
-      ? `Phase 2: join each pair R_i, S_i. A partition of R with at most B − 2 = ${cap} pages fits in memory. ${res.fallbacks ? `${res.fallbacks} partition${res.fallbacks === 1 ? "" : "s"} had one hot key and could not be split, so ${res.fallbacks === 1 ? "it uses" : "they use"} a nested-loop join.` : ""}`
+      ? `Phase 2: join each pair $R_i$, $S_i$. A partition of R with at most B − 2 = ${cap} pages fits in memory. ${res.fallbacks ? `${res.fallbacks} partition${res.fallbacks === 1 ? "" : "s"} had one hot key and could not be split, so ${res.fallbacks === 1 ? "it uses" : "they use"} a nested-loop join.` : ""}`
       : last && last.t === "part"
-        ? `${last.id} has key ${kOf.get(last.id)}: h1(${kOf.get(last.id)}) sends it to partition ${last.part}${last.mem ? ", which stays in memory" : ""}.`
+        ? `${last.id} has key ${kOf.get(last.id)}: $h_1(${kOf.get(last.id)})$ sends it to partition ${last.part}${last.mem ? ", which stays in memory" : ""}.`
         : "";
   return (
     <Demo
@@ -332,7 +332,7 @@ export function GracePartitionDemo() {
           );
         })}
       </div>
-      <StepCaption label={`${s.i}/${firstLevel.length + 1}`} tone={phase2 && res.fallbacks ? "bad" : null}>{textNow}</StepCaption>
+      <StepCaption label={`${s.i}/${firstLevel.length + 1}`} tone={phase2 && res.fallbacks ? "bad" : null}>{rich(textNow)}</StepCaption>
       <div style={{ height: 10 }} />
       <Stats items={[
         { label: "page reads", value: res.reads },
@@ -342,7 +342,7 @@ export function GracePartitionDemo() {
         { label: "partition joins (incl. recursive)", value: fitsInfo.length },
         { label: "output pairs (checked against nested loop)", value: `${res.pairs.length} = ${data.ref}` },
       ]} />
-      <Note>Keys are {skew ? "Zipf-distributed (key 0 is very common)" : "uniform over 0–39"}. 48 R tuples and 64 S tuples, 4 tuples per page. h1 is a 32-bit hash; {hyb ? `hybrid hash join puts the first ${hp!.memPages} / ${M} of the hash range in partition 0.` : `the partition is h1(key) mod ${B - 1}.`}{hybrid && !hyb ? ` With B = ${B}, no split keeps every spilled partition within B − 2 pages, so hybrid falls back to Grace.` : ""} Example: h1(7) mod {B - 1} = {hash32(7, 0) % (B - 1)}.</Note>
+      <Note>Keys are {skew ? "Zipf-distributed (key 0 is very common)" : "uniform over 0–39"}. 48 R tuples and 64 S tuples, 4 tuples per page. <Tex>{"h_1"}</Tex> is a 32-bit hash; {hyb ? `hybrid hash join puts the first ${hp!.memPages} / ${M} of the hash range in partition 0.` : `the partition is h1(key) mod ${B - 1}.`}{hybrid && !hyb ? ` With B = ${B}, no split keeps every spilled partition within B − 2 pages, so hybrid falls back to Grace.` : ""} Example: h1(7) mod {B - 1} = {hash32(7, 0) % (B - 1)}.</Note>
     </Demo>
   );
 }

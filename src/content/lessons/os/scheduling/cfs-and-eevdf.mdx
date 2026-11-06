@@ -49,7 +49,7 @@ $$\Delta v = \Delta t \cdot \frac{1024}{w}$$
 
 A nice 0 task has a vruntime that follows real time. A task with a higher weight has a slower clock. If every task has the same vruntime, each task has received exactly its share. So the rule is simple: **run the task with the smallest vruntime**.
 
-CFS keeps the waiting tasks in a **red-black tree** (a balanced binary search tree) ordered by vruntime. The leftmost node is the next task. The kernel caches a pointer to it (`rb_root_cached`), so the pick is O(1) and an insert is O(log n). The running task is not in the tree: `set_next_entity()` removes it, and `put_prev_entity()` inserts it again.
+CFS keeps the waiting tasks in a **red-black tree** (a balanced binary search tree) ordered by vruntime. The leftmost node is the next task. The kernel caches a pointer to it (`rb_root_cached`), so the pick is $O(1)$ and an insert is $O(\log n)$. The running task is not in the tree: `set_next_entity()` removes it, and `put_prev_entity()` inserts it again.
 
 ```c
 // kernel/sched/fair.c, simplified. curr is a struct sched_entity.
@@ -139,7 +139,7 @@ fn pick_eevdf<'a>(rq: &'a [Entity]) -> Option<&'a Entity> {
 }
 ```
 
-The kernel does not scan a list. It uses an augmented red-black tree, so that the search is O(log n). Each part of the rule has a job. A short request gives an early deadline, so the task runs soon. Eligibility stops it from taking more than its share: after it runs, it is ahead of $V$, and it must wait.
+The kernel does not scan a list. It uses an augmented red-black tree, so that the search is $O(\log n)$. Each part of the rule has a job. A short request gives an early deadline, so the task runs soon. Eligibility stops it from taking more than its share: after it runs, it is ahead of $V$, and it must wait.
 
 <Predict
   id="eevdf"

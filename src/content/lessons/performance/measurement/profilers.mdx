@@ -52,7 +52,7 @@ Instrumentation is good for exact call counts and for traces of one request (Ope
 
 <Recall cards={[
   { q: "How does a sampling profiler estimate the time of a function?", a: "It counts the share of periodic samples in which that function runs." },
-  { q: "What is the standard error of a sampled share p with n samples?", a: "√(p(1 − p) / n)." },
+  { q: "What is the standard error of a sampled share $p$ with $n$ samples?", a: "$\\sqrt{p(1 - p)/n}$." },
   { q: "Why does instrumentation give the wrong order of hotspots?", a: "It adds a fixed cost to each call. Short functions with many calls look much more expensive than they are." },
   { q: "What is skid?", a: "The profiler reports an instruction a little after the real one. Precise events (cycles:pp) decrease it." },
   { q: "What does a CPU sampling profiler not show?", a: "Time that a thread waits for I/O, locks or sleep (off-CPU time)." },

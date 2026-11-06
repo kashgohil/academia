@@ -56,14 +56,14 @@ A filter in a vectorized engine does not copy the rows that pass. It writes a **
   question="A batch has 16 rows. Filter 1 (a > 40) keeps 10 of them. On how many rows does filter 2 (b < 50) evaluate its predicate?"
   options={["16: every filter reads the whole batch", "10: only the positions in the selection vector", "8"]}
   answer={1}
-  explain="Filter 2 reads b only at the 10 positions of sel₁, and 8 rows pass. The two filters evaluate 26 predicates, not 32. The aggregate then reads a and b only at the 8 positions of sel₂, and no row is ever copied."
+  explain="Filter 2 reads b only at the 10 positions of $\text{sel}_1$, and 8 rows pass. The two filters evaluate 26 predicates, not 32. The aggregate then reads a and b only at the 8 positions of $\text{sel}_2$, and no row is ever copied."
 >
 <SelectionVectorDemo />
 </Predict>
 
 1. Move **Filter 1** to 90. Only 2 rows pass. Filter 2 evaluates just those 2, and most of column b is never read.
-2. Move **Filter 1** to 0. Every row passes, so sel₁ lists all 16 positions. A real engine skips the selection vector in this case and uses a flat loop.
-3. Select **SUM(a × b)**. The aggregate follows sel₂, so a batch can lose rows in many filters without any copy.
+2. Move **Filter 1** to 0. Every row passes, so $\text{sel}_1$ lists all 16 positions. A real engine skips the selection vector in this case and uses a flat loop.
+3. Select **SUM(a × b)**. The aggregate follows $\text{sel}_2$, so a batch can lose rows in many filters without any copy.
 
 A selection vector has a cost too. Access through it is indirect: `a[sel[j]]`, not `a[j]`. With few survivors, the batch is mostly empty, and each primitive call does little work. Some engines then **compact** the surviving rows into a new dense batch. DuckDB passes selection vectors between filters and projections, and it materializes dense vectors at pipeline breakers.
 

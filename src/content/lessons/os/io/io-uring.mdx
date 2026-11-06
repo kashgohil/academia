@@ -22,7 +22,7 @@ Things to try:
 1. Press **Write SQE 1** and **Write SQE 2**. The SQ tail moves, but the system call count stays at 0 and the kernel has seen nothing.
 2. Press **io_uring_enter**. One system call takes both operations. Finish operation 2 and then operation 1, then read the CQEs. The order is 2, 1.
 3. Write SQEs until the button stops. With 4 entries, the ring is full at `tail - head = 4`, with no empty slot. Compare this with [the descriptor ring](/os/io/device-drivers), which gives up one slot.
-4. Turn on **Start 3 steps before 2^32** and push some operations through. The tail wraps to 0, and the head is still near 4,294,967,296. The fill count stays correct.
+4. Turn on **Start 3 steps before $2^{32}$** and push some operations through. The tail wraps to 0, and the head is still near 4,294,967,296. The fill count stays correct.
 5. Turn on **SQPOLL**. Press **Write SQE** and **SQPOLL thread looks**. The kernel takes the operation with no system call. Then make the thread idle, and see that you need one call to wake it.
 
 ## The rings

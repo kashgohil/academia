@@ -37,9 +37,9 @@ Chips with tens of cores use a **network** instead. A network connects each core
 | Topology | Hops | Links | Where |
 |---|---|---|---|
 | Bus | 1 | 1 (shared) | small SMPs; the conceptual model |
-| Crossbar | 1 | n² | small core counts, GPUs between SMs and L2 slices |
-| Ring | ~n/4 | n | Intel client CPUs and older Xeons (ring bus through L3 slices) |
-| 2D mesh | ~2√n/3 | ~2n | Intel Xeon since Skylake-SP, many-core research chips |
+| Crossbar | 1 | $n^2$ | small core counts, GPUs between SMs and L2 slices |
+| Ring | ${\sim}n/4$ | $n$ | Intel client CPUs and older Xeons (ring bus through L3 slices) |
+| 2D mesh | ${\sim}2\sqrt{n}/3$ | ${\sim}2n$ | Intel Xeon since Skylake-SP, many-core research chips |
 | Chiplets + switch | 2 levels | — | AMD EPYC/Ryzen: core chiplets connected via an I/O die (Infinity Fabric) |
 
 Three numbers describe a network:
@@ -77,7 +77,7 @@ Most current servers use a **snoop filter**. It is a structure like a directory.
 
 <Recall cards={[
   { q: "Why does broadcast snooping stop scaling?", a: "Every cache sees every transaction. So traffic and lookups grow with the number of cores, even when only one or two cores share the line." },
-  { q: "What is the average number of hops on a ring and on a 2D mesh of n cores?", a: "About n/4 on a ring, and about 2√n/3 on a mesh." },
+  { q: "What is the average number of hops on a ring and on a 2D mesh of n cores?", a: "About $n/4$ on a ring, and about $2\\sqrt{n}/3$ on a mesh." },
   { q: "What does a directory store for each line?", a: "The coherence state and the set of sharers, for example a bit vector. It is kept at the home node of the line." },
   { q: "On what does the cost of a directory miss depend?", a: "On the number of actual sharers that it must invalidate or forward to, not on the total number of cores." },
   { q: "What is a snoop filter?", a: "A structure that records which cores may hold each line, so that only those cores are snooped." },

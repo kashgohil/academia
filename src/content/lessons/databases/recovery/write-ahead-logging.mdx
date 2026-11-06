@@ -133,7 +133,7 @@ A volatile write cache in the drive can acknowledge a flush before the data is s
 <Recall cards={[
   { q: "What are the two parts of the WAL rule?", a: "A page goes to disk only after the log records that changed it are durable. Commit returns only after all records of the transaction, including the commit record, are durable." },
   { q: "Which buffer pool policy makes undo necessary, and which makes redo necessary?", a: "STEAL (writing pages with uncommitted changes) makes undo necessary. NO-FORCE (not writing pages at commit) makes redo necessary." },
-  { q: "What is the pageLSN, and which check uses it?", a: "The LSN of the last record that changed the page, stored in the page header. Before a page write, the engine checks pageLSN <= flushedLSN." },
+  { q: "What is the pageLSN, and which check uses it?", a: "The LSN of the last record that changed the page, stored in the page header. Before a page write, the engine checks $\\text{pageLSN} \\le \\text{flushedLSN}$." },
   { q: "Why can PostgreSQL use a redo-only WAL with STEAL?", a: "MVCC keeps the old row versions in the table and pg_xact records commit status. Readers ignore versions of transactions that did not commit, so no undo is needed." },
   { q: "Why is STEAL + NO-FORCE the usual choice?", a: "Commit needs only one sequential log flush, hot pages absorb many updates before a write, and transactions are not limited by the buffer pool size." },
   { q: "What is an LSN in PostgreSQL and InnoDB?", a: "The byte offset of a record in the log stream. It only grows, so it orders all changes." },

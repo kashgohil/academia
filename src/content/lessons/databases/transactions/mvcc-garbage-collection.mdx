@@ -56,7 +56,7 @@ InnoDB keeps the newest version in the table, so its table does not fill with de
 
 ## Transaction id wraparound
 
-PostgreSQL stores xmin and xmax as 32-bit numbers. There are 2^32 = 4,294,967,296 transaction ids, and the counter wraps around. So "older" cannot mean "smaller". PostgreSQL compares two normal ids on a ring. Id a is older than id b when the 32-bit difference a − b is negative as a signed integer. Each id sees 2^31 = 2,147,483,648 ids in its past and the same number in its future.
+PostgreSQL stores xmin and xmax as 32-bit numbers. There are $2^{32} = 4{,}294{,}967{,}296$ transaction ids, and the counter wraps around. So "older" cannot mean "smaller". PostgreSQL compares two normal ids on a ring. Id a is older than id b when the 32-bit difference a − b is negative as a signed integer. Each id sees $2^{31} = 2{,}147{,}483{,}648$ ids in its past and the same number in its future.
 
 ```rust
 /// TransactionIdPrecedes for normal XIDs (3 and above): compare on a ring of 2^32.
@@ -70,7 +70,7 @@ fn xid_precedes(a: u32, b: u32) -> bool {
   question="A row was inserted and committed, and nobody ever froze it. Since then, 2.2 billion transactions have used ids. What does a new query see?"
   options={["The row, as usual", "Nothing: the row seems to be in the future, so it disappears", "An error that asks you to run VACUUM"]}
   answer={1}
-  explain="2.2 billion is more than 2^31. On the ring, the old xmin is now on the future side of the current id. The visibility rule then treats the row as written by a transaction that has not started yet. Freezing prevents this, and PostgreSQL refuses new ids before it can happen."
+  explain="2.2 billion is more than $2^{31}$. On the ring, the old xmin is now on the future side of the current id. The visibility rule then treats the row as written by a transaction that has not started yet. Freezing prevents this, and PostgreSQL refuses new ids before it can happen."
 >
 <XidRingDemo />
 </Predict>
@@ -96,6 +96,6 @@ If freezing cannot keep up, PostgreSQL warns when fewer than 40 million ids rema
   { q: "Name three things in PostgreSQL that can hold back the horizon.", a: "A long-running transaction, a session that is idle in transaction, and a slow or abandoned replication slot. A standby with hot_standby_feedback and a forgotten prepared transaction also do it." },
   { q: "When does autovacuum vacuum a table?", a: "When its dead tuples exceed autovacuum_vacuum_threshold + autovacuum_vacuum_scale_factor × reltuples, by default 50 + 0.2 × rows. It checks every autovacuum_naptime, 1 minute by default." },
   { q: "Why does a plain VACUUM not shrink the table file?", a: "It only marks the space of dead tuples as free for new rows in the free space map. Only empty pages at the end of the file are truncated. VACUUM FULL rewrites the table, under an exclusive lock." },
-  { q: "Why does PostgreSQL need to freeze tuples?", a: "XIDs are 32 bits and are compared on a ring with 2^31 ids in the past. An unfrozen xmin older than that would look like a future id, and the row would disappear. A frozen tuple counts as older than every id." },
+  { q: "Why does PostgreSQL need to freeze tuples?", a: "XIDs are 32 bits and are compared on a ring with $2^{31}$ ids in the past. An unfrozen xmin older than that would look like a future id, and the row would disappear. A frozen tuple counts as older than every id." },
   { q: "What does a growing InnoDB history list length tell you?", a: "Purge cannot remove committed undo records, usually because a long transaction holds an old read view. The undo log grows, and reads of old versions walk longer chains." },
 ]} />

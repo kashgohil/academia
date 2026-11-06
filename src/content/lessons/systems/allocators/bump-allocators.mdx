@@ -99,8 +99,8 @@ All other frees do nothing until the next reset. This is not a defect. It is the
 
 | Property | Bump |
 |---|---|
-| alloc | O(1), about 3 instructions |
-| free | O(1) at the top; otherwise it does nothing |
+| alloc | $O(1)$, about 3 instructions |
+| free | $O(1)$ at the top; otherwise it does nothing |
 | metadata per allocation | none |
 | locality | very good: allocations are next to each other, in program order |
 | fragmentation | none, until you need individual frees |

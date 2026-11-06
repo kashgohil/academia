@@ -16,7 +16,7 @@ Take a population, draw $n$ values, and calculate their average. Do this many ti
     "It is flat (uniform)",
   ]}
   answer={1}
-  explain="The skewness of a mean of n draws is γ/√n. The exponential has γ = 2, so at n = 30 the skewness is about 0.37. This is much smaller, but it is not zero. The Q-Q plot shows it as a small upward curve at the right end."
+  explain="The skewness of a mean of n draws is $\gamma/\sqrt{n}$. The exponential has γ = 2, so at n = 30 the skewness is about 0.37. This is much smaller, but it is not zero. The Q-Q plot shows it as a small upward curve at the right end."
 >
 <CltDemo />
 </Predict>
@@ -49,7 +49,7 @@ $$
 
 This statement has two separate parts:
 
-- **Location and scale.** $\mathbb E[\bar X_n] = \mu$ and $\operatorname{SD}(\bar X_n) = \sigma/\sqrt n$. These are exact for every $n$. They need only a finite variance and independence. In the first demo, compare *SD of means (observed)* with *σ/√n (theory)*.
+- **Location and scale.** $\mathbb E[\bar X_n] = \mu$ and $\operatorname{SD}(\bar X_n) = \sigma/\sqrt n$. These are exact for every $n$. They need only a finite variance and independence. In the first demo, compare *SD of means (observed)* with *$\sigma/\sqrt{n}$ (theory)*.
 - **Shape.** The distribution of the standardized mean approaches the normal curve. This is the real theorem. It is only a statement about the limit.
 
 <Callout title="The √n law in practice">
@@ -80,7 +80,7 @@ The next demo calculates the exact distribution of a sum of dice. It uses **conv
 </Predict>
 
 1. Select **Fair die** and press **Add a die**. One die is flat, two dice make a triangle, and three dice already look like a bell.
-2. Select **Loaded (mostly 1)**. Its skewness is 1.47. At n = 30, the skewness is 0.27, which is 1.47/√30.
+2. Select **Loaded (mostly 1)**. Its skewness is 1.47. At n = 30, the skewness is 0.27, which is $1.47/\sqrt{30}$.
 3. Look at the **largest CDF gap**. This is the largest difference between the cumulative distribution function (CDF) of the sum and the normal CDF. For the fair die, it decreases from 0.143 with one die to 0.021 with 30 dice.
 4. Select **Only 1 or 6**. The skewness is always 0, but the gap stays large: 0.072 at n = 30. The bars are 5 apart, so the CDF jumps in large steps.
 5. Compare the gap with the **Berry–Esseen limit**. The gap is always below the limit.
@@ -117,7 +117,7 @@ This is the *generalized* CLT. File sizes, city populations, wealth, insurance l
 **Cauchy** has no mean at all. The average of $n$ standard Cauchy draws is *exactly* standard Cauchy for every $n$. Averages do not help, because one very large draw controls each sum.
 
 <Callout kind="warn" title="Independence is as important as finite variance">
-Samples with a positive correlation have a standard error much larger than σ/√n. Examples are users in the same session, adjacent time points, and servers in the same rack. With correlation ρ between all pairs, $\operatorname{Var}(\bar X) = \frac{\sigma^2}{n}\big(1 + (n-1)\rho\big)$, so it never goes to zero. With n = 100 and ρ = 0.1, the variance is 10.9 times larger, and the standard error is 3.3 times larger. Time series and clustered A/B tests must include this effect.
+Samples with a positive correlation have a standard error much larger than $\sigma/\sqrt{n}$. Examples are users in the same session, adjacent time points, and servers in the same rack. With correlation ρ between all pairs, $\operatorname{Var}(\bar X) = \frac{\sigma^2}{n}\big(1 + (n-1)\rho\big)$, so it never goes to zero. With n = 100 and ρ = 0.1, the variance is 10.9 times larger, and the standard error is 3.3 times larger. Time series and clustered A/B tests must include this effect.
 </Callout>
 
 ## Why this is important in other areas
@@ -128,10 +128,10 @@ Samples with a positive correlation have a standard error much larger than σ/�
 - **Benchmarks**: the mean of a heavy-tailed latency distribution converges slowly. Report percentiles instead (Performance → Measurement).
 
 <Recall cards={[
-  { q: "State the CLT and its two main assumptions.", a: "For iid X with mean μ and finite variance σ², (X̄ − μ)/(σ/√n) converges in distribution to N(0,1). It needs independence and a finite variance." },
-  { q: "How does the standard error of a sample mean change with n? How much more data halves it?", a: "It is σ/√n. You need 4 times the data to halve it." },
-  { q: "At what rate does the skewness of a sample mean decrease?", a: "As γ/√n, where γ is the skewness of the population. Skewed populations converge more slowly." },
+  { q: "State the CLT and its two main assumptions.", a: "For iid $X$ with mean $\\mu$ and finite variance $\\sigma^2$, $(\\bar X - \\mu)/(\\sigma/\\sqrt{n})$ converges in distribution to $\\mathcal N(0, 1)$. It needs independence and a finite variance." },
+  { q: "How does the standard error of a sample mean change with n? How much more data halves it?", a: "It is $\\sigma/\\sqrt{n}$. You need 4 times the data to halve it." },
+  { q: "At what rate does the skewness of a sample mean decrease?", a: "As $\\gamma/\\sqrt{n}$, where $\\gamma$ is the skewness of the population. Skewed populations converge more slowly." },
   { q: "Why can a sum of symmetric dice be further from normal than a sum of skewed dice?", a: "If the values are far apart on a lattice, the CDF of the sum climbs in large jumps. A smooth normal CDF cannot follow these jumps." },
   { q: "What happens to the average of n standard Cauchy variables?", a: "It is exactly standard Cauchy for every n. The average does not concentrate at all." },
-  { q: "Pareto with 1 < α < 2: does the sample mean converge? Is the limit normal?", a: "It converges to μ, because the mean is finite. But the fluctuations decrease like n^(1/α − 1), and the limit is an α-stable law, not a normal law." },
+  { q: "Pareto with $1 < \\alpha < 2$: does the sample mean converge? Is the limit normal?", a: "It converges to μ, because the mean is finite. But the fluctuations decrease like $n^{1/\\alpha - 1}$, and the limit is an $\\alpha$-stable law, not a normal law." },
 ]} />

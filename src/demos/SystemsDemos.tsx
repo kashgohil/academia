@@ -153,7 +153,7 @@ export function FanoutDemo() {
   const bins = useMemo(() => { const h = histogram(cur.samples.map((x) => Math.log10(x)), 0.5, 3, 40); return h.map((b) => ({ x0: b.x0, x1: b.x1, y: b.count / cur.samples.length })); }, [cur]);
   return (
     <Demo title="One request waits for all of its backends" controls={<Param spec={range({ label: "Backends per request", min: 1, max: 200, default: 10, log: true, format: (v) => String(Math.round(v)) })} value={nRaw} onChange={(v) => setN(v as number)} />}>
-      <Stats items={[{ label: "requests slower than 50 ms", value: pct(cur.slowShare, 1) }, { label: "1 − 0.99ⁿ", value: pct(1 - 0.99 ** n, 1) }, { label: "request median", value: `${cur.p50.toFixed(0)} ms` }, { label: "request p99", value: `${cur.p99.toFixed(0)} ms` }]} />
+      <Stats items={[{ label: "requests slower than 50 ms", value: pct(cur.slowShare, 1) }, { label: "$1 - 0.99^n$", value: pct(1 - 0.99 ** n, 1) }, { label: "request median", value: `${cur.p50.toFixed(0)} ms` }, { label: "request p99", value: `${cur.p99.toFixed(0)} ms` }]} />
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 16, marginTop: 12 }}>
         <div>
           <div className="muted" style={{ fontSize: 12.5 }}>Request latency distribution (log scale)</div>

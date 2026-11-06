@@ -153,7 +153,7 @@ For 100,000 random keys and k = 10, the sim counts 100,411 comparisons. A full m
 
 <Recall cards={[
   { q: "What does pass 0 of external merge sort produce, and how many runs?", a: "Sorted runs of B pages each: it reads B pages, sorts them in memory and writes them back. It produces ceil(N / B) runs." },
-  { q: "Give the number of passes and the I/O cost of external merge sort.", a: "passes = 1 + ceil(log_(B−1)(ceil(N / B))). Each pass reads and writes all N pages, so the cost is 2N · passes." },
+  { q: "Give the number of passes and the I/O cost of external merge sort.", a: "$\\text{passes} = 1 + \\lceil \\log_{B-1} \\lceil N/B \\rceil \\rceil$. Each pass reads and writes all N pages, so the cost is $2N \\cdot \\text{passes}$." },
   { q: "About how much memory does a two-pass sort of N pages need, and why?", a: "About the square root of N frames. Two passes can sort B(B − 1) pages: runs of B pages, and B − 1 runs in one merge." },
   { q: "How long are replacement selection runs on random, sorted and reverse-sorted input?", a: "About 2M on random input, the whole input on sorted input, and exactly M on reverse-sorted input, where M is the heap size in records." },
   { q: "When does hash aggregation beat sort aggregation, and what does PostgreSQL 13 do when the groups do not fit?", a: "When the groups fit in memory: it reads the input once. When they do not fit, PostgreSQL keeps updating the groups in the table and writes rows of new groups to partitions on disk." },

@@ -1,6 +1,6 @@
 /** Demos for vectorized execution: the vector-size cost model, selection vectors, and branching vs branch-free selection. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, Plot, Line, Dots, RuleX, Legend, range, select, si, bytes, BAD, GOOD, MONO, Note, StepCaption } from "../../kit";
+import { Demo, Param, Stats, Plot, Line, Dots, RuleX, Legend, range, select, si, bytes, BAD, GOOD, MONO, Note, StepCaption, Tex, rich } from "../../kit";
 import { VEC_MODEL, vectorCost, bestVectorSize, fitsIn, DEMO_BATCH, selectionSteps, branchSim, BRANCH_MODEL } from "../../sims/db/query/vector";
 import { ACC, WARM } from "./QueryUi";
 
@@ -104,8 +104,8 @@ export function SelectionVectorDemo() {
         </table>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "6px 10px", alignItems: "center", margin: "10px 0", fontSize: 12.5 }}>
-        <span className="muted">sel₁ (a &gt; {x})</span>{vec(st.p1.sel, ACC)}
-        {stage !== "p1" && <><span className="muted">sel₂ (b &lt; {y})</span>{vec(st.p2.sel, GOOD)}</>}
+        <span className="muted"><Tex>{`\\text{sel}_1\\ (a > ${x})`}</Tex></span>{vec(st.p1.sel, ACC)}
+        {stage !== "p1" && <><span className="muted"><Tex>{`\\text{sel}_2\\ (b < ${y})`}</Tex></span>{vec(st.p2.sel, GOOD)}</>}
       </div>
       <pre style={{ fontFamily: MONO, fontSize: 12, margin: 0, padding: "8px 10px", background: "var(--subtle)", borderRadius: 6, overflowX: "auto", lineHeight: 1.5 }}>
         <span style={{ color: stage === "p1" ? ACC : "var(--muted)" }}>{"// filter 1: all 16 rows, no branch\nlet mut k = 0;\nfor i in 0..n { sel1[k] = i; k += (a[i] > x) as usize; }\n"}</span>
@@ -114,8 +114,8 @@ export function SelectionVectorDemo() {
       </pre>
       <StepCaption>
         {stage === "p1" && `Filter 1 tests a > ${x} on all 16 rows and writes the ${st.p1.sel.length} passing positions into a selection vector. No row is copied.`}
-        {stage === "p2" && `Filter 2 tests b < ${y} only on the ${st.p1.sel.length} positions in sel₁, and ${st.p2.sel.length} remain. Faded cells were never read.`}
-        {stage === "agg" && `The aggregate reads a and b only at the ${st.p2.sel.length} positions of sel₂: SUM(a × b) = ${sum}.`}
+        {stage === "p2" && rich(`Filter 2 tests b < ${y} only on the ${st.p1.sel.length} positions in $\\text{sel}_1$, and ${st.p2.sel.length} remain. Faded cells were never read.`)}
+        {stage === "agg" && rich(`The aggregate reads a and b only at the ${st.p2.sel.length} positions of $\\text{sel}_2$: SUM(a × b) = ${sum}.`)}
       </StepCaption>
       <div style={{ height: 10 }} />
       <Stats items={[

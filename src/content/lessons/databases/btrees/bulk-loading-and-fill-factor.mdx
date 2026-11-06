@@ -21,13 +21,13 @@ The rules of a B+ tree only say that pages are between half full and full. Where
 <FillOrderDemo />
 </Predict>
 
-1. Keep **random** order. The histogram spreads from 50% to 100%, with more leaves near the low end. The mean is close to the dashed line at ln 2 = 69.3%.
+1. Keep **random** order. The histogram spreads from 50% to 100%, with more leaves near the low end. The mean is close to the dashed line at $\ln 2 = 69.3\%$.
 2. Select **ascending**. All leaves except the last sit at one bar, at about half full. Then select **descending**: the same happens at the left edge of the tree.
 3. With ascending order, select **rightmost split**. The split now keeps the left page full and puts only the new key in the right page. The mean jumps to the value of the slider.
 4. Move **Rightmost split: left page keeps** to 90%. This is what PostgreSQL does for its default index fillfactor of 90.
 5. Compare **node writes** with the bulk-load numbers. One-by-one inserts write some pages many times.
 
-**Why ln 2 for random keys?** A split makes two half-full pages. A page with more keys covers a wider key range, so it receives random inserts faster, and it fills and splits sooner. So pages spend more time near half full than near full. For a large order, the share of pages at fill x is proportional to $1/x^2$ on $[\tfrac12, 1]$. The mean fill is then
+**Why $\ln 2$ for random keys?** A split makes two half-full pages. A page with more keys covers a wider key range, so it receives random inserts faster, and it fills and splits sooner. So pages spend more time near half full than near full. For a large order, the share of pages at fill x is proportional to $1/x^2$ on $[\tfrac12, 1]$. The mean fill is then
 
 $$\bar f = \frac{\int_{1/2}^{1} x \cdot x^{-2}\,dx}{\int_{1/2}^{1} x^{-2}\,dx} = \frac{\ln 2}{1} \approx 0.693.$$
 
@@ -130,7 +130,7 @@ A rebuild is not free. It reads and writes the whole index, and after it, a rand
 - The same trade-off of space now against work later in memory allocators: [fragmentation](/systems/allocators/fragmentation).
 
 <Recall cards={[
-  { q: "What is the mean leaf fill after many random inserts, and why is it not 75%?", a: "About ln 2 = 69%. Fuller pages cover wider key ranges, so they receive inserts faster and split sooner. So pages spend more time near half full." },
+  { q: "What is the mean leaf fill after many random inserts, and why is it not 75%?", a: "About $\\ln 2 = 69\\%$. Fuller pages cover wider key ranges, so they receive inserts faster and split sooner. So pages spend more time near half full." },
   { q: "Why do ascending inserts with half splits leave pages about 50% full?", a: "Every insert goes to the rightmost leaf. After a split, the left half never gets another key, so every page except the last stays half full." },
   { q: "What does the rightmost-split optimization do, and which engines use it?", a: "An insert overflows the rightmost page at its right end. The split keeps the left page full, or at the fillfactor, and puts the new key in a new page. PostgreSQL, InnoDB and SQLite do this." },
   { q: "List the steps of a bottom-up bulk load.", a: "Sort the keys. Fill leaves one after another to the target fill and link them. Collect the first key and page of each node, and build the level above from that list. Repeat until one root remains." },

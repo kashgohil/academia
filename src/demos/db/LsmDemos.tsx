@@ -303,7 +303,7 @@ export function SkipListDemo() {
         items={[
           { label: "comparisons, this search", value: search.comparisons },
           { label: "average over all keys", value: fixed(avg, 1) },
-          { label: "formula log₁/ₚ(n) / p", value: fixed(expectedSearchCost(nodes.length, p), 1) },
+          { label: "formula $\\log_{1/p}(n) / p$", value: fixed(expectedSearchCost(nodes.length, p), 1) },
           { label: "pointers per node (expected 1/(1−p))", value: `${fixed(nodes.reduce((s, x) => s + x.height, 0) / nodes.length, 2)} (${fixed(1 / (1 - p), 2)})` },
         ]}
       />

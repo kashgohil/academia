@@ -55,7 +55,7 @@ A crash point is a place where the state on the device can change. There are fiv
 
 The generator first runs a trace without crashes to list its I/O points. Then it picks one or more of them. Sometimes it adds a second crash point a little later, inside the recovery that follows. The heatmap shows where the power cuts landed: the kind of I/O against what the engine was doing.
 
-Some cells stay empty, and that is information too. A data-file fsync and a master write happen only in checkpoints and at the end of recovery. Redo never writes the log, because it only repeats records that are already durable. Rare cells, such as a page write during undo, need many runs. **Coverage-guided** selection gives a cell a weight of 1 / (1 + crashes there)², so rare cells get more crashes.
+Some cells stay empty, and that is information too. A data-file fsync and a master write happen only in checkpoints and at the end of recovery. Redo never writes the log, because it only repeats records that are already durable. Rare cells, such as a page write during undo, need many runs. **Coverage-guided** selection gives a cell a weight of $1 / (1 + \text{crashes there})^2$, so rare cells get more crashes.
 
 In the tests, 2,000 guided runs with 2 crash points each inject 7,417 power cuts. 1,136 of them hit recovery itself, and there is no violation.
 

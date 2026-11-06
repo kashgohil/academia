@@ -28,7 +28,7 @@ const INPUTS: { value: string; label: string; v: bigint }[] = [
   { value: "63", label: "63", v: 63n },
   { value: "64", label: "64", v: 64n },
   { value: "m1", label: "-1", v: -1n },
-  { value: "big", label: "2^40", v: 1n << 40n },
+  { value: "big", label: "$2^{40}$", v: 1n << 40n },
 ];
 
 function runProgram(prog: NonNullable<ReturnType<typeof compile>["prog"]>, rdi: bigint, packetLen: number) {
@@ -192,7 +192,7 @@ export function LatencyHistogramDemo() {
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(270px, 1fr))", gap: 12 }}>
         <div style={{ minWidth: 0 }}>
           <SmallLabel>The map after {SAMPLE_EVENTS} events: the real program ran once for each event.</SmallLabel>
-          <Plot x={[8, 28]} y={[0, maxY * 1.05]} height={200} xLabel="latency (log2 of ns)" yLabel="events" xTicks={[10, 14, 18, 22, 26]} xFormat={(t) => (t < 20 ? `${si(2 ** t * 1e-9, "s", 2)}` : si(2 ** t * 1e-9, "s", 2))}>
+          <Plot x={[8, 28]} y={[0, maxY * 1.05]} height={200} xLabel="latency (log₂ of ns)" yLabel="events" xTicks={[10, 14, 18, 22, 26]} xFormat={(t) => (t < 20 ? `${si(2 ** t * 1e-9, "s", 2)}` : si(2 ** t * 1e-9, "s", 2))}>
             <Bars bins={bins} color="var(--c1)" />
           </Plot>
           <div style={{ fontSize: 12.5, marginTop: 4, color: same ? "var(--c3)" : "var(--c4)" }}>{same ? "All 64 buckets match the histogram from every shipped event." : "The histograms differ."}</div>

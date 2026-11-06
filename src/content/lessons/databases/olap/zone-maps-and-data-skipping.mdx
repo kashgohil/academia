@@ -122,7 +122,7 @@ A Bloom filter costs much more space than a min/max pair, and it helps only equa
 
 <Recall cards={[
   { q: "What does a zone map store, and why can it never drop a matching row?", a: "The min and max of each column per block. A block that holds a matching value has a [min, max] range that overlaps the predicate, so it is always scanned." },
-  { q: "Why is a zone map almost useless on an unsorted column?", a: "Each block is a sample of the whole domain, so its [min, max] covers nearly everything. The chance to skip a block of n rows is l^n + (1 − h)^n, which is tiny." },
+  { q: "Why is a zone map almost useless on an unsorted column?", a: "Each block is a sample of the whole domain, so its [min, max] covers nearly everything. The chance to skip a block of $n$ rows is $l^n + (1 - h)^n$, which is tiny." },
   { q: "Rows are sorted by A. Which predicates prune well, and which do not?", a: "Predicates on A prune well, because each block covers a narrow range of A. Predicates on B do not prune, because each block holds B values from the whole domain." },
   { q: "What does Z-ordering do, and what does it trade?", a: "It sorts by interleaved bits of several columns, so each block covers a small square. Predicates on any of the columns prune, but less than a sort by that one column." },
   { q: "When does a Bloom filter per block help where min/max does not?", a: "For an equality or IN predicate on an unsorted, high-cardinality column. Min/max covers the whole range, but the filter can say the value is not in the block." },

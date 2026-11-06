@@ -24,7 +24,7 @@ const CONTRACTION = /\b\w+n't\b|\b\w+'(re|ve|ll|d)\b|\b(it|that|there|what|who|h
 
 /** Extracts checkable prose: paragraphs and list items, plus question/explain/q/a strings in JSX. */
 export function prose(src: string): string[] {
-  const strings = [...src.matchAll(/\b(question|explain|q|a)[=:]\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => m[2]!);
+  const strings = [...src.matchAll(/\b(question|explain|q|a)[=:]\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => m[2]!.replace(/(?<!\\)\$[^$]+?(?<!\\)\$/g, "X")); // math is one word, as in prose
   let s = src
     .replace(/^---[\s\S]*?---/, "")
     .replace(/```[\s\S]*?```/g, "")

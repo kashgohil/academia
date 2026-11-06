@@ -57,7 +57,7 @@ A **tagged pointer** puts a version counter next to the pointer, and the CAS com
 
 <TagBitsDemo />
 
-1. With **4 low bits**, click **Set to 2^4**. After 16 changes, the tag is 0 again. If the address is also A again, the CAS cannot see the change.
+1. With **4 low bits**, click **Set to $2^4$**. After 16 changes, the tag is 0 again. If the address is also A again, the CAS cannot see the change.
 2. Select **16 high bits**. The tag repeats only after 65,536 changes. A thread that sleeps for a long time can still miss exactly that number of changes, but it is much less likely.
 3. Select **Second word**. A 64-bit counter does not wrap in practice.
 

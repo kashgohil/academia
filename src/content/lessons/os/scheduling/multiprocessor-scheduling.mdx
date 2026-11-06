@@ -7,7 +7,7 @@ Scheduling on one CPU is a question of order. On many CPUs it is also a question
 
 The first design choice is the queue.
 
-- **A single shared queue.** Any CPU takes the next task. This balances load by itself. But each pick takes one global lock, and a task moves between CPUs at almost every turn. Linux had this design until the O(1) scheduler in 2.6.
+- **A single shared queue.** Any CPU takes the next task. This balances load by itself. But each pick takes one global lock, and a task moves between CPUs at almost every turn. Linux had this design until the $O(1)$ scheduler in 2.6.
 - **One queue per CPU.** Each CPU has its own runqueue (`struct rq` in Linux) and its own lock. A task stays on its CPU, so picks do not contend and caches stay warm. But one CPU can be idle while another has a long queue. This is **imbalance**, and it needs a **load balancer**.
 
 <Predict

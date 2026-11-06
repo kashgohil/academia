@@ -214,7 +214,7 @@ export function XidRingDemo() {
   const [mx, my] = pt(-FREEZE_MAX_AGE / XID_SPACE, R + 12);
   const [wx, wy] = pt(-(XID_HALF - WARN_REMAINING) / XID_SPACE, R + 12);
   return (
-    <Demo title="2^32 transaction ids on a ring" controls={<><Param spec={XID_SCHEMA.consumed} value={consumed} onChange={(v) => P.set("consumed", v as number)} /><Param spec={XID_SCHEMA.frozen} value={frozen} onChange={(v) => P.set("frozen", v as boolean)} /><Param spec={XID_SCHEMA.rate} value={rate} onChange={(v) => P.set("rate", v as number)} /></>}>
+    <Demo title="2³² transaction ids on a ring" controls={<><Param spec={XID_SCHEMA.consumed} value={consumed} onChange={(v) => P.set("consumed", v as number)} /><Param spec={XID_SCHEMA.frozen} value={frozen} onChange={(v) => P.set("frozen", v as boolean)} /><Param spec={XID_SCHEMA.rate} value={rate} onChange={(v) => P.set("rate", v as number)} /></>}>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(230px, 1fr))", gap: 12, alignItems: "center" }}>
         <svg viewBox="0 0 240 240" style={{ width: "100%", maxWidth: 300, display: "block", margin: "0 auto" }}>
           <path d={arc(-0.5, 0, R)} fill="none" stroke={GOOD} strokeWidth={14} opacity={0.35} />
@@ -252,7 +252,7 @@ export function XidRingDemo() {
         </div>
       </div>
       <Stats items={[
-        { label: "days until 2^31 ids at this rate", value: daysToWraparound(rate).toFixed(1) },
+        { label: "days until $2^{31}$ ids at this rate", value: daysToWraparound(rate).toFixed(1) },
         { label: "days between forced freeze vacuums", value: daysToForcedVacuum(rate).toFixed(1) },
       ]} />
     </Demo>

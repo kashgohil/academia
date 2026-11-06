@@ -1,6 +1,6 @@
 /** Demos for "Cost models": an access-path calculator, plan flips, and join methods vs outer rows. */
 import { useMemo } from "react";
-import { Demo, Param, Plot, Line, RuleX, RuleY, Dots, Legend, Stats, range, toggle, useParams, usePlot, pct, Note, SectionLabel, fixed, int, mono, seg } from "../../kit";
+import { Demo, Param, Plot, Line, RuleX, RuleY, Dots, Legend, Stats, range, toggle, useParams, usePlot, pct, Note, SectionLabel, fixed, int, mono, seg, Tex } from "../../kit";
 import {
   PG_DEFAULTS, TENK1, TENK1_UNIQUE1, EVENTS, EVENTS_TS, accessPaths, planFlips, limitedCost, PATH_LABEL, joinMethods, joinCrossover, JOIN_LABEL,
   type AccessPath, type CostParams, type PathCost, type JoinMethod,
@@ -80,7 +80,7 @@ export function CostCalculatorDemo() {
       </div>
       <SectionLabel>The planner keeps the cheapest path</SectionLabel>
       <pre style={{ ...mono, fontSize: 11.5, margin: 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{explain}</pre>
-      <Note>Formulas from PostgreSQL's costsize.c and btcostestimate(). The index part charges random_page_cost per leaf page; the heap part interpolates between random fetches and an in-order read with correlation².</Note>
+      <Note>Formulas from PostgreSQL's costsize.c and btcostestimate(). The index part charges random_page_cost per leaf page; the heap part interpolates between random fetches and an in-order read with <Tex>{"\\text{correlation}^2"}</Tex>.</Note>
     </Demo>
   );
 }

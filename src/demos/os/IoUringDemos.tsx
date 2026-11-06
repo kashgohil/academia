@@ -34,7 +34,7 @@ function Strip({ title, n, filled, head, tail, headName, tailName, rawHead, rawT
 
 const RG = {
   size: seg<"4" | "8">("SQ entries", [["4", "4"], ["8", "8"]], "4"),
-  wrap: toggle({ label: "Start 3 steps before 2^32", default: false }),
+  wrap: toggle({ label: "Start 3 steps before $2^{32}$", default: false }),
   sqpoll: toggle({ label: "SQPOLL: a kernel thread reads the SQ", default: false }),
 };
 

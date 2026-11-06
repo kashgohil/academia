@@ -31,7 +31,7 @@ ext2 keeps 15 pointers in the inode. The first 12 point at data blocks. The next
 
 <Steps>
 <div>A 4 KiB block holds 1,024 pointers of 4 bytes.</div>
-<div>The tree reaches 12 + 1,024 + 1,024² + 1,024³ blocks. That is 1,074,791,436 blocks.</div>
+<div>The tree reaches $12 + 1{,}024 + 1{,}024^2 + 1{,}024^3$ blocks. That is 1,074,791,436 blocks.</div>
 <div>At 4 KiB per block, the tree reaches about 4 TiB.</div>
 <div>The real limit is lower. `i_blocks` counts 512-byte units in 32 bits, so it stops at 2 TiB.</div>
 </Steps>

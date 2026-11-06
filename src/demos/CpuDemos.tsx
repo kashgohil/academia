@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Demo, Stats, Controls, Plot, Line, Dots, Legend, RuleX, RuleY, useParams, select, range, toggle, pct, useWidth } from "../kit";
+import { Demo, Stats, Controls, Plot, Line, Dots, Legend, RuleX, RuleY, useParams, select, range, toggle, pct, useWidth, rich } from "../kit";
 import { PREDICTORS, BRANCH_PATTERNS, makePredictor, mispredictRate, branchyCost, branchlessCost, MISPREDICT_PENALTY, schedule, sumOps, LOOPS, vectorize, type Op } from "../sims/perf/cpu";
 import { mulberry32 } from "../sims/rng";
 
@@ -131,7 +131,7 @@ export function SimdDemo() {
         </table>
       </div>
       <p className="muted" style={{ fontSize: 12, marginBottom: 0 }}>
-        {lanes === 1 ? "Scalar: one element per instruction." : `Each instruction processes ${lanes} lanes. At the end, a horizontal reduction adds the lanes together in log₂(${lanes}) = ${Math.log2(lanes)} shuffle-and-add steps.`}
+        {lanes === 1 ? "Scalar: one element per instruction." : rich(`Each instruction processes ${lanes} lanes. At the end, a horizontal reduction adds the lanes together in $\\log_2(${lanes}) = ${Math.log2(lanes)}$ shuffle-and-add steps.`)}
       </p>
     </Demo>
   );

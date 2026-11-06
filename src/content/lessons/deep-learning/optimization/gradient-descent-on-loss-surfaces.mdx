@@ -25,7 +25,7 @@ The bowl is **ill-conditioned**: it is 20 times more curved in y than in x. In t
 
 1. Turn off momentum and Adam. With SGD at η = 0.09, the path zig-zags across the narrow valley. It moves slowly along the long valley.
 2. Move the learning rate just above **0.1**. SGD diverges, and its curve in the lower plot goes up.
-3. Turn momentum on and set β to 0.5. Momentum gets the loss gap below 10⁻⁶ in 27 steps. SGD needs 86 steps.
+3. Turn momentum on and set β to 0.5. Momentum gets the loss gap below $10^{-6}$ in 27 steps. SGD needs 86 steps.
 4. Set β to 0.99. Momentum now circles the minimum for a long time. It has too much inertia.
 
 Then change the surface:
@@ -40,7 +40,7 @@ The contour plot is a map. The next demo shows the same surfaces as a landscape.
 
 <Predict
   id="momentum-09"
-  question="On the bowl with η = 0.09, SGD and momentum with β = 0.9 start at the same point. Which one first gets the loss gap below 10⁻⁶?"
+  question="On the bowl with η = 0.09, SGD and momentum with β = 0.9 start at the same point. Which one first gets the loss gap below $10^{-6}$?"
   options={["Momentum, because it accelerates along the flat valley", "SGD", "They need the same number of steps"]}
   answer={1}
   explain="SGD needs 86 steps. Momentum with β = 0.9 needs 170 steps. Its velocity carries it past the minimum again and again, and it circles for a long time. With β = 0.5, momentum needs only 27 steps."
@@ -51,9 +51,9 @@ The contour plot is a map. The next demo shows the same surfaces as a landscape.
 Things to try:
 
 1. Drag the view to look along the narrow valley. The red SGD ball jumps from wall to wall. The blue momentum ball swings past the minimum many times.
-2. Set β to **0.5**. Momentum now gets the gap below 10⁻⁶ at step 27, before SGD.
+2. Set β to **0.5**. Momentum now gets the gap below $10^{-6}$ at step 27, before SGD.
 3. Select **Himmelblau** and set η to **0.01**. SGD rolls into the minimum at (3, 2). Momentum with β = 0.9 starts at the same point. Its speed carries it over a ridge into the minimum near (3.58, −1.85).
-4. Select **Rosenbrock valley** with η = 0.01. SGD reaches the floor of the curved valley quickly. After 400 steps, its loss is still 0.0225. Momentum gets below 10⁻⁶ at step 163.
+4. Select **Rosenbrock valley** with η = 0.01. SGD reaches the floor of the curved valley quickly. After 400 steps, its loss is still 0.0225. Momentum gets below $10^{-6}$ at step 163.
 5. Select **Saddle point**. The surface curves up in x and down in y. SGD balances on the ridge for many steps. Then it rolls down to one of the two minima.
 
 ## The quadratic model
@@ -80,7 +80,7 @@ The heavy-ball method keeps a velocity $v$: $v \leftarrow \beta v + \nabla L$, t
 - In the steep direction, the gradient changes sign at each step. These gradients cancel in $v$, so the zig-zag becomes smaller.
 - In the flat direction, the gradient keeps the same sign. These gradients add up in $v$, so the step grows to almost $\eta/(1-\beta)$.
 
-With the best $\eta$ and $\beta$, the factor per step becomes $\dfrac{\sqrt\kappa - 1}{\sqrt\kappa + 1}$. For the bowl, the best values are η ≈ 0.13 and β ≈ 0.40. The factor is then 0.63 instead of 0.905. So the error becomes 10 times smaller in about 5 steps, not 23 steps. For κ = 10⁴, the difference is about 115 steps against about 11,500 steps.
+With the best $\eta$ and $\beta$, the factor per step becomes $\dfrac{\sqrt\kappa - 1}{\sqrt\kappa + 1}$. For the bowl, the best values are η ≈ 0.13 and β ≈ 0.40. The factor is then 0.63 instead of 0.905. So the error becomes 10 times smaller in about 5 steps, not 23 steps. For $\kappa = 10^4$, the difference is about 115 steps against about 11,500 steps.
 
 Momentum is not always faster. A β that is too high makes the ball overshoot and circle. On the bowl at η = 0.09, β = 0.9 needs 170 steps, and β = 0.99 does not converge in 400 steps.
 
@@ -101,10 +101,10 @@ A **minibatch** is a small random part of the training data. A minibatch gradien
 - **The minimum that you reach depends on the start and on the step size.** A large learning rate cannot stay in a minimum with a curvature above $2/\eta$. So training prefers flat minima. This *implicit bias* is linked to better generalization. Training often stays exactly at this limit. This effect is the "edge of stability".
 
 <Recall cards={[
-  { q: "What is the largest stable learning rate for gradient descent on a quadratic with Hessian H?", a: "η < 2/λ_max. λ_max is the largest eigenvalue of H, the sharpest curvature." },
-  { q: "What is the best factor per step for gradient descent on a quadratic with condition number κ?", a: "(κ − 1)/(κ + 1), at η = 2/(λ_max + λ_min)." },
-  { q: "Heavy-ball momentum improves the factor per step to what?", a: "(√κ − 1)/(√κ + 1). The factor now depends on √κ, not on κ." },
+  { q: "What is the largest stable learning rate for gradient descent on a quadratic with Hessian H?", a: "$\\eta < 2/\\lambda_{\\max}$. $\\lambda_{\\max}$ is the largest eigenvalue of $H$, the sharpest curvature." },
+  { q: "What is the best factor per step for gradient descent on a quadratic with condition number κ?", a: "$(\\kappa - 1)/(\\kappa + 1)$, at $\\eta = 2/(\\lambda_{\\max} + \\lambda_{\\min})$." },
+  { q: "Heavy-ball momentum improves the factor per step to what?", a: "$(\\sqrt\\kappa - 1)/(\\sqrt\\kappa + 1)$. The factor now depends on $\\sqrt\\kappa$, not on $\\kappa$." },
   { q: "Why does Adam converge quickly on an ill-conditioned bowl whose axes are the coordinate axes?", a: "It divides the step of each coordinate by the RMS gradient of that coordinate. So the step size is almost equal in all directions." },
-  { q: "Why does SGD with a constant learning rate not converge to the exact minimum?", a: "Gradient noise keeps it moving in a cloud whose size grows with η·σ². A decreasing η makes the cloud smaller." },
-  { q: "Gradient descent is which numerical method applied to which equation?", a: "Explicit Euler applied to the gradient flow dθ/dt = −∇L." },
+  { q: "Why does SGD with a constant learning rate not converge to the exact minimum?", a: "Gradient noise keeps it moving in a cloud whose size grows with $\\eta \\cdot \\sigma^2$. A decreasing $\\eta$ makes the cloud smaller." },
+  { q: "Gradient descent is which numerical method applied to which equation?", a: "Explicit Euler applied to the gradient flow $d\\theta/dt = -\\nabla L$." },
 ]} />

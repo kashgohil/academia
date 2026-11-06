@@ -266,7 +266,7 @@ export function TagBitsDemo() {
         {same ? `The tag wrapped back to 0 after ${changes.toLocaleString("en-US")} changes. If the address is A again, T0's CAS succeeds: ABA is back.` : `The tags differ, so T0's CAS fails and T0 tries again. This is correct.`}
       </p>
       <Stats items={[
-        { label: "tag values before it repeats", value: bits < 53 ? `2^${bits} = ${wrap.toLocaleString("en-US")}` : "2^64 ≈ 1.8 × 10^19" },
+        { label: "tag values before it repeats", value: bits < 53 ? `$2^{${bits}} = ${wrap.toLocaleString("en-US").replaceAll(",", "{,}")}$` : "$2^{64} \\approx 1.8 \\times 10^{19}$" },
         { label: "changes while T0 sleeps", value: changes.toLocaleString("en-US") },
       ]} />
     </Demo>

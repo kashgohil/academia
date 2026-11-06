@@ -6,7 +6,7 @@ import { PoolFreeListDemo, SafeLinkingDemo } from "@/demos/AllocExtrasA";
 
 Sometimes all objects have the same size: particles, network packets, tree nodes or kernel inodes. Then you do not need a general allocator. A **pool allocator** cuts a buffer into equal **slots** and keeps the free slots on a linked list.
 
-The important idea is this: a free slot holds no data. So **the free slot itself stores the "next" pointer** of the list. A list that is stored inside the items in this way is an **intrusive list**. The result is zero metadata, O(1) allocate and free, and no external fragmentation for that size.
+The important idea is this: a free slot holds no data. So **the free slot itself stores the "next" pointer** of the list. A list that is stored inside the items in this way is an **intrusive list**. The result is zero metadata, $O(1)$ allocate and free, and no external fragmentation for that size.
 
 <Predict
   id="lifo"

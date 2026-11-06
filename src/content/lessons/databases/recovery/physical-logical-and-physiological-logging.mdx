@@ -41,7 +41,7 @@ Recovery cannot know how much of the work reached disk. The buffer pool may have
     "Recovery stops with an error",
   ]}
   answer={1}
-  explain="'Set qty to 7' and 'delete slot 0' give the same result twice. 'Insert cyd into the page' does not: it adds a second slot. A physiological record becomes idempotent only with the pageLSN check: skip the record if pageLSN >= its LSN."
+  explain="'Set qty to 7' and 'delete slot 0' give the same result twice. 'Insert cyd into the page' does not: it adds a second slot. A physiological record becomes idempotent only with the pageLSN check: skip the record if $\text{pageLSN} \ge$ its LSN."
 >
 <ReplayDemo />
 </Predict>
@@ -128,7 +128,7 @@ Logical logs are also the base of replication and change data capture. The MySQL
 
 <Recall cards={[
   { q: "What does 'physical to a page, logical within a page' mean?", a: "A physiological record names one page exactly, and describes an operation inside that page, such as an insert into a slot, not exact byte offsets." },
-  { q: "How does the pageLSN check make physiological redo idempotent?", a: "A page contains exactly the records up to its pageLSN. Redo skips any record with LSN <= pageLSN and applies the others, so a second replay changes nothing." },
+  { q: "How does the pageLSN check make physiological redo idempotent?", a: "A page contains exactly the records up to its pageLSN. Redo skips any record with $\\text{LSN} \\le \\text{pageLSN}$ and applies the others, so a second replay changes nothing." },
   { q: "Why can a logical record not use the pageLSN check?", a: "A logical record names no page. One operation can change many pages, such as the table and its indexes, so there is no single pageLSN to compare with." },
   { q: "What is a torn page, and how does PostgreSQL recover from one?", a: "A page write that stopped between sectors, so part of the page is old. PostgreSQL logs a full page image at the first change after each checkpoint, and replay copies that image in." },
   { q: "Why is ARIES undo logical and not physiological?", a: "Other transactions can move a row to another page after the change, for example by a B-tree split. A logical undo finds the row where it is now." },

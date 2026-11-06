@@ -75,7 +75,7 @@ fn lookup(tree: &Tree, key: u64) -> Option<u64> {
 }
 ```
 
-Each split and merge changes a few pages and takes O(m) time. A search reads one page per level, so the cost of every operation is O(log N) page reads. Real engines do not always follow the delete rules. PostgreSQL never merges half-empty index pages: it removes a page only when the page is completely empty. InnoDB merges a page with a neighbor when the page drops below 50% full. The next lesson shows how this threshold is set.
+Each split and merge changes a few pages and takes $O(m)$ time. A search reads one page per level, so the cost of every operation is $O(\log N)$ page reads. Real engines do not always follow the delete rules. PostgreSQL never merges half-empty index pages: it removes a page only when the page is completely empty. InnoDB merges a page with a neighbor when the page drops below 50% full. The next lesson shows how this threshold is set.
 
 ## How flat is it?
 

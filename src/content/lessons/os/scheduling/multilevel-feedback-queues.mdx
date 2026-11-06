@@ -96,10 +96,10 @@ Most real schedulers in the 1980s to 2000s are variations on this idea. Quanta u
 | **BSD Unix** | It computes priority from recent CPU use, which decays over time. A formula takes the place of a queue move, and nice values add to it. |
 | **Solaris** | Its time-sharing class has 60 levels. A table sets the quantum and the next level for each case. An administrator can change the table. |
 | **Windows NT and later** | It has 32 priority levels. Threads in the dynamic range get a boost after I/O completes, and a thread that has starved gets a boost from a kernel helper. |
-| **Linux O(1), 2.6.0 to 2.6.22** | It has 140 levels, with active and expired arrays. Heuristics guessed which tasks were interactive. |
+| **Linux $O(1)$, 2.6.0 to 2.6.22** | It has 140 levels, with active and expired arrays. Heuristics guessed which tasks were interactive. |
 | **macOS (XNU)** | Timeshare threads lose priority as they use CPU and recover over time. Recent versions add the Clutch scheduler, which groups threads by application and QoS class. |
 
-Linux replaced the O(1) scheduler in 2.6.23, because its interactivity heuristics were fragile. The workloads that broke them were hard to predict and to debug. Its successor removes the guess: it does not classify tasks at all. It tracks how much CPU each task has had. The next lesson, [CFS and EEVDF](/os/scheduling/cfs-and-eevdf), explains this.
+Linux replaced the $O(1)$ scheduler in 2.6.23, because its interactivity heuristics were fragile. The workloads that broke them were hard to predict and to debug. Its successor removes the guess: it does not classify tasks at all. It tracks how much CPU each task has had. The next lesson, [CFS and EEVDF](/os/scheduling/cfs-and-eevdf), explains this.
 
 ## Connect
 

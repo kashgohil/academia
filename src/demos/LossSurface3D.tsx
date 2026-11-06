@@ -4,7 +4,7 @@ import { Canvas, useThree } from "@react-three/fiber";
 import { Line, OrbitControls } from "@react-three/drei";
 import * as THREE from "three";
 import { contours } from "d3-contour";
-import { Demo, Controls, Param, useParams, useSim, range, select, toggle, cssVar } from "../kit";
+import { Demo, Controls, Param, useParams, useSim, range, select, toggle, cssVar, Tex } from "../kit";
 import { SURFACES, getSurface, type OptimizerId, type Surface, type Vec2 } from "../sims/optim";
 import { heightMap, summarize, type RunSummary } from "../sims/flagshipextras";
 
@@ -280,7 +280,7 @@ export function LossSurface3DDemo() {
               <div className="muted">loss now: <b style={{ color: "var(--fg)", fontWeight: 550 }}>{now}</b></div>
               <div className="muted">loss after {STEPS} steps: <b style={{ color: "var(--fg)", fontWeight: 550 }}>{r.diverged ? "diverged" : fmt(r.finalLoss)}</b></div>
               <div className="muted">
-                gap below 10⁻⁶ at step: <b style={{ color: "var(--fg)", fontWeight: 550 }}>{r.diverged ? "never" : r.stepsToConverge ?? `not in ${STEPS}`}</b>
+                gap below <Tex>{"10^{-6}"}</Tex> at step: <b style={{ color: "var(--fg)", fontWeight: 550 }}>{r.diverged ? "never" : r.stepsToConverge ?? `not in ${STEPS}`}</b>
               </div>
               {surf.minima.length > 1 && !r.diverged && (
                 <div className="muted">ends near: <b style={{ color: "var(--fg)", fontWeight: 550 }}>({r.nearest[0].toFixed(2)}, {r.nearest[1].toFixed(2)})</b></div>

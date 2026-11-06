@@ -12,7 +12,7 @@ import { LaneRaceDemo } from "@/demos/CpuExtrasDemos";
 
 1. Watch the two rows. The scalar row adds one pair in each step. The SIMD row adds a full vector in each step.
 2. Change the lanes to **16**. The SIMD row finishes in 2 steps.
-3. Look at the tree below the rows. At the end, the lanes of one vector must be added together. This takes log₂(lanes) steps.
+3. Look at the tree below the rows. At the end, the lanes of one vector must be added together. This takes $\log_2(\text{lanes})$ steps.
 
 ## Use both SIMD and accumulators
 
@@ -85,6 +85,6 @@ Some older Intel server CPUs reduced their clock speed during heavy AVX-512 use.
   { q: "How many 32-bit floats fit in an SSE, an AVX2 and an AVX-512 register?", a: "4, 8 and 16." },
   { q: "Why use several vector accumulators?", a: "One vector accumulator is still one dependency chain. Several chains hide the latency of the add." },
   { q: "How does SIMD do `if (x > 0) sum += x`?", a: "A compare makes a mask for all lanes. The mask selects the values to add. There is no branch." },
-  { q: "What is a horizontal sum?", a: "Adding the lanes of one vector together. It takes log₂(lanes) steps, so do it once at the end." },
+  { q: "What is a horizontal sum?", a: "Adding the lanes of one vector together. It takes $\\log_2(\\text{lanes})$ steps, so do it once at the end." },
   { q: "What is Zig's vector type, and how do you add its lanes?", a: "@Vector(N, T), and @reduce(.Add, v)." },
 ]} />

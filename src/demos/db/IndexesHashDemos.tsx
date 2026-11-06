@@ -1,6 +1,6 @@
 /** Demos for "Hash indexes": extendible hashing stepper, linear hashing stepper, cost vs load factor. */
 import { useMemo, useRef, useState } from "react";
-import { Demo, Stats, Param, range, Plot, Line, Dots, RuleX, RuleY, Legend, pct, useWidth, Note, fixed, mono, seg, useChunked } from "../../kit";
+import { Demo, Stats, Param, range, Plot, Line, Dots, RuleX, RuleY, Legend, pct, useWidth, Note, fixed, mono, seg, useChunked, Tex, rich } from "../../kit";
 import {
   ExtendibleHash, LinearHash, hashKey, lowBits, staticCost, linearCost, extendibleStats, openAddressingCost,
   linearProbingHit, linearProbingMiss, chainingHit, cuckooMaxLoad, EXT_START, EXT_SEQUENCE, LIN_START, LIN_SEQUENCE, type ExtSnapshot, type ExtEvent, type LinSnapshot, type LinEvent,
@@ -256,8 +256,8 @@ export function LinearHashDemo() {
         </>
       }
     >
-      <div style={{ ...mono, fontSize: 12, marginBottom: 8 }} className="muted">
-        round {snap.level}: h₀ = hash mod {M}, h₁ = hash mod {2 * M}. {snap.next === 0 ? "No bucket has split in this round, so all use h₀." : `Buckets 0…${snap.next - 1} have split and use h₁; the rest use h₀.`}
+      <div style={{ fontSize: 12.5, marginBottom: 8 }} className="muted">
+        round {snap.level}: <Tex>{`h_0 = \\text{hash} \\bmod ${M}`}</Tex>, <Tex>{`h_1 = \\text{hash} \\bmod ${2 * M}`}</Tex>. {rich(snap.next === 0 ? "No bucket has split in this round, so all use $h_0$." : `Buckets 0…${snap.next - 1} have split and use $h_1$; the rest use $h_0$.`)}
       </div>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "flex-start" }}>
         {snap.buckets.map((b, i) => {

@@ -136,7 +136,7 @@ Do not trust a table of latency numbers from another machine. Firmware, power st
 - [Tail latency](/performance/systems/tail-latency) is the soft real-time problem in servers.
 
 <Recall cards={[
-  { q: "Give the utilization bounds for RM and EDF, and say which is exact.", a: "RM: n times (2^(1/n) - 1), which falls to ln 2. It is sufficient only. EDF: 1, which is exact for implicit deadlines." },
+  { q: "Give the utilization bounds for RM and EDF, and say which is exact.", a: "RM: $n$ times $(2^{1/n} - 1)$, which falls to $\\ln 2$. It is sufficient only. EDF: 1, which is exact for implicit deadlines." },
   { q: "What is the exact test for RM, and what instant does it assume?", a: "Response-time analysis: R = C + sum of ceil(R/Tj) times Cj over higher priorities, iterated to a fixed point. It assumes that all tasks release together." },
   { q: "How do RM and EDF fail differently under overload?", a: "RM misses only in the lowest-priority tasks. EDF can miss in all tasks, because each late job delays others: the domino effect." },
   { q: "What does SCHED_DEADLINE add to plain EDF?", a: "Admission control, and a constant bandwidth server that stops a task when it uses up its runtime, so an overrun cannot harm other tasks." },

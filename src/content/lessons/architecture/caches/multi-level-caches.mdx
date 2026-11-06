@@ -81,7 +81,7 @@ Exclusive hierarchies prevent the duplication. But every L2 hit swaps lines betw
 - **A shared L3 has noisy neighbors**: a streaming job on another core can remove your working set. Cache partitioning (Intel CAT, AMD QoS) exists for this problem.
 
 <Recall cards={[
-  { q: "What is the AMAT formula for a two-level cache?", a: "t1 + m1·(t2 + m2·t_mem), where m2 is the local miss rate of L2." },
+  { q: "What is the AMAT formula for a two-level cache?", a: "$t_1 + m_1 \\cdot (t_2 + m_2 \\cdot t_{\\text{mem}})$, where $m_2$ is the local miss rate of L2." },
   { q: "What is the difference between the local and the global miss rate of L2?", a: "Local: L2 misses divided by the accesses that reach L2. Global: L2 misses divided by all accesses, which is m1·m2." },
   { q: "What is the effective capacity of an inclusive and of an exclusive L1 + L2?", a: "Inclusive: the size of L2, because L1 is a copy. Exclusive: L1 + L2." },
   { q: "What is the main advantage of an inclusive last-level cache?", a: "It works as a snoop filter. If a line is not in L3, no private cache has it, and this makes coherence simpler." },

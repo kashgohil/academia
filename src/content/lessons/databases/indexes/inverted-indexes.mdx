@@ -145,7 +145,7 @@ SELECT id FROM docs WHERE to_tsvector('english', body) @@ to_tsquery('merge & se
 
 <Recall cards={[
   { q: "What does a posting hold, and why does a phrase query need more than an AND query?", a: "A doc id, the term frequency and the positions of the term. A phrase query must check that the terms sit at consecutive positions, not only that they share a document." },
-  { q: "When does galloping intersection beat a linear merge, and what does it cost?", a: "When one list is much shorter. It costs O(m log(n/m)) comparisons for lists of length m and n, against m + n for the merge." },
+  { q: "When does galloping intersection beat a linear merge, and what does it cost?", a: "When one list is much shorter. It costs $O(m \\log(n/m))$ comparisons for lists of length $m$ and $n$, against $m + n$ for the merge." },
   { q: "Why does PForDelta beat plain bit packing on lists with rare large gaps?", a: "Bit packing must use the width of the largest gap for the whole block. PForDelta picks a width that fits about 90% of the gaps and stores the rest as exceptions." },
   { q: "What do k1 and b control in BM25?", a: "k1 sets how fast the term-frequency part saturates toward k1 + 1. b sets how much a long document is penalized; b = 0 ignores length." },
   { q: "How does Lucene handle new and deleted documents?", a: "New documents go into immutable segments; a delete sets a bit in the segment's live-docs bitmap. Background merges combine segments and drop deleted documents, like LSM compaction." },

@@ -130,7 +130,7 @@ The price is memory: the keydir must hold every key. In our model each entry hol
 <Recall cards={[
   { q: "In extendible hashing, when must the directory double?", a: "When a full bucket has a local depth equal to the global depth. If the local depth is smaller, several slots share the bucket, and only the bucket splits." },
   { q: "Which bucket splits in linear hashing when the load factor passes the limit?", a: "The bucket at the split pointer, not the bucket that overflowed. The pointer then moves one step; at the end of a round it goes back to 0." },
-  { q: "How does linear hashing compute a bucket address without a directory?", a: "a = h mod M for M = N0 × 2^L. If a is less than the split pointer, that bucket has split, so use a = h mod 2M." },
+  { q: "How does linear hashing compute a bucket address without a directory?", a: "$a = h \\bmod M$ for $M = N_0 \\times 2^L$. If $a$ is less than the split pointer, that bucket has split, so use $a = h \\bmod 2M$." },
   { q: "Why can a hash index not answer WHERE x BETWEEN 10 AND 20?", a: "The hash scatters nearby keys to unrelated buckets, so the engine would have to read every bucket. Hash indexes answer only equality." },
   { q: "What changed for PostgreSQL hash indexes in version 10, and what do they store?", a: "They became WAL-logged, so they are crash-safe and replicated. Each entry stores only the 4-byte hash code and a row pointer, not the key." },
   { q: "What does Bitcask keep in memory, and what does a read cost?", a: "The keydir: every key with its file, offset and size. A read is one hash lookup in memory and one disk read." },

@@ -73,15 +73,15 @@ The last lesson of this module, Fragmentation, measures these policies on the sa
 
 ## Make it fast
 
-A search over a single list is O(number of blocks). Real allocators use these methods:
+A search over a single list is $O(\text{number of blocks})$. Real allocators use these methods:
 
 - **Explicit free lists** link only the free blocks. The pointers go through the payloads of the free blocks. In the demo, best fit for 40 B walks 10 blocks on the implicit list, but only 5 on an explicit list.
-- **Segregated free lists** keep one list for each size range. This is almost best fit, at almost O(1) cost. dlmalloc uses small "bins" for exact sizes and trees for large sizes.
+- **Segregated free lists** keep one list for each size range. This is almost best fit, at almost $O(1)$ cost. dlmalloc uses small "bins" for exact sizes and trees for large sizes.
 - **Deferred coalescing** keeps recently freed blocks separate, so that the program can use them again quickly. The tcache and fastbins of glibc do this, and they coalesce later.
 
 <Recall cards={[
   { q: "Why can an allocator store flags in the low bits of a block header?", a: "Block sizes are multiples of 8 (or 16), so the low 3 (or 4) bits of the size are always zero." },
-  { q: "What do boundary tags make possible?", a: "O(1) backward coalescing. Each free block stores its size in a footer, so the start of the previous block is easy to find from the current header." },
+  { q: "What do boundary tags make possible?", a: "$O(1)$ backward coalescing. Each free block stores its size in a footer, so the start of the previous block is easy to find from the current header." },
   { q: "Why does next fit usually cause more fragmentation than first fit?", a: "It cuts into blocks across the full heap. First fit uses holes at low addresses again and keeps large free regions." },
   { q: "Much memory is free, but a request fails. What is that called, and what causes it?", a: "External fragmentation. The free space is split into blocks between live allocations, so no single block is large enough." },
   { q: "Why does best fit walk more blocks than first fit?", a: "First fit can stop at the first block that fits. Best fit must look at every free block to find the smallest one that fits." },

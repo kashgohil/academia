@@ -116,7 +116,7 @@ export function RcBucketDemo() {
           { label: "step", value: `${n} / ${maxSteps}` },
           { label: "time t", value: `${t.toFixed(2)} τ` },
           { label: "level v (bucket rule)", value: v.toFixed(3) },
-          { label: "exact 1 − e^(−t/τ)", value: (1 - Math.exp(-t)).toFixed(3) },
+          { label: "exact $1 - e^{-t/\\tau}$", value: (1 - Math.exp(-t)).toFixed(3) },
         ]}
       />
       <div style={{ height: 8 }} />
@@ -147,7 +147,7 @@ export function RcSquareWaveDemo() {
         items={[
           { label: "output swing (peak to peak)", value: pct(st.ripple) },
           { label: "output average", value: pct(st.average, 0) },
-          { label: "f / f_c", value: ratio.toPrecision(3) },
+          { label: "$f / f_c$", value: ratio.toPrecision(3) },
           { label: "behavior", value: ratio < 0.5 ? "follows the input" : ratio < 5 ? "rounds the edges" : "averages (low-pass)" },
         ]}
       />

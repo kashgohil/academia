@@ -1,6 +1,6 @@
 /** Demos for the relational algebra lesson: a query-tree playground and a rewrite stepper. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, Plot, Label, range, select as selectSpec, BAD, GOOD, MONO, StepButtons, StepCaption, StepSlider, int, useStepper } from "../../kit";
+import { Demo, Param, Stats, Plot, Label, range, select as selectSpec, BAD, GOOD, MONO, StepButtons, StepCaption, StepSlider, int, useStepper, rich } from "../../kit";
 import {
   SAMPLE_DB, scaledDb, displayNames, hasCol, colName, fmtValue, type Db, type Relation,
 } from "../../sims/db/query/relation";
@@ -161,7 +161,7 @@ const RULE_TEXT: Record<string, string> = {
   canonical: "The direct translation of the SQL block: a product of all FROM tables, one selection with the whole WHERE clause, and a projection on top.",
   cascade: "Cascade of selections: σ with a conjunction becomes a chain of σ, one per conjunct. This alone adds work, but now each conjunct can move on its own.",
   "push-selections": "Push each selection down to the lowest node that has all its columns. The filters on d.city and p.budget now run on the base tables, before any product.",
-  "form-joins": "A selection with a predicate on both sides of a product is a join: σ_p(A × B) = A ⋈_p B. A join operator never builds the full product.",
+  "form-joins": "A selection with a predicate on both sides of a product is a join: $\\sigma_p(A \\times B) = A \\bowtie_p B$. A join operator never builds the full product.",
   reassociate: "Join associativity: (E ⋈ D) ⋈ P = E ⋈ (D ⋈ P). The small filtered inputs D and P join first, so the big table E joins with a tiny result.",
   "push-projections": "Push projections down: each scan keeps only the columns that some operator above needs. The rows stay the same, but they get narrower.",
 };
@@ -198,7 +198,7 @@ export function RewriteDemo() {
       <pre style={{ fontFamily: MONO, fontSize: 12, margin: "0 0 10px", padding: "6px 10px", background: "var(--subtle)", borderRadius: 6, overflowX: "auto" }}>{sqlText(REWRITE_QUERY)}</pre>
       <div style={{ fontSize: 12.5, marginBottom: 6 }} className="muted">emp {n} rows · dept 8 rows · proj 30 rows. The badge is the number of rows each operator outputs.</div>
       <OpTree root={planToTree(cur.plan, cur.r)} slot={150} />
-      <StepCaption label={`${s.i + 1}/6`}>{RULE_TEXT[cur.rule]}</StepCaption>
+      <StepCaption label={`${s.i + 1}/6`}>{rich(RULE_TEXT[cur.rule])}</StepCaption>
       <div style={{ height: 10 }} />
       <Plot x={[-0.5, 5.5]} y={[1, Math.max(...data.map((d) => d.work.tuples)) * 3]} logY height={170} xTicks={[0, 1, 2, 3, 4, 5]} xFormat={(v) => String(v + 1)} yLabel="rows produced by all operators (log)" xLabel="rewrite step" yFormat={(v) => (v >= 1000 ? `${v / 1000}k` : String(v))}>
         <BaseBars base={1} bins={data.map((d, i) => ({ x0: i - 0.35, x1: i + 0.35, y: d.work.tuples, color: i === s.i ? ACC : "var(--faint)" }))} />

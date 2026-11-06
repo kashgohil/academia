@@ -77,7 +77,7 @@ fn hashJoin(alloc: std.mem.Allocator, r: []const Tuple, s: []const Tuple, out: *
 
 ### Grace hash join
 
-When R does not fit, the **Grace hash join** (Kitsuregawa and others, 1983) first partitions both inputs. With one input frame and B − 1 output frames, it hashes each tuple of R with a function h1 into one of B − 1 partitions. A full output frame is written to disk. Then it partitions S with the same h1. Two tuples with the same key always land in partitions with the same number. So the join needs only to join each pair $R_i$, $S_i$, each with an in-memory hash join and a different hash function h2.
+When R does not fit, the **Grace hash join** (Kitsuregawa and others, 1983) first partitions both inputs. With one input frame and B − 1 output frames, it hashes each tuple of R with a function $h_1$ into one of B − 1 partitions. A full output frame is written to disk. Then it partitions S with the same $h_1$. Two tuples with the same key always land in partitions with the same number. So the join needs only to join each pair $R_i$, $S_i$, each with an in-memory hash join and a different hash function $h_2$.
 
 Each page is read, written and read again, so the cost is about 3(M + N) = 4,500 I/Os. This works if each partition of R fits in memory: $M / (B - 1) \le B - 2$, so B must be larger than about $\sqrt{M}$. If a partition is still too large, the join partitions it again with a new hash function. Each extra level costs 2(M + N) more.
 
@@ -143,7 +143,7 @@ Only nested loops work for any predicate, such as `r.a < s.b`. Hash joins, and t
 
 <Recall cards={[
   { q: "Give the I/O cost of a block nested-loop join and say which input should be the outer one.", a: "M + ceil(M / (B − 2)) · N, with R as the outer input of M pages. The smaller input should be outside, so that S is scanned fewer times." },
-  { q: "Why can a Grace hash join join each pair of partitions on its own?", a: "Both inputs are partitioned with the same hash function h1, so tuples with equal keys land in partitions with the same number. No pair from different partitions can match." },
+  { q: "Why can a Grace hash join join each pair of partitions on its own?", a: "Both inputs are partitioned with the same hash function $h_1$, so tuples with equal keys land in partitions with the same number. No pair from different partitions can match." },
   { q: "Where does the 3(M + N) cost of Grace hash join come from, and when does it hold?", a: "Partitioning reads and writes both inputs (2(M + N)); the join phase reads them again (M + N). It holds when each partition of R fits in memory, which needs B larger than about the square root of M." },
   { q: "What does hybrid hash join do differently from Grace, and when does it help most?", a: "It keeps partition 0 of R in memory and probes it with S tuples at once, so those tuples are never written. It helps most when R is just a little larger than memory." },
   { q: "Why does repartitioning not fix a partition that overflows because of skew?", a: "All copies of a hot key hash to the same value with any hash function. The partition stays too large, so the engine falls back to nested loops for it." },

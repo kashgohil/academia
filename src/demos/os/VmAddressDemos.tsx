@@ -1,6 +1,6 @@
 /** Demos for the lesson on address spaces. */
 import { useMemo, useState } from "react";
-import { Demo, Param, Stats, toggle, useParams, useWidth, Note, mono, seg } from "../../kit";
+import { Demo, Param, Stats, toggle, useParams, useWidth, Note, mono, seg, Tex } from "../../kit";
 import { addressMap, bandBytes, bandLog, fmtBytes, hexShort, hexVa, mapsText, procMaps, twoProcesses, type Band, type MapsLine, type ProcPage } from "../../sims/os/vm";
 
 // ---------------- the address map ----------------
@@ -20,7 +20,7 @@ const pxText = (h: number) => (h >= 0.1 ? `${h.toFixed(1)} px` : h === 0 ? "0 px
 
 export function VmAddressMapDemo() {
   const p = useParams("vmmap", {
-    scale: seg<Scale>("Height of each band", [["log", "log2 of its size"], ["linear48", "Linear, 48 bits"], ["linear64", "Linear, 64 bits"]], "log"),
+    scale: seg<Scale>("Height of each band", [["log", "$\\log_2$ of its size"], ["linear48", "Linear, 48 bits"], ["linear64", "Linear, 64 bits"]], "log"),
     aslr: toggle({ label: "ASLR on", default: true }),
   });
   const [seed, setSeed] = useState(3);
@@ -80,7 +80,7 @@ export function VmAddressMapDemo() {
           ]} />
         </div>
       </div>
-      <Note>Blue is user memory, purple is kernel memory, and pale bands hold no mapping. Hover or tap a band. In the log view, height is proportional to log2 of the size, so every band stays visible.</Note>
+      <Note>Blue is user memory, purple is kernel memory, and pale bands hold no mapping. Hover or tap a band. In the log view, height is proportional to <Tex>{"\\log_2"}</Tex> of the size, so every band stays visible.</Note>
     </Demo>
   );
 }

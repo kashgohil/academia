@@ -86,7 +86,7 @@ So the SSD never updates a page in place. The **flash translation layer (FTL)** 
 | 28% | 2.40 | 2.73 | 1.00 |
 | 100% | 1.23 | 1.48 | 1.00 |
 
-The 7% comes from units: a drive sold as 256 GB (10^9 bytes each) often carries 256 GiB (2^30 bytes each) of NAND. Enterprise drives reserve 28% or more to keep write amplification low. The **TRIM** command tells the FTL that a range is free, which has the same effect as more spare space. A file system that issues TRIM after deletes helps the drive.
+The 7% comes from units: a drive sold as 256 GB ($10^9$ bytes each) often carries 256 GiB ($2^{30}$ bytes each) of NAND. Enterprise drives reserve 28% or more to keep write amplification low. The **TRIM** command tells the FTL that a range is free, which has the same effect as more spare space. A file system that issues TRIM after deletes helps the drive.
 
 ## Queue depth and parallelism
 

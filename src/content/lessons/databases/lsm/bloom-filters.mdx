@@ -127,7 +127,7 @@ Many range scans share a prefix, for example all keys of user 42. RocksDB's `pre
 
 <Recall cards={[
   { q: "Can a Bloom filter give a false negative? Why?", a: "No. An insert only sets bits to 1 and nothing sets them back to 0, so all bits of an inserted key stay set." },
-  { q: "What is the false positive rate of a Bloom filter with m bits, n keys and k hashes?", a: "About (1 − e^(−kn/m))^k. With the best k = (m/n) ln 2, it is 0.6185^(m/n)." },
+  { q: "What is the false positive rate of a Bloom filter with m bits, n keys and k hashes?", a: "About $(1 - e^{-kn/m})^k$. With the best $k = (m/n) \\ln 2$, it is $0.6185^{m/n}$." },
   { q: "About how many bits per key give a 1% false positive rate?", a: "9.59 bits per key with k = 7. In practice people use 10 bits per key, which gives about 0.82%." },
   { q: "What does a blocked (cache-line) Bloom filter trade?", a: "All k probes stay in one 64-byte line, so a query costs one cache miss. The false positive rate is a little higher, for example 0.96% in place of 0.82% at 10 bits per key." },
   { q: "How does Monkey allocate filter memory across LSM levels?", a: "It makes each run's false positive rate proportional to its number of keys. Small runs get many bits per key, the big last level gets fewer, and the sum of the rates falls." },

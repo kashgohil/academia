@@ -1,11 +1,14 @@
 /** Demos for "Cardinality estimation": histogram builder, correlated columns, error growth through joins. */
 import { useMemo } from "react";
-import { Demo, Param, Plot, Line, Bars, RuleX, RuleY, Legend, Stats, range, toggle, useParams, usePlot, Note, SectionLabel, fixed, int, mono, seg, useChunked } from "../../kit";
+import { Demo, Param, Plot, Line, Bars, RuleX, RuleY, Legend, Stats, range, toggle, useParams, usePlot, Note, SectionLabel, fixed, int, mono, seg, useChunked, Tex } from "../../kit";
 import {
   skewedColumn, valueCounts, dataQueries, buildStats, estimateRange, trueRange, histErrors, qError,
   correlatedReport, MODE_LABEL, qErrorCurve, errorSamples, type EstMode,
 } from "../../sims/db/optimizer";
 import { Code, num, once, LogBar, logTicks } from "./OptimizerUi";
+
+/** Unicode superscript digits for SVG tick labels, which cannot render KaTeX. */
+const sup = (n: number) => String(n).replace(/[0-9.-]/g, (c) => (c === "-" ? "⁻" : c === "." ? "·" : "⁰¹²³⁴⁵⁶⁷⁸⁹"[Number(c)]!));
 
 const column = () => once("opt-skewed", () => { const c = skewedColumn(); return { col: c, counts: valueCounts(c), queries: dataQueries(c) }; });
 
@@ -197,8 +200,8 @@ export function ErrorGrowthDemo() {
         <RuleY at={10} label="10×" />
       </Plot>
       <Legend items={[{ label: "median", color: "var(--c1)" }, { label: "90th percentile", color: "var(--c5)" }, { label: "99th percentile", color: "var(--c4)" }]} />
-      <SectionLabel>2,000 queries with {v.joins} join{v.joins === 1 ? "" : "s"}: log₁₀(estimate / true)</SectionLabel>
-      <Plot x={[-6, 6]} y={[0, Math.max(...hist.map((b) => b.y)) * 1.1]} height={150} xLabel="log₁₀(estimate / true)" xFormat={(x) => (x === 0 ? "exact" : x < 0 ? `÷10^${-x}` : `×10^${x}`)} xTicks={[-6, -4, -2, 0, 2, 4, 6]}>
+      <SectionLabel>2,000 queries with {v.joins} join{v.joins === 1 ? "" : "s"}: <Tex>{"\\log_{10}(\\text{estimate} / \\text{true})"}</Tex></SectionLabel>
+      <Plot x={[-6, 6]} y={[0, Math.max(...hist.map((b) => b.y)) * 1.1]} height={150} xLabel="log₁₀(estimate / true)" xFormat={(x) => (x === 0 ? "exact" : x < 0 ? `÷10${sup(-x)}` : `×10${sup(x)}`)} xTicks={[-6, -4, -2, 0, 2, 4, 6]}>
         <Bars bins={hist} color="var(--c2)" />
         <RuleX at={0} color="var(--fg)" />
       </Plot>

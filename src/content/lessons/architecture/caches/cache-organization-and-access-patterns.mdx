@@ -119,7 +119,7 @@ Associativity has a cost. On each access, the cache compares the tags in all way
 - **Measure.** `perf stat -e cache-misses,L1-dcache-load-misses` shows which case you have.
 
 <Recall cards={[
-  { q: "How does a cache with S bytes, B-byte lines and W ways split an address?", a: "Offset: log2(B) bits. Set index: log2(S / (B·W)) bits. Tag: all the remaining high bits." },
+  { q: "How does a cache with S bytes, B-byte lines and W ways split an address?", a: "Offset: $\\log_2 B$ bits. Set index: $\\log_2 (S / (B \\cdot W))$ bits. Tag: all the remaining high bits." },
   { q: "Name the three C's of cache misses and a fix for each.", a: "Compulsory: larger lines or prefetching. Capacity: a larger cache or a smaller working set. Conflict: more ways, padding, or a different layout." },
   { q: "How do you tell a conflict miss from a capacity miss?", a: "A conflict miss would hit in a fully associative cache of the same size. A capacity miss would also miss there." },
   { q: "A loop touches a few more lines than a fully associative LRU cache holds, in the same order each time. What is the hit rate?", a: "0%. LRU always removes the line that the loop needs next. Random replacement does better." },

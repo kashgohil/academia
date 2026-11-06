@@ -136,7 +136,7 @@ Some data only expires: logs, metrics, cache entries. For these, RocksDB has `kC
 
 <Recall cards={[
   { q: "What three problems grow without compaction?", a: "Lookups must check more sorted runs, old versions and tombstones use more space, and deleted data never leaves the disk." },
-  { q: "What is the write amplification of tiered compaction, and why?", a: "About one write per level, so about log_T(D/W) in total. A merge writes each byte once into the next level." },
+  { q: "What is the write amplification of tiered compaction, and why?", a: "About one write per level, so about $\\log_T(D/W)$ in total. A merge writes each byte once into the next level." },
   { q: "Why does leveled compaction cost up to T + 1 writes per level?", a: "A byte that moves down merges with the overlapping part of the next level. When that level is full, the part is T times bigger." },
   { q: "What is the worst-case space amplification of leveled compaction with T = 10, and why?", a: "About 1.11, which is T/(T−1). The last level holds about 90% of the data, so old versions in the upper levels add at most about 11%." },
   { q: "When can compaction drop a tombstone?", a: "When no lower level can hold an older version of the key, and no live snapshot needs the old version." },

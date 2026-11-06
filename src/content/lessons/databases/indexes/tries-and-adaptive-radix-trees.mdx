@@ -75,7 +75,7 @@ A radix tree compares bytes from left to right, like `memcmp`. So the bytes of a
 | Type | Encoding | Why |
 |---|---|---|
 | unsigned integer | big-endian | the most significant byte must come first |
-| signed integer | flip the sign bit, then big-endian | −2³¹ becomes 00 00 00 00, −1 becomes 7F FF FF FF, 0 becomes 80 00 00 00 |
+| signed integer | flip the sign bit, then big-endian | $-2^{31}$ becomes 00 00 00 00, −1 becomes 7F FF FF FF, 0 becomes 80 00 00 00 |
 | IEEE 754 float | positive: flip the sign bit; negative: flip all bits; big-endian | negative floats have the sign bit set and a reversed magnitude order |
 | string | UTF-8, escape 00 as 00 FF, end with 00 00 | the terminator makes keys prefix-free; byte order is code point order, not a collation |
 | composite | concatenate the encoded parts | each part must be self-delimiting, or the next part leaks into the comparison |

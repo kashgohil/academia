@@ -75,12 +75,12 @@ impl BitmapFrames {
 }
 ```
 
-A **free-list stack** keeps a next pointer inside each free frame, and one head word. Allocation and free both take O(1) time, and the metadata uses no extra memory. But free frames must be mapped, so that the kernel can write the pointer. Also, setup touches every free frame, so a large machine pays for this at boot. Compare the two.
+A **free-list stack** keeps a next pointer inside each free frame, and one head word. Allocation and free both take $O(1)$ time, and the metadata uses no extra memory. But free frames must be mapped, so that the kernel can write the pointer. Also, setup touches every free frame, so a large machine pays for this at boot. Compare the two.
 
 | | Bitmap | Free-list stack |
 |---|---|---|
 | Metadata | 1 bit per frame, in one block | 8 bytes in total, plus a word in each free frame |
-| Allocate one frame | Scan; often 1 word with a hint | O(1) |
+| Allocate one frame | Scan; often 1 word with a hint | $O(1)$ |
 | Contiguous frames | Possible: search for a run of bits | Not practical |
 | Double free | Easy to detect: the bit is already clear | Needs extra work |
 | Needs free frames mapped | No | Yes |

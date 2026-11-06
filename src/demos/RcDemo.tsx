@@ -5,7 +5,7 @@ import { charge, discharge, eulerCharge, tau, energy } from "../sims/rc";
 const schema = {
   R: range({ label: "Resistance R", min: 100, max: 1e6, default: 10_000, log: true, format: (v) => si(v, "Ω") }),
   C: range({ label: "Capacitance C", min: 1e-6, max: 1e-3, default: 100e-6, log: true, format: (v) => si(v, "F") }),
-  Vs: range({ label: "Source Vs", min: 1, max: 12, step: 0.5, default: 5, format: (v) => `${v} V` }),
+  Vs: range({ label: "Source $V_s$", min: 1, max: 12, step: 0.5, default: 5, format: (v) => `${v} V` }),
   mode: select({ label: "Switch", options: [{ value: "charge", label: "Charge" }, { value: "discharge", label: "Discharge" }], default: "charge", segmented: true }),
   units: toggle({ label: "Time axis in units of τ", default: false }),
 };
@@ -64,15 +64,15 @@ export function RcDemo() {
       <Schematic charge={mode === "charge"} fill={cur.v / Vs} current={Math.abs(cur.i) / iMax} />
       <Stats
         items={[
-          { label: "τ = RC", value: si(T, "s") },
-          { label: "t", value: units ? `${(now / T).toFixed(2)} τ` : si(now, "s") },
-          { label: "v_C(t)", value: si(cur.v, "V") },
-          { label: "i(t)", value: si(cur.i, "A") },
+          { label: "$\\tau = RC$", value: si(T, "s") },
+          { label: "$t$", value: units ? `${(now / T).toFixed(2)} τ` : si(now, "s") },
+          { label: "$v_C(t)$", value: si(cur.v, "V") },
+          { label: "$i(t)$", value: si(cur.i, "A") },
           { label: "Energy in C", value: si(energy(C, cur.v), "J") },
         ]}
       />
       <div style={{ height: 12 }} />
-      <Plot x={[0, x(tEnd)]} y={[0, Vs * 1.05]} height={200} xLabel={units ? "t / τ" : "t (s)"} yLabel="v_C (V)">
+      <Plot x={[0, x(tEnd)]} y={[0, Vs * 1.05]} height={200} xLabel={units ? "t / τ" : "t (s)"} yLabel="capacitor voltage (V)">
         <Line points={curve.map((q) => [x(q.t), q.v])} color="var(--border)" width={1.5} />
         <Area points={visible.map((q) => [x(q.t), q.v])} />
         <Line points={visible.map((q) => [x(q.t), q.v])} />
@@ -100,7 +100,7 @@ function Schematic({ charge, fill, current }: { charge: boolean; fill: number; c
       <line x1={28} y1={50} x2={52} y2={50} />
       <line x1={33} y1={58} x2={47} y2={58} />
       <line x1={40} y1={58} x2={40} y2={100} />
-      <text x={6} y={58} {...muted}>Vs</text>
+      <text x={6} y={58} {...muted}>Vₛ</text>
       {/* switch: contacts A (source) and B (ground), pivot on the right */}
       <line x1={40} y1={20} x2={98} y2={20} />
       <circle cx={101} cy={20} r={2.5} />
@@ -153,7 +153,7 @@ export function RcEulerDemo() {
     <Demo title="Simulating the same circuit with explicit Euler" controls={<Controls params={params} />}>
       <Stats items={[{ label: "max error", value: err.toFixed(3) + " V" }, { label: "steps", value: euler.length - 1 }, { label: "regime", value: ratio < 1 ? "monotone" : ratio < 2 ? "oscillating" : "unstable" }]} />
       <div style={{ height: 8 }} />
-      <Plot x={[0, tEnd]} y={[-0.5, 2]} height={220} xLabel="t / τ" yLabel="v / Vs">
+      <Plot x={[0, tEnd]} y={[-0.5, 2]} height={220} xLabel="t / τ" yLabel="v / Vₛ">
         <Line points={exact} color="var(--faint)" />
         <Line points={euler} color="var(--c4)" width={1.5} />
         <Dots points={euler} color="var(--c4)" r={2.5} />

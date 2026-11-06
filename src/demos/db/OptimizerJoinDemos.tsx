@@ -106,7 +106,7 @@ export function JoinGraphDemo() {
   const hi = Math.max(10, res.worst.cost / best);
   return (
     <Demo
-      title={`${g.n} tables, ${g.edges.length} join predicates · cost = C_out (sum of intermediate result sizes)`}
+      title={`${g.n} tables, ${g.edges.length} join predicates · cost = Cₒᵤₜ (sum of intermediate result sizes)`}
       controls={<>
         <Param spec={p.schema.n} value={v.n} onChange={(x) => p.set("n", x as number)} />
         <Param spec={p.schema.shape} value={v.shape} onChange={(x) => p.set("shape", x as GraphId)} />

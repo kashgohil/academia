@@ -86,7 +86,7 @@ export function BloomPlayDemo() {
         items={[
           { label: "bits per key (m/n)", value: n ? fixed(m / n, 1) : "–" },
           { label: "bits set: measured (formula)", value: `${filled} (${fixed(m * (1 - Math.exp((-k * n) / m)), 1)})` },
-          { label: "FPR formula (1 − e^(−kn/m))^k", value: pct(n ? bloomFpr(m / n, k) : 0) },
+          { label: "FPR formula $(1 - e^{-kn/m})^k$", value: pct(n ? bloomFpr(m / n, k) : 0) },
           { label: "FPR measured, 4,000 probes", value: pct(measured) },
         ]}
       />

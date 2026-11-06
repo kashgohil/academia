@@ -138,7 +138,7 @@ const V: Record<GfpVerdict, { t: string; c: string }> = {
 
 export function GfpExplorerDemo() {
   const p = useParams("gfp", {
-    order: range({ label: "Order (2^order pages)", min: 0, max: 10, step: 1, default: 0, format: (x) => `${x} (${bytes(4096 * 2 ** x)})` }),
+    order: range({ label: "Order ($2^{\\text{order}}$ pages)", min: 0, max: 10, step: 1, default: 0, format: (x) => `${x} (${bytes(4096 * 2 ** x)})` }),
     ctx: select<GfpContext>({ label: "Calling context", options: (Object.keys(CONTEXT_LABEL) as GfpContext[]).map((value) => ({ value, label: CONTEXT_LABEL[value] })), default: "spinlock" }),
     base: select<GfpBase>({ label: "Flags", options: (Object.keys(GFP_BITS) as GfpBase[]).map((value) => ({ value, label: value })), default: "GFP_KERNEL" }),
     nofail: toggle({ label: "__GFP_NOFAIL", default: false }),

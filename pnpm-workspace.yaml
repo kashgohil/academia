@@ -1,0 +1,5 @@
+# rehype-katex renders lesson math at build time, and src/styles.css loads the KaTeX CSS of the app's own
+# version. Both must be the same version: 0.19 renamed CSS classes (sizing became katex-sizing), and a
+# mismatch breaks every sub- and superscript. tests/unit/katex-version.test.ts checks this.
+overrides:
+  katex: 0.19.1

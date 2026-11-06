@@ -119,7 +119,8 @@ export function tradeoff(run: Pick<HbRun, "arrivals">, timeout: number, horizon:
 
 // ---------------------------------------------------------------- phi accrual
 
-export type PhiDist = "normal" | "exponential";
+/** normal: the exact normal tail (the paper). akka: Akka's logistic approximation of it. exponential: Cassandra. */
+export type PhiDist = "normal" | "akka" | "exponential";
 
 export interface PhiConfig {
   /** Inter-arrival times kept (Akka: max-sample-size = 1000). */
@@ -139,6 +140,12 @@ export function phiOf(elapsed: number, intervals: readonly number[], cfg: PhiCon
   const m = mean(intervals) + cfg.acceptablePause;
   if (cfg.dist === "exponential") return Math.max(0, elapsed) / m / Math.LN10; // -log10(e^(-t/m))
   const s = Math.max(cfg.minStd, std(intervals));
+  if (cfg.dist === "akka") {
+    // PhiAccrualFailureDetector.scala: a logistic approximation of the normal CDF.
+    const y = (elapsed - m) / s;
+    const e = Math.exp(-y * (1.5976 + 0.070566 * y * y));
+    return elapsed > m ? -Math.log10(e / (1 + e)) : -Math.log10(1 - 1 / (1 + e));
+  }
   return -log10NormTail((elapsed - m) / s);
 }
 

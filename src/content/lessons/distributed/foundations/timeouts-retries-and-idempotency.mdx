@@ -1,0 +1,127 @@
+---
+summary: "How to choose a timeout, why naive retries turn a short outage into a long one, how exponential backoff with full jitter and retry budgets stop the storm, and how idempotency keys make a retry safe."
+---
+import { RetryStormDemo, IdempotencyDemo } from "@/demos/dist/FoundationsRetryDemos";
+
+A timeout is the only failure detector that a client has. When it fires, the client knows only that no answer came in time. The request may be lost, the reply may be lost, or the server may still be working. The [partial failure demo](/distributed/foundations/why-distribute) showed that these cases look the same. This lesson is about what a client should do next, so that the system stays correct and stays up.
+
+## Choosing a timeout
+
+A timeout trades two errors. If it is too short, it fires on requests that would have succeeded: a **false timeout**. If it is too long, the client waits a long time for a server that is really dead: **slow detection**. Choose it from the measured latency distribution of the call, not from a guess.
+
+Take the backend model from the [fallacies lesson](/distributed/foundations/the-eight-fallacies): a median of 10 ms and a stall of 1 second on 1% of calls. A 50 ms timeout fires on about 1% of calls, and all of them are real stalls. A 20 ms timeout fires on 2.0% of calls. Half of those are normal answers that were only a little slow. A retry after a false timeout doubles the work for that request.
+
+Real systems compute the timeout from what they observe. TCP keeps a smoothed round-trip time and its variation, and sets the retransmission timeout to $\text{SRTT} + 4 \cdot \text{RTTVAR}$. RFC 6298 rounds it up to at least 1 second, but Linux uses a minimum of 200 ms (`TCP_RTO_MIN`). For an RPC, a common rule is a little above the p99 or p99.9 of the latency.
+
+Then send a **deadline** with the request. A server can then skip a request whose caller has already given up. In gRPC, a client sets a deadline on a call, and gRPC sends it to the server. By default, gRPC sets no deadline, so set one on every call.
+
+## Retries can make an outage worse
+
+A retry adds load at the moment the server is least able to take it. Retries also multiply across layers. If each of 3 services in a call chain makes 3 attempts, the bottom service can see 27 attempts for one user request.
+
+<Predict
+  id="storm"
+  question="195 clients hit a server at the same moment. The server queues 20 requests and rejects the rest with 'busy'. Clients retry with exponential backoff: 10, 20, 40 ms and so on, with no randomness. Compared with full jitter, the last request succeeds…"
+  options={["At about the same time", "Much later", "Much sooner"]}
+  answer={1}
+  explain="Without jitter, all rejected clients wait the same time and come back together. Each wave finds the queue full again, and the server is idle between waves. Full jitter spreads the retries, so the server works all the time. In this run, the last success comes at 300 ms instead of 720 ms."
+>
+<RetryStormDemo />
+</Predict>
+
+1. Read the table for the burst. No backoff makes 1,437 attempts, and 89 requests give up after 10 attempts. Exponential backoff makes 811 attempts and finishes at 720 ms. Full jitter makes 779 and finishes at 300 ms.
+2. Select **exponential** and look at the orange bars. The retries arrive in waves, with idle gaps between them.
+3. Select **steady load, server down 300–500 ms**. Every policy keeps the server 100% busy after the outage, but almost no request succeeds.
+4. Turn on **Retry budget**. The server recovers within a few hundred milliseconds, and wasted work drops to 0.
+5. Raise the client timeout to 100 ms with the budget off. The outage now ends without a collapse, because queued requests no longer time out.
+
+## Backoff and jitter
+
+**Exponential backoff** waits longer after each failure, so that the total retry rate falls as failures continue. **Jitter** adds randomness, so that clients that failed together do not retry together. Marc Brooker compared the variants on the AWS Architecture Blog ("Exponential Backoff And Jitter", 2015). In **full jitter**, the wait is uniform between 0 and the exponential value:
+
+```go
+// Full jitter: sleep a random time in [0, min(cap, base * 2^attempt)).
+func backoff(attempt int, base, cap time.Duration, rnd *rand.Rand) time.Duration {
+	d := base << attempt // base * 2^attempt
+	if d <= 0 || d > cap {
+		d = cap // also guards against overflow of the shift
+	}
+	return time.Duration(rnd.Int63n(int64(d)))
+}
+```
+
+His conclusion was that "equal jitter", which keeps half of the wait fixed, is the loser. Full jitter does less work than "decorrelated jitter", but it takes slightly more time. Plain exponential backoff without jitter does poorly, as the demo shows.
+
+Jitter gives a bound that you can state. Retry number a waits a uniform time over a span $c_a = \min(\text{cap}, \text{base} \cdot 2^{a-1})$. So the chance that it lands in a given window of w ms is at most $\min(1, w / c_a)$, whatever happened before. For R requests, the expected number of retries in any window is at most:
+
+$$
+R \sum_{a} \min\left(1, \frac{w}{c_a}\right)
+$$
+
+With 100 requests, a base of 100 ms, a cap of 1 second and 5 retries, the bound is 19.75 retries per 10 ms window. The tests check the bound over 300 random runs. Without jitter, all 100 retries of the same number land in one window.
+
+## Retry budgets and metastable failure
+
+The outage scenario shows a worse problem. After the server restarts, its queue fills with retries. Each request waits longer than the client timeout, so the client abandons it, and the server then does the work for nobody. In the demo, more than 80% of the server work after the outage is wasted, and goodput stays at 0. The trigger is gone, but the system stays down. Bronson et al. call this a **metastable failure** (HotOS 2021).
+
+Backoff alone does not fix this, because new requests keep coming. What fixes it is a limit on the share of traffic that is retries. Three real versions:
+
+- **gRPC retry throttling** keeps a token count per server, up to `maxTokens`. A failure costs 1 token, and a success adds `tokenRatio`. Retries stop while the count is at most half of `maxTokens`. The demo uses 10 and 0.1, the example values of the gRPC design.
+- **Google SRE** ("Handling Overload") gives up after 3 attempts per request, and a client retries only while retries are below 10% of its requests.
+- **AWS SDKs** in standard mode make at most 3 attempts, use full jitter, and draw each retry from a token bucket called the retry quota.
+
+A budget has a cost. In the burst scenario with the budget on, most requests fail fast instead of succeeding late. That is the trade: under overload, a fast failure is better than a slow collapse. Also keep the server queue shorter than the client timeout, so that the server never works on requests that nobody waits for.
+
+## Idempotency: making the retry safe
+
+A retry is safe only if doing the operation twice has the same effect as doing it once. Such an operation is **idempotent**. "Set x to 5" is idempotent. "Add 10 to the balance" and "charge the card $10" are not.
+
+<Predict
+  id="idem"
+  question="A client asks for a $10 charge. The server charges the card, but the reply is lost. The client retries, and this time the reply arrives. How much did the customer pay?"
+  options={["$10", "$20", "$0"]}
+  answer={1}
+  explain="Both requests reached the server, and the server cannot tell a retry from a new payment. It charged twice. With an idempotency key, the second request finds the saved result and charges nothing."
+>
+<IdempotencyDemo />
+</Predict>
+
+1. Read the default: attempt 1 loses its reply, attempt 2 arrives. The card is charged twice.
+2. Turn on **Send an idempotency key**. The second request gets the saved result, marked "saved", and the card is charged once.
+3. Set attempt 1 to **slow server** and attempt 2 to **arrives**. Without a key, the slow first request and the retry both charge.
+4. Set attempt 1 to **duplicated**. The network delivers the request twice. With the key, the second copy gets "busy", because the first is still running.
+5. Turn on **Server forgets keys** and set attempts 1 and 2 to **reply lost**. Attempt 3 arrives after the key expired, and the card is charged twice again.
+
+## How an idempotency key works
+
+The client makes a unique key for each logical operation, such as a random UUID, and sends it with every attempt. The server stores the key and the result in the same transaction as the effect:
+
+```sql
+BEGIN;
+INSERT INTO idempotency_keys (key, status, created_at) VALUES ($1, 'running', now()); -- fails if the key exists
+INSERT INTO charges (id, account, amount) VALUES ($2, $3, 1000);
+UPDATE idempotency_keys SET status = 'done', response = $4 WHERE key = $1;
+COMMIT;
+```
+
+If the key already exists, the server returns the stored response and does nothing else. The search in the demo checks all 125 combinations of fates for 3 attempts. Without a key, 87 of them charge twice. With a key, none do. If keys expire too soon, 28 do.
+
+Stripe uses this design. A client sends an `Idempotency-Key` header with a POST. Stripe compares the parameters of a repeat with the original and returns an error if they differ. Keys can be removed once they are at least 24 hours old. The IETF draft "The Idempotency-Key HTTP Header Field" suggests two status codes. A repeat gets 409 Conflict while the first request still runs, and a reused key with a different body gets 422.
+
+Two rules follow. The key must live longer than the longest retry window, or a late retry looks new. And the key record and the effect must commit together, or a crash between them breaks the guarantee. This pattern, **at-least-once delivery plus deduplication**, is how most systems get an effect that happens exactly once.
+
+## Connect
+
+- [The network model](/distributed/foundations/the-network-model-messages-delays-and-partitions): duplicates and sequence numbers at the link level.
+- [Failure detectors](/distributed/foundations/failure-detectors): timeouts for nodes, not requests.
+- [Exactly-once semantics](/distributed/data-systems/exactly-once-semantics): idempotent producers and transactions in Kafka.
+- [Queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law): why a queue near capacity makes waits explode.
+
+<Recall cards={[
+  { q: "What two errors does a timeout trade?", a: "False timeouts, when it fires on a request that would succeed, and slow detection, when it waits long for a server that is dead." },
+  { q: "How does TCP set its retransmission timeout, and what are the minimums?", a: "SRTT + 4 × RTTVAR. RFC 6298 says at least 1 second; Linux uses a minimum of 200 ms." },
+  { q: "Why does exponential backoff without jitter still cause trouble?", a: "Clients that failed together wait the same time and retry together. Each wave hits a full queue, and the server is idle between waves." },
+  { q: "Give the full-jitter backoff formula.", a: "Before retry number a, sleep a uniform random time in $[0, \\min(\\text{cap}, \\text{base} \\cdot 2^{a-1}))$." },
+  { q: "What is a metastable failure, and what stops it?", a: "The trigger is gone, but retries keep the server overloaded with work that nobody waits for. A retry budget, a short queue, and deadlines stop it." },
+  { q: "What two rules must an idempotency key implementation follow?", a: "Keep keys longer than the longest retry window, and commit the key record and the effect in one transaction." },
+]} />

@@ -1,0 +1,129 @@
+---
+summary: "What a network may do to a message: delay it without bound, lose it, reorder it, copy it, or cut nodes off. The synchronous, asynchronous and partially synchronous models, and why two generals can never be sure."
+---
+import { NetworkPlaygroundDemo, TwoGeneralsDemo } from "@/demos/dist/FoundationsNetworkDemos";
+
+A protocol is correct only with respect to a **model**: a precise list of what the network and the nodes may do. A model that is too kind gives a protocol that breaks in production. A model that is too harsh makes some problems impossible to solve. This lesson defines the network side of the model. The [next lesson](/distributed/foundations/failure-models) defines the node side.
+
+## What a message can suffer
+
+Between two nodes, the network is a **link**. On a real link, a message can suffer five things:
+
+1. **Delay.** It arrives later than usual: a queue in a switch, a retransmission, a route change.
+2. **Loss.** It never arrives: a full buffer drops it, or a cable fails.
+3. **Reordering.** Message 2 arrives before message 1, because the two took different paths or one was retransmitted.
+4. **Duplication.** It arrives twice, because a sender or a proxy retransmitted a message that was only slow.
+5. **Partition.** A group of nodes cannot reach another group for some time, while each group works inside itself.
+
+Corruption is a sixth. Checksums in Ethernet, TCP and the application turn almost all corruption into loss, so most models leave it out.
+
+<Predict
+  id="fifo"
+  question="Two nodes talk over TCP, which keeps the order of bytes on a connection. Can the receiver still see a request twice, or two requests out of order?"
+  options={["No: TCP prevents both", "Yes: after a reconnect, a client can resend a request that the server already got", "Only if the network is partitioned"]}
+  answer={1}
+  explain="TCP orders bytes inside one connection. If the connection breaks, the client does not know which requests arrived. It opens a new connection and sends them again. The server then sees a duplicate, and the new connection can overtake data that is still in flight on the old one."
+>
+<NetworkPlaygroundDemo />
+</Predict>
+
+1. Set the loss to 30%. Crosses that stop short of a line are messages that the network dropped. Press **New random run** a few times.
+2. Set the loss to 0, the latency range to 1–120 ms, and look at the labels. On one link, a 2 often arrives before a 1. **Arrived out of order** counts these.
+3. Turn on **FIFO links**. The count of out-of-order messages goes to 0. The delays become longer, because a later message now waits for an earlier one.
+4. Turn on **Cut node C off**. Messages that reach C during the cut end in a cross on its line. Messages that arrive after 110 ms get through again.
+5. Set duplication to 30%. A prime (′) marks the second copy. The receiver must recognize it by its sequence number.
+
+## Three timing models
+
+The most important property of a model is what it says about time. There are three classic choices.
+
+| Model | Message delay | Processing speed | What a timeout tells you |
+|---|---|---|---|
+| synchronous | at most a known bound Δ | known bounds | silence longer than the bound means the node crashed |
+| asynchronous | finite, but no bound | no bound | nothing: the node may be slow |
+| partially synchronous | bounded, but the bound or its start time is unknown | the same | eventually correct, if the timeout keeps growing |
+
+In the **asynchronous** model, a message "may be delayed without bound". For any timeout that you choose, there is a run where the message arrives after it. The message is not lost, and it does arrive in finite time. But no fixed wait is long enough. Fischer, Lynch and Paterson showed that in this model no deterministic protocol can always reach consensus if even one node may crash. The [FLP lesson](/distributed/consensus/flp-impossibility) proves it.
+
+The **synchronous** model is too kind for real networks. A garbage-collection pause, a full queue or a route change breaks any bound that is short enough to be useful. Protocols that depend on it, such as some leases based on clocks, fail in rare and dangerous ways.
+
+Dwork, Lynch and Stockmeyer (1988) defined the middle ground, **partial synchrony**, in two versions. In one, bounds on delay and speed exist, but nobody knows them. In the other, the bounds are known, but they hold only after an unknown time, the **global stabilization time** (GST). Before GST, the network can act asynchronously.
+
+Paxos and Raft are built for this model. They are always **safe**: they never return a wrong result. They are **live**, which means that they make progress, only after GST.
+
+A protocol for partial synchrony therefore must not depend on time for correctness. It uses timeouts only to decide when to try again. If a timeout fires too early, the protocol does extra work but stays correct.
+
+## From lossy links to reliable ones
+
+A **fair-loss link** may lose any message, but if a node sends a message again and again, a copy eventually arrives. Retransmission plus duplicate removal turns it into a reliable link. The receiver keeps the highest sequence number it delivered from each sender:
+
+```go
+// Receiver side of a reliable link over a lossy, duplicating network.
+type Link struct {
+	delivered map[NodeID]uint64 // highest sequence number delivered, per sender
+}
+
+func (l *Link) OnMessage(from NodeID, seq uint64, payload []byte, ack func(uint64), deliver func([]byte)) {
+	ack(seq) // always ack, even a duplicate: the first ack may have been lost
+	if seq <= l.delivered[from] {
+		return // a copy we already delivered
+	}
+	if seq == l.delivered[from]+1 {
+		l.delivered[from] = seq
+		deliver(payload)
+	}
+	// seq > next: a gap. Drop it; the sender retransmits in order (go-back-N).
+}
+```
+
+The sender retransmits each message until it gets an ack. TCP does this inside one connection. Across connections and across process restarts, the application must do it again, with sequence numbers that survive a crash. Kafka producers, for example, attach a producer id and a sequence number to each batch for this reason.
+
+## Partitions are real
+
+A **network partition** splits the nodes into groups that cannot talk to each other. It is not a rare theoretical case. Alquraan et al. studied 136 failures caused by partitions in 25 widely used systems (OSDI 2018). About 80% of them had a catastrophic effect, and data loss was the most common one, at 27%. Most failures were silent: the system gave no error.
+
+Two details from that study matter for design. Isolating a single node was enough to trigger 88% of the failures. And 29% of the failures came from **partial partitions**, where A can reach B and B can reach C, but A cannot reach C. A simple model of "two clean halves" misses these.
+
+## The two generals
+
+Two armies camp on two hills, with the enemy in the valley between. They win only if both attack at the same time. They can communicate only by messengers, and the enemy can capture any messenger. Akkoyunlu, Ekanadham and Huber described the problem in 1975, and Jim Gray stated it as a problem of two generals in 1978.
+
+<Predict
+  id="generals"
+  question="General A sends the plan. Each messenger that arrives is answered with a confirmation. How many messengers are enough for both generals to attack with certainty?"
+  options={["2: the plan and one confirmation", "4: two full round trips", "No finite number"]}
+  answer={2}
+  explain="The sender of the last messenger never learns if it arrived. Its view is the same whether the messenger arrived or not, so it must act the same way in both runs. Step back one messenger at a time, and every run must end the same as the run where nothing arrived."
+>
+<TwoGeneralsDemo />
+</Predict>
+
+1. Keep 3 messengers and the rule "attack after 1 messenger". Capture **m2**. A got nothing and waits; B got the plan and attacks alone.
+2. Set A to attack after 2 messengers. Now capturing **m2** is fine, but capturing **m3** is not: A got its 1 confirmation and B got only the plan.
+3. Try every pair of thresholds. The banner always says that 0 pairs pass every run.
+4. Set 6 messengers. The knowledge line grows, "B knows that A knows that B knows…", but the table still has a failing row.
+
+## Why no number of messengers is enough
+
+The demo checks every threshold rule. The argument behind it covers every protocol. Compare the run where all k messengers arrive with the run where messenger k is captured. Only the receiver of messenger k sees a difference. The sender has the same view in both runs, so it decides the same way.
+
+Repeat the step down to the run where nothing arrives. Each step changes the view of exactly one general. If the two always agree, the decision never changes along the chain. In the run where nothing arrives, B never learned the plan and cannot attack. So in the run where everything arrives, nobody attacks either.
+
+Each messenger adds one level of knowledge. **Common knowledge**, where both know, both know that both know, and so on without end, needs infinitely many messages. Real systems give up certainty instead. They make the decision durable on a quorum, and they let a participant that is unsure ask again later. [Two-phase commit](/distributed/transactions/two-phase-commit) does exactly this, and it can block while it waits.
+
+## Connect
+
+- [Why distribute](/distributed/foundations/why-distribute): partial failure, where this ambiguity starts.
+- [Failure models](/distributed/foundations/failure-models): what the nodes themselves may do.
+- [FLP impossibility](/distributed/consensus/flp-impossibility): what the asynchronous model rules out.
+- [Exactly-once semantics](/distributed/data-systems/exactly-once-semantics): sequence numbers and deduplication at the scale of Kafka.
+- [Tail latency](/performance/systems/tail-latency): the delays that make the synchronous model a fiction.
+
+<Recall cards={[
+  { q: "Name the five things a network can do to a message, besides deliver it on time.", a: "Delay it, lose it, reorder it, duplicate it, or cut its receiver off in a partition." },
+  { q: "What does 'a message may be delayed without bound' mean in the asynchronous model?", a: "Every message arrives in finite time, but for any timeout you choose there is a run where it arrives later. No fixed wait can tell a slow node from a dead one." },
+  { q: "Give the two versions of partial synchrony from Dwork, Lynch and Stockmeyer (1988).", a: "Bounds on delay and speed exist but are unknown; or the bounds are known but hold only after an unknown global stabilization time (GST)." },
+  { q: "How does a protocol for partial synchrony use timeouts?", a: "Only for liveness: to decide when to try again. Safety must never depend on a timeout, so an early timeout costs work but not correctness." },
+  { q: "Why does TCP not remove the need for duplicate detection in an application?", a: "TCP orders and deduplicates only inside one connection. After a reconnect or a restart, the client resends requests that may have arrived, so the server needs its own sequence numbers or keys." },
+  { q: "Why can no finite exchange of messengers let both generals attack with certainty?", a: "The sender of the last messenger has the same view whether it arrived or not. Removing the last messenger one step at a time changes one view per step, so every run must end like the run where nothing arrived." },
+]} />

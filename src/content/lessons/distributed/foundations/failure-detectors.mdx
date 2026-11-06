@@ -1,0 +1,133 @@
+---
+summary: "How a node decides that another node has crashed: heartbeats and timeouts, completeness and accuracy (Chandra and Toueg), the eventually perfect detector, and the phi accrual detector that Akka and Cassandra use."
+---
+import { HeartbeatDetectorDemo, PhiAccrualDemo } from "@/demos/dist/FoundationsDetectorDemos";
+
+Many protocols need to know which nodes are down. A leader must be replaced, a lock must be released, a replica must be rebuilt. A **failure detector** is the part of a node that gives this answer. It answers with a list of **suspected** nodes. In an asynchronous network, it cannot be sure: a node that is slow and a node that is dead look the same for a while.
+
+## Heartbeats and a timeout
+
+The usual design is a **heartbeat**. Each node sends a small message every interval, for example every 100 ms. A monitor suspects a node when no heartbeat came for a **timeout**, and trusts it again when one comes. Raft uses the leader's empty AppendEntries messages as heartbeats. The etcd raft library sends a separate heartbeat message instead, every 100 ms by default. A follower starts an election after a random silence of 1000 to 2000 ms.
+
+<Predict
+  id="timeout"
+  question="Heartbeats come every 100 ms. Sometimes the sender pauses for a garbage collection of about 150 ms on average. You set the timeout to 250 ms. How often does the detector accuse a live node?"
+  options={["Never: 250 ms is more than twice the interval", "Rarely: about once an hour", "Often: several times a minute"]}
+  answer={2}
+  explain="A pause adds to the interval, and pause lengths have a long tail. A gap of 100 ms plus a pause of more than about 150 ms is common. In the demo, a 250 ms timeout gives 10.5 false suspicions per minute."
+>
+<HeartbeatDetectorDemo />
+</Predict>
+
+1. Read the diagram at a 250 ms timeout. Red bars on the monitor line are false suspicions, after pauses. The blue bar after the crash is the correct suspicion.
+2. Move the timeout to 500 ms. False suspicions fall to 1 per minute, but the mean detection time grows from 214 ms to 461 ms.
+3. Read the curve. Each dot is one timeout. No timeout gives both fast detection and no false suspicions.
+4. Set the pause chance to 0. The curve drops: with only network jitter, a short timeout is safe.
+5. Set the latency maximum to 150 ms. Jitter alone now causes false suspicions at short timeouts.
+
+## Completeness and accuracy
+
+Chandra and Toueg (JACM, 1996) defined failure detectors by two properties. **Completeness** says that crashed nodes are eventually suspected. **Accuracy** says that correct nodes are not suspected. Each property has strong and weak forms:
+
+| Property | Definition |
+|---|---|
+| strong completeness | eventually, every crashed node is suspected by every correct node, forever |
+| weak completeness | eventually, every crashed node is suspected by some correct node |
+| strong accuracy | no node is suspected before it crashes |
+| weak accuracy | some correct node is never suspected |
+| eventual strong accuracy | after some time, no correct node is suspected |
+| eventual weak accuracy | after some time, some correct node is never suspected |
+
+Completeness is easy: stop hearing from a node, and suspect it forever. Accuracy is the hard part, because it needs bounds on time. The classes combine the two:
+
+- **P, perfect**: strong completeness and strong accuracy. Possible only in a synchronous system.
+- **◇P, eventually perfect**: strong completeness and eventual strong accuracy. It may make mistakes, but only for a finite time.
+- **◇S, eventually strong**: strong completeness and eventual weak accuracy. At least one correct node is eventually trusted by all.
+
+The result that makes this theory useful is about consensus. Consensus is solvable with ◇S if a majority of nodes is correct. Chandra, Hadzilacos and Toueg showed in a second 1996 paper that ◇W, which is equivalent to ◇S, is the weakest detector that solves it. Paxos and Raft rely on the same idea. They need a leader that is eventually trusted, not a detector that is always right.
+
+## Building an eventually perfect detector
+
+In a partially synchronous network, a timeout detector becomes ◇P with one rule: when a suspicion turns out false, make the timeout longer.
+
+```rust
+/// Timeout detector that adapts: each false suspicion doubles that node's timeout.
+/// After the network becomes stable (GST), the timeout eventually exceeds the real bound,
+/// and from then on no live node is suspected: eventual strong accuracy.
+struct Detector {
+    timeout_ms: Vec<u64>,
+    last_heard: Vec<u64>,
+    suspected: Vec<bool>,
+}
+
+impl Detector {
+    fn on_heartbeat(&mut self, node: usize, now: u64) {
+        if self.suspected[node] {
+            self.suspected[node] = false;
+            self.timeout_ms[node] = self.timeout_ms[node].saturating_mul(2); // we were wrong
+        }
+        self.last_heard[node] = now;
+    }
+
+    fn tick(&mut self, now: u64) {
+        for n in 0..self.last_heard.len() {
+            if now - self.last_heard[n] > self.timeout_ms[n] {
+                self.suspected[n] = true; // a crashed node stays suspected: completeness
+            }
+        }
+    }
+}
+```
+
+Real systems choose fixed values and let operators tune them. ZooKeeper measures time in ticks: the sample configuration sets `tickTime=2000` ms, and a session timeout must lie between 2 and 20 ticks by default. A Kafka consumer in the classic group protocol has `session.timeout.ms` = 45 s and `heartbeat.interval.ms` = 3 s. A wrong guess costs in both directions: a false suspicion triggers an election or a rebalance, and a slow detection blocks clients.
+
+## The phi accrual detector
+
+A timeout gives a yes or no answer. Hayashibara, Défago, Yared and Katayama proposed the **phi accrual failure detector** (SRDS 2004). It outputs a number instead: the suspicion level φ. The monitor keeps a window of recent heartbeat inter-arrival times and fits a distribution to it. Then, with $\Delta$ the time since the last heartbeat:
+
+$$
+\varphi(\Delta) = -\log_{10} P(\text{next heartbeat later than } \Delta)
+$$
+
+φ = 1 means that a live node would be this late with probability 0.1, and φ = 8 means a probability of $10^{-8}$. Each application picks its own threshold. A threshold that adapts to the measured jitter replaces a timeout that someone guessed.
+
+<Predict
+  id="phi"
+  question="Heartbeats arrive every 100 ms with little jitter, and the threshold is φ = 8. The node crashes. Roughly when does φ cross 8?"
+  options={["After about 100 ms", "After about 200 ms", "After about 800 ms"]}
+  answer={1}
+  explain="With a normal model, φ = 8 is a silence about 5.6 standard deviations above the mean interval. Here the mean is about 100 ms and the standard deviation is about 20 ms, so φ crosses 8 at about 215 ms of silence. The demo detects the crash 200 ms after it, because the last heartbeat came before the crash."
+>
+<PhiAccrualDemo />
+</Predict>
+
+1. Read the default run. φ stays near 0 while heartbeats arrive, jumps after a pause, and climbs steeply after the crash at 3000 ms.
+2. Lower the threshold to 2. The pause near 1600 ms now causes a false suspicion.
+3. Select **exponential**. φ grows in a straight line with the silence, much more slowly. At threshold 8, the crash is not detected before the run ends.
+4. Select **normal** again and raise the pause chance to 20%. Even at φ = 8, a pause now causes a false suspicion near 1250 ms. The normal model is too optimistic about long pauses.
+
+## What phi buys, and what real systems set
+
+With a normal model, φ depends on how far the silence is above the mean, in standard deviations. $P(Z > 5.61) = 10^{-8}$, so φ = 8 is a silence of the mean plus 5.6 standard deviations. A steady network has a small deviation, and detection is fast. A noisy network has a large one, and the detector waits longer by itself.
+
+Akka Cluster uses this design. Its defaults are a threshold of 8.0 and a heartbeat interval of 1 s. An `acceptable-heartbeat-pause` of 3 s is added to the mean, the `min-std-deviation` is 100 ms, and the window holds up to 1000 samples. With steady heartbeats, φ reaches 8 after about 4.52 seconds of silence. Akka approximates the normal curve with a logistic function. The exact normal curve gives 4.56 seconds.
+
+Cassandra also names its detector after phi, with `phi_convict_threshold` = 8 by default. But its code computes φ as the silence divided by the mean interval, times $1/\ln 10$. That is the exponential model: φ grows linearly with the silence. If heartbeats came once a second, φ would reach 8 only after 18.4 seconds.
+
+Accrual does not remove the trade-off from the first demo. It moves the choice from "how many milliseconds" to "how unlikely", and it adapts the timeout to each link. It cannot see a gray failure, where heartbeats arrive on time but real requests fail. Large clusters also do not want every node to watch every other node. Gossip protocols such as SWIM (DSN 2002) spread the work, and the [gossip lesson](/distributed/data-systems/gossip-and-swim) covers them.
+
+## Connect
+
+- [Failure models](/distributed/foundations/failure-models): what a detector can and cannot see, including gray failure.
+- [Raft leader election](/distributed/consensus/raft-leader-election): randomized election timeouts as a failure detector.
+- [Leases and fencing tokens](/distributed/coordination/leases-and-fencing-tokens): what to do when a suspected node is still alive and acting.
+- [Gossip and SWIM](/distributed/data-systems/gossip-and-swim): failure detection that scales to thousands of nodes.
+
+<Recall cards={[
+  { q: "Define completeness and accuracy for a failure detector.", a: "Completeness: every crashed node is eventually suspected. Accuracy: correct nodes are not suspected. Each has strong and weak forms, and accuracy also has eventual forms." },
+  { q: "What is an eventually perfect detector (◇P)?", a: "Strong completeness and eventual strong accuracy: it can wrongly suspect live nodes, but only for a finite time." },
+  { q: "Which failure detector is the weakest that solves consensus, and under what condition?", a: "◇W, equivalent to ◇S (Chandra, Hadzilacos and Toueg, 1996), if a majority of nodes is correct." },
+  { q: "How does a timeout detector become ◇P in a partially synchronous network?", a: "Increase the timeout for a node each time a suspicion of it turns out false. After GST, the timeout eventually exceeds the real bound." },
+  { q: "Define φ in the phi accrual detector.", a: "$\\varphi = -\\log_{10}$ of the probability that a live node's next heartbeat comes later than the current silence, from a distribution fitted to recent inter-arrival times." },
+  { q: "How do Akka and Cassandra differ in computing φ?", a: "Akka fits a normal distribution, adds an acceptable pause to the mean, and floors the standard deviation. Cassandra uses silence / mean / ln 10, an exponential model. Both use threshold 8 by default." },
+]} />

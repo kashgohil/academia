@@ -1,0 +1,107 @@
+---
+summary: "Why we spread a system over many machines: scale, fault tolerance and latency. What it costs: partial failure, no shared clock, no shared memory. And when one large machine is the better answer."
+---
+import { AvailabilityCalcDemo, PartialFailureDemo } from "@/demos/dist/FoundationsWhyDemos";
+
+A **distributed system** is a set of computers that work together and talk only by messages over a network. Each computer is a **node**. We accept the extra difficulty for three reasons, and we pay for it with three new problems. This lesson puts numbers on both sides.
+
+The three reasons are these:
+
+1. **Scale.** One machine has a limit on CPU, memory, disk and network bandwidth. More machines give more of each.
+2. **Fault tolerance.** One machine fails sometimes. Copies on several machines, called **replicas**, can keep the service up.
+3. **Latency to users.** A signal in fiber is slower than light in a vacuum, and a round trip across an ocean takes tens of milliseconds. A replica near the user removes that round trip.
+
+## Availability: what N replicas buy
+
+Assume that each node is down with probability p, independently of the others. The **availability** of a service is the share of time that it can answer. It depends on how many nodes each operation needs. A read that any replica can serve needs only 1 of N. A protocol such as Raft needs a **majority**, which is more than half of the nodes. A write that waits for every replica needs all N.
+
+<Predict
+  id="all-n"
+  question="Each node is down 1% of the time. A write must reach all 3 replicas before it succeeds. Is the write more or less available than with one node?"
+  options={["More available: 3 copies are safer", "The same: 99%", "Less available: about 97%"]}
+  answer={2}
+  explain="The write needs all three nodes up at the same time: 0.99 to the power 3 = 0.970299. Three copies make the data safer, but an operation that needs all of them is up less often than one node."
+>
+<AvailabilityCalcDemo />
+</Predict>
+
+1. Keep N = 3 and p = 1%. Read the table: any 1 of 3 gives 99.9999%, a majority gives 99.9702%, and all 3 give 97.0299%.
+2. Move N from 3 to 4. The blue majority line goes down. Four nodes need 3 up, and they still tolerate only one failure.
+3. Set N = 10 and read the red line. An operation that needs all 10 nodes is up only about 90% of the time.
+4. Move the serial share to 20%. The speedup with 15 nodes is now below 4, and no number of nodes gives more than 5.
+
+The arithmetic is the binomial distribution. With $q = 1 - p$, the availability of a rule that needs k of N up is:
+
+$$
+A = \sum_{j=k}^{N} \binom{N}{j} q^{j} p^{N-j}
+$$
+
+For N = 3 and p = 0.01, the majority rule gives $3 q^{2} p + q^{3} = 0.999702$. That is 2.6 hours of downtime per year, against 3.65 days for one node. Five nodes give 99.99901%. So consensus clusters almost always have an odd number of voting members, usually 3 or 5.
+
+The model is optimistic in one important way. It assumes that failures are independent. A shared power supply, a top-of-rack switch or a bad deploy takes many nodes down together. Real availability is limited by these **correlated failures**, so replicas go into different racks, zones and regions.
+
+## Throughput: Amdahl's limit
+
+More nodes give more throughput only for the part of the work that runs in parallel. Amdahl (1967) made this argument for processors. If a share s of the work is serial, N workers give at most:
+
+$$
+S(N) = \frac{1}{s + (1 - s)/N}
+$$
+
+With s = 5%, 16 nodes give a speedup of 9.14, and the limit for any N is 20. In a distributed system, the serial part is often coordination: one leader that orders every write, or one lock. Gunther's **Universal Scalability Law** adds a cost for each pair of nodes that must agree, $\kappa N(N-1)$. With a contention of 5% and $\kappa = 0.001$, throughput peaks at about 31 nodes and then falls.
+
+So a design that scales out must avoid coordination on the common path. Partitioning, which gives each node its own slice of the keys, is the usual tool. Later modules show where it still needs coordination.
+
+## When one machine is enough
+
+A single large server is bigger than many people think. Take these round numbers as **model inputs**, not measurements. The server has 192 cores, 2 TiB of RAM, 30 TB of NVMe storage and a 100 Gbit/s network card. If one core serves 100,000 simple in-memory key-value operations per second, the machine serves 19.2 million per second. Its network card moves 12.5 GB/s.
+
+Many services never reach those numbers. If yours does not, one machine plus a standby replica and good backups is simpler and faster. It has no network partitions inside, and a single clock. You still need replication for fault tolerance, but not for scale.
+
+## The costs: three things you lose
+
+A program on one machine has three comforts that a distributed system loses.
+
+1. **Shared memory.** Nodes share no RAM. Each node knows only its own state and the messages that it received.
+2. **A global clock.** Each node has its own clock, and the clocks drift apart. No node can know the exact time of an event on another node.
+3. **Total failure.** One machine usually works or fails as a whole. A distributed system has **partial failure**: some parts fail while others run, and the others often cannot tell.
+
+Partial failure is the hardest of the three. The next demo shows why.
+
+<Predict
+  id="partial"
+  question="A client sends a request to three services and waits 40 ms. No service replies in time. What can the client conclude?"
+  options={["All three services crashed", "None of them did the work", "Nothing: each one may or may not have done the work"]}
+  answer={2}
+  explain="The request may be lost, the reply may be lost, or the service may be slow. These cases look the same to the client: silence. In some cases the work is done, and in others it is not."
+>
+<PartialFailureDemo />
+</Predict>
+
+1. Read the default run. Service A lost the request, B lost the reply, and C is slow. The client sees "no reply" from all three.
+2. Read **What really happened**. A did nothing, B did the work at 12 ms, and C did it at 70 ms, after the timeout.
+3. Set service C to **crashed**. The client view does not change at all.
+4. Set every service to **works**. Each reply arrives at 22 ms, well before the timeout.
+
+## Why partial failure is hard
+
+The client must decide what to do next with no new information. If it retries, it may do the work twice, as with B and C. If it does not retry, the work may never happen, as with A. A timeout does not mean "failed". It means "unknown".
+
+Every protocol in this track deals with this ambiguity. Idempotent requests make a retry safe. Quorums let a system continue without the slow nodes. Consensus lets nodes agree on one outcome even when some messages are lost.
+
+## Connect
+
+- [The network model](/distributed/foundations/the-network-model-messages-delays-and-partitions): what the network may do to a message.
+- [Failure models](/distributed/foundations/failure-models): how bad a node may behave, and how many nodes each model needs.
+- [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency): how a client acts on "unknown".
+- [Leaderless and quorums](/distributed/replication/leaderless-and-quorums): the majority rule from the calculator, used for reads and writes.
+- [Latency vs throughput](/performance/systems/latency-vs-throughput): the same trade-off inside one machine.
+
+<Recall cards={[
+  { q: "Each node is down 1% of the time. Give the availability of an operation that needs any 1, a majority, and all of 3 nodes.", a: "Any 1 of 3: 99.9999%. A majority (2 of 3): 99.9702%. All 3: 97.0299%, which is less than one node." },
+  { q: "Why do clusters use 3 or 5 voting nodes, not 4?", a: "A majority of 4 is 3, so 4 nodes still tolerate only one failure. The extra node adds a chance of failure but no tolerance." },
+  { q: "What assumption makes the simple availability formula optimistic?", a: "Independent failures. A shared switch, power supply or bad deploy takes several nodes down together." },
+  { q: "State Amdahl's law and its limit.", a: "With a serial share s, N workers give a speedup of $1/(s + (1-s)/N)$. The limit for large N is $1/s$: 20 for s = 5%." },
+  { q: "Name the three things a distributed system loses compared with one machine.", a: "Shared memory, a global clock, and all-or-nothing failure. It gets partial failure instead." },
+  { q: "A request times out. Name three causes that look the same to the client.", a: "The request was lost, the reply was lost, or the server is slow. In the last two cases the work was done." },
+]} />

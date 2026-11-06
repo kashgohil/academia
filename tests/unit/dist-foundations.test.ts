@@ -313,9 +313,12 @@ describe("failure detectors", () => {
     }
   });
   test("phi thresholds in real systems", () => {
-    // Akka defaults: 1 s heartbeats, acceptable pause 3 s, min std 100 ms, threshold 8 -> about 4.56 s of silence.
+    // Akka defaults: 1 s heartbeats, acceptable pause 3 s, min std 100 ms, threshold 8. Akka's logistic formula gives
+    // about 4.52 s of silence; the exact normal tail would give 4.56 s.
     const steady = new Array(100).fill(1000);
-    expect(bisect((e) => phiOf(e, steady, { maxSamples: 1000, minStd: 100, acceptablePause: 3000, dist: "normal" }), 8, 0, 1e6)).toBeCloseTo(4561, 0);
+    const akka = { maxSamples: 1000, minStd: 100, acceptablePause: 3000 };
+    expect(bisect((e) => phiOf(e, steady, { ...akka, dist: "akka" }), 8, 0, 1e6)).toBeCloseTo(4523, 0);
+    expect(bisect((e) => phiOf(e, steady, { ...akka, dist: "normal" }), 8, 0, 1e6)).toBeCloseTo(4561, 0);
     // Exponential model (Cassandra), mean 1 s: phi = 8 after 8 ln 10 = 18.4 s.
     expect(bisect((e) => phiOf(e, steady, { ...PHI_DEFAULTS, dist: "exponential" }), 8, 0, 1e6)).toBeCloseTo(18421, 0);
   });

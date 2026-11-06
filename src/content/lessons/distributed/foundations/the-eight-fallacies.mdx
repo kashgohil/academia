@@ -1,0 +1,99 @@
+---
+summary: "The eight false assumptions that Deutsch and Gosling listed at Sun, each with the failure it causes. Then two that cost the most: the bandwidth-delay product, and tail latency when one request fans out to many servers."
+---
+import { FanoutTailDemo, BdpDemo } from "@/demos/dist/FoundationsFallacyDemos";
+
+In 1994, L Peter Deutsch at Sun Microsystems wrote down seven assumptions that programmers new to distributed systems make. All seven are false. Around 1997, James Gosling added an eighth. Earlier, Bill Joy and others at Sun had already listed the first four. Each fallacy is a model that is too kind, and each one causes a known kind of outage.
+
+## The list, with what goes wrong
+
+1. **The network is reliable.** A request or its reply is lost, and the client retries. If the operation is not idempotent, the retry does it twice. The [retries lesson](/distributed/foundations/timeouts-retries-and-idempotency) shows a double charge.
+2. **Latency is zero.** Code that makes 100 calls one after another is fine inside one data center. With a round trip of 0.5 ms (a model input), the calls take 50 ms. Move one service to another continent, with a 70 ms round trip, and the same code takes 7 seconds.
+3. **Bandwidth is infinite.** A sender can have only one window of data unacknowledged. On a long, fast link, a small window leaves most of the link idle. The second demo shows this.
+4. **The network is secure.** Raft and Paxos trust every message. A process that can reach the cluster port can send a forged vote or a forged log entry. Use mutual TLS between nodes, also inside the data center.
+5. **Topology does not change.** A container restarts with a new IP address, but a client keeps the old address from its DNS cache. A route change turns a clean network into a partial partition.
+6. **There is one administrator.** Another team changes a firewall rule or a load balancer timeout. Your nodes see this as an omission fault that nobody announced.
+7. **Transport cost is zero.** Each message costs CPU for serialization, and traffic between cloud zones or regions is billed per gigabyte. A design that replicates every write to three zones pays for it on every write.
+8. **The network is homogeneous.** During a rolling upgrade, old and new versions of a protocol run side by side. Links with different maximum packet sizes (MTU) can silently drop large packets while small ones get through.
+
+The list is from the 1990s, but it describes the cloud well. The fallacies about latency, bandwidth and reliability have the most numbers behind them. The rest of this lesson works through two of them.
+
+## Tail latency at fan-out
+
+A search, a feed or a dashboard often sends one request to many backends and waits for all the answers. The request is then as slow as the slowest backend. Rare slowness on one server becomes common slowness for the user.
+
+<Predict
+  id="fanout"
+  question="Each backend answers in about 10 ms, but 1 request in 100 stalls for 1 second. A user request goes to 100 backends and waits for all of them. What share of user requests takes more than 1 second?"
+  options={["About 1%", "About 10%", "About 63%"]}
+  answer={2}
+  explain="A user request is fast only if all 100 backends are fast: 0.99 to the power 100 = 0.366. So 1 − 0.366 = 63.4% of user requests wait for at least one stall. Dean and Barroso gave this example in 'The Tail at Scale'."
+>
+<FanoutTailDemo />
+</Predict>
+
+1. Read the stats at n = 100. The median user request takes about 1 second, although the median backend takes 10 ms.
+2. Move n down. The orange median line drops back to milliseconds below 69 backends. From 69 on, more than half of all requests hit a stall.
+3. Set **Answers it can skip** to 5. The green p99 line falls to about 20 ms: the request uses the 95 fastest answers.
+4. Set the stall chance to 0.1% and n = 100. About 1 request in 10 still hits a stall.
+
+## Why the tail grows
+
+Let $F(t)$ be the probability that one backend answers within t. If backends are independent, a request that waits for all n answers is done by t with probability $F(t)^{n}$. A request that waits for k of n is done when at least k backends are done:
+
+$$
+P(T_{k:n} \le t) = \sum_{j=k}^{n} \binom{n}{j} F(t)^{j} \left(1 - F(t)\right)^{n-j}
+$$
+
+The demo solves this for t at the 50th and 99th percentiles. The model of one backend is a **model input**: a lognormal body with a median of 10 ms, plus a rare stall. Stalls come from garbage collection, a compaction, a slow disk or a queue behind another request.
+
+Dean and Barroso give the same number in "The Tail at Scale" (CACM, 2013). With 100 servers, each with a p99 of 1 second, 63% of user requests take more than 1 second. Their remedies follow from the formula:
+
+- **Wait for k of n.** If the answer is still useful without a few backends, return early. Search engines do this with partial results.
+- **Hedged requests.** Send a second copy of a request when the first is slower than, for example, the p95. Use the first answer and cancel the other.
+- **Fix the tail at its source.** Make backends shed load early, and schedule background work so that it does not block requests.
+
+## The bandwidth-delay product
+
+A sender may have only a **window** of data unacknowledged. After it sends one window, it must wait for an ack, and the first ack comes back one round trip later. So the throughput is at most the window divided by the round-trip time (RTT). To fill the link, the window must be at least the **bandwidth-delay product**, the number of bytes that are in flight on a full link:
+
+$$
+\text{BDP} = \text{bandwidth} \times \text{RTT}
+$$
+
+A 10 Gbit/s link with a 100 ms RTT holds 125 MB in flight, which is 119 MiB.
+
+<Predict
+  id="bdp"
+  question="A TCP sender with a 64 KiB window sends over a 10 Gbit/s link with a 100 ms round trip. About what throughput does it get?"
+  options={["About 10 Gbit/s", "About 650 Mbit/s", "About 5 Mbit/s"]}
+  answer={2}
+  explain="It sends 64 KiB, then waits 100 ms for the ack. 65,535 bytes × 8 / 0.1 s = 5.24 Mbit/s. The link is 99.95% idle."
+>
+<BdpDemo />
+</Predict>
+
+1. Read the default: a 64 KiB window gives 5.24 Mbit/s, and 1 GB takes about 25 minutes.
+2. Press **Window = BDP**. The pipe fills, and throughput reaches 10 Gbit/s.
+3. Go back to a 64 KiB window and set the RTT to 0.5 ms. The same window now gives about 1 Gbit/s. Short links forgive small windows.
+4. Set a 100 Mbit/s link with a 100 ms RTT. The BDP is now 1.25 MB, so a window of about 1.2 MiB fills the link.
+
+The 64 KiB limit is real. The TCP header has a 16-bit window field, so without the **window scale** option (RFC 7323) a window cannot exceed 65,535 bytes. With the largest shift, 14, the window can reach about 1 GiB. Operating systems scale windows by default today, but the buffers must also be large enough: on Linux, the `net.ipv4.tcp_rmem` and `net.ipv4.tcp_wmem` limits.
+
+The same rule applies above TCP. A replication protocol that sends one batch and waits for its ack gets at most one batch per RTT. A follower across a continent then lags behind, however fast the link is. The fix is the same: **pipelining**, which keeps several batches in flight. The raft library of etcd, for example, keeps several append messages in flight per follower, up to its `MaxInflightMsgs` setting.
+
+## Connect
+
+- [Tail latency](/performance/systems/tail-latency): hedged requests and the tail inside one machine.
+- [Latency vs throughput](/performance/systems/latency-vs-throughput): batching and why throughput is not the inverse of latency.
+- [The network model](/distributed/foundations/the-network-model-messages-delays-and-partitions): loss, delay and partitions as part of the model.
+- [Raft log replication](/distributed/consensus/raft-log-replication): pipelined appends between a leader and its followers.
+
+<Recall cards={[
+  { q: "List the eight fallacies of distributed computing.", a: "The first four: the network is reliable, latency is zero, bandwidth is infinite, the network is secure. The last four: topology does not change, there is one administrator, transport cost is zero, the network is homogeneous." },
+  { q: "Who wrote the list, and when?", a: "L Peter Deutsch at Sun wrote the first seven in 1994. James Gosling added the eighth, 'the network is homogeneous', around 1997." },
+  { q: "One backend is slow 1% of the time. A request fans out to 100 backends and waits for all. How often is it slow?", a: "$1 - 0.99^{100} \\approx 63\\%$ of the time. From 69 backends on, the median request is slow." },
+  { q: "Name two remedies for tail latency at fan-out.", a: "Wait for k of n answers instead of all n; send hedged requests after a delay and use the first answer. Also reduce stalls at the source." },
+  { q: "What is the bandwidth-delay product, and why does it matter?", a: "Bandwidth × RTT: the bytes in flight on a full link. A sender with a smaller window gets at most window / RTT, whatever the link speed." },
+  { q: "What limits a TCP window to 64 KiB, and what removes the limit?", a: "The 16-bit window field in the TCP header. The window scale option (RFC 7323) shifts it by up to 14 bits, to about 1 GiB." },
+]} />

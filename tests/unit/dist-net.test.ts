@@ -87,4 +87,22 @@ describe("Net", () => {
     expect(fired).toEqual(["b"]);
     expect(net.clock(1)).toBeCloseTo(20 * (1 + 100e-6) + 3, 9);
   });
+
+  test("hold mode: the learner chooses the order, and drops; timers still fire", () => {
+    const got: number[] = [], fired: string[] = [];
+    const net = new Net<{ i: number }>(2, { seed: 1 }, { onMessage: (_n, m) => got.push(m.payload.i), onTimer: (_n, tag) => fired.push(tag) });
+    net.hold = true;
+    const ids = [0, 1, 2].map((i) => net.send(0, 1, { i }).id);
+    net.setTimer(0, 5, "t");
+    net.runAll();
+    expect(got).toEqual([]);
+    expect(fired).toEqual(["t"]);
+    expect(net.held().map((m) => m.id)).toEqual(ids);
+    net.deliverHeld(ids[2]!);
+    net.dropHeld(ids[0]!);
+    net.deliverHeld(ids[1]!);
+    expect(got).toEqual([2, 1]);
+    expect(net.messages.find((m) => m.id === ids[0])!.lost).toBe("dropped");
+    expect(net.held()).toEqual([]);
+  });
 });

@@ -9,6 +9,9 @@
  * - The same seed gives the same run, so a demo can replay a scenario and a test can pin its numbers.
  *
  * A protocol is a set of handlers. The network calls them for each delivery and timer, in time order.
+ *
+ * Hold mode lets a learner be the network. With `net.hold = true`, a sent message waits in `held()` instead of
+ * arriving on its own. `deliverHeld(id)` delivers it now and `dropHeld(id)` loses it. Timers still run with step().
  */
 import { mulberry32, type Rng } from "../rng";
 
@@ -124,6 +127,9 @@ export class Net<P> {
   readonly messages: Message<P>[] = [];
   private rng: Rng;
   private q = new Queue<Pending<P>>();
+  /** When true, sent messages wait for deliverHeld or dropHeld. */
+  hold = false;
+  private heldMsgs: Message<P>[] = [];
   private seq = 0;
   private nextMsg = 1;
   private nextTimer = 1;
@@ -185,7 +191,8 @@ export class Net<P> {
         at = Math.max(at, (this.linkLast.get(key) ?? -Infinity) + 1e-6);
         this.linkLast.set(key, at);
       }
-      this.q.push({ t: at, seq: this.seq++, kind: "deliver", node: to, msg: m, run: () => this.deliver(m) });
+      if (this.hold) this.heldMsgs.push(m);
+      else this.q.push({ t: at, seq: this.seq++, kind: "deliver", node: to, msg: m, run: () => this.deliver(m) });
     }
     return msg;
   }
@@ -203,6 +210,31 @@ export class Net<P> {
 
   cancelTimer(id: number) {
     this.cancelled.add(id);
+  }
+
+  /** Messages waiting for the learner, oldest first. */
+  held(): Message<P>[] {
+    return [...this.heldMsgs];
+  }
+
+  /** Delivers a held message now. Time moves one step, so each choice shows on the diagram. */
+  deliverHeld(id: number): boolean {
+    const i = this.heldMsgs.findIndex((m) => m.id === id);
+    if (i < 0) return false;
+    const [m] = this.heldMsgs.splice(i, 1);
+    this.now += 1;
+    this.deliver(m!);
+    return true;
+  }
+
+  /** Loses a held message, as the network might. */
+  dropHeld(id: number): boolean {
+    const i = this.heldMsgs.findIndex((m) => m.id === id);
+    if (i < 0) return false;
+    const [m] = this.heldMsgs.splice(i, 1);
+    this.now += 1;
+    this.lose(m!, "dropped", this.now);
+    return true;
   }
 
   crash(node: NodeId) {

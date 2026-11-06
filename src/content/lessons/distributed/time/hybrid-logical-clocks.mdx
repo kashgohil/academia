@@ -1,0 +1,112 @@
+---
+summary: "Hybrid logical clocks put Lamport's rules on top of physical time: the l and c fields, the update rules, why l stays within the clock skew of physical time, and how CockroachDB uses HLC with a maximum offset and uncertainty intervals."
+---
+import { TimeHlcStepperDemo, TimeHlcCompareDemo, TimeUncertaintyDemo } from "@/demos/dist/TimeHlcDemos";
+
+Databases want two things from a timestamp. It must respect causality: if a write happened before another, its timestamp must be smaller. It must also be close to real time. Then a user can read "the data as of 10:00" and expire a row after a day.
+
+A Lamport clock gives the first and not the second. A physical clock gives the second and not the first. A **hybrid logical clock** (HLC) gives both, in 64 bits, with no special hardware.
+
+## The obvious hybrid, and its flaw
+
+Start from a Lamport clock that counts in milliseconds and never falls behind the physical clock $pt$. A local event sets $l = \max(l + 1, pt)$, and a receive sets $l = \max(l + 1, m.l + 1, pt)$. This respects causality. But each event adds 1 ms, even if no real time passed. When a node does more than one event per millisecond, $l$ runs ahead of physical time, and nothing pulls it back.
+
+Kulkarni, Demirbas and others fixed this in "Logical Physical Clocks" (OPODIS 2014). They split the timestamp into two fields:
+
+- $l$: the largest physical time that the node has heard of, from its own clock or from a message.
+- $c$: a counter that orders events with the same $l$.
+
+$l$ changes only to a physical time that some node really read. The logical part of the order goes into $c$.
+
+## The rules
+
+These are the rules from figure 5 of the paper, for a node with physical clock $pt$:
+
+```ts
+type Hlc = { l: number; c: number };
+
+// Send or local event.
+function local(h: Hlc, pt: number): Hlc {
+  const l = Math.max(h.l, pt);
+  return l === h.l ? { l, c: h.c + 1 } : { l, c: 0 };
+}
+
+// Receive of a message stamped m.
+function recv(h: Hlc, m: Hlc, pt: number): Hlc {
+  const l = Math.max(h.l, m.l, pt);
+  if (l === h.l && l === m.l) return { l, c: Math.max(h.c, m.c) + 1 };
+  if (l === h.l) return { l, c: h.c + 1 };
+  if (l === m.l) return { l, c: m.c + 1 };
+  return { l, c: 0 }; // the physical clock is ahead of everything heard
+}
+```
+
+Timestamps compare by $l$, then by $c$. If the physical clock is ahead, $c$ resets to 0. If not, $c$ continues from the largest $l$ seen. The paper packs $l$ into the high 48 bits and $c$ into the low 16 bits of a 64-bit NTP-format timestamp. So an HLC fits where a physical timestamp used to be.
+
+<Predict
+  id="recv"
+  question="A node's clock reads pt = 10, and its HLC is (10, 0). It receives a message stamped (52, 0) from a node whose clock is ahead. What is its new HLC?"
+  options={["(10, 1): its own clock wins", "(52, 1): it takes the message's l and counts up", "(53, 0): it moves 1 ms past the message"]}
+  answer={1}
+  explain="l = max(10, 52, 10) = 52, which comes from the message, so c = m.c + 1 = 1. The naive hybrid would give 53 and so run 1 ms further ahead of real time. HLC adds no time that no clock has read."
+>
+<TimeHlcStepperDemo />
+</Predict>
+
+1. Press **Step** a few times. P2's clock is 40 ms ahead, so its events have $l$ = its own $pt$ and $c$ = 0.
+2. Step to a receive on P1 from P2. P1's $pt$ is lower than the message's $l$, so P1 takes $l$ from the message and counts $c$ up. The table shows that P1's $l - pt$ is now positive.
+3. Step on to the next local events on P1. While P1's $pt$ is still below $l$, $c$ keeps counting. When $pt$ passes $l$, $c$ resets to 0.
+4. Read the stats. The largest clock gap ε is 60 ms, and the largest $l - pt$ is 54 ms. The smallest is 0 ms: $l$ is never below the node's own clock.
+5. Set both offsets to 0 and the drift to 0. All clocks agree, $l$ equals $pt$ almost everywhere, and $c$ stays small.
+
+## Why l stays close to physical time
+
+The paper proves three properties. First, $e \to f$ implies $(l, c)(e) < (l, c)(f)$, so HLC satisfies the clock condition, like a Lamport clock. Second, $l \ge pt$ at every event, because $l$ takes the maximum with $pt$.
+
+Third, $l$ is never far ahead. $l$ is always a physical time that some node read at an earlier event. Let ε be the largest difference between two clocks. That earlier reading is at most ε above any node's clock now, so $l - pt \le \varepsilon$.
+
+The counter is bounded too. Assume that each node's clock moves by at least 1 between two of its events. Then the paper shows that $c$ is at most $N(\varepsilon + 1)$ for $N$ nodes. In practice $c$ is small, because each tick of the physical clock resets it.
+
+<TimeHlcCompareDemo />
+
+1. With the defaults (one event every 10 ms on each node), both hybrids stay near physical time. The naive one is at most 55 ms ahead, and HLC is at most 54 ms ahead.
+2. Move the event gap to 0.3 ms. Each node now does more than 3 events per millisecond. The naive clock runs 615 ms ahead of physical time, and it keeps going.
+3. Read HLC at the same rate. Its $l - pt$ stays at 57 ms, below ε = 60 ms. The extra order is in $c$, which reaches 35.
+4. Set the clock spread to 0. The bound ε is now 0, so $l$ equals $pt$ at every event, and only $c$ orders events in the same millisecond.
+
+HLC does not detect concurrency. It is a Lamport clock whose numbers are close to real time, so two concurrent events still get ordered stamps. Its value is that a timestamp means "about this time", with an error bounded by the clock skew.
+
+## HLC in real systems
+
+CockroachDB gives every transaction an HLC timestamp. Its documentation states that HLC time is always greater than or equal to the wall time. Nodes put their HLC timestamp on each request, and a receiver updates its own HLC from it. MongoDB's cluster time, used for causal consistency since version 3.6, is also a hybrid logical clock. YugabyteDB orders its transactions with an HLC as well.
+
+An HLC cannot make clocks agree. So CockroachDB also assumes a bound on clock offset, set by the `--max-offset` flag. The default is 500 ms. Each node checks its clock against the other nodes. A node that is off from at least half of them by 80% of the maximum offset crashes on purpose. With the default, that is 400 ms.
+
+The bound is used for reads. A read at timestamp $r$ can find a value with a timestamp $w > r$. If $w \le r + \text{max offset}$, the value is in the read's **uncertainty interval**. The write may have committed before the read began, on a node whose clock is ahead. CockroachDB cannot tell, so it restarts the read at a timestamp above $w$ (the `ReadWithinUncertaintyIntervalError`). Values above $r + \text{max offset}$ are surely later, so the read ignores them.
+
+<TimeUncertaintyDemo />
+
+1. With the defaults, the writer's clock is 120 ms ahead. The write gets timestamp 120, and the read 50 ms later gets 50. The write is inside the interval, so the read restarts and sees it.
+2. Turn off the uncertainty interval. The read ignores the write with timestamp 120, although the write had committed. This is a stale read.
+3. Turn the interval on, and set the writer's offset to +400 ms. The real clock gap is 400 ms, larger than the configured 250 ms. The write is above the whole interval, so the read misses it. A broken bound gives wrong answers with no error.
+4. Keep the writer at +400 ms, and set the gap between commit and read to 200 ms. The interval now reaches 450, the write is inside it, and the read restarts and sees it.
+
+The interval has a cost: a restart. A larger maximum offset is safer but makes more reads uncertain. CockroachDB reduces this in one way. A transaction remembers the clock reading of each node that it visited, and it caps its interval on that node at that reading. The documentation says that reads "will never encounter uncertainty issues on any node which was previously visited".
+
+Compare this with [Spanner and TrueTime](/distributed/transactions/spanner-and-truetime). Spanner keeps the bound small with GPS and atomic clocks, and it waits out the uncertainty at commit. CockroachDB uses ordinary NTP, a larger bound, and pushes the cost to reads that meet an uncertain value.
+
+## Connect
+
+- [Lamport clocks](/distributed/time/lamport-clocks): the rules that HLC keeps.
+- [NTP and clock synchronization](/distributed/time/ntp-and-clock-synchronization): where the bound ε comes from.
+- [Spanner and TrueTime](/distributed/transactions/spanner-and-truetime): bounded uncertainty with commit wait.
+- [Linearizability](/distributed/consistency/linearizability): the guarantee that a stale read breaks.
+
+<Recall cards={[
+  { q: "What do the two fields l and c of an HLC hold?", a: "The field l is the largest physical time that the node has heard of, from its clock or from messages. The field c counts events that share the same l." },
+  { q: "Give the HLC rule for a send or local event.", a: "l = max(l, pt). If l did not change, add 1 to c. If it changed (pt was larger), set c to 0." },
+  { q: "Why does the naive hybrid max(l + 1, m.l + 1, pt) run away from physical time?", a: "It adds 1 ms per event even when no time passed. At more than one event per ms, it moves ahead faster than the clock, with no bound." },
+  { q: "Why is l − pt at most ε, the largest clock difference?", a: "l is always a physical reading taken at some earlier event that happened before this one. That reading is at most ε above any clock now." },
+  { q: "What is CockroachDB's uncertainty interval for a read at timestamp r?", a: "The values with timestamps in (r, r + max offset]. The read cannot know if they came first, so it restarts above such a value. The default max offset is 500 ms." },
+  { q: "What happens in CockroachDB when a clock breaks the offset bound?", a: "A node whose clock is off from at least half of the others by 80% of the max offset crashes. If the bound is broken anyway, a read can miss a committed write: a stale read." },
+]} />

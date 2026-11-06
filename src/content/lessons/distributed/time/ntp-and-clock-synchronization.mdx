@@ -1,0 +1,117 @@
+---
+summary: "How a machine learns the time from another one over a network with unknown delays: Cristian's algorithm, NTP's four timestamps, the asymmetry error bound, filters, strata, PTP, and why a bound on the error matters more than the error."
+---
+import { TimeNtpExchangeDemo, TimeNtpWedgeDemo, TimeNtpSyncDemo } from "@/demos/dist/TimeClockDemos";
+
+Clocks drift apart, so machines must correct them again and again. A machine with a good clock, a **time server**, tells the others the time. But the answer travels over a network, and the network adds a delay that nobody can measure exactly. This lesson derives what a client can learn from one exchange of messages, and how large its error can be.
+
+## Cristian's algorithm
+
+Flaviu Cristian described the simplest method in "Probabilistic clock synchronization" (1989). The client notes its time $T_0$ and asks the server. The server replies with its time $S$. The client receives the reply at $T_1$ on its own clock. It assumes that the reply took half of the round trip, and it sets its clock to:
+
+$$
+S + \frac{T_1 - T_0}{2}
+$$
+
+For example, a request at 100 ms, a server time of 500 ms and a reply at 120 ms give 510 ms. The guess is good when the round trip is short. Cristian called the method probabilistic: a client keeps only the readings with a short round trip, so it can ask again until it gets one.
+
+## NTP's four timestamps
+
+The Network Time Protocol (NTP, RFC 5905) improves this in one way. The server stamps both the arrival and the departure of the request, so its own processing time does not count as network delay. One exchange gives four timestamps:
+
+- $t_0$: the client sends the request, read on the client's clock.
+- $t_1$: the server receives it, read on the server's clock.
+- $t_2$: the server sends the reply, read on the server's clock.
+- $t_3$: the client receives the reply, read on the client's clock.
+
+Let $\theta$ be the amount to add to the client's clock, and let the paths take $d_{\text{out}}$ and $d_{\text{back}}$. Then $t_1 = t_0 + \theta + d_{\text{out}}$ and $t_3 = t_2 - \theta + d_{\text{back}}$. Two equations have three unknowns, so the client assumes $d_{\text{out}} = d_{\text{back}}$. This gives the two NTP formulas:
+
+$$
+\theta = \frac{(t_1 - t_0) + (t_2 - t_3)}{2} \qquad \delta = (t_3 - t_0) - (t_2 - t_1)
+$$
+
+<Predict
+  id="asym"
+  question="The path from client to server takes 20 ms, and the path back takes 5 ms. The server holds the request for 2 ms. How wrong is the NTP offset estimate?"
+  options={["It is exact, because NTP removes the server time", "It is wrong by 7.5 ms", "It is wrong by 12.5 ms"]}
+  answer={1}
+  explain="The error is half the difference of the two paths: (20 − 5) / 2 = 7.5 ms. The client cannot see this error. It knows only that the error is at most half the round trip, δ / 2 = 12.5 ms."
+>
+<TimeNtpExchangeDemo />
+</Predict>
+
+1. Press **Play** with the defaults. Both paths take 10 ms, so the estimate is exact: θ = −30 ms, the negative of the client's offset.
+2. Set the path out to 20 ms and the path back to 5 ms. The error is +7.5 ms, and δ is 25 ms.
+3. Change the server hold time. θ and δ do not change, because $t_2 - t_1$ removes it.
+4. Set the path back to 20 ms and the path out to 5 ms. The error changes sign. The client sees only four numbers, and a different offset with different paths can give the same four numbers. So it cannot find the asymmetry.
+
+## The error bound
+
+Put the assumption in and look at what is left. The estimate is wrong by exactly half the asymmetry:
+
+$$
+\theta_{\text{est}} - \theta = \frac{d_{\text{out}} - d_{\text{back}}}{2}
+$$
+
+The client does not know the asymmetry, but it knows that each path is at least zero. So the worst case is a path of length $\delta$ in one direction and zero in the other, and $|\text{error}| \le \delta / 2$. This bound is always true, and it is the only one that the client can prove. It is also why NTP prefers samples with a small delay: a small $\delta$ gives a small bound.
+
+Real paths are rarely symmetric. Routes can differ in each direction, and a queue in a busy switch adds delay to one direction only. The demo below runs 200 exchanges with random queueing on each path. Plotted as error against delay, the points fill a wedge.
+
+<TimeNtpWedgeDemo />
+
+1. Look at the shape. All points lie inside the dashed lines, where the error is at most $(\delta - \delta_{\min}) / 2$. Points with a large delay can have a large error.
+2. Read the stats. With a mean queueing of 8 ms per direction (a model input), the mean error of a single sample is 3.86 ms. The filter picks have a mean error of 1.00 ms.
+3. Set the queueing to 0.5 ms. The wedge gets narrow, and every sample is good.
+
+The picks are NTP's **clock filter**. It keeps the last 8 samples from each server and uses the one with the lowest delay. NTP then combines several servers. It discards servers whose intervals do not overlap with the majority (the **falsetickers**). It drops outliers from the rest and takes a weighted average of the survivors.
+
+## Strata, polling and slewing
+
+NTP servers form layers called **strata**. A stratum 1 server reads a reference clock directly, such as GPS or an atomic clock. A stratum 2 server synchronizes to stratum 1, and so on. RFC 5905 uses stratum 16 to mean "unsynchronized". The client asks again at a **poll interval**, a power of two in seconds. The RFC suggests 64 s to 1024 s as default limits.
+
+Between two polls, the clock drifts freely. So the error has a saw-tooth shape.
+
+<TimeNtpSyncDemo />
+
+1. With the defaults (drift 50 ppm, poll every 64 s), the clock walks 3.2 ms between polls. The largest error after the first poll is 4.5 ms, because each correction also has a small error.
+2. Set the poll interval to 1024 s. The walk grows to 51.2 ms. Polling less often costs accuracy in direct proportion.
+3. Turn on **Correct the rate too**. The client estimates its drift from two corrections and cancels it, so the saw-tooth becomes flat. Real NTP disciplines the frequency in this way.
+4. Set the queueing to 10 ms, and turn on **Best of 8**. The filter removes most of the noise that the queueing adds.
+
+How does a daemon apply a correction? It can **step** the clock (jump to the new value) or **slew** it (run it fast or slow until it catches up). The ntpd documentation says that it steps when the offset is above a threshold of 128 ms, and it slews below that. It also says that typical Unix kernels limit the slew to 0.5 ms per second, so each second of error needs 2,000 s to remove. Slewing keeps the time-of-day clock monotonic, which is why daemons prefer it.
+
+## PTP and what accuracy to expect
+
+The **Precision Time Protocol** (PTP, IEEE 1588) uses the same four-timestamp idea. Network cards stamp packets in hardware, which removes the delay of the software stack. Switches that support PTP can measure the time a packet spends inside them and correct for it. On a local network that is built for it, PTP can be much more accurate than NTP over the internet.
+
+The numbers depend on the network, the hardware and the load. Treat these as model inputs, not as promises:
+
+| Setup (model input) | Typical skew to plan for |
+|---|---|
+| NTP over the public internet | milliseconds to tens of milliseconds |
+| NTP in one data center | sub-millisecond to a few milliseconds |
+| PTP with hardware timestamps | sub-microsecond to microseconds |
+
+## Why a bound matters more than the error
+
+A system can not use a clock safely if it does not know the clock's error. With a bound, it can. If every clock is within $\varepsilon$ of true time, then two events whose timestamps differ by more than $2\varepsilon$ are surely in that order. This is the idea behind Google's TrueTime, which returns an interval and not a single time.
+
+The Spanner paper (OSDI 2012) gives concrete numbers. Each machine assumes a worst-case drift of 200 µs per second between polls of its time masters. The uncertainty grows from 0 to 6 ms between polls, and 1 ms more comes from the communication delay. Spanner waits out the uncertainty before it makes a commit visible.
+
+There is one danger. A bound is an assumption, and a broken assumption gives wrong answers with no error. A clock with a bad crystal, or a virtual machine that was paused, can break it. So systems that rely on a bound also check it, and they stop a node whose clock is out of range.
+
+## Connect
+
+- [Physical clocks and drift](/distributed/time/physical-clocks-and-drift): where the saw-tooth comes from.
+- [Spanner and TrueTime](/distributed/transactions/spanner-and-truetime): commit wait, built on a bound $\varepsilon$.
+- [Hybrid logical clocks](/distributed/time/hybrid-logical-clocks): how CockroachDB uses a bound on clock offset without special hardware.
+- [The network model](/distributed/foundations/the-network-model-messages-delays-and-partitions): the delays that make synchronization hard.
+
+<Recall cards={[
+  { q: "Write the NTP formulas for the offset θ and the delay δ from the four timestamps.", a: "$\\theta = ((t_1 - t_0) + (t_2 - t_3)) / 2$ and $\\delta = (t_3 - t_0) - (t_2 - t_1)$." },
+  { q: "What is the error of the NTP offset estimate when the two paths differ?", a: "Exactly half the asymmetry, $(d_{\\text{out}} - d_{\\text{back}}) / 2$. The client cannot see it, so it uses the bound $|\\text{error}| \\le \\delta / 2$." },
+  { q: "Why does the NTP clock filter use the sample with the lowest delay?", a: "The error bound is half the delay, and queueing adds delay. The sample with the lowest delay had the least queueing, so its offset is the most reliable." },
+  { q: "A clock drifts 50 ppm and is corrected every 1024 s. How far does it walk between corrections?", a: "50 µs per second times 1024 s, which is 51.2 ms. Polling every 64 s instead gives 3.2 ms." },
+  { q: "Why do time daemons prefer to slew a clock and not to step it?", a: "A step makes the time-of-day clock jump, possibly backwards, which breaks code that compares timestamps. A slew changes the rate, so the clock stays monotonic." },
+  { q: "In the Spanner paper, where do the 1 to 7 ms of TrueTime uncertainty come from?", a: "An assumed worst-case drift of 200 µs per second between polls gives a saw-tooth from 0 to 6 ms. The delay to the time masters adds about 1 ms." },
+]} />

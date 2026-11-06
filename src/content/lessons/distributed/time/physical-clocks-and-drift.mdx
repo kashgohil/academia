@@ -1,0 +1,111 @@
+---
+summary: "Why two machines never agree on the time: quartz drift in ppm, time-of-day versus monotonic clocks, leap seconds and smears, and how last-write-wins loses data when clocks are skewed."
+---
+import { TimeDriftDemo, TimeMonotonicDemo, TimeLwwDemo } from "@/demos/dist/TimeClockDemos";
+
+Every computer has a clock, and every program reads it. In one machine, the clock is good enough to order events: a later read gives a larger value. Across machines, this is false. Each machine counts time with its own crystal, and no two crystals tick at the same rate. This lesson shows how fast clocks move apart and which clock a program must read for each job. It also shows what breaks when a system orders writes by wall-clock time.
+
+## Quartz and drift
+
+A computer clock counts the cycles of a **quartz oscillator**: a small crystal that vibrates at a known frequency when a voltage is applied. Its real frequency is a little different from the stated one. The difference depends on how the crystal was cut, on its temperature and on its age.
+
+We measure the rate error as **drift**, in parts per million (ppm). A clock with a drift of +20 ppm gains 20 µs in each second. The arithmetic is simple, and its result is large:
+
+$$
+\text{error per day} = \text{drift} \times 86\,400\ \text{s}
+$$
+
+| Drift (model input) | Error per day |
+|---|---|
+| 1 ppm | 86.4 ms |
+| 20 ppm | 1.73 s |
+| 50 ppm | 4.32 s |
+| 100 ppm | 8.64 s |
+
+The drift values are model inputs, not measurements of a real part. Server crystals with no temperature control are often in the range of a few ppm to tens of ppm. The important fact is that the drift is never zero and that it changes. So two machines that agree now will disagree later, and a single correction does not fix this.
+
+A clock also has an **offset**: its error at a given moment. Drift is the rate at which the offset changes. **Skew** is the difference between the readings of two clocks at the same moment.
+
+<Predict
+  id="drift"
+  question="Two servers start with the same time. One drifts +20 ppm and the other −35 ppm. How long until they are more than 100 ms apart?"
+  options={["About a week", "About a day", "About half an hour"]}
+  answer={2}
+  explain="Their relative drift is 55 ppm. 100 ms divided by 55 µs per second is about 1,820 s, so roughly 30 minutes. After a day they are 4.75 s apart."
+>
+<TimeDriftDemo />
+</Predict>
+
+1. Read the stats with the defaults. After 24 hours, N1 and N2 are 4.75 s apart. The gap passes 100 ms after about 0.6 hours.
+2. Set all three drifts to the same value, for example +20 ppm. The lines are parallel, and the gap stays at zero. Only the difference in drift moves clocks apart.
+3. Give N3 an offset of +300 ms and a drift of 0. Its line is flat but high. An offset is a constant error, and drift makes the error grow.
+4. Move the simulated time to 72 hours. Errors grow linearly, so three days give three times the error of one day.
+
+## Two kinds of clock in one machine
+
+An operating system gives a program more than one clock. They answer two different questions. The **time-of-day clock** answers "what is the date and time now?". The **monotonic clock** answers "how much time passed since a point in the past?".
+
+| Use | Linux | Rust | Go |
+|---|---|---|---|
+| time of day | `CLOCK_REALTIME` | `SystemTime` | wall reading of `time.Time` |
+| elapsed time | `CLOCK_MONOTONIC` | `Instant` | monotonic reading of `time.Time` |
+
+The time-of-day clock can jump. An administrator can set it, and an NTP daemon can step it when the error is large. The Linux man page says that `CLOCK_REALTIME` is affected by discontinuous jumps. `CLOCK_MONOTONIC` is not affected by jumps, but NTP can still change its rate a little. `CLOCK_MONOTONIC_RAW` ignores those rate changes too.
+
+Rust makes the difference visible in the types. `SystemTime::duration_since` returns a `Result`, because the documentation states that the system clock "is not monotonic". `Instant` is documented as "monotonically nondecreasing". Since Go 1.9, the value from `time.Now()` holds both a wall reading and a monotonic reading. `Sub`, `Before` and `After` use the monotonic reading when both values have one, and `t.Round(0)` strips it.
+
+```go
+start := time.Now()            // wall + monotonic reading
+doWork()
+elapsed := time.Since(start)   // uses the monotonic reading: never negative
+
+stamp := start.Round(0)        // wall reading only, for example after a round trip through JSON
+bad := time.Now().Sub(stamp)   // a step of the wall clock goes straight into this value
+```
+
+<TimeMonotonicDemo />
+
+1. With the defaults, the wall clock steps back by 1,000 ms during the work. The time-of-day clock measures −700 ms.
+2. Move **Step happens at** to before the start. Both clocks measure 300 ms, because the step is not inside the interval.
+3. Set the step to +500 ms. The work now seems to take 800 ms, and a timeout can fire early.
+
+This failure is real. On 1 January 2017, a leap second stepped clocks back by one second. Cloudflare's DNS service measured upstream response times with `time.Now().Sub(start)` in Go, and it got negative values. A negative value reached `rand.Int63n`, which panics on a negative argument. Go 1.9 added the monotonic reading to `time.Time` later that year.
+
+So use the monotonic clock for timeouts, rates and durations. Use the time-of-day clock only to show a time to a person or to compare with an outside time source.
+
+## Leap seconds and smears
+
+Civil time (UTC) follows the rotation of the Earth, and the rotation is not regular. So UTC sometimes adds a **leap second**: the last minute of a day has 61 seconds. The most recent one was added at the end of 2016. In 2022, the General Conference on Weights and Measures (CGPM) passed resolution 4. It will increase the allowed difference between UTC and Earth rotation in or before 2035. This will stop leap seconds for a long time.
+
+A system can apply a leap second in two ways. It can **step**: repeat the last second of the day, so the time-of-day clock goes back. Or it can **smear**: run the clock slow for some hours, so it absorbs the extra second with no jump. Google's public NTP uses a 24-hour linear smear from noon to noon UTC. Each smeared second is longer by one part in 86,400, which is a rate change of about 11.6 ppm.
+
+A smear has a cost. During the smear, a smeared clock and a stepped clock differ by up to 0.5 s at the middle of the window. So all machines that compare times must use the same method.
+
+## Why wall-clock timestamps cannot order events
+
+Now take two machines. Machine A writes `x = A`. Some milliseconds later, machine B writes `x = B`. Each write carries the writer's wall-clock time, and the store keeps the write with the larger timestamp. This rule is **last write wins** (LWW). Cassandra resolves concurrent writes to a cell with this rule, and its documentation says that its correctness depends on synchronized clocks.
+
+<TimeLwwDemo />
+
+1. With the defaults, B's clock is 40 ms behind A's, and B writes 25 ms after A. B's timestamp is smaller, so the store keeps `x = A`. B's write is lost, and no error is reported.
+2. Make the skew smaller than the gap, for example 20 ms. Now the timestamps follow real time, and B wins.
+3. Read the lower plot. The red area is every combination where the later write is lost. The rule is exact: a later write loses when the skew is larger than the gap.
+
+Three facts make this dangerous. First, the loss is silent: both writes succeed. Second, the window is the skew, and the skew grows with drift between synchronizations. Third, even a perfect order of timestamps is not what the user meant. If B read `x` and then wrote, the write of B depends on A. Wall-clock time cannot record that dependency.
+
+A timestamp from a clock is a measurement with an error. To order events across machines, there are two ways. One way bounds the error and waits it out, as Spanner does with TrueTime. The other way records the order of events directly, with logical clocks. The next lessons show both.
+
+## Connect
+
+- [NTP and clock synchronization](/distributed/time/ntp-and-clock-synchronization): how machines keep the skew small, and how small.
+- [Lamport clocks](/distributed/time/lamport-clocks): an order of events that needs no physical clock at all.
+- [Spanner and TrueTime](/distributed/transactions/spanner-and-truetime): a database that uses physical time safely, by bounding its error.
+- [Leaderless replication and quorums](/distributed/replication/leaderless-and-quorums): where last-write-wins is a common default.
+
+<Recall cards={[
+  { q: "How much does a clock with a drift of 50 ppm gain or lose in one day?", a: "50 µs per second times 86,400 s, which is 4.32 s per day. Each ppm is 86.4 ms per day." },
+  { q: "What is the difference between offset, drift and skew?", a: "Offset is the error of one clock at a moment. Drift is the rate at which the offset changes, in ppm. Skew is the difference between two clocks at the same moment." },
+  { q: "Which clock must a program use to measure a timeout, and why?", a: "The monotonic clock (CLOCK_MONOTONIC, Rust Instant, the monotonic reading in a Go time.Time). The time-of-day clock can step back or forward, so a duration from it can be negative or too large." },
+  { q: "What is a leap smear, and what is its rate in a 24-hour linear smear?", a: "The clock runs slow for a window to absorb the leap second with no step. Over 24 hours, each second is longer by 1/86,400, which is about 11.6 ppm." },
+  { q: "Under last-write-wins with wall-clock timestamps, when does a later write lose?", a: "When the writer of the later write has a clock that is behind by more than the real time between the two writes. The loss is silent." },
+]} />

@@ -1,0 +1,115 @@
+---
+summary: "Vector clocks capture happens-before exactly: the rules, the comparison, concurrency detection, version vectors and dotted version vectors in stores such as Dynamo and Riak, siblings, and the cost of one entry per writer."
+---
+import { TimeVectorBuilderDemo, TimeVersionVectorKvDemo } from "@/demos/dist/TimeLogicalDemos";
+
+A Lamport clock gives one number per event. One number cannot say "these two events are concurrent", because any two numbers are ordered. A replicated store needs exactly that answer. When two clients write the same key, the store must know if one write saw the other. If neither did, both writes must be kept. A **vector clock** gives that answer with one counter per process.
+
+## The rules
+
+Colin Fidge and Friedemann Mattern described vector clocks independently in 1988. Each of $n$ processes keeps a vector $V$ of $n$ counters. Entry $V[j]$ on process $i$ is the number of events of process $j$ that process $i$ knows about.
+
+- Before each event, process $i$ adds 1 to its own entry $V[i]$.
+- A message carries the vector of its send event.
+- On a receive, the process takes the maximum of each entry of its own vector and the message's vector. Then it adds 1 to its own entry.
+
+Two vectors compare entry by entry:
+
+$$
+V(a) \le V(b) \iff \forall k:\ V(a)[k] \le V(b)[k] \qquad V(a) < V(b) \iff V(a) \le V(b) \land V(a) \ne V(b)
+$$
+
+If neither $V(a) \le V(b)$ nor $V(b) \le V(a)$, each vector is larger in some entry, and the events are concurrent. This order is partial, as happens-before is.
+
+```rust
+#[derive(Clone, PartialEq)]
+struct Vc(Vec<u64>);
+
+enum Order { Before, After, Equal, Concurrent }
+
+impl Vc {
+    fn merge(&mut self, o: &Vc) {
+        for (a, b) in self.0.iter_mut().zip(&o.0) { *a = (*a).max(*b); }
+    }
+    fn compare(&self, o: &Vc) -> Order {
+        let le = self.0.iter().zip(&o.0).all(|(a, b)| a <= b);
+        let ge = self.0.iter().zip(&o.0).all(|(a, b)| a >= b);
+        match (le, ge) {
+            (true, true) => Order::Equal,
+            (true, false) => Order::Before,
+            (false, true) => Order::After,
+            (false, false) => Order::Concurrent,
+        }
+    }
+}
+```
+
+<Predict
+  id="compare"
+  question="V(a) = [2,0,0] and V(b) = [1,3,0]. Which is true?"
+  options={["a → b, because a has the larger first entry", "b → a, because b has the larger sum", "a and b are concurrent"]}
+  answer={2}
+  explain="a is larger in entry 1, and b is larger in entry 2. Neither vector is ≤ the other, so neither event knows all that the other knows. The sum of the entries means nothing."
+>
+<TimeVectorBuilderDemo />
+</Predict>
+
+1. Read the marked pair, j and h. $V(j) = [3,0,0]$ and $V(h) = [2,3,0]$. Each is larger in one entry, so the vectors say concurrent. Lamport gave 3 and 4 and could not tell.
+2. Click a and i. $[1,0,0] \le [2,3,4]$, so a → i. The vector of i holds the whole history that reached it: 2 events of P1, 3 of P2 and 4 of its own.
+3. Read the stats. The preset has 24 concurrent pairs, and Lamport would order 17 of them. Vector clocks mark all 24 correctly.
+4. Press **Clear**, and send from P1 to P2 and from P2 to P1 before either is delivered. Deliver both. The two sends are concurrent, and each receive is after both sends.
+
+## Why the comparison is exact
+
+The clock condition held for Lamport clocks. For vector clocks, the converse holds too:
+
+$$
+a \to b \iff V(a) < V(b)
+$$
+
+The reason is what the entries mean. $V(b)[j]$ counts the events of process $j$ from which a chain leads to $b$. If $a$ is the $k$-th event of process $j$, then $a \to b$ exactly when $V(b)[j] \ge k$. And $V(a)[j] = k$, so the test reduces to comparing vectors. The tests of this lesson check the equivalence against happens-before on many random runs.
+
+The cost is size. A vector clock has one entry per process, and a message carries the whole vector. Charron-Bost proved in 1991 that a clock which characterizes causality in this way needs vectors of $n$ entries in the worst case.
+
+## Version vectors in storage
+
+A store that accepts writes at several replicas uses the same idea on data. A **version vector** is attached to each value, and it summarizes which writes the value includes. When a client writes, it sends back the vector of the value that it read: its **causal context**. The store compares contexts. If the new write's context covers the old value, the new value replaces it. If not, the two are concurrent, and the store keeps both as **siblings**.
+
+Amazon's Dynamo (SOSP 2007) used vector clocks in this way. Its shopping cart merges siblings by taking the union of their items. So "an add to cart operation is never lost", but deleted items can come back. In a 24-hour sample, 99.94% of requests saw exactly one version.
+
+Riak uses siblings when a bucket has `allow_mult` set to true. Since Riak 2.0, it can use **dotted version vectors** in place of vector clocks, with the bucket property `dvv_enabled`. Its documentation recommends them, because plain vectors can cause **sibling explosion**: many siblings that the store cannot tell apart.
+
+Why do plain vectors per replica fail? Suppose two clients read the empty cart from replica R1 and both write through R1. The replica increments its own entry for each write. The first write gets $[1,0]$, and the second gets $[2,0]$. Now $[1,0] < [2,0]$, so the store thinks the second write saw the first, and it drops it. Both writes were concurrent, and one is lost.
+
+A **dotted version vector** (Preguiça, Baquero and others, 2010) fixes this with one extra field. Each sibling keeps a **dot**: the pair (replica, counter) of the one write that created it. A new write removes only the siblings whose dots its context has seen. In the case above, the second write's context is empty, so it keeps the sibling with dot R1:1 and adds R1:2.
+
+<TimeVersionVectorKvDemo />
+
+1. The preset has two clients that read an empty cart and then add milk and eggs through R1. With **dotted vectors**, R1 keeps two siblings with dots R1:1 and R1:2.
+2. Select **vector per replica**. The second write gets a larger vector, and milk is lost. Select **last write wins**: milk is lost again.
+3. Return to dotted vectors. With C1 and R1 selected, press **C1 reads R1**, then **C1 adds bread via R1**. The read returned both siblings and the context [2,0], so the write replaces both with one merged cart.
+4. Select C2 and R2. Add an item through R2 with no read first, and then sync R2 to R1. R1 now has a sibling again, because the write on R2 was concurrent with the merge.
+
+## Size, pruning and who gets an entry
+
+A version vector needs an entry for each actor that can create a version. With one entry per replica, the size stays small, but the store needs dots to stay correct. With one entry per client, the vector grows with the number of clients. At 16 bytes per entry (a model input: an 8-byte id and an 8-byte counter), 1,000 writers make a 16 KB vector on every key.
+
+Real systems limit the size. Dynamo stored a timestamp with each (node, counter) pair. When the vector reached a threshold, such as 10 pairs, it removed the oldest pair. A pruned vector has lost information.
+
+A newer version can then look concurrent with an older one, so the client sees a sibling that is not real. That is safe for a cart, because the merge is a union. It is a problem for data whose merge loses information.
+
+## Connect
+
+- [Lamport clocks](/distributed/time/lamport-clocks): the one-number clock that cannot see concurrency.
+- [Leaderless replication and quorums](/distributed/replication/leaderless-and-quorums): where siblings come from in a Dynamo-style store.
+- [State-based CRDTs](/distributed/crdts/state-based-crdts): data types whose merge is defined, so siblings merge themselves.
+- [Sequential and causal consistency](/distributed/consistency/sequential-and-causal-consistency): causal order, which vector clocks track.
+
+<Recall cards={[
+  { q: "State the update rules of a vector clock.", a: "Before each event, process i adds 1 to V[i]. A message carries V. On receive, take the entry-wise maximum with the message's vector, then add 1 to V[i]." },
+  { q: "How do you decide from two vectors that the events are concurrent?", a: "Neither vector is ≤ the other entry by entry: each one is larger in at least one entry." },
+  { q: "Why is a → b equivalent to V(a) < V(b)?", a: "V(b)[j] counts the events of process j that reach b by a chain. If a is the k-th event of j, a → b exactly when V(b)[j] ≥ k, which is what V(a) ≤ V(b) checks." },
+  { q: "How can plain version vectors with one entry per replica lose a write?", a: "Two clients write through the same replica with the same old context. The replica increments its entry twice, so the second vector dominates the first, and the first write is dropped as old." },
+  { q: "What does a dot add in a dotted version vector?", a: "Each sibling records the (replica, counter) of the write that made it. A new write removes only siblings whose dot its context has seen, so concurrent writes stay as siblings." },
+  { q: "What happens when Dynamo prunes a vector clock at its threshold?", a: "It removes the oldest (node, counter) pair. Ancestry can no longer be derived exactly, so a newer version can look concurrent and create a false sibling." },
+]} />

@@ -1,0 +1,123 @@
+---
+summary: "Happens-before, Lamport's clock rules, the clock condition and why its converse fails, a total order from node ids, and Lamport's mutual exclusion algorithm with the FIFO assumption that it needs."
+---
+import { TimeLamportBuilderDemo, TimeLamportConverseDemo, TimeLamportMutexDemo } from "@/demos/dist/TimeLogicalDemos";
+
+Physical clocks cannot order events across machines, because their errors are larger than the gaps between events. Leslie Lamport saw that most systems do not need the real time of an event. They need to know if one event could have influenced another. His paper "Time, Clocks, and the Ordering of Events in a Distributed System" (CACM, July 1978) defines this relation. It then builds a clock for it from counters.
+
+## Happens-before
+
+A system has processes that do three kinds of events: local steps, sends and receives. Lamport defines the **happens-before** relation, written $a \to b$, by three rules.
+
+1. If $a$ and $b$ are on the same process and $a$ comes first, then $a \to b$.
+2. If $a$ sends a message and $b$ receives that message, then $a \to b$.
+3. If $a \to b$ and $b \to c$, then $a \to c$.
+
+So $a \to b$ means that a chain of steps and messages leads from $a$ to $b$. Only then can information from $a$ reach $b$. If neither $a \to b$ nor $b \to a$, the events are **concurrent**, written $a \parallel b$. Concurrent does not mean "at the same time". It means that neither event could know about the other.
+
+## The clock rules
+
+A **logical clock** gives each event a number $C(e)$. Lamport asks for one property, the **clock condition**:
+
+$$
+a \to b \implies C(a) < C(b)
+$$
+
+Each process keeps a counter $C$. The paper calls the rules IR1 and IR2.
+
+- Before each event, the process adds 1 to its counter (IR1).
+- A message carries the counter of its send event. A receiver sets its counter to at least its own value and above the value in the message (IR2).
+
+```go
+type Lamport struct{ c uint64 }
+
+// Local event or send: tick, then stamp. A send puts the result in the message.
+func (l *Lamport) Tick() uint64 { l.c++; return l.c }
+
+// Receive: jump past the sender's stamp, then tick.
+func (l *Lamport) Recv(msg uint64) uint64 {
+	if msg > l.c {
+		l.c = msg
+	}
+	l.c++
+	return l.c
+}
+```
+
+The proof of the clock condition follows the three rules. Rule 1 holds because the counter rises at each event. Rule 2 holds because a receive is stamped above the send. Rule 3 holds because $<$ is transitive.
+
+<Predict
+  id="converse"
+  question="In the run below, event j on P1 has C = 3 and event h on P2 has C = 4. What do the timestamps tell you?"
+  options={["j happened before h", "h did not happen before j", "Both: j happened before h, so h did not happen before j"]}
+  answer={1}
+  explain="If h → j were true, the clock condition would give C(h) < C(j), but 4 > 3. So h → j is false. The timestamps cannot show that j → h: in this run, j and h are concurrent."
+>
+<TimeLamportBuilderDemo />
+</Predict>
+
+1. Read the marked pair. Events j and h are concurrent, but their clocks are 3 and 4. A reader of the timestamps alone would put j first.
+2. Click event a and event i. A chain leads from a through the messages to i, and the clocks are 1 and 5, as the clock condition requires.
+3. Press **Clear**. Add three local events on P3, then send from P1 to P3 and deliver it. The receive jumps from the value of P3, not from the message, because P3's counter is larger.
+4. Send two messages from P1 to P2, and deliver the second one first. Both receives still get larger numbers than their sends.
+5. Watch the last stat. Most concurrent pairs get different numbers, so the timestamps suggest an order that does not exist.
+
+## Why the converse fails
+
+The clock condition goes in one direction only. $C(a) < C(b)$ does not imply $a \to b$. Lamport clocks map a partial order onto the integers, which are totally ordered. So every concurrent pair gets an order too, and nothing in the numbers marks which orders are real.
+
+The useful direction is the contrapositive: if $C(a) \ge C(b)$, then $a \not\to b$, so $b$ cannot know about $a$. That is enough for some jobs, such as discarding an old message. It is not enough to detect concurrent updates. For that, a system needs [vector clocks](/distributed/time/vector-clocks).
+
+<TimeLamportConverseDemo />
+
+1. With the defaults, 30% of events send a message. Of all pairs with $C(a) < C(b)$, about a third are concurrent. Over 8 runs per point, the plot gives 36%.
+2. Set the chance to send to 5%. Processes rarely talk, so most events are concurrent: 55% of the ordered pairs are false orders.
+3. Set it to 100%. More messages give more chains, and the false share drops to 15%. It never reaches zero.
+4. Read the last stat. A pair with $a \to b$ and $C(a) \ge C(b)$ never appears. The tests check this on many random runs.
+
+## A total order
+
+Many algorithms need every process to agree on one order of all events. Lamport extends the clock to a **total order**: order by $C$, and break ties by process id.
+
+$$
+(C(a), p_a) < (C(b), p_b) \iff C(a) < C(b) \ \lor\ (C(a) = C(b) \land p_a < p_b)
+$$
+
+This order is consistent with happens-before, and every process computes it in the same way from the stamps alone. It is also arbitrary for concurrent events. Paxos ballot numbers often use the same pair: a counter and a node id that breaks ties. Paxos itself asks only that different proposers use disjoint sets of numbers.
+
+## Application: mutual exclusion
+
+Lamport used the total order to build a lock with no central server. Every process keeps a queue of requests, sorted by $(C, p)$.
+
+1. To request the lock, a process stamps a request, puts it in its own queue and sends it to every other process.
+2. A process that receives a request puts it in its queue and replies with a timestamped acknowledgement.
+3. A process enters the critical section when two things are true. Its request is first in its queue. And it has a message with a later stamp from every other process.
+4. To release, it removes its request and sends a release to everyone. Each receiver removes that request.
+
+Each entry costs $3(N - 1)$ messages: a request, an acknowledgement and a release to each other process. The proof needs one more assumption: messages between two processes arrive in the order that they were sent (**FIFO** links). In the demo, you are the network.
+
+<TimeLamportMutexDemo />
+
+1. With the defaults, P1 and P2 ask at the same time with the same stamp. The tie goes to P1. The run uses 18 messages for 3 grants: 6 per grant, which is $3(N - 1)$ for 3 processes.
+2. Set the delay on P1's request to P2 to 30 ms. With FIFO links, P1's ack waits behind its request, and the lock stays safe.
+3. Now turn FIFO off. P1's ack arrives first, with a stamp later than P2's request. P2 sees no earlier request in its queue, so it enters. P1 also enters. Two processes hold the lock.
+4. The tests run the algorithm with no FIFO and random latencies of 1 to 30 ms. 6 of 200 seeds break mutual exclusion, and with FIFO none do.
+
+Rule 3 is where FIFO matters. "A later stamp from every process" is meant to prove that no earlier request is still on its way. That proof holds only if a later message cannot overtake an earlier one on the same link. TCP gives FIFO order on one connection, but not across a reconnect.
+
+The algorithm is not practical as a lock. It waits for every process, so one crashed process blocks everyone. Lamport's real point, as he has written since, was the general method. If all processes apply the same commands in the same total order, they stay in the same state. That is the **replicated state machine**, the basis of [consensus](/distributed/consensus/the-consensus-problem) protocols.
+
+## Connect
+
+- [Vector clocks](/distributed/time/vector-clocks): a clock for which the converse holds.
+- [Hybrid logical clocks](/distributed/time/hybrid-logical-clocks): Lamport's rules on top of physical time.
+- [Sequential and causal consistency](/distributed/consistency/sequential-and-causal-consistency): consistency models defined with happens-before.
+- [The consensus problem](/distributed/consensus/the-consensus-problem): agreeing on one total order when processes can fail.
+
+<Recall cards={[
+  { q: "Give the three rules that define happens-before.", a: "Program order on one process; a send happens before its receive; and transitivity." },
+  { q: "State Lamport's clock rules.", a: "Before each event, add 1 to the counter. A message carries the counter of its send. On receive, set the counter to the larger of its own value and the message's value, then add 1." },
+  { q: "What does C(a) < C(b) tell you about a and b?", a: "Only that b did not happen before a. The events can be causally ordered (a → b) or concurrent." },
+  { q: "How does Lamport make the order total, and what does it cost?", a: "Order by (C, process id). Concurrent events get an arbitrary but consistent order." },
+  { q: "How many messages does Lamport's mutual exclusion use per entry, and which network assumption does it need?", a: "3(N − 1): request, acknowledgement and release to each other process. It needs FIFO links, or an ack can overtake an earlier request." },
+]} />

@@ -443,15 +443,17 @@ export const TRACKS: Track[] = [
   ]),
 
   track("distributed", "Distributed Systems", "Agreement among unreliable machines.", [
-    ["Foundations", 1, ["Why distribute", "Failure models", "The eight fallacies", "Timeouts and retries"]],
-    ["Time and order", 2, ["Physical clocks and drift", "Lamport clocks", "Vector clocks", "Hybrid logical clocks"], "time"],
-    ["Replication", 2, ["Leader-follower", "Multi-leader", "Leaderless and quorums", "Anti-entropy"]],
-    ["Consistency", 3, ["Linearizability", "Sequential and causal consistency", "Eventual consistency", "CAP and PACELC"]],
-    ["Consensus", 3, ["FLP impossibility", "Paxos", "Raft", "Byzantine fault tolerance"]],
-    ["CRDTs", 3, ["State-based CRDTs", "Operation-based CRDTs", "Sequence CRDTs for collaborative editing"]],
-    ["Partitioning", 2, ["Sharding", "Consistent hashing", "Rebalancing"]],
-    ["Distributed transactions", 3, ["Two-phase commit", "Sagas", "Spanner and TrueTime"], "transactions"],
-    ["Data systems", 3, ["Gossip protocols", "Distributed logs", "Stream processing", "Exactly-once semantics"]],
+    ["Foundations", 1, ["Why distribute", "The network model: messages, delays and partitions", "Failure models", "The eight fallacies", "Timeouts, retries and idempotency", "Failure detectors"]],
+    ["Time and order", 2, ["Physical clocks and drift", "NTP and clock synchronization", "Lamport clocks", "Vector clocks", "Hybrid logical clocks"], "time"],
+    ["Replication", 2, ["Leader-follower", "Replication lag and read-your-writes", "Multi-leader", "Leaderless and quorums", "Anti-entropy and Merkle trees"]],
+    ["Consistency", 3, ["Linearizability", "Sequential and causal consistency", "Eventual consistency", "Session guarantees", "CAP and PACELC", "Checking histories like Jepsen"]],
+    ["Consensus", 3, ["The consensus problem", "FLP impossibility", "Paxos", "Multi-Paxos", "Raft leader election", "Raft log replication", "Raft membership changes and snapshots", "Byzantine fault tolerance"]],
+    ["CRDTs", 3, ["State-based CRDTs", "Operation-based CRDTs", "Sets, maps and deletion", "Sequence CRDTs for collaborative editing"]],
+    ["Partitioning", 2, ["Sharding", "Consistent hashing", "Rendezvous and jump hashing", "Rebalancing", "Secondary indexes across partitions", "Hot keys"]],
+    ["Distributed transactions", 3, ["Two-phase commit", "Sagas", "Spanner and TrueTime", "Calvin and deterministic databases", "Percolator and snapshot isolation"], "transactions"],
+    ["Coordination", 3, ["Leases and fencing tokens", "Distributed locks", "ZooKeeper and etcd"]],
+    ["Data systems", 3, ["Gossip and SWIM", "Distributed logs", "Stream processing", "Exactly-once semantics"]],
+    ["Building a replicated store", 4, ["Architecture of a replicated store", "A Raft key-value store, end to end", "Deterministic simulation testing", "etcd, CockroachDB and DynamoDB compared"], "capstone"],
   ]),
 
   track("graphics", "Computer Graphics & GPU", "Turning math into pixels.", [

@@ -1,0 +1,117 @@
+---
+summary: "Why followers fall behind, the three read anomalies that lag causes, and the fixes: read from the leader, sticky sessions, and reads that wait for a log position."
+---
+import { ReplicationReadAnomalyDemo, ReplicationLagBurstDemo } from "@/demos/dist/ReplicationLagDemos";
+
+Followers exist to serve reads. A leader with five followers can serve six times the reads of one node. But an asynchronous follower is always a little behind. **Replication lag** is how far behind it is: the time between a commit on the leader and the moment that the follower shows it. Most of the time the lag is a few milliseconds. Under load, a slow disk, or a long transaction, it can grow to seconds or minutes.
+
+The data is not wrong. It is old. But old data in the wrong order looks wrong to a user, and that is a bug in your product.
+
+## Three anomalies
+
+Each anomaly is a promise that a single node keeps for free, and that a set of lagging replicas breaks.
+
+- **Read your writes**: after a session writes a value, its own reads show that write or a newer one. A user saves a comment and then reloads the page. If the reload hits a follower that is behind, the comment is gone.
+- **Monotonic reads**: a session never sees time go backward. A user reloads twice. The first read hits a fresh follower, and the second hits a stale one. A comment appears and then disappears.
+- **Consistent prefix**: a session sees the writes in an order that happened. If it sees a later write, it also sees the earlier ones. An answer must not appear before its question.
+
+A **session** here is one client, such as one user or one browser tab. Each read in the demo carries the **log sequence number** (LSN) of what it saw. An LSN is a position in the leader's log. A larger LSN means a later state.
+
+<Predict
+  id="sticky"
+  question="Each session always reads from the same follower (a sticky session). The follower applies the log in order. Which anomaly can still happen?"
+  options={["None of them", "Read your writes", "Monotonic reads"]}
+  answer={1}
+  explain="A follower only moves forward through the log, so one follower never shows time going backward, and it always shows a prefix. But the session's own write goes to the leader. The sticky follower can still be behind it."
+>
+<ReplicationReadAnomalyDemo />
+</Predict>
+
+The demo has a leader, two followers, and three sessions. Each session repeats a pattern: write its own key, read it, read it again, and read the key of another session. Follower F1 applies each entry at the earliest after the follower delay, and F2 after 2.5 times that delay. The delay is a model input.
+
+1. Keep **any follower** with a 15 ms delay. Of 270 reads, 136 break read-your-writes and 5 break consistent prefix. Most anomalies come from a read right after the session's own write.
+2. Move the delay to 40 ms. Now 49 reads also go back in time (monotonic reads) and 34 break consistent prefix. A larger gap between the two followers makes these two anomalies more common.
+3. Select **sticky follower**. Monotonic reads and consistent prefix are now 0, but 123 reads still miss the session's own write.
+4. Select **leader only**. Every anomaly is 0, because one node serves everything. The followers now serve no reads at all.
+5. Select **wait for LSN**. Every anomaly is 0, and the followers still serve the reads. The mean read time grows from 4.9 ms to 11.7 ms, because some reads wait for the follower to catch up.
+
+## The fixes
+
+| Fix | Gives | Cost |
+|---|---|---|
+| read from the leader | all three, and more | the leader serves every read, so followers add no read capacity |
+| read your own data from the leader | read your writes for that data | the app must know which data a user owns |
+| sticky session (one follower per session) | monotonic reads, consistent prefix | not read your writes; failover of that follower breaks the guarantee |
+| read after LSN | all three | reads wait during lag; the client must carry a token |
+
+**Read after LSN** is the general fix. The client keeps a **token**: the highest LSN that it has written or seen. Each read carries the token. A follower answers only when it has applied the log up to the token. Otherwise it waits, or it sends the client to another replica or to the leader.
+
+```ts
+// A session token: the highest log position this client has written or seen.
+class Session {
+  private token = 0n;
+  async write(sql: string) {
+    const { lsn } = await leader.exec(sql);
+    this.token = lsn > this.token ? lsn : this.token;
+  }
+  async read(sql: string) {
+    const r = pickFollower();
+    await r.waitForApplied(this.token, { timeoutMs: 50 }); // or retry at the leader
+    const { rows, appliedLsn } = await r.query(sql);
+    this.token = appliedLsn > this.token ? appliedLsn : this.token;
+    return rows;
+  }
+}
+```
+
+PostgreSQL has the pieces. `pg_current_wal_lsn()` on the primary returns the current WAL write position. `pg_last_wal_replay_lsn()` on a standby returns the last position that it has replayed. An app can compare the two before a read. With `synchronous_commit = remote_apply`, a commit waits until the synchronous standbys have replayed it. A read on such a standby after the commit then sees the write.
+
+Some systems build the token into the client driver, for example the causally consistent sessions of MongoDB. The idea is always the same: carry a position, and wait for it.
+
+## How fast lag grows, and how it drains
+
+A follower falls behind when it applies the log more slowly than the leader writes it. The leader commits many transactions in parallel on many cores. A follower often replays them with one thread, or with a few. Since MySQL 8.0.27, a replica uses 4 applier threads by default (`replica_parallel_workers`), and it keeps the commit order of the source (`replica_preserve_commit_order`).
+
+Treat the follower as a queue. It replays $\mu$ entries per second. During a burst of $\lambda > \mu$ writes per second that lasts $T$ seconds, the queue grows by $\lambda - \mu$ entries each second:
+
+$$
+B = (\lambda - \mu)\,T
+$$
+
+The lag peaks when the follower applies the last entry of the burst. That entry waited $B / \mu$ seconds. After the burst, the queue drains at the spare rate $\mu - \lambda_{\text{base}}$. So the time to catch up is $B / (\mu - \lambda_{\text{base}})$.
+
+<Predict
+  id="burst"
+  question="A follower replays 625 entries per second. A burst of 1,500 writes per second lasts 300 ms, and then the rate drops back to 200 per second. What is the peak lag?"
+  options={["About 300 ms, the length of the burst", "About 420 ms", "About 60 ms"]}
+  answer={1}
+  explain="The queue grows by 1,500 − 625 = 875 entries per second, so it holds about 262 entries when the burst ends. The last of them waits 262 / 625 s, about 420 ms. That is longer than the burst itself."
+>
+<ReplicationLagBurstDemo />
+</Predict>
+
+1. Read the defaults. F1 replays 1,250 entries per second, so its lag peaks at about 60 ms. F2 replays 625 per second and peaks at about 420 ms. Both match $B / \mu$.
+2. Read the catch-up times. F1 is back to normal about 71 ms after the burst, and F2 after about 618 ms. A short burst leaves a long tail of stale reads.
+3. Lower the burst rate below 625. F2 keeps up, and its lag stays near the network delay. Lag is not linear in load: below the replay rate it is nearly zero, and above it, it grows without limit.
+4. Raise the F2 replay cost until its rate is near 200 per second. The queue drains very slowly. If the base rate exceeds the replay rate, the follower never catches up.
+
+## Measuring lag
+
+Measure lag in time, not only in bytes or entries. PostgreSQL reports `write_lag`, `flush_lag` and `replay_lag` per standby in `pg_stat_replication` (since version 10). It also shows the positions `sent_lsn`, `write_lsn`, `flush_lsn` and `replay_lsn`. The demo plots the age of the oldest change that the follower has not applied yet, which is close to `replay_lag`.
+
+Alert on lag, and take a lagging follower out of the read pool. A load balancer that sends reads to a follower that is minutes behind turns an infrastructure problem into a user-visible bug.
+
+## Connect
+
+- [Session guarantees](/distributed/consistency/session-guarantees): read your writes, monotonic reads, monotonic writes and writes follow reads, stated in general.
+- [Leader-follower](/distributed/replication/leader-follower): where the log and its lag come from.
+- [Eventual consistency](/distributed/consistency/eventual-consistency): the guarantee that lagging replicas give with no fix at all.
+- [Linearizability](/distributed/consistency/linearizability): the strongest guarantee, which reads from the leader come close to.
+
+<Recall cards={[
+  { q: "Name the three read anomalies that replication lag causes, with one example each.", a: "Read your writes: a saved comment disappears on reload. Monotonic reads: a comment appears, then disappears. Consistent prefix: an answer appears before its question." },
+  { q: "Which anomalies does a sticky session fix, and which does it not fix?", a: "It fixes monotonic reads and consistent prefix, because one follower only moves forward through the log. It does not fix read your writes: the sticky follower can be behind the session's own write." },
+  { q: "How does read-after-LSN work?", a: "The client keeps the highest log position it has written or seen, and sends it with each read. A replica answers only after it has applied the log up to that position, or the client goes elsewhere." },
+  { q: "A follower replays $\\mu$ entries/s. A burst of $\\lambda > \\mu$ lasts $T$ seconds. What is the peak lag?", a: "The backlog is $B = (\\lambda - \\mu)T$ entries, and the last burst entry waits $B/\\mu$ seconds. Catch-up after the burst takes $B/(\\mu - \\lambda_{\\text{base}})$." },
+  { q: "Why do followers often fall behind under a write burst even with fast hardware?", a: "The leader commits transactions in parallel, but a follower replays the log with one or a few threads. Its replay rate can be lower than the leader's commit rate." },
+]} />

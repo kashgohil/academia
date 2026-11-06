@@ -1,0 +1,116 @@
+---
+summary: "More than one node accepts writes: why systems do it, how concurrent writes conflict, what last-write-wins, merges and siblings keep or lose, and how replication topologies fail."
+---
+import { ReplicationConflictDemo, ReplicationTopologyDemo } from "@/demos/dist/ReplicationMultiDemos";
+
+With one leader, every write crosses the network to that leader. If the leader is in Virginia and the user is in Sydney, each write costs a round trip across the Pacific. If the link between the regions fails, the far region cannot write at all.
+
+**Multi-leader replication** (also called multi-primary or active-active) lets more than one node accept writes. Each leader ships its changes to the others, asynchronously. There are three common reasons to do this.
+
+- **Several datacenters**: each datacenter has a leader, so writes stay local and a datacenter keeps working when the link between datacenters fails.
+- **Offline clients**: a phone or a laptop with a local database is a leader. It accepts writes offline and syncs later. A calendar app on three devices is a multi-leader system.
+- **Collaborative editing**: each editor applies changes locally first, and the changes meet later.
+
+The price is **write conflicts**. Two leaders can change the same data at the same time, and each confirms the change to its client. When the changes meet, the system must pick a result.
+
+## Concurrent writes
+
+Two writes are **concurrent** when neither knew about the other. Real time does not decide this; knowledge does. A **version vector** records, for each leader, how many of its writes a value includes. If one vector is at least as large as the other in every entry, that value already includes the other, and it simply replaces it. If each vector is larger somewhere, the writes are concurrent, and that is a conflict. See [vector clocks](/distributed/time/vector-clocks).
+
+<Predict
+  id="lww"
+  question="DC A sets the title to 'Plan A' at 10 ms. DC B sets it to 'Plan B' at 40 ms, during a partition. DC B's clock runs 50 ms behind. With last-write-wins on timestamps, which title survives the heal?"
+  options={["Plan B, because it was written later", "Plan A", "Both, as two versions"]}
+  answer={1}
+  explain="DC B stamps its write with its own clock: 40 − 50 = −10 ms. DC A stamps 10 ms. Last-write-wins compares the stamps, not real time, so the earlier write wins and Plan B is lost without any error."
+>
+<ReplicationConflictDemo />
+</Predict>
+
+A document has a title, a set of tags and a like counter. A partition separates the two datacenters before the first write and heals after the last one. Then each side sends the fields that it changed. Click a chip to remove a write, or add writes with the buttons.
+
+1. Select **arrival order**: each side applies the incoming change over its own. DC A ends with title "Plan B" and DC B with "Plan A". The replicas disagree, and nothing will ever repair them.
+2. Select **last write wins**. Both sides agree, but each side lost 3 writes: A's title, A's tag and one like.
+3. Move the clock of DC B to −50 ms. Last-write-wins now keeps "Plan A", the write that came first in real time.
+4. Select **merge**. The tags become the union `{blue, red}`, and the likes become 2: the base plus both increments. Only one title is lost, because two titles cannot merge.
+5. Select **keep both**. Nothing is lost, and the replicas agree. But three fields now hold two versions each, and the app must merge them on the next read.
+
+## Resolving conflicts
+
+Every resolver must **converge**: all replicas must end with the same value, whatever order the changes arrived in. Arrival order fails this test, so it is never acceptable.
+
+| Resolver | Keeps | Loses | Used by |
+|---|---|---|---|
+| last-write-wins (LWW) | the write with the largest timestamp | every concurrent write but one, with no error | Cassandra (per cell), DynamoDB global tables |
+| type-aware merge | both changes where the type allows: set union, counter sums | what the type cannot merge, such as two strings | CRDTs, Riak data types |
+| siblings (keep both) | every concurrent version | nothing, but the app must merge | Dynamo, CouchDB conflicts |
+| custom code | what the app decides | depends on the code | many sync engines |
+
+**Last-write-wins** is simple and common. Cassandra keeps a timestamp on every cell (one column of one row), in microseconds. The client driver or the coordinator assigns it. Current drivers send a client timestamp by default, and the coordinator uses its own clock only when none arrives. On reconciliation the larger timestamp wins. On a tie between two plain live cells, the larger value wins, and a deletion marker wins over a live cell.
+
+DynamoDB global tables, in their default multi-Region mode, keep the write with the latest internal timestamp for each item. AWS calls this "last writer wins".
+
+LWW has two problems. First, it drops concurrent writes silently: a confirmed write disappears. Second, it trusts clocks. A node with a slow clock loses every conflict, and a node with a fast clock wins even against later writes. See [physical clocks and drift](/distributed/time/physical-clocks-and-drift).
+
+**Merging** needs to know what a value means. A set of tags can take the union. A counter cannot merge two totals, but it can merge two increments: the demo adds both deltas to the common ancestor. Data types that merge in any order are [CRDTs](/distributed/crdts/state-based-crdts).
+
+**Siblings** move the problem to the app. CouchDB picks a winning revision with a deterministic rule, so all replicas show the same winner. It keeps the losing revisions, and a read with `?conflicts=true` returns them in a `_conflicts` field. The Dynamo shopping cart merges siblings by union. Its paper notes the cost: a deleted item can come back.
+
+```rust
+/// Last-write-wins with a deterministic tie-break on the writer id.
+fn lww<'a>(a: &'a Version, b: &'a Version) -> &'a Version {
+    if (a.ts, a.writer) >= (b.ts, b.writer) { a } else { b }
+}
+```
+
+The tie-break matters. Without it, two replicas can pick different winners for equal timestamps, and they never converge.
+
+## Topologies
+
+With more than two leaders, the **topology** says which leader sends changes to which. There are three common shapes.
+
+- **All-to-all**: each leader sends its changes to every other leader.
+- **Circular**: each leader sends to the next one in a ring, and forwards what it receives.
+- **Star**: one hub receives changes from every leader and forwards them to the rest.
+
+In a ring or a star, a change passes through other leaders. Each change carries the ID of the leader where it started, so that a leader does not apply or forward its own change again.
+
+<Predict
+  id="overtake"
+  question="Four leaders replicate all-to-all. A inserts a row. B applies the insert and at once updates the row. The link from A to C is slow. What can C see?"
+  options={["The insert, then the update, always", "The update before the insert", "Only the insert"]}
+  answer={1}
+  explain="The insert travels on the slow link from A to C. The update travels on the link from B to C, which is fast. Each link keeps its own order, but nothing orders two different links, so the update can arrive first."
+>
+<ReplicationTopologyDemo />
+</Predict>
+
+1. Keep the defaults: all-to-all, 25 ms of extra delay from A to C. The update reaches C first. C has no row to update, so the update fails. Then the insert creates the old row, and C disagrees with the others for good.
+2. Select **circular**. The insert reaches C through B, and B sends the update after it on the same link, so C sees them in order. Do the same with **star**.
+3. Return to all-to-all and turn on causal order. C holds the update until the insert arrives. A version vector on each change says which changes it depends on.
+4. Select **circular** and crash D. Changes from B and C must pass through D to reach A, so A never gets the update.
+5. Select **star** and crash A, the hub, at 14 ms. C misses both changes, and D misses the update. With all-to-all and a crash of D, no live leader misses anything.
+
+The trade-off is plain. A ring or a star has fewer links and keeps causal order, but one dead node cuts the flow until an operator changes the topology. All-to-all survives any single failure, but messages can overtake each other. So all-to-all needs causal ordering, for example with version vectors.
+
+## When to avoid multi-leader
+
+Multi-leader replication turns every invariant across rows into a problem. A uniqueness rule, such as "one user per email address", cannot hold if two leaders each accept a new user at the same time. Auto-increment keys collide unless each leader uses its own range. Many teams route each user's writes to one home leader instead. That gives most of the latency benefit with far fewer conflicts.
+
+Some systems now offer the other choice. DynamoDB global tables have a multi-Region strong consistency mode, generally available since June 2025. It replicates each write synchronously to at least one other Region, and a conflicting write fails with an error instead of a silent loss.
+
+## Connect
+
+- [Vector clocks](/distributed/time/vector-clocks): how a replica tells concurrent writes from ordered ones.
+- [State-based CRDTs](/distributed/crdts/state-based-crdts): types that merge without losing writes.
+- [Leaderless and quorums](/distributed/replication/leaderless-and-quorums): every replica accepts writes, and LWW comes back.
+- [Sequence CRDTs for collaborative editing](/distributed/crdts/sequence-crdts-for-collaborative-editing): conflict-free merges for text.
+
+<Recall cards={[
+  { q: "Give three reasons to use multi-leader replication.", a: "Local writes in several datacenters (and survival of a cut link between them), offline clients that write locally and sync later, and collaborative editing." },
+  { q: "What makes two writes concurrent, and how does a replica detect it?", a: "Neither write knew about the other. Each value carries a version vector; if each vector is larger in some entry, the writes are concurrent." },
+  { q: "Name two problems of last-write-wins.", a: "It silently drops all but one concurrent write, even confirmed ones. And it trusts clocks, so a node with a slow clock loses conflicts even to earlier writes." },
+  { q: "Why can a counter not be merged from two totals, and what fixes it?", a: "Two totals lose how much each side added. Merging the increments against a common ancestor (or keeping a count per node, as a CRDT does) keeps both." },
+  { q: "Why can all-to-all replication apply an update before its insert, and what fixes it?", a: "The two changes travel on different links, and nothing orders different links. Causal delivery fixes it: a replica holds a change until the changes it depends on arrive, using version vectors." },
+  { q: "What is the main weakness of circular and star topologies?", a: "Changes pass through other leaders, so one crashed node stops the flow to the nodes behind it until the topology is changed." },
+]} />

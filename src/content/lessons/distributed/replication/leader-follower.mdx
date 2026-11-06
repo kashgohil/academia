@@ -1,0 +1,116 @@
+---
+summary: "One node takes all writes and ships its log to followers: synchronous and asynchronous followers, what a failover can lose, split brain, and how PostgreSQL and MySQL ship their logs."
+---
+import { ReplicationFailoverDemo, ReplicationSplitBrainDemo } from "@/demos/dist/ReplicationLeaderDemos";
+
+**Replication** keeps a copy of the same data on more than one machine. Each copy is a **replica**. Replicas let a system survive the loss of a machine, serve more reads, and put data near its users. The hard part is change: every write must reach every replica.
+
+The most common design gives one replica a special job. The **leader** (also called primary or source) accepts every write. It appends each change to a **replication log**, an ordered list of changes. The other replicas are **followers** (also called standbys or replicas). Each follower applies the log in the same order, so it goes through the same states as the leader, only later.
+
+A follower can be **synchronous**: the leader waits for its acknowledgement before it confirms a write to the client. Or it can be **asynchronous**: the leader confirms at once and ships the change later. The difference shows only when the leader dies.
+
+<Predict
+  id="async-failover"
+  question="The leader confirms each write to its client at once and ships its log to two followers. It crashes. You promote the follower with the longest log. Can a write that a client saw confirmed be gone?"
+  options={["No: the longest log has every confirmed write", "Yes: the leader can confirm a write that no follower has yet", "Only if a follower also crashes"]}
+  answer={1}
+  explain="With asynchronous followers, confirmation and shipping are separate events. A write that the leader confirmed but did not ship yet exists only on the dead leader. Promotion makes the newest follower log the truth, so that write is gone."
+>
+<ReplicationFailoverDemo />
+</Predict>
+
+The demo runs on the shared network model. A client write reaches the leader every 10 ms. A sender ships new log entries to F1 every 5 ms and to F2 every 30 ms. These periods are model inputs: a real sender streams, and it falls behind when its link or follower is slow. A follower makes a batch durable in 2 ms (a model input) and then acknowledges it.
+
+1. Keep F1 sync and F2 async. The leader crashes at 115 ms. Promote F2: writes 9 and 10 were confirmed, but F2 never got them. Promote F1 instead: nothing is lost.
+2. Set both followers to async. Now a write is confirmed with no wait. Promote F2: three confirmed writes are gone. F1 has the longer log, and a careful failover tool picks it.
+3. Set F1 back to sync. The mean wait for confirmation grows from 0 to about 13 ms. That wait is one network round trip plus the follower flush.
+4. Set both followers to sync. Move the crash. No promotion loses a confirmed write, but each write must wait for the slower follower.
+5. Promote F2 while F1 holds more entries. F1 must throw away the entries that the new leader lacks before it can follow F2.
+
+## Synchronous, asynchronous, semi-synchronous
+
+A write is **durable** when it survives the loss of a machine. With only asynchronous followers, a confirmed write is durable on one machine until the sender ships it. The **window of loss** is the replication lag at the moment of the crash.
+
+| Mode | Leader confirms after | Loss on failover | Cost |
+|---|---|---|---|
+| asynchronous | its own log write | writes not yet shipped | none on the write path |
+| synchronous (all) | every follower acks | none | the slowest follower sets the latency; one dead follower stops all writes |
+| semi-synchronous | one (or k) follower acks | none, if you promote a follower that acked | one round trip to the fastest follower |
+
+All-synchronous replication is rare, because one slow follower stalls every write. The usual compromise makes one follower synchronous and the others asynchronous. If the synchronous follower fails, another follower takes its place. This keeps two durable copies of every confirmed write.
+
+PostgreSQL streams its **write-ahead log** (WAL) to standbys. A `walsender` process on the primary sends WAL records to a `walreceiver` process on each standby. Replication is asynchronous by default. The setting `synchronous_standby_names` turns on synchronous replication. `FIRST 1 (s1, s2)` waits for the first standby in priority order, and `ANY 1 (s1, s2)` waits for any one of them (a quorum commit, since PostgreSQL 10). The setting `synchronous_commit` says how far the standby must get: `remote_write`, `on` (flushed to disk), or `remote_apply` (replayed, so visible to reads).
+
+MySQL ships its **binary log** (binlog). Its semisynchronous replication waits for `rpl_semi_sync_source_wait_for_replica_count` replicas, default 1. A replica acknowledges after it has written the events to its relay log and flushed them to disk, before it applies them. If no ack arrives within `rpl_semi_sync_source_timeout` (default 10000 ms), the source falls back to asynchronous replication. So under a long outage, MySQL semisync silently becomes async. The default wait point `AFTER_SYNC` waits for the ack before the commit becomes visible to other clients.
+
+## What goes into the log
+
+The log can describe a change in three ways.
+
+- **Statement-based**: ship the SQL text, for example `UPDATE t SET n = n + 1`. It is compact, but a statement must give the same result on every replica. MySQL marks `UUID()`, `RAND()` and `SYSDATE()` as unsafe for statement-based logging. `NOW()` is safe, because the binlog carries the timestamp of the statement.
+- **Physical (WAL shipping)**: ship the byte changes to pages. PostgreSQL streaming replication works this way. It is exact and cheap to produce, but it ties the follower to the same storage format and major version. It is the same log that recovery uses: see [write-ahead logging](/databases/recovery/write-ahead-logging).
+- **Logical (row-based)**: ship the new values of each changed row. MySQL uses row format by default since 5.7.7. PostgreSQL logical replication (since version 10) uses publications and subscriptions. A logical log can feed another engine version, a search index or a stream processor.
+
+## Failover
+
+**Failover** replaces a dead leader with a follower. It has three steps, and each one can go wrong.
+
+1. **Detect** the failure. A node cannot tell a dead leader from a slow one, so failover uses a timeout (see [failure detectors](/distributed/foundations/failure-detectors)). A short timeout causes needless failovers under load. A long timeout means a long outage.
+2. **Choose** a new leader. It should be the follower with the most of the log. With a synchronous follower, choose that one.
+3. **Reconfigure**. Clients must send writes to the new leader, the other followers must follow it, and the old leader must not come back as a leader.
+
+PostgreSQL has no built-in failure detection. An operator or an external tool runs `pg_ctl promote` or calls `pg_promote()` (since version 12).
+
+GitHub described one way that step 2 goes wrong, in September 2012. During a network partition, cluster software elected a MySQL node that the operations team already knew was out of date. Redis held keys that pointed to MySQL-generated ids. Those references went out of sync, and for seven minutes some private repositories were visible to the wrong users.
+
+## Split brain
+
+A **network partition** cuts the cluster into groups that cannot talk. The old leader is alive but cut off. The followers time out and promote one of them. Now two nodes accept writes: this is **split brain**.
+
+<Predict
+  id="split"
+  question="Node 0 leads and confirms writes at once. A partition cuts it off for 140 ms, and node 1 takes over after a 50 ms election timeout. Client A keeps writing to node 0. After the heal, what happens to the writes that node 0 confirmed during the partition?"
+  options={["They merge with the writes of node 1", "They are thrown away", "Node 0 wins, because it was the leader first"]}
+  answer={1}
+  explain="Node 1 promoted itself in a higher epoch. When node 0 sees that epoch, it steps down and rolls its log back to the log of node 1. Nothing merges the two histories, so every write that node 0 confirmed alone is lost."
+>
+<ReplicationSplitBrainDemo />
+</Predict>
+
+Each leader has an **epoch** (a term number). A new leader takes a higher epoch, and a node that sees a higher epoch steps down. Epochs settle who wins at the heal. They do not stop the old leader during the partition, because it hears nothing.
+
+1. Keep the defaults. Node 0 confirms 8 writes that no other node has, and two nodes act as leader for 96 ms. All 8 writes are lost at the heal.
+2. Set **after 1 follower ack**. Node 0 cannot reach a follower, so it confirms nothing. No confirmed write is lost. The 8 writes are still thrown away, but their clients never saw a confirmation, so they can retry. Two leaders still exist for 96 ms, and a read from node 0 can return old data.
+3. Set the 30 ms lease with async confirmation. Node 0 stops after 30 ms without a follower ack, before node 1 takes over. No two leaders overlap, but the 2 writes that node 0 confirmed inside its lease are lost.
+4. Use both: the sync ack and the lease. Nothing confirmed is lost, and there is never more than one leader.
+
+The fourth row is the core of consensus. A leader confirms a write only after a majority stores it, and it serves as leader only while a majority recently confirmed it. The lease is only safe if clocks run at nearly the same rate. [Leases and fencing tokens](/distributed/coordination/leases-and-fencing-tokens) covers this, and [Raft log replication](/distributed/consensus/raft-log-replication) builds the whole protocol.
+
+```go
+// The leader confirms a write when every synchronous follower has acked it.
+// acked[f] is the highest log index that follower f has made durable.
+func (l *Leader) confirmable(index uint64) bool {
+	for _, f := range l.syncFollowers {
+		if l.acked[f] < index {
+			return false
+		}
+	}
+	return true // with no sync follower, confirm at once
+}
+```
+
+## Connect
+
+- [Write-ahead logging](/databases/recovery/write-ahead-logging): the log that PostgreSQL streams to its standbys.
+- [Replication lag and read-your-writes](/distributed/replication/replication-lag-and-read-your-writes): what clients see when they read from a follower that is behind.
+- [Raft log replication](/distributed/consensus/raft-log-replication): a leader-follower log with majority acks and terms, which removes split brain.
+- [Leases and fencing tokens](/distributed/coordination/leases-and-fencing-tokens): how an old leader learns to stop.
+
+<Recall cards={[
+  { q: "With asynchronous followers, which confirmed writes can a failover lose?", a: "Every write that the leader confirmed but had not shipped to the promoted follower. The window is the replication lag at the moment of the crash." },
+  { q: "What does semi-synchronous replication mean, and how does MySQL semisync weaken under a long outage?", a: "The leader waits for one (or k) follower acks, not all. MySQL falls back to asynchronous replication when no ack arrives within rpl_semi_sync_source_timeout, 10 seconds by default." },
+  { q: "Name the three forms of a replication log and one weakness of each.", a: "Statement-based: nondeterministic functions such as UUID() give different results. Physical WAL: ties followers to the same storage format and version. Logical rows: larger for bulk updates, but portable." },
+  { q: "What three steps make up a failover?", a: "Detect the failure with a timeout, and choose the most up-to-date follower. Then reconfigure clients, followers and the old leader, so that only the new leader takes writes." },
+  { q: "Why do epochs alone not prevent split brain?", a: "An epoch only settles who wins when the nodes talk again. During the partition the old leader hears nothing, so it keeps accepting writes until a lease or a majority rule stops it." },
+  { q: "What two rules together remove both split brain and the loss of confirmed writes?", a: "Confirm a write only after a majority stores it. Act as leader only while a recent majority supports you, with a lease or a term check. This is what consensus protocols such as Raft do." },
+]} />

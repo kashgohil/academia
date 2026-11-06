@@ -1,0 +1,115 @@
+---
+summary: "Background repair between replicas: why read repair and hinted handoff are not enough, how Merkle trees find the few differing keys among millions, what that costs, and how Dynamo and Cassandra use them."
+---
+import { ReplicationMerkleStepDemo, ReplicationMerkleSweepDemo } from "@/demos/dist/ReplicationMerkleDemos";
+
+A leaderless store has three ways to fix a stale replica. **Hinted handoff** sends a missed write to a replica when it comes back. **Read repair** fixes the replicas that a read finds stale. **Anti-entropy** is a background process that compares whole replicas and fixes every difference. Each one covers a gap that the others leave.
+
+Hinted handoff has limits. Cassandra keeps hints for `max_hint_window`, 3 hours by default. If a node is down longer, its hints stop, and it misses those writes. A hint also lives on one node, so it is lost if that node dies.
+
+Read repair only fixes keys that someone reads. A key that nobody reads stays stale on a replica for as long as it exists. And a replica can lose data for other reasons: a bad disk, an operator error, a bug.
+
+So every Dynamo-style store needs a way to answer one question: which keys differ between replica A and replica B? The simple answer sends every key and value from one replica to the other. For a replica with 10,000 keys of 200 bytes each, that is 2,160,000 bytes, to find perhaps one changed key. Real replicas hold millions or billions of keys.
+
+## A tree of hashes
+
+A **hash** maps data of any size to a short fixed-size value. Equal data gives an equal hash. Different data gives a different hash, except with a tiny chance of a collision. Compare two hashes, and you know if two large pieces of data are equal, after you send only a few bytes.
+
+A **Merkle tree** is a tree of hashes, named after Ralph Merkle (US patent 4,309,569, filed 1979). Here is the version that replicas use.
+
+1. Hash each key to a position in a key space, for example the 32-bit hash of the key.
+2. Cut the key space into $2^d$ equal ranges, where $d$ is the depth of the tree. Each range is a **leaf**.
+3. The hash of a leaf covers the sorted (key, hash of value) pairs in its range.
+4. The hash of an inner node is the hash of its two children's hashes. The root covers all the data.
+
+Both replicas build trees with the same depth and the same ranges. If a key differs, the hash of its leaf differs, and so does every hash on the path up to the root. Every other hash is equal.
+
+<Predict
+  id="walk"
+  question="Two replicas hold 48 keys in a tree with 16 leaves (31 nodes in all). 3 keys differ, in 3 different leaves. How many node hashes must the replicas compare to find them?"
+  options={["All 31", "About 19", "Exactly 3"]}
+  answer={1}
+  explain="The walk starts at the root and opens a node only when its hashes differ. Each differing leaf adds one path from the root, and paths share their top nodes. Here the walk compares 19 hashes: the open nodes plus their equal siblings."
+>
+<ReplicationMerkleStepDemo />
+</Predict>
+
+The walk is breadth first. B sends its root hash. If it equals the root hash of A, the replicas are in sync, and the walk stops after one hash. If not, B sends the two child hashes, and A compares each one. The walk opens only the nodes that differ. At a leaf that differs, B sends its list of keys and value hashes for that range, and A finds the keys that differ.
+
+1. Press **Step** a few times. The root differs, so the walk opens both children. A green node matches: the walk skips its whole range.
+2. Play to the end. The walk compares 19 hashes and opens 3 leaves. It sends 1,016 bytes, against 10,368 bytes for every key and value. The sizes are model inputs: 8 bytes per hash, 16 per key and 200 per value.
+3. Set **Keys that differ** to 0. The roots match, and one hash of 8 bytes crosses the network.
+4. Set it to 8, and press **New data** a few times. When two differing keys share a leaf, the walk costs less than when they fall in different leaves.
+
+The search is exact. Every key that differs makes its leaf hash differ, so the walk finds it. Every key that the walk reports differs. The unit tests check this on random data against a brute-force comparison. The only risk is a hash collision, which would hide a difference. The demo uses a 64-bit hash; a production system wants a stronger one.
+
+```go
+// Walk two trees of the same depth, breadth first, opening only nodes that differ.
+func diff(a, b *Tree) (leaves []int) {
+	frontier := []int{0}
+	for lv := 0; lv <= a.Depth && len(frontier) > 0; lv++ {
+		var next []int
+		for _, i := range frontier {
+			if a.Hash[lv][i] == b.Hash[lv][i] {
+				continue // the whole range is equal
+			}
+			if lv < a.Depth {
+				next = append(next, 2*i, 2*i+1)
+			} else {
+				leaves = append(leaves, i) // exchange the key lists of this range
+			}
+		}
+		frontier = next
+	}
+	return leaves
+}
+```
+
+## What it costs
+
+Let $n$ be the number of keys, $L = 2^d$ the number of leaves, and $D$ the number of differing keys. Let $h$, $k$ and $v$ be the sizes of a hash, a key and a value. While the differences are few and scattered, each one opens one path of $d$ levels. Each opened node costs its two child hashes, so a path costs about $2d + 1$ hashes. Then the leaf sends about $n / L$ key entries, and the value itself crosses the network.
+
+$$
+\text{bytes} \approx D\left[(2d + 1)\,h + \frac{n}{L}(k + h) + v\right]
+$$
+
+The cost grows with $D$, not with $n$. That is the point of the tree.
+
+<ReplicationMerkleSweepDemo />
+
+1. Read the left end: 10,000 keys, depth 10, one differing key. The walk compares 21 hashes and sends 624 bytes. Sending every key and value costs 2,160,000 bytes. Sending every key with its value hash costs 240,200 bytes.
+2. Read 100 differing keys: the walk sends 50,312 bytes. It is still far below both lists.
+3. Read the right end. When most keys differ, the walk opens every node and every leaf, and it costs more than sending everything. The Merkle line crosses the line of the key and hash list near 5,000 differing keys. A tree is for replicas that are mostly in sync.
+4. Change the depth. A shallow tree has large leaves, so each difference costs a long key list. A deep tree has short lists but long paths, and the tree itself takes more memory to build and to hold.
+
+## Dynamo and Cassandra
+
+The Dynamo paper (DeCandia et al., 2007) uses Merkle trees for anti-entropy. In its design the leaves are hashes of the values of individual keys. Each node keeps a separate Merkle tree for each key range that it hosts: the set of keys of one virtual node. Two nodes that share a key range compare the trees of that range. The paper names the drawback: many key ranges change when a node joins or leaves, so the trees must be computed again.
+
+Cassandra runs anti-entropy as **repair**, with `nodetool repair`. Each replica of a range builds a Merkle tree by reading its data. The replicas compare their trees, and they stream only the ranges that differ. The Cassandra docs advise a repair often enough that the gc grace period (10 days by default) never expires on unrepaired data. Otherwise, deleted data can reappear: a replica that missed a delete still holds the old value after the other replicas drop the deletion marker.
+
+Tree size is a real limit. In Cassandra 3.0.19 and 3.11.5, `repair_session_max_tree_depth` capped the depth, with a default of 18. The config file notes that this default "generates trees of maximum size around 50 MiB". Cassandra 4.0 deprecated it for a memory budget, now `repair_session_space`.
+
+Building the trees means reading all the data, which is the expensive part. Since Cassandra 2.2, `nodetool repair` is **incremental** by default. It marks data as repaired and later compares only data written since the last incremental repair. A full repair (`nodetool repair --full`) still has a place, because incremental repair does not find disk corruption in data that it already marked as repaired.
+
+| Mechanism | Fixes | Misses |
+|---|---|---|
+| hinted handoff | writes missed during a short outage | long outages; hints lost with their node |
+| read repair | keys that are read | keys nobody reads |
+| anti-entropy (Merkle) | everything, in the background | nothing, but it costs reads of all data and runs only now and then |
+
+## Connect
+
+- [Leaderless and quorums](/distributed/replication/leaderless-and-quorums): the stale replicas that anti-entropy repairs.
+- [Gossip and SWIM](/distributed/data-systems/gossip-and-swim): another background protocol that spreads state between pairs of nodes.
+- [Bloom filters](/databases/lsm/bloom-filters): another compact summary of a set, which answers membership instead of equality.
+- [State-based CRDTs](/distributed/crdts/state-based-crdts): replicas that exchange and merge whole states, where a Merkle tree tells them what to send.
+
+<Recall cards={[
+  { q: "Why are hinted handoff and read repair not enough?", a: "Hints are kept only for a limited window (3 hours by default in Cassandra) and live on one node. Read repair fixes only keys that are read. Keys nobody reads, long outages and lost data need anti-entropy." },
+  { q: "What does a Merkle tree for replica repair hash at each level?", a: "Each leaf hashes the sorted (key, value hash) pairs in its key range. Each inner node hashes the hashes of its two children, so the root covers all the data." },
+  { q: "How does the comparison avoid reading the whole tree?", a: "It starts at the root and opens a node only when the two hashes differ. A matching hash skips its whole subtree." },
+  { q: "Roughly what does a Merkle repair cost for D scattered differences in a tree of depth d with L leaves over n keys?", a: "About $D[(2d+1)h + (n/L)(k+h) + v]$ bytes: a path of hashes, one leaf key list, and the value, for each difference. It grows with D, not n." },
+  { q: "When does a Merkle walk cost more than sending a list of every key and value hash?", a: "When most keys differ: the walk then opens every node and every leaf. In the demo with 10,000 keys at depth 10, this happens near 5,000 differing keys." },
+  { q: "What drawback of per-range Merkle trees does the Dynamo paper name?", a: "Many key ranges change when a node joins or leaves, so the trees for those ranges must be computed again." },
+]} />

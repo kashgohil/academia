@@ -1,0 +1,123 @@
+---
+summary: "Dynamo-style replication with no leader: N, W and R, why W + R > N makes reads and writes overlap, why that is still not linearizable, sloppy quorums, hinted handoff, read repair and tail latency."
+---
+import { ReplicationQuorumPlaygroundDemo, ReplicationQuorumLatencyDemo, ReplicationNotLinearizableDemo } from "@/demos/dist/ReplicationQuorumDemos";
+
+A leader is a single point that every write must pass. If it fails, writes stop until failover ends. **Leaderless replication** removes the leader: a client sends each write to several replicas at once, and any of them can accept it. Amazon described this design in "Dynamo: Amazon's Highly Available Key-value Store" (DeCandia et al., SOSP 2007). Cassandra and Riak follow it.
+
+Each key lives on $N$ replicas. A node that handles a request for a client is the **coordinator**. For a write, it sends the new value to all $N$ replicas and waits for $W$ acknowledgements. For a read, it asks the replicas and waits for $R$ answers. Each value carries a version, here a timestamp, and the read returns the newest of the $R$ answers.
+
+## Why W + R > N works
+
+A write that succeeded is on at least $W$ replicas. A read hears from $R$ replicas. If $W + R > N$, the two sets cannot be disjoint: there are only $N$ replicas, so at least one replica is in both sets. That replica has the write, and the read returns the newest version that it sees. The Dynamo paper calls this "a quorum-like system", and its common configuration is $(N, R, W) = (3, 2, 2)$.
+
+$$
+|S_W \cap S_R| \ge W + R - N \ge 1
+$$
+
+The choice of $W$ and $R$ moves cost between reads and writes. $W = N$ makes reads cheap ($R = 1$), but one dead replica stops all writes. $R = N$ does the reverse. Majorities on both sides ($W = R = \lfloor N/2 \rfloor + 1$) tolerate the loss of a minority for both.
+
+<Predict
+  id="w1r1"
+  question="N = 3, W = 1, R = 1. Each replica is down with chance 20% during the write and, independently, during the read. A replica that missed the write comes back before the read. What share of successful reads return the write?"
+  options={["100%: the write succeeded", "About 83%", "About 33%: one replica in three"]}
+  answer={1}
+  explain="With W + R = 2 ≤ 3, the one replica that answers the read can be one that missed the write. That happens in about 17% of runs here. A replica that missed a write stays stale until something repairs it."
+>
+<ReplicationQuorumPlaygroundDemo />
+</Predict>
+
+The playground runs one write and then one read. The single run at the top uses the replica states that you click. The meters below run 1,000 random cases: each home replica is down with the chosen chance during the write and during the read.
+
+1. Keep the defaults: $N = 3$, $W = R = 2$, and r0 down during the write. The write lands on r1 and r2, and the read must hear from one of them. Over 1,000 runs, every successful read sees the write. But 9.6% of writes and 9.2% of reads fail, because two of the three replicas were down.
+2. Set $W = R = 1$. Writes and reads rarely fail now, but only 83.1% of reads see the write. Increase the read delay to 20 ms: it does not help (82.7%). A replica that was down during the write stays stale, and waiting does not fix it.
+3. Set $W = 3$, $R = 1$. Every read is fresh, but 47.7% of writes fail: one down replica is enough to stop a write. $W = 1$, $R = 3$ fails 49.4% of reads instead.
+4. Set $N = 5$. With $W = R = 2$ (sum 4, not above 5), 96.8% of reads are fresh. With $W = R = 3$, all reads are fresh, and only 5.1% of writes fail. More replicas let majorities tolerate more failures.
+5. Return to $N = 3$, $W = R = 2$ and turn on the sloppy quorum. No write or read fails now, but only 94.2% of reads see the write, although $W + R > N$. The next section explains why.
+
+## Sloppy quorums and hinted handoff
+
+The keys of a Dynamo ring have a **preference list**: the $N$ home replicas, followed by more nodes. In a **sloppy quorum**, the coordinator sends a write to the first $N$ healthy nodes in that list. If a home replica is down, a node further along the list takes the write in its place. The Dynamo paper says that this replica "will have a hint in its metadata that suggests which node was the intended recipient". When the home replica recovers, the stand-in sends it the write and deletes its copy. This is **hinted handoff**.
+
+A sloppy quorum keeps writes available during failures. But the $W$ acks can come from stand-ins, and a later read can go to the recovered home replicas. Then the two sets do not overlap, and $W + R > N$ promises nothing until handoff ends. The overlap also fails the other way: when home replicas are down at the read, stand-ins that never saw the key answer it.
+
+In the playground, set the read delay to 45 ms, above the handoff period of 40 ms (a model input). The share of fresh reads rises from 94.2% to 98.2%, but not to 100%. The rest are reads that stand-ins answered.
+
+Cassandra also stores hints. The coordinator writes a hint for a replica that is down, and keeps hints for `max_hint_window`, 3 hours by default. But Cassandra does not count a hint toward the consistency level, except for the level `ANY`. So a `QUORUM` write in Cassandra needs real acks from a majority of the home replicas.
+
+## Read repair
+
+A read sees the versions of $R$ replicas. If some answers are older than others, the coordinator knows that those replicas are stale. **Read repair** writes the newest version back to them. The Dynamo paper describes this step.
+
+Cassandra 4.0 removed the old background options `read_repair_chance` and `dclocal_read_repair_chance`. Now, when the answers of a read above `ONE` disagree, Cassandra repairs the replicas in the read before it returns. This is the table option `read_repair = 'BLOCKING'`, the default.
+
+Read repair only fixes data that someone reads. A key that nobody reads stays stale on a replica for as long as it exists. The next lesson covers anti-entropy, which repairs everything in the background.
+
+## Quorums are not linearizable
+
+$W + R > N$ promises that a read after a finished write sees it. It does not promise anything for a read during a write. A register is **linearizable** when every operation seems to take effect at one moment between its start and its end. See [linearizability](/distributed/consistency/linearizability).
+
+<Predict
+  id="lin"
+  question="N = 3, W = 3, R = 2. A write of x = 1 is in flight: r0 has it, but r1 and r2 do not yet. Reader A asks r0 and r1 and gets x = 1. Then reader B starts and asks r1 and r2. What can B get?"
+  options={["x = 1, because W + R > N", "x = 0", "An error, because the write has not finished"]}
+  answer={1}
+  explain="B asks two replicas that do not have the write yet. Its answer is x = 0, after A already saw x = 1. So the value went back in time, which a linearizable register forbids."
+>
+<ReplicationNotLinearizableDemo />
+</Predict>
+
+1. With the toggle off, A returns x = 1 at about 24 ms, and B returns x = 0 later. Both reads met their quorum. The write had not finished, so the quorum rule did not apply.
+2. Turn on blocking read repair. A sees that r1 is stale and writes x = 1 to it before it returns. B then finds x = 1 on r1.
+
+A read that writes back before it returns is the read of the ABD algorithm (Attiya, Bar-Noy and Dolev, 1995). With majority quorums and a single writer, it gives a linearizable register. Each read pays a second round trip, unless all the answers it gets already agree. With several writers, each write must first read the highest timestamp from a majority. Last-write-wins on clocks skips that step, so concurrent writes with skewed timestamps can make a later write lose.
+
+## Tail latency
+
+A coordinator waits for the $k$-th fastest of $N$ answers, where $k$ is $W$ or $R$. So a small $k$ hides slow replicas, and $k = N$ waits for the slowest replica every time.
+
+<ReplicationQuorumLatencyDemo />
+
+The model inputs: each replica answers in 0.5 to 3 ms, but with chance 5% it takes 20 to 100 ms. The network adds 0.5 to 1.5 ms each way.
+
+1. With $N = 3$, the p99 latency is about 5 ms for $k = 1$ and $k = 2$. It jumps to about 97 ms for $k = 3$. At $k = 3$, the chance that at least one replica is slow is $1 - 0.95^{3} \approx 14.3\%$, far above 1%.
+2. Select $N = 5$. The p99 is about 5 ms for $k = 3$, about 55 ms for $k = 4$, and about 98 ms for $k = 5$.
+3. Set the slow chance to 0. All the lines drop to a few milliseconds. Quorums with $k < N$ are a cheap defence against slow replicas.
+
+The Dynamo paper states its goals in the 99.9th percentile, for example "99.9% of the read and write requests execute within 300ms". Bailis et al. measured how fresh partial quorums are in practice in "Probabilistically Bounded Staleness for Practical Partial Quorums" (VLDB 2012).
+
+```go
+// Coordinator: send to all replicas, return after k answers.
+func (c *Coord) read(ctx context.Context, key string, k int) (Versioned, error) {
+	ch := make(chan Versioned, len(c.replicas))
+	for _, r := range c.replicas {
+		go func(r Replica) { if v, err := r.Get(ctx, key); err == nil { ch <- v } }(r)
+	}
+	var best Versioned
+	for got := 0; got < k; got++ {
+		select {
+		case v := <-ch:
+			if v.TS > best.TS { best = v }
+		case <-ctx.Done():
+			return Versioned{}, ctx.Err() // fewer than k answers in time
+		}
+	}
+	return best, nil
+}
+```
+
+## Connect
+
+- [Multi-leader](/distributed/replication/multi-leader): last-write-wins, siblings and version vectors, which leaderless stores also need.
+- [Anti-entropy and Merkle trees](/distributed/replication/anti-entropy-and-merkle-trees): how stale replicas heal when nobody reads them.
+- [Consistent hashing](/distributed/partitioning/consistent-hashing): how a Dynamo ring picks the $N$ replicas of a key.
+- [CAP and PACELC](/distributed/consistency/cap-and-pacelc): the latency and consistency trade that $W$ and $R$ tune.
+
+<Recall cards={[
+  { q: "Why does $W + R > N$ make a read see a finished write?", a: "The write is on at least W replicas and the read hears from R. With only N replicas, the two sets share at least $W + R - N \\ge 1$ replica, and the read returns the newest version it sees." },
+  { q: "What is a sloppy quorum, and why does it break the overlap?", a: "The coordinator uses the first N healthy nodes in the preference list, so stand-ins can take a write. A later read of the home replicas may not include any node with the write, until hinted handoff ends." },
+  { q: "Does Cassandra count hints toward QUORUM?", a: "No. A hint counts only for consistency level ANY. A QUORUM write needs acks from a majority of the real replicas." },
+  { q: "Why are quorum reads and writes not linearizable by themselves?", a: "During a write, one read can reach a replica with the new value and a later read can reach two without it. The value goes back in time. A write-back before the read returns (as in ABD) fixes this." },
+  { q: "Why is $W = N$ bad for tail latency?", a: "The coordinator waits for the slowest replica on every write. If each replica is slow with chance p, the write is slow with chance $1 - (1 - p)^N$." },
+  { q: "What does read repair not fix?", a: "Keys that nobody reads. They stay stale until a background anti-entropy process compares the replicas." },
+]} />

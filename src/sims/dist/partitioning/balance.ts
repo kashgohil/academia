@@ -4,7 +4,7 @@
  */
 import { HashRing, jumpHash, key64, keyPos, maglevTable, rendezvous } from "./hashing";
 
-/** The Maglev table size: the paper's default, a prime. It must stay the same when backends change. */
+/** The Maglev table size: a prime from the paper's evaluation. It must stay the same when backends change. */
 export const MAGLEV_TABLE = 65537;
 import { keyName } from "./workload";
 

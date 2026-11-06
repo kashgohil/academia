@@ -1,0 +1,129 @@
+---
+summary: "The hash ring of Karger et al. (1997): why hash mod N moves almost every key, why the ring moves only about K/N, why few servers give uneven load, and how virtual nodes and weights fix it."
+---
+import { PartitioningRingDemo, PartitioningVnodePlotDemo } from "@/demos/dist/PartitioningRingDemos";
+
+The simplest hash partitioning is `node = hash(key) mod N`. It spreads keys evenly, and a lookup is one division. It breaks when $N$ changes. Going from 10 to 11 nodes changes the answer for almost every key, because $h \bmod 10$ and $h \bmod 11$ agree only by chance. In the next lesson's demo, 91% of the keys move. Each moved key is data that must cross the network, or a cache entry that is lost.
+
+**Consistent hashing** fixes this. Karger, Lehman, Leighton, Panigrahy, Levine and Lewin described it at STOC 1997, for web caches. When a node joins or leaves, only the keys of that node move. With $K$ keys and $N$ nodes, that is about $K/N$ keys.
+
+## The ring
+
+Take the 32-bit hash space and bend it into a circle, so that $2^{32} - 1$ is next to 0. Hash each server name to a point on the circle. Hash each key to a point too. A key belongs to the first server point that you reach when you walk clockwise from the key. A lookup is a binary search in the sorted list of server points.
+
+Now add a server. Its point lands inside one arc. The keys between the previous point and the new point change owner, and they all go to the new server. No other key changes owner. Removing a server is the reverse: its keys go to the next server clockwise.
+
+<Predict
+  id="few"
+  question="Three servers each put one point on the ring, at random. On average, how much of the ring does the busiest server own?"
+  options={["About one third: the points are random, so they spread evenly", "About 61%", "About half"]}
+  answer={1}
+  explain="Three random points cut the circle into three arcs of very different lengths. The longest of N random arcs has an expected length of H(N)/N, where H is the harmonic number. For N = 3 that is 1.83/3, or 61% of the ring."
+>
+<PartitioningRingDemo />
+</Predict>
+
+1. Look at the three servers with one point each. Here B owns 86% of the ring and gets 262 of the 300 keys.
+2. Press **Add a server**. The outlined dots moved, and every one of them moved to D. Compare the count with the ideal $K/N$.
+3. Remove B. Its keys go to the next point clockwise, and only to that point.
+4. Move **Virtual nodes per server** to 64. Each server now owns many short arcs, and the bars become almost even.
+5. Turn on **Give server A weight 2**. A gets twice as many points, and about twice the keys.
+
+## Why few points give uneven load
+
+With one point per server, the arcs are the gaps between $N$ random points on a circle. These gaps are far from equal. The expected length of the longest gap is $H(N)/N$, where $H(N) = 1 + 1/2 + \dots + 1/N$. So the busiest server owns $H(N) \approx \ln N + 0.58$ times its fair share. For 10 servers, that is 2.93 times. The demo below measures 2.83 over 60 random rings.
+
+A second problem is how the load moves. When a server leaves, all of its keys go to one neighbour. That neighbour now has double load, while the rest of the cluster does not help.
+
+## Virtual nodes
+
+The fix is to give each server $v$ points instead of one. Each point is a **virtual node**. Server A puts points at `hash("A#0")`, `hash("A#1")`, and so on. A server now owns $v$ short arcs, scattered over the ring, and the sum of many random arcs is close to its mean.
+
+<Steps>
+
+1. There are $Nv$ points in all, so they cut the ring into $Nv$ arcs. The arc lengths are exchangeable: any set of $v$ of them has the same distribution.
+
+2. The total of $v$ arcs out of $Nv$ follows a Beta distribution, $\text{Beta}(v, Nv - v)$. Its mean is $1/N$, the fair share.
+
+3. The variance of $\text{Beta}(a, b)$ is $ab/((a+b)^2(a+b+1))$. Divide by the squared mean and simplify:
+
+$$
+\frac{\sigma}{\mu} = \sqrt{\frac{N-1}{Nv+1}} \approx \frac{1}{\sqrt{v}}
+$$
+
+4. So the spread of the load falls as the square root of $v$. To halve the spread, you need four times as many virtual nodes.
+
+</Steps>
+
+<Predict
+  id="vnodes"
+  question="With 10 servers, how many virtual nodes per server bring the standard deviation of the load under 10% of the mean?"
+  options={["About 10", "About 100", "About 10,000"]}
+  answer={1}
+  explain="The spread is close to 1 over the square root of v. For 10% you need v near 100. The formula gives 9.5% at v = 100, and the simulation agrees."
+>
+<PartitioningVnodePlotDemo />
+</Predict>
+
+1. Read the dashed formula line and the blue dots. They agree at every $v$, so the derivation is right.
+2. Read the red line. The busiest server is always further from the mean than the standard deviation. At $v = 128$ with 10 servers, it is 1.14 times the mean.
+3. Raise **Servers** to 50. The busiest server at $v = 1$ gets worse, because $H(50) = 4.5$. The spread at large $v$ hardly changes.
+
+Virtual nodes also fix the second problem. A leaving server has $v$ arcs, and each arc goes to a different neighbour. So its load spreads over many servers. A new server takes a little from many servers, not a lot from one.
+
+Virtual nodes have costs. The ring has $Nv$ points, so it needs more memory, and the binary search takes $\log_2(Nv)$ steps. With replication, the next $r$ distinct servers clockwise hold the copies, and the walk must skip points of servers that it has already picked. Repairs and streaming also work per arc, so more arcs mean more small operations.
+
+## Weights
+
+Servers are often not equal. A server with twice the disk should own twice the keys. On a ring, you give it twice the virtual nodes: $v_i = v \cdot w_i$. The spread formula still holds for each server, with its own count of points.
+
+```rust
+/// A consistent hash ring with weighted virtual nodes.
+pub struct Ring { points: Vec<(u32, usize)> } // (position, server), sorted by position
+
+impl Ring {
+    pub fn new(servers: &[(&str, f64)], vnodes: usize) -> Ring {
+        let mut points = Vec::new();
+        for (i, (name, weight)) in servers.iter().enumerate() {
+            let v = ((vnodes as f64) * weight).round().max(1.0) as usize;
+            for j in 0..v {
+                points.push((murmur3(format!("{name}#{j}").as_bytes(), 0), i));
+            }
+        }
+        points.sort_unstable();
+        Ring { points }
+    }
+    /// The first point at or after the key's hash, wrapping to the start.
+    pub fn owner(&self, key: &[u8]) -> usize {
+        let h = murmur3(key, 0);
+        let i = self.points.partition_point(|&(p, _)| p < h);
+        self.points[if i == self.points.len() { 0 } else { i }].1
+    }
+}
+```
+
+## In real systems
+
+Amazon's Dynamo paper (DeCandia et al., SOSP 2007) used a ring with virtual nodes. It then compared three strategies. In the first, each node has $T$ random tokens. In the third, the ring is cut into $Q$ equal partitions and each of $S$ nodes takes $Q/S$ of them. The paper found that the third strategy balances load best. The [rebalancing](/distributed/partitioning/rebalancing) lesson returns to this idea of fixed partitions.
+
+Cassandra uses a ring of 64-bit tokens with `Murmur3Partitioner`. Before version 4.0, the shipped `cassandra.yaml` set `num_tokens: 256`. In 4.0 it sets `num_tokens: 16`, together with `allocate_tokens_for_local_replication_factor: 3`. With 16 tokens, random placement would give a spread near 25%. So the allocator places new tokens where they even out the load, instead of at random.
+
+Cassandra's documentation gives the reasons for fewer tokens. With more tokens, a node shares data with more peers, which lowers availability, and repair has more ranges to cover.
+
+Riak also uses a ring, on 160-bit SHA-1 hashes. But it cuts the ring into a fixed number of equal partitions, 64 by default (`ring_size`), and assigns whole partitions to nodes.
+
+## Connect
+
+- [Sharding](/distributed/partitioning/sharding): the hash partitioning that the ring makes elastic.
+- [Rendezvous and jump hashing](/distributed/partitioning/rendezvous-and-jump-hashing): two schemes that move the same minimum of keys with no ring at all.
+- [Hash indexes](/databases/indexes/hash-indexes): extendible and linear hashing solve the same problem of growth inside one machine.
+- [Leaderless replication and quorums](/distributed/replication/leaderless-and-quorums): Dynamo-style stores place replicas on the next nodes of the ring.
+
+<Recall cards={[
+  { q: "Why does hash mod N move almost every key when N grows by one?", a: "The new modulus gives an unrelated answer for most hash values. A key keeps its node only when $h \\bmod N$ and $h \\bmod (N+1)$ agree by chance, which happens for about $1/(N+1)$ of the keys." },
+  { q: "On a consistent hash ring, which keys move when a server joins?", a: "Only the keys on the arc between the previous point and the new server's point. They all move to the new server, about $K/(N+1)$ keys in all." },
+  { q: "With one point per server, how much more than its fair share does the busiest server own on average?", a: "About $H(N) \\approx \\ln N + 0.58$ times, because the longest of N random arcs has expected length $H(N)/N$. For 10 servers, that is 2.93 times." },
+  { q: "How does the spread of load depend on the number of virtual nodes v?", a: "The standard deviation over the mean is $\\sqrt{(N-1)/(Nv+1)}$, which is close to $1/\\sqrt{v}$. Four times as many virtual nodes halve the spread." },
+  { q: "Name two benefits of virtual nodes besides a more even spread.", a: "A leaving server's load goes to many neighbours, not one. A server with more capacity can get more points, which gives it a weight." },
+  { q: "Why did Cassandra 4.0 lower the default num_tokens, and what makes this safe?", a: "With fewer tokens, a node shares data with fewer peers, which helps availability, and repair has fewer ranges. The token allocator places new tokens to even out the load, so 16 tokens do not give the 25% spread that random tokens would." },
+]} />

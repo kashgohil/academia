@@ -5,7 +5,7 @@
 import { jumpHash, maglevTable, SPACE } from "./hashing";
 import { murmur3 } from "../../db/lsm/hash";
 
-/** The default Maglev table size in the paper (a prime). */
+/** A Maglev table size from the paper's evaluation (a prime, larger than 100 × backends). */
 export const MAGLEV_M = 65537;
 
 /** The finalizer of MurmurHash3: a fast, good mixer of 32 bits. */

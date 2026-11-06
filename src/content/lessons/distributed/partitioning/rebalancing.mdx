@@ -1,0 +1,114 @@
+---
+summary: "Moving partitions when nodes join or data grows: fixed partition counts (Riak, Elasticsearch, Couchbase), dynamic range splits (HBase, CockroachDB), partitions per node (Cassandra), the bytes each one copies, and how systems throttle the copy."
+---
+import { PartitioningRebalanceDemo, PartitioningSplitDemo } from "@/demos/dist/PartitioningRebalanceDemos";
+
+A cluster changes. Nodes join because the data grew, and nodes leave because they failed. **Rebalancing** moves partitions so that each node again holds a fair share. A good rebalance has three properties.
+
+After it, the load is even. During it, the cluster keeps serving reads and writes. And it copies no more data than it must, because copying uses the same disks and network that serve the clients.
+
+The [consistent hashing](/distributed/partitioning/consistent-hashing) lesson showed one answer for single keys. Real stores move data in larger units, so the question becomes: how many partitions, and how big? There are three common answers.
+
+## Three strategies
+
+**A fixed number of partitions.** Create many more partitions than nodes when the cluster starts, for example 1,000 partitions for 10 nodes. A partition never splits. When a node joins, it takes whole partitions from the others until the counts are even. The mapping from key to partition never changes; only the mapping from partition to node does.
+
+- Riak sets `ring_size` when the cluster is first created. The default is 64, and it must be a power of 2. A later resize exists, but it is a separate manual operation.
+- Couchbase maps each key with CRC32 to a fixed set of vBuckets. Couchstore buckets use 1,024 on Linux and Windows. Since 8.0, a new bucket defaults to Magma with 128 vBuckets. macOS always uses 64.
+- Elasticsearch fixes `index.number_of_shards` when it creates an index. Since 7.0 the default is 1; before, it was 5. To change it, you reindex, or you use the split API, which needs a multiple of the old count.
+
+The hard choice is the count. Too few partitions limit how far the cluster can grow, because a partition cannot be split across nodes. They also give coarse balance: 16 partitions over 6 nodes give some nodes 3 and others 2. Too many partitions waste memory and per-partition overhead. And when the data grows, each fixed partition grows with it.
+
+**Dynamic splitting.** Start with one key range. When a range passes a size limit, split it in two. When two neighbours become small, merge them. A balancer moves ranges between nodes. A split only changes metadata: both halves stay on the same node until the balancer moves one.
+
+- Bigtable's tablets are about 100–200 MB by default.
+- HBase splits a region at `hbase.hregion.max.filesize`, 10 GB by default in 2.x. Its default `SteppingSplitPolicy` splits much earlier when the table has only one region on the server: at twice the flush size, 128 MB × 2. So a new table spreads quickly.
+- CockroachDB splits a range above `range_max_bytes`, 512 MiB by default, and `range_min_bytes` is 128 MiB. It also splits by load. By default it measures CPU: a range that uses more than 500 ms of CPU per second becomes a candidate (`kv.range_split.load_cpu_threshold`). Under the QPS objective, the threshold is 2,500 queries per second.
+
+**Partitions proportional to nodes.** Each node owns a fixed number of partitions. A new node picks that many split points, splits the ranges there, and takes one part of each. This is the Cassandra design, with `num_tokens` tokens per node. The points are random, or chosen by an allocator since 4.0. The number of partitions grows with the cluster, and partition size grows with the data per node.
+
+## Watch a cluster grow
+
+<Predict
+  id="grow"
+  question="A cluster grows from 3 to 6 nodes while its data grows from 300 GB to 450 GB. Under hash mod N, how much data is copied, compared with 64 fixed partitions?"
+  options={["About the same: both must fill the new nodes", "About twice as much", "About four times as much"]}
+  answer={2}
+  explain="Each time N changes, hash mod N gives a new home to most keys, so most of the data moves, between old nodes too. In the demo it copies 851 GB, and 64 fixed partitions copy 208 GB."
+>
+<PartitioningRebalanceDemo />
+</Predict>
+
+1. Read the table. Hash mod N copies 851 GB. Fixed partitions copy 208 GB, close to the 217 GB that perfect balance needs.
+2. Look at the top chart after each join. The new node starts empty, so the busiest node is far above the new mean. The line falls as copies complete.
+3. Raise the **Copy budget** to 100 MB/s. The minutes out of balance for fixed partitions fall from 69 to 27. The bytes copied do not change.
+4. Set **Fixed: partitions** to 16. At the end, the busiest node holds 1.125 times the mean, because 16 does not divide by 6.
+5. Set **Per-node tokens** to 1, then to 256. One random token per node leaves the busiest node at 2.29 times the mean. With 256 tokens it is 1.08.
+
+The per-node token line needs a note. With 16 random tokens, the busiest node holds 1.70 times the mean at the end of this run. Over 20 random seeds, the mean of that number is 1.41. That is the spread of random tokens from the consistent hashing lesson. It is why Cassandra 4.0 places new tokens with an allocator instead of at random.
+
+## The cost of moving data
+
+Moving a partition means copying its data to the new node, while the partition keeps taking writes. The usual sequence is this:
+
+1. Take a snapshot of the partition, or of its files, at some position in its log.
+2. Stream the snapshot to the new node. This is the expensive part.
+3. Stream the log entries that arrived since the snapshot, until the new copy is nearly current.
+4. Switch ownership with a short pause, or through the consensus group of the partition. Then delete the old copy.
+
+CockroachDB first adds the new replica as a learner, which receives the Raft log but does not vote. It sends the learner a Raft snapshot, and then promotes it to a voter. That promotion is a membership change, as the [Raft membership](/distributed/consensus/raft-membership-changes-and-snapshots) lesson shows.
+
+All of this competes with client traffic. So every system throttles it:
+
+| System | Setting | Default |
+|---|---|---|
+| CockroachDB | `kv.snapshot_rebalance.max_rate` | 32 MiB/s |
+| Elasticsearch | `indices.recovery.max_bytes_per_sec` | 40 MB/s per node |
+| Elasticsearch | `cluster.routing.allocation.node_concurrent_recoveries` | 2 |
+
+A low throttle protects latency, but it leaves the cluster unbalanced for longer. In the demo, the copy budget changes how long the curves stay high, but not how much data moves. If a node fails during a long rebalance, its partitions have fewer copies for longer. So the throttle is a trade between latency now and risk later.
+
+## Automatic or manual
+
+A system can rebalance on its own, or wait for an operator. Automatic rebalancing reacts fast, but it can make a bad situation worse. Suppose a node is slow because it is overloaded. The failure detector declares it dead. The cluster then starts to copy its partitions to other nodes. That copying adds load to nodes that are already busy, and they can fail too.
+
+This is a **cascading failure**.
+
+So most systems combine the two. They move data on their own, but with a delay before they treat a node as gone, and with a throttle on the copy. The operator can pause the balancer, for example during a planned restart. The [failure detectors](/distributed/foundations/failure-detectors) lesson explains why a timeout cannot tell a slow node from a dead one.
+
+## Splits and merges up close
+
+The stepper runs a range-partitioned table on 3 nodes. The table starts as one range, as a new table in HBase or CockroachDB does. Then a write burst arrives. The sizes are scaled down: a split at 64 MB here plays the role of 512 MiB in CockroachDB.
+
+<Predict
+  id="rising"
+  question="A burst writes keys that only rise, such as an auto-increment ID. Ranges split when they pass 64 MB, and a balancer moves ranges to even out the writes. What share of the writes does the busiest node take?"
+  options={["About one third, once the ranges have spread", "About half", "All of them"]}
+  answer={2}
+  explain="Every split leaves the newest keys in the right half, and all new writes go there. The balancer has nothing useful to move: moving the hot range only moves the hot spot. One node takes 100% of the writes for the whole burst."
+>
+<PartitioningSplitDemo />
+</Predict>
+
+1. Select **rising keys** and press **Play**. The ranges split six times, and every new write still goes to the last range. The busiest node takes 100% of the writes.
+2. Turn on **Also split by load**. Now each tick splits off the keys that were just written, and moves them. But the next writes go beyond them, so the hot spot never leaves the tail.
+3. Select **one hot range** with load splitting. The range around keys 300 to 360 splits into small pieces, and the pieces move to all three nodes.
+4. Step past tick 22. The burst ends, and a TTL job deletes its data. Small neighbours merge, and the table ends as one range again.
+
+Rising keys are the hard case for range partitioning, in every system. CockroachDB's documentation on hash-sharded indexes says it directly: such a range cannot benefit from load-based splitting. The fix is in the key, not in the balancer: hash the key, or put a well-spread prefix before it, as the [sharding](/distributed/partitioning/sharding) lesson showed.
+
+## Connect
+
+- [Consistent hashing](/distributed/partitioning/consistent-hashing): the random tokens behind the per-node strategy, and their spread.
+- [Rendezvous and jump hashing](/distributed/partitioning/rendezvous-and-jump-hashing): fixed partitions plus a small table, in code.
+- [Anti-entropy and Merkle trees](/distributed/replication/anti-entropy-and-merkle-trees): how a moved or repaired copy finds out what it is missing.
+- [Hash indexes](/databases/indexes/hash-indexes): linear hashing splits one bucket at a time, much as dynamic splitting does.
+
+<Recall cards={[
+  { q: "Name the three common rebalancing strategies and one system for each.", a: "Fixed partitions (Riak, Couchbase, Elasticsearch). Dynamic splitting of key ranges (HBase, CockroachDB, Bigtable). A fixed number of partitions per node (Cassandra, num_tokens)." },
+  { q: "What is the main risk of choosing a fixed number of partitions?", a: "The count limits growth and balance. Too few partitions give coarse balance and cannot use more nodes than partitions; too many cost overhead. Partition size also grows with the data." },
+  { q: "Why does a split move no data?", a: "A split only changes metadata: both halves stay on the same node. Data moves later, when the balancer moves one of the halves to another node." },
+  { q: "Why does load-based splitting not help a workload with rising keys?", a: "All new writes go to the newest keys. Every split leaves them in one range, so the hot spot stays in the tail however often it splits." },
+  { q: "How can automatic rebalancing cause a cascading failure?", a: "An overloaded node looks dead to a timeout. The cluster copies its partitions to other nodes, which adds load to them, so they can fail too." },
+  { q: "What does a copy throttle trade?", a: "A low throttle protects client latency, but the cluster stays unbalanced, and short of copies, for longer. The bytes copied stay the same." },
+]} />

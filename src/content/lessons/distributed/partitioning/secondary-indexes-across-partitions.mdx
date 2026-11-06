@@ -1,0 +1,109 @@
+---
+summary: "A secondary index on a partitioned table: local indexes that make every query a scatter/gather, global indexes that make every write a distributed write, how stale a global index can be, and why the slowest partition sets the latency."
+---
+import { PartitioningRouterDemo, PartitioningStaleIndexDemo, PartitioningTailDemo } from "@/demos/dist/PartitioningIndexDemos";
+
+A partitioned table answers one question fast: "give me the row with this key". The partition key leads straight to one partition. Real applications ask other questions too, such as "all red cars" or "all orders of customer 42". A **secondary index** answers them. On one machine, a secondary index is a second B-tree, as the [secondary and covering indexes](/databases/indexes/secondary-and-covering-indexes) lesson shows. On a partitioned table, the index must be partitioned too, and there are two ways to do it.
+
+## Local indexes
+
+A **local index**, also called a **document-partitioned index**, lives inside each partition. Each partition indexes only its own rows. A write touches one partition: the row and its index entry change together, in one local transaction.
+
+A query by the indexed column cannot know which partitions hold matches. So the router sends the query to every partition and merges the answers. This is **scatter/gather**. Its cost grows with the number of partitions, not with the number of matches.
+
+## Global indexes
+
+A **global index**, also called a **term-partitioned index**, is partitioned by the indexed value, not by the row key. All entries for `color = red` live in one index partition, wherever the rows live. A query asks that one partition. If the index entries hold only row keys, the query then fetches the rows from their partitions. If the entries also hold the needed columns, the index is **covering**, and one read is enough.
+
+The cost moves to the writes. A new row changes its own partition and the index partition of its value. Changing a car from red to blue changes three places: the row, the red entry and the blue entry. They can be on three different partitions.
+
+<Predict
+  id="router"
+  question="A table has 6 partitions and a local index on color. A query asks for all red cars. How many partitions must the router ask?"
+  options={["One: the partition that holds the red entries", "Only the partitions that hold red cars", "All 6"]}
+  answer={2}
+  explain="With a local index, no partition knows what the others hold. The router cannot tell which partitions have red cars without asking them, so it asks all 6."
+>
+<PartitioningRouterDemo />
+</Predict>
+
+1. Keep **local** and **find red cars**. All 6 partitions answer, although only some hold red cars.
+2. Select **global**. One partition holds the index entries for red. Then the router fetches the red cars from the row partitions that hold them.
+3. Turn on **covering**. The query now reads one partition.
+4. Select **repaint car 7 blue** under **global**. Up to three partitions change: the row, the old entry and the new entry.
+5. Move **Partitions** up to 12 under **local** and **find red cars**. The read fan-out grows with the cluster. Under **global** with **covering**, it stays at 1.
+
+| | Local index | Global index |
+|---|---|---|
+| Write | 1 partition, local transaction | row partition + 1 or 2 index partitions |
+| Query by index | all partitions (scatter/gather) | 1 index partition, + row fetches unless covering |
+| Consistency | same as the row | needs a distributed transaction, or lags |
+| Examples | Cassandra secondary indexes and SAI, DynamoDB LSIs, Elasticsearch shards, MongoDB | DynamoDB GSIs, CockroachDB secondary indexes |
+
+## How fresh is a global index?
+
+A global index entry and its row are in different partitions. To change both atomically, the database needs a distributed transaction, such as [two-phase commit](/distributed/transactions/two-phase-commit). Many systems avoid that cost. They write the row, acknowledge the client, and update the index later, from a queue or a change stream.
+
+DynamoDB does this. Its documentation says that global secondary indexes are "updated asynchronously, using an eventually consistent model", and they support only eventually consistent reads. Its local secondary indexes, which live with the rows of one partition key, support strongly consistent reads too. A GSI also pushes back on the table: if a GSI has too little write capacity, writes to the table are throttled.
+
+CockroachDB takes the other side. A secondary index is a separate span of keys, often in other ranges, and the index entries change in the same transaction as the row. So the index is never stale, and each write pays for a distributed commit.
+
+<Predict
+  id="stale"
+  question="The index is updated asynchronously. The client repaints car 7 red, gets the acknowledgement, and then queries the index for red cars. Is car 7 in the answer?"
+  options={["Yes: the write was acknowledged before the read", "Not always: the index entry may still be in the queue"]}
+  answer={1}
+  explain="The acknowledgement covers the row, not the index. If the read reaches the index partition before the queued entry does, the client does not see its own write."
+>
+<PartitioningStaleIndexDemo />
+</Predict>
+
+1. Keep the defaults: the read is sent at 30 ms. The client got the acknowledgement at 20 ms, but the index changes only at 60 ms. The read is stale.
+2. Move **Client reads the index at** to 60 ms. The read now arrives after the index entry.
+3. Set **Index queue delay** to 0 and read at 30 ms again. The entry arrives at 20 ms, before the read at 40 ms, so the read sees it.
+4. Select **in the write path**. The row partition updates the index before it acknowledges. Any read sent after the acknowledgement now sees the write.
+
+This is the same failure of read-your-writes as with an asynchronous follower, and the same cures apply. The [replication lag](/distributed/replication/replication-lag-and-read-your-writes) lesson covers them.
+
+## Scatter/gather and the tail
+
+A local index looks cheap: each partition does a small lookup. But the query must wait for every partition, so its latency is the latency of the slowest one. Dean and Barroso made this point in "The Tail at Scale" (CACM 2013). Take a server that answers in 10 ms, but in one second at the 99th percentile. A request that needs 100 such servers takes more than one second 63% of the time.
+
+The math is short. Let $F(t)$ be the probability that one partition answers within $t$. The query is done when all $P$ partitions have answered, so:
+
+$$
+P(\text{query} \le t) = F(t)^{P}, \qquad P(\text{some partition is slow}) = 1 - (1 - q)^{P}
+$$
+
+With $q = 1\%$ and $P = 100$, the second formula gives 63.4%. The demo models each partition as 5 ms on average, or 1,000 ms with probability $q$. Both numbers are model inputs.
+
+<PartitioningTailDemo />
+
+1. Keep 1% and 100 partitions. The median query takes 1,000 ms, because most queries meet at least one slow partition. One partition alone has a median of 3.5 ms.
+2. Move **Partitions asked** down to 10. Now only 9.6% of the queries wait for a slow partition, and the median falls to about 14 ms.
+3. Move **Slow answer chance** down to 0.1%. The median at 100 partitions drops back to tens of milliseconds, but the 99th percentile still hits the slow time.
+
+There are several ways to fight the tail.
+
+- **Ask fewer partitions.** Use a global index, or put the partition key in the query.
+- **Send a hedged request.** If a partition does not answer within its 95th percentile, send the same request to a replica, and use the first answer.
+- **Return partial results** when the query allows it, as a search engine can.
+
+Elasticsearch runs a search as "query then fetch". First each shard finds its own top hits and returns their IDs and sort values. Then the coordinating node merges the lists and fetches only the documents of the requested page.
+
+## Connect
+
+- [Secondary and covering indexes](/databases/indexes/secondary-and-covering-indexes): the same index on one machine, and why covering saves a lookup.
+- [Inverted indexes](/databases/indexes/inverted-indexes): the index inside each Elasticsearch shard.
+- [Replication lag and read-your-writes](/distributed/replication/replication-lag-and-read-your-writes): the stale read of an async index is the same anomaly.
+- [Two-phase commit](/distributed/transactions/two-phase-commit): what a synchronous global index needs.
+- [Sharding](/distributed/partitioning/sharding): the request routing that a scatter/gather builds on.
+
+<Recall cards={[
+  { q: "What does a query by an indexed column cost with a local index, and why?", a: "It must ask every partition (scatter/gather), because each partition indexes only its own rows and none knows where the other matches are." },
+  { q: "What does a write cost with a global index?", a: "It changes the row's partition and the index partition of each changed value: up to three partitions for an update from one value to another." },
+  { q: "Why can a client miss its own write when it reads a DynamoDB GSI?", a: "GSIs are updated asynchronously. The acknowledgement covers the table write; the index entry can still be on its way when the read arrives." },
+  { q: "If each of P partitions is slow with probability q, how often does a scatter/gather query wait for a slow one?", a: "$1 - (1-q)^{P}$. For q = 1% and P = 100, that is 63.4%." },
+  { q: "Name two ways to cut the tail latency of scatter/gather.", a: "Ask fewer partitions, with a global index or the partition key in the query. Or send hedged requests to replicas after a short delay, and take the first answer." },
+  { q: "How does CockroachDB keep its secondary indexes consistent?", a: "Index entries are ordinary keys in their own span, and they change in the same distributed transaction as the row. Writes pay for that commit." },
+]} />

@@ -1,0 +1,109 @@
+---
+summary: "Three ways to map keys to servers without a ring: rendezvous (highest random weight) hashing, jump consistent hash in a few lines of code, and Maglev's lookup table, compared on keys moved, balance, speed and memory."
+---
+import { PartitioningSchemeCompareDemo, PartitioningSpeedDemo } from "@/demos/dist/PartitioningHashDemos";
+
+A consistent hash ring needs many virtual nodes to balance load, and it must store and search all of them. Three other schemes give the same main property with different costs. The property is **minimal disruption**: when a server joins or leaves, only the keys of that server move. Each scheme pays for it in a different place: lookup time, memory, or which servers you can remove.
+
+## Rendezvous hashing
+
+**Rendezvous hashing**, also called **highest random weight (HRW)** hashing, comes from Thaler and Ravishankar. Their journal paper, "Using Name-Based Mappings to Increase Hit Rates", appeared in IEEE/ACM Transactions on Networking in 1998. The rule is short. For a key, compute a score for every server, `score = hash(server, key)`. The server with the highest score owns the key.
+
+Why does this move few keys? A new server S gets its own score for each key. It takes a key only if its score beats the old winner. Every other key keeps the same winner, because the old scores did not change. When a server leaves, only the keys that it won need a new winner, which is their second-best server. So the keys move exactly to or from the server that changed.
+
+Balance is also good with no extra work. Each server wins a key with the same probability, $1/N$, independently for each key. So the load is as even as a fair random assignment, without virtual nodes.
+
+The cost is time. A lookup computes $N$ hashes. That is fine for 10 servers, and slow for 10,000. A second benefit is free: the servers in score order give a replica list. The top $r$ scores are the $r$ replicas, and when one fails, the next one in the list takes over.
+
+Weights fit naturally too. Let $u$ be the hash scaled into $(0, 1)$, and use the score $-w / \ln u$. Then $-\ln(u)/w$ is an exponential random variable with rate $w$. The server with the highest score has the smallest such variable. The smallest of independent exponentials is server $i$ with probability $w_i / \sum w$, which is exactly its weighted share.
+
+Apache Ignite places cache partitions on nodes with its `RendezvousAffinityFunction`, which its source describes as the Highest Random Weight algorithm.
+
+## Jump consistent hash
+
+Lamping and Veach, at Google, published **jump consistent hash** in 2014 ("A Fast, Minimal Memory, Consistent Hash Algorithm"). It maps a 64-bit key to a bucket number in $[0, n)$. It needs no memory at all, and the whole algorithm is a few lines:
+
+```cpp
+int32_t JumpConsistentHash(uint64_t key, int32_t num_buckets) {
+    int64_t b = -1, j = 0;
+    while (j < num_buckets) {
+        b = j;
+        key = key * 2862933555777941757ULL + 1;
+        j = (b + 1) * (double(1LL << 31) / double((key >> 33) + 1));
+    }
+    return b;
+}
+```
+
+The idea is this. Imagine the number of buckets growing from 1 to $n$, one at a time. When it grows from $j$ to $j+1$, a key must move to the new bucket with probability $1/(j+1)$, and stay otherwise. That is exactly what keeps the load even and the moves minimal. A naive loop would draw one random number per step, which costs $O(n)$.
+
+The trick is to jump. The key is the seed of a pseudo-random generator (the multiply and add line). From the current bucket $b$, the code computes directly the next $j$ at which the key moves. The probability that the key is still in bucket $b$ when there are $j$ buckets is $(b+1)/j$. So the code draws a uniform number $r$ and finds the largest $j$ with $(b+1)/j \geq r$, which is $j = \lfloor (b+1)/r \rfloor$. The last line computes exactly this, with $r$ taken from the top 31 bits of the key.
+
+The key visits bucket $i$ with probability $1/(i+1)$, so the expected number of loop turns is $H(n) = 1 + 1/2 + \dots + 1/n$. The paper states this as fewer than $\ln n + 1$. For 1,000 buckets the sim measures 7.48 turns, against $H(1000) = 7.49$.
+
+Jump hash has one large limit. Buckets are numbers from 0 to $n-1$. You can add bucket $n$, or remove bucket $n-1$, and nothing else.
+
+To remove a server in the middle, you must give its number to another server, usually the last one. Then the last server's keys move too. So jump hash suits data stores where shards are numbered and change rarely. It suits less well a cache tier where any server can fail.
+
+## Maglev hashing
+
+Google's Maglev load balancer (Eisenbud et al., NSDI 2016) needs very fast lookups for every packet. It builds a **lookup table** of $M$ entries, where $M$ is a prime. The paper picks $M$ larger than $100N$, so that backend shares differ by at most 1%. Its evaluation uses $M = 65537$ and $M = 655373$. Each backend gets its own permutation of the table slots:
+
+$$
+\text{offset} = h_1(\text{name}) \bmod M, \quad \text{skip} = h_2(\text{name}) \bmod (M-1) + 1
+$$
+
+The permutation is $(\text{offset} + j \cdot \text{skip}) \bmod M$ for $j = 0, 1, 2, \dots$. Because $M$ is prime, each skip visits every slot. The backends take turns. Each one claims the next slot of its permutation that is still empty, until the table is full. A lookup is then one hash and one array read.
+
+The turns make the balance almost perfect: each backend gets $M/N$ slots, plus or minus one. Maglev pays for this with a little disruption. When a backend leaves, its slots go to others, but a few other slots also change owner, because the turns now fall differently. The paper says this openly: Maglev prefers balance, and it tolerates a small number of disruptions.
+
+## Compare them
+
+<Predict
+  id="middle"
+  question="A cluster of 10 servers loses server 5, in the middle. Which scheme moves more keys than the minimum?"
+  options={["Rendezvous hashing", "The ring with 100 virtual nodes", "Jump consistent hash"]}
+  answer={2}
+  explain="Jump hash can only drop the last bucket. So server 9 takes bucket number 5, and the keys in bucket 9 move as well. The ring and rendezvous hashing move only the keys of server 5."
+>
+<PartitioningSchemeCompareDemo />
+</Predict>
+
+1. Keep **add one** with 10 servers. Hash mod N moves 91% of the keys, and 8,170 of them needlessly. The ring, rendezvous and jump move about 9%, all to the new server.
+2. Look at Maglev. It moves 968 keys, and 27 of them did not have to move.
+3. Select **remove one in the middle**. Jump hash now moves about twice the minimum, because the last server's keys also move.
+4. Set **Ring: virtual nodes** to 1 and read the last column. The ring is now the least balanced scheme.
+
+<PartitioningSpeedDemo />
+
+1. Read the times at 50 servers. Maglev is the fastest, because it reads one array entry.
+2. Move **Servers** to 1,000. Rendezvous becomes much slower, because it computes one hash per server. Jump grows only with $\ln N$.
+3. Read the memory column. The ring needs $8Nv$ bytes, and Maglev needs a full table. Jump needs nothing.
+
+The times in this demo come from your own browser, so treat them only as ratios. The table below gives the model behind them.
+
+| Scheme | State | Lookup | Remove any server | Moves only needed keys |
+|---|---|---|---|---|
+| hash mod N | none | one division | yes | no: almost all keys move |
+| ring, $v$ vnodes | $Nv$ points | binary search, $\log_2(Nv)$ steps | yes | yes |
+| rendezvous | list of servers | $N$ hashes | yes | yes |
+| jump | none | about $\ln N$ loop turns | only the last | yes, for the last bucket |
+| Maglev | $M$ entries | one array read | yes | almost: a few extra |
+
+A common pattern combines the schemes in two levels. First, hash keys into a fixed set of partitions, with jump hash or a modulus that never changes. Then map partitions to servers with an explicit table, or with rendezvous hashing. The partition count stays fixed, so the first level never changes. The second level is small, so any scheme is fast enough there.
+
+## Connect
+
+- [Consistent hashing](/distributed/partitioning/consistent-hashing): the ring that these schemes compete with.
+- [Rebalancing](/distributed/partitioning/rebalancing): fixed partitions plus a small table, the pattern above, in Riak, Elasticsearch and Couchbase.
+- [Hash indexes](/databases/indexes/hash-indexes): linear hashing also grows a table one bucket at a time, much as jump hash grows the bucket count.
+- [Gossip and SWIM](/distributed/data-systems/gossip-and-swim): how the servers agree on the member list that each of these schemes needs as input.
+
+<Recall cards={[
+  { q: "How does rendezvous hashing choose the owner of a key, and what does a lookup cost?", a: "It computes a hash of each server with the key and picks the highest. A lookup costs N hashes." },
+  { q: "Why does rendezvous hashing move only the keys of the server that joins or leaves?", a: "The scores of the other servers do not change. A key changes owner only if the new server beats the old winner, or if its winner is the one that left." },
+  { q: "What does jump consistent hash compute in each loop turn?", a: "It advances a 64-bit random generator seeded by the key and jumps to the next bucket count $j = \\lfloor (b+1)/r \\rfloor$ at which the key would move. Expected turns are $H(n)$, under $\\ln n + 1$." },
+  { q: "What is the main limit of jump consistent hash?", a: "Buckets are numbered 0 to n − 1, so only the last bucket can be removed. Removing a server in the middle means renumbering, which moves extra keys." },
+  { q: "How does Maglev fill its lookup table, and what does it trade?", a: "Each backend has a permutation (offset + j·skip) mod M of the prime-sized table, and the backends take turns to claim their next free slot. It trades a few extra key moves for near-perfect balance and one array read per lookup." },
+  { q: "How can weights be added to rendezvous hashing?", a: "Use the score $-w/\\ln u$, with u the hash in (0, 1). The winner is then server i with probability proportional to its weight $w_{i}$." },
+]} />

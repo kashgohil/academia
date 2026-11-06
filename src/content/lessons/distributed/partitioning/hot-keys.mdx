@@ -1,0 +1,148 @@
+---
+summary: "One key that gets a large share of all traffic: Zipf workloads, finding hot keys with a count-min sketch or Space-Saving, and the mitigations (split keys, caching, request coalescing, replicas, DynamoDB adaptive capacity) with what each one costs."
+---
+import { PartitioningZipfDemo, PartitioningMitigationDemo } from "@/demos/dist/PartitioningHotKeyDemos";
+
+Partitioning spreads keys over nodes. It cannot spread one key. If one key gets a large share of all requests, the partition that holds it runs at its limit while the others idle. This is the **hot key** problem, also called the **celebrity problem**. Examples are one account with millions of followers, or one chat channel during a live event.
+
+Adding nodes does not help. The hot key still lives on one partition, so the busiest partition stays as busy as before. The cluster has spare capacity, but that capacity cannot reach the hot key.
+
+## Zipf workloads
+
+Real popularity is very uneven. A common model is the **Zipf distribution**: the key of rank $r$ gets a share proportional to $1/r^{\theta}$. With $K$ keys, the share of rank $r$ is:
+
+$$
+p_r = \frac{r^{-\theta}}{H(K, \theta)}, \qquad H(K, \theta) = \sum_{i=1}^{K} i^{-\theta}
+$$
+
+With $\theta = 0$ every key is equally popular. As $\theta$ grows, the head of the list takes more of the traffic. The YCSB benchmark uses $\theta = 0.99$ by default, with a generator from Gray et al. (SIGMOD 1994). For 10,000 keys and $\theta = 0.99$, the hottest key gets 9.8% of all requests, and the top 10 keys get 28.9%.
+
+<Predict
+  id="theta"
+  question="10,000 keys with Zipf θ = 0.99 are hash-partitioned over 8 shards. The fair share of a shard is 12.5%. The hottest key alone gets 9.8% of the requests. How busy is the busiest shard?"
+  options={["About 12.5%: hashing spreads the keys", "About 27%: the hot key adds to a normal share", "About 50%"]}
+  answer={1}
+  explain="The shard that holds the hottest key gets its share of all the other keys too, and often one more popular key. In the demo it takes 10,800 of 40,000 requests, 27%, which is 2.15 times the mean."
+>
+<PartitioningZipfDemo />
+</Predict>
+
+1. Read the bars at $\theta = 0.99$. Shard s1 holds the hottest key and takes 2.15 times the mean.
+2. Move θ to 0. The shards are even, and there is no hot key to find.
+3. Move θ to 1.5. The hottest key alone now gets 38.6% of all requests.
+4. Set the sketch width to 32 and the depth to 1. Collisions push cold keys up the list. Then raise the depth to 4, and most of the errors go away.
+5. Compare the estimates with the true counts. An estimate is never lower than the true count.
+
+## Finding hot keys
+
+To fix a hot key, you must first know which key is hot, and you must know it fast. Counting every key exactly needs memory for every key. Two small summaries do the job with fixed memory.
+
+A **count-min sketch** (Cormode and Muthukrishnan, 2005) is a table of $d$ rows with $w$ counters each. Each row has its own hash function. To add a key, increment one counter in each row. To estimate a key, read its $d$ counters and take the smallest.
+
+<Steps>
+
+1. Every counter of a key holds that key's count plus the counts of other keys that collide with it. So each counter is at least the true count, and so is the smallest. The sketch never undercounts.
+
+2. In one row, the expected excess is at most $N/w$, where $N$ is the total count. By Markov's inequality, the excess passes $eN/w$ with probability at most $1/e$.
+
+3. The $d$ rows use independent hashes. The minimum is too high only if all $d$ rows are too high, with probability at most $e^{-d}$.
+
+4. So with $w = \lceil e/\varepsilon \rceil$ and $d = \lceil \ln(1/\delta) \rceil$, the estimate exceeds the true count by at most $\varepsilon N$ with probability $1 - \delta$.
+
+</Steps>
+
+For $\varepsilon = 0.1\%$ and $\delta = 1\%$, this gives $w = 2{,}719$ and $d = 5$: about 54 KB of 4-byte counters, whatever the number of keys. To find the top keys, keep a small list of candidates beside the sketch. After each add, a key joins the list if its estimate beats the smallest entry.
+
+**Space-Saving** (Metwally, Agrawal and El Abbadi, ICDT 2005) finds the top $k$ directly, with $k$ counters. A new key, when all counters are taken, replaces the key with the smallest count and inherits that count plus one. A counter never falls below the true count of its key, and it records how much it may be over.
+
+In production, each node or proxy keeps such a summary over a short window, such as 10 seconds. It reports keys whose share passes a threshold. The system can then act on those keys only.
+
+## Mitigations
+
+<Predict
+  id="split"
+  question="The hot key gets 90% reads. You split it into 8 sub-keys on different shards: a write goes to one random sub-key, and a read must read all 8. What happens to the busiest shard?"
+  options={["It drops to about the mean", "It gets busier"]}
+  answer={1}
+  explain="Each read of the hot key now goes to all 8 sub-keys. Every shard that holds a sub-key gets the full read rate of the hot key, plus its own keys. In the demo the busiest shard goes from 2.14 to 2.68 times the mean."
+>
+<PartitioningMitigationDemo />
+</Predict>
+
+1. Keep **split the key** with 90% reads. The busiest shard is worse, and the backend gets 1.62 requests per client request.
+2. Move **Reads** to 10%. Now the hot key is write-hot, and the split brings the busiest shard from 2.14 to 1.40 times the mean.
+3. Select **cache** with 90% reads. With the top 8 keys cached, the busiest shard falls to 0.96 times the mean.
+4. Select **coalesce reads**. The hot key gets 8,803 reads per second. With a read in flight for 2 ms, only 473 of them reach the shard.
+5. Select **replicate the shard** with 3 replicas. Reads spread, but each write now goes to 3 places.
+
+**Split the key.** Add a suffix, so that `post:42` becomes `post:42#0` to `post:42#7`. A write goes to a random sub-key, and the sub-keys land on different shards. A read must read all of them and merge.
+
+DynamoDB's documentation describes this as write sharding. Its example adds a random number from 1 to 200 to a date key, and a read of one day must query all 200 suffixes. Use it for keys that are hot for writes, such as counters and append-only logs. Some systems split only keys that the detector reports, and keep a small table of which keys are split.
+
+**Cache.** Put the hot keys in a cache in front of the shards: in the application, in a proxy, or in a cache tier. A read that hits the cache never reaches the shard. The cost is staleness: the cache must expire entries or be told when a key changes. A cache tier has its own hot keys, too. Facebook's memcache paper (NSDI 2013) replicates some keys inside a pool when one server cannot handle their request rate.
+
+**Coalesce requests.** When many reads of one key arrive at the same time, send one read to the shard and give its answer to all of them. Let reads arrive at rate $\lambda$, and let a read be in flight for $T$. Each backend read covers itself and the $\lambda T$ reads that arrive while it waits. So the shard sees:
+
+$$
+\lambda_{\text{shard}} = \frac{\lambda}{1 + \lambda T}
+$$
+
+A hot key gains the most, because $\lambda T$ is large for it. Discord's data services, written in Rust, sit between the API and ScyllaDB and coalesce requests. They route requests by channel ID with consistent hashing, so that the requests for one channel meet in one service instance. Facebook's memcache uses **leases** for a related problem, the thundering herd. After a miss, a server gives a lease token for a key at most once every 10 seconds. Only the client with the token fetches the value from the database.
+
+```go
+// Coalesce concurrent reads of the same key: one backend read, many waiters.
+type call struct { wg sync.WaitGroup; val []byte; err error }
+
+type Group struct { mu sync.Mutex; m map[string]*call }
+
+func (g *Group) Do(key string, fetch func() ([]byte, error)) ([]byte, error) {
+	g.mu.Lock()
+	if c, ok := g.m[key]; ok { // a read is in flight: wait for its answer
+		g.mu.Unlock()
+		c.wg.Wait()
+		return c.val, c.err
+	}
+	c := &call{}
+	c.wg.Add(1)
+	g.m[key] = c
+	g.mu.Unlock()
+
+	c.val, c.err = fetch() // the only read that reaches the shard
+	c.wg.Done()
+
+	g.mu.Lock()
+	delete(g.m, key)
+	g.mu.Unlock()
+	return c.val, c.err
+}
+```
+
+**Replicate the hot shard.** Give the hot partition more read replicas, and spread the reads over them. Writes do not get cheaper: every write must reach every replica. With follower reads, the reads may also be stale, as the [replication lag](/distributed/replication/replication-lag-and-read-your-writes) lesson explains.
+
+**Let the store adapt.** DynamoDB has **adaptive capacity**. It increases the throughput of partitions that receive more traffic, within the table's capacity. Each partition is designed for at most 3,000 read units and 1,000 write units per second. 
+
+When one item stays hot, DynamoDB can "isolate frequently accessed items": it rebalances so that the hot item is alone on its partition. That partition can then serve the full per-partition limit for that one item, but no more. A single item that needs more than one partition's limit still needs a fix in the application.
+
+| Mitigation | Helps | Costs |
+|---|---|---|
+| split the key | write-hot keys | every read fans out to all sub-keys |
+| cache | read-hot keys | staleness, invalidation, the cache's own hot spots |
+| coalesce | read bursts on one key | a short wait; all waiters share one answer or one error |
+| replicate the shard | read-hot partitions | every write goes to all replicas; follower reads may be stale |
+| adaptive capacity | uneven partitions | cannot exceed one partition's limit for one item |
+
+## Connect
+
+- [Sharding](/distributed/partitioning/sharding): single-key skew is the kind that hashing cannot fix.
+- [Rebalancing](/distributed/partitioning/rebalancing): load-based splitting helps a hot range, but not a hot key.
+- [Secondary indexes across partitions](/distributed/partitioning/secondary-indexes-across-partitions): a read of a split key is a small scatter/gather, with the same tail.
+- [Bloom filters](/databases/lsm/bloom-filters): the count-min sketch is a counting cousin of the Bloom filter.
+
+<Recall cards={[
+  { q: "Why does adding nodes not fix a hot key?", a: "One key lives on one partition. More nodes lower the fair share, but the busiest partition still carries the whole key." },
+  { q: "Why does a count-min sketch never undercount?", a: "Every counter of a key holds its true count plus the counts of keys that collide with it. The minimum of such counters is still at least the true count." },
+  { q: "How large must a count-min sketch be for error ε·N with probability 1 − δ?", a: "$w = \\lceil e/\\varepsilon \\rceil$ counters per row and $d = \\lceil \\ln(1/\\delta) \\rceil$ rows. For 0.1% and 1%, that is 2,719 by 5." },
+  { q: "When does splitting a key into sub-keys help, and when does it hurt?", a: "It helps a write-hot key, because writes spread over the sub-keys. It hurts a read-hot key, because every read must read all the sub-keys." },
+  { q: "With reads at rate λ and a read in flight for T, what rate reaches the shard with coalescing?", a: "$\\lambda/(1 + \\lambda T)$. Each backend read covers itself and the $\\lambda T$ reads that arrive while it is in flight." },
+  { q: "What can DynamoDB adaptive capacity do for one hot item, and what can it not do?", a: "It can isolate the item on its own partition. That partition serves up to 3,000 read and 1,000 write units per second. It cannot give one item more than that limit." },
+]} />

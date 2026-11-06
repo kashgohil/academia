@@ -1,0 +1,126 @@
+---
+summary: "Why one machine is not enough, key-range against hash partitioning, skew and hot shards, range scans, and how a request finds its shard in Bigtable, Cassandra, DynamoDB and MongoDB."
+---
+import { PartitioningLoadDemo, PartitioningScanDemo } from "@/demos/dist/PartitioningShardingDemos";
+
+Replication puts a copy of all the data on each node. That does not help when the data, or the write rate, is larger than one machine can hold. **Partitioning** (also called **sharding**) cuts the data into pieces, and each node stores some of the pieces. A piece is a **partition** or **shard**. Bigtable calls it a tablet, HBase a region, CockroachDB a range, and Cassandra a token range.
+
+Each partition is usually also replicated. So a node holds replicas of several partitions, and each partition lives on several nodes. This lesson is about the first question only: which partition does a key belong to? The answer decides two things. It decides how even the load is, and it decides which queries stay on one machine.
+
+## Two ways to assign keys
+
+**Key-range partitioning** gives each partition a contiguous range of keys, in sorted order. Partition 0 holds keys from `a` to `f`, partition 1 holds `g` to `m`, and so on. **Hash partitioning** first applies a hash function to the key, and then assigns ranges of the hash value. Neighbouring keys get unrelated hashes, so they land on unrelated partitions.
+
+The demo writes 20,000 keys into a key space of one million keys. Pick a scheme and a workload, and watch the load per shard.
+
+<Predict
+  id="timestamps"
+  question="A table stores events with a timestamp as the key. It is range-partitioned over 8 shards of equal width. New events arrive at a steady rate. What happens to the write load?"
+  options={["It spreads evenly, because the ranges have equal width", "All new writes go to one shard", "Writes alternate between the first and the last shard"]}
+  answer={1}
+  explain="Each new timestamp is larger than every older one, so it falls in the last range. Equal widths do not help: the load depends on where the writes go, not on how large the ranges are. In the demo the busiest shard takes 8.00 times the mean."
+>
+<PartitioningLoadDemo />
+</Predict>
+
+1. Keep **key range** and **timestamps**. One shard takes all 20,000 writes, and its load is 8.00 times the mean. The other seven shards are idle.
+2. Select **hash of key**. The same timestamps now spread over all shards, and the ratio drops to 1.02.
+3. Select **uniform keys**. Both schemes are close to 1.0. Range partitioning is only bad when the keys are skewed.
+4. Select **Zipf**. A few keys get most of the requests, and the hottest key alone gets 6.5% of them. Under hashing the busiest shard is 1.66 times the mean. Hashing cannot help, because one key lives on one shard.
+5. Move **Shards** up to 32 under Zipf. The fair share falls, but the hottest key does not shrink, so the ratio grows.
+
+## Skew and hot spots
+
+A partition that gets more than its share of the load is a **hot spot**. **Skew** is the general name for uneven load. There are two kinds, and they need different cures.
+
+- **Key-order skew.** Many requests go to keys that are close together, such as recent timestamps or rising IDs. Hashing fixes this, because it scatters neighbours.
+- **Single-key skew.** Many requests go to one key, such as the account of a celebrity. No partitioning scheme fixes this alone. The [hot keys](/distributed/partitioning/hot-keys) lesson covers the cures.
+
+A common trick against key-order skew keeps range partitioning but changes the key. You put a small, well-spread prefix in front of the timestamp, such as a sensor ID or a bucket number. Writes then spread over as many ranges as there are prefixes. The cost is that a query for one time window must read every prefix.
+
+## Range scans
+
+Range partitioning has one large advantage. A query for a range of keys reads one partition, or a few neighbouring ones. Under hashing, the same keys are spread everywhere.
+
+<Predict
+  id="scan"
+  question="A table has 16 hash partitions. A query reads 1,000 consecutive keys. How many partitions must answer?"
+  options={["One or two", "About 4", "All 16"]}
+  answer={2}
+  explain="Each key goes to a partition at random. With 1,000 keys and 16 partitions, a partition gets none of them with probability (15/16) to the power 1,000. That is almost zero. So every partition must answer."
+>
+<PartitioningScanDemo />
+</Predict>
+
+1. Keep the defaults. Range partitioning asks 1 shard; hashing asks all 16.
+2. Move **Scan length** down to 10. Hashing now asks 9 shards, and the formula below expects 7.6.
+3. Move **Scan start** so that the scan crosses a range boundary. Range partitioning now asks 2 shards.
+4. Raise **Shards** to 64 with a scan of 100 keys. Hashing asks about 50 shards for only 100 rows.
+
+If each of $L$ keys falls in one of $N$ partitions at random, a given partition gets none of them with probability $(1 - 1/N)^L$. So the expected number of partitions that a scan touches is:
+
+$$
+E[\text{shards}] = N\left(1 - \left(1 - \frac{1}{N}\right)^{L}\right)
+$$
+
+For $N = 64$ and $L = 100$, this is 50.7. A query that asks many partitions costs more than the sum of its parts. Each partition must parse the request and do a disk seek, and the query waits for the slowest one. The [secondary indexes](/distributed/partitioning/secondary-indexes-across-partitions) lesson measures that wait.
+
+## What real systems choose
+
+| System | Unit | Scheme | Notes |
+|---|---|---|---|
+| Bigtable (2006) | tablet | key range | rows in lexicographic order; a tablet is about 100–200 MB by default |
+| HBase | region | key range | splits at `hbase.hregion.max.filesize`, 10 GB by default in 2.x |
+| CockroachDB | range | key range | splits at `range_max_bytes`, 512 MiB by default |
+| Cassandra | token range | hash | `Murmur3Partitioner` maps keys to tokens from $-2^{63}$ to $2^{63}-1$ |
+| DynamoDB | partition | hash | the partition key goes into an internal hash function |
+| MongoDB | chunk (range) | key range or hash | you choose ranged or hashed sharding per collection |
+
+Systems that hash often keep a second, sorted part of the key. In Cassandra, the partition key picks the node, and the clustering columns are sorted inside the partition. In DynamoDB, the sort key does the same. So "all events of sensor 17, by time" is one partition key and one sorted scan. DynamoDB may still spread a very large item collection over several partitions. This combines the even spread of hashing with cheap scans inside one entity.
+
+MongoDB shows the trade-off in its documentation. With hashed sharding, range queries on the shard key are "less likely to target a single shard", which gives more broadcast operations.
+
+## Request routing
+
+A client has a key. It must find the node that holds the partition for that key. There are three common designs.
+
+1. **The client knows the map.** The client library caches the partition map and sends each request straight to the right node. Cassandra drivers that are token-aware and the HBase client work like this.
+2. **A routing tier.** A proxy that knows the map receives every request and forwards it. MongoDB's `mongos` routes queries and writes to shards. A query without the shard key goes to all shards.
+3. **Any node.** The client sends the request to any node. That node forwards it to the owner, or answers with a redirect. In Cassandra, any node can act as the coordinator for a request.
+
+In all three designs, the map changes when partitions split or move. So the map needs a source of truth, and the routers need a way to learn about changes.
+
+Bigtable stores tablet locations in a metadata table that is itself a set of tablets. CockroachDB stores range addresses in special meta ranges. Many other systems keep the map in ZooKeeper or etcd, as the [ZooKeeper and etcd](/distributed/coordination/zookeeper-and-etcd) lesson shows. A router with an old map sends a request to the wrong node. That node must reject it, and the router must refresh its map and try again.
+
+```go
+// A client-side router with a cached map. A stale map is normal: the server rejects
+// the request with WrongShard, and the client refreshes the map and tries again.
+func (c *Client) Get(ctx context.Context, key []byte) ([]byte, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		shard := c.shardMap.Lookup(key) // range: binary search on start keys; hash: hash then search
+		val, err := c.conns[shard.Leader].Get(ctx, shard.ID, key)
+		if errors.Is(err, ErrWrongShard) {
+			c.shardMap = c.meta.Refresh(ctx, key) // read the new owner from the metadata service
+			continue
+		}
+		return val, err
+	}
+	return nil, ErrTooManyRedirects
+}
+```
+
+## Connect
+
+- [Hash indexes](/databases/indexes/hash-indexes): the same trade-off inside one machine. A hash finds one key fast but cannot scan a range.
+- [Consistent hashing](/distributed/partitioning/consistent-hashing): how to hash keys to nodes so that a new node moves few keys.
+- [Rebalancing](/distributed/partitioning/rebalancing): how partitions split and move as the cluster grows.
+- [Leader and followers](/distributed/replication/leader-follower): how each partition is replicated.
+
+<Recall cards={[
+  { q: "Why does a timestamp key put all writes on one shard under range partitioning?", a: "Each new timestamp is larger than all earlier ones, so it falls in the last range. The width of the ranges does not matter." },
+  { q: "Which kind of skew does hashing fix, and which kind does it not fix?", a: "It fixes key-order skew, such as rising timestamps, because it scatters neighbouring keys. It does not fix single-key skew, because one key always maps to one partition." },
+  { q: "How many partitions does a scan of L keys touch, on average, under hash partitioning with N partitions?", a: "$N(1 - (1 - 1/N)^{L})$. For 100 keys and 64 partitions, that is about 50." },
+  { q: "How do Cassandra and DynamoDB keep range scans cheap although they hash keys?", a: "The key has two parts. A hash of the partition key picks the partition, and rows inside one partition are sorted by the clustering or sort key." },
+  { q: "Name three ways a request can find the node that owns its key.", a: "The client caches the partition map. Or a routing tier such as mongos forwards it. Or any node accepts it and forwards it or redirects the client." },
+  { q: "What must happen when a router uses a stale partition map?", a: "The node that gets the request must reject it as the wrong shard. The router then refreshes its map from the metadata store and retries." },
+]} />

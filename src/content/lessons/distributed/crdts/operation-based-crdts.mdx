@@ -1,0 +1,120 @@
+---
+summary: "Send the update, not the state: op-based CRDTs, the delivery they need (exactly once, causal order), commutativity of concurrent ops, causal broadcast with vector clocks, pure op-based CRDTs and causal stability, and when to pick which kind."
+---
+import { CrdtDeliveryDemo, CrdtCausalStepperDemo } from "@/demos/dist/CrdtOpDemos";
+
+A state-based replica sends its whole state, so the network can do almost anything to the messages. An **operation-based** replica (a CmRDT) sends only the update: "add 1", "insert x after character 7". The messages are small and do not grow with the state. The price moves to the network layer. Now each message carries information that exists nowhere else, so the delivery layer must not lose it, repeat it, or deliver it too early.
+
+Shapiro, Preguiça, Baquero and Zawirski (SSS 2011) give the conditions. Ops go through **reliable causal broadcast**: every op reaches every replica exactly once, in an order consistent with happens-before. And all **concurrent** ops must commute. This lesson takes each condition away in turn, and shows what breaks.
+
+<Predict
+  id="which"
+  question="An op-based counter sends +1 and −1 ops to the other replicas. The network reorders messages and duplicates 30% of them. Which fault makes the replicas show a wrong value?"
+  options={["The reordering: a −1 can arrive before the +1 that it follows", "The duplicates: a repeated +1 counts twice", "Both of them"]}
+  answer={1}
+  explain="Addition commutes, so the order of +1 and −1 never changes the sum. But addition is not idempotent: a second copy of +1 adds 1 again. The counter needs exactly-once delivery, not order."
+>
+<CrdtDeliveryDemo />
+</Predict>
+
+1. Read the default run. No replica shows the expected sum. The stats say that 100% of 200 runs end wrong.
+2. Turn on **Drop duplicates by op id**. Each op carries a unique id (origin, sequence number), and a replica drops an id that it has seen. Now 0% of runs are wrong, and the order is still random.
+3. Set **Duplicated messages** to 0%, and select **add/remove set**. R1 adds items, and R2 removes each item when it sees the add. With no causal order, 84.5% of runs leave an item stuck at R3.
+4. Turn on **Causal delivery**. Now 0% of runs are wrong. A remove that arrives early waits until its add is delivered.
+5. Move **Run** through some seeds with causal delivery off. Find a run where the set is correct by luck: every add arrived before its remove.
+
+## Why the counter and the set need different things
+
+The two objects fail for different reasons. Increments commute with all other increments, so a counter accepts any order. A counter still needs **exactly-once** delivery, because $x + 1 + 1 \neq x + 1$. An id per op and a set of seen ids give that.
+
+The set fails on order. An **observed-remove set** (OR-Set) tags each add with a unique id. A remove sends the tags of the element that its origin has seen. Look at the run in the demo:
+
+- R1 runs add(a) with tag 1.1 and sends it.
+- R2 receives the add, then runs remove(a) with tags [1.1]. The remove is **causally after** the add, because R2 saw the add first.
+- R3 receives the remove first. Tag 1.1 is not there, so the remove does nothing. Then the add arrives, and tag 1.1 stays forever.
+
+The add and the remove do not commute, and they do not need to. Shapiro et al. only ask that **concurrent** ops commute. Ops that are ordered by happens-before must arrive in that order, and causal delivery makes sure that they do.
+
+## Causal broadcast with vector clocks
+
+The standard delivery layer uses a vector clock per replica. Replica $j$ keeps a vector $D$, where $D[k]$ counts the ops from replica $k$ that $j$ has delivered. Each op carries the vector $V$ of its origin at the time it was made, so $V[\text{origin}]$ is its sequence number. Replica $j$ delivers the op only when
+
+$$
+V[\text{origin}] = D[\text{origin}] + 1 \quad\text{and}\quad V[k] \le D[k] \text{ for every } k \neq \text{origin}.
+$$
+
+The first part says that this is the next op from that origin. The second says that $j$ has delivered every op that the origin had delivered when it made this one. If either part fails, the op waits in a buffer. An op with $V[\text{origin}] \le D[\text{origin}]$ was delivered before, so it is a duplicate and the layer drops it.
+
+```go
+// deliverable reports whether op m can be applied at a replica with delivered vector d.
+func deliverable(d []uint64, m Op) bool {
+	if m.VC[m.Origin] != d[m.Origin]+1 {
+		return false // not the next op from this origin (a gap, or a duplicate)
+	}
+	for k, v := range m.VC {
+		if k != m.Origin && v > d[k] {
+			return false // the origin had seen an op that we have not
+		}
+	}
+	return true
+}
+```
+
+The layer does not repair loss on its own. If the network loses an op, the buffer at the receiver waits forever for the gap. Real systems add retransmission, for example anti-entropy that compares delivered vectors and resends what is missing. The lesson on sequence CRDTs uses that.
+
+<Predict
+  id="buffer"
+  question="R1 adds x. R2 receives the add and removes x. You deliver R2's remove to R3 before R1's add. With the causal buffer on, what does R3 do with the remove?"
+  options={["It applies it at once, and removes nothing", "It holds it in a buffer until R1's add is delivered, then applies both in order", "It rejects it, and R2 must send it again"]}
+  answer={1}
+  explain="The remove carries R2's vector [1,1,0]. R3 has delivered [0,0,0], so it lacks op 1.1 from R1. The remove waits. When the add arrives, R3 applies the add, then the remove, and x is gone."
+>
+<CrdtCausalStepperDemo />
+</Predict>
+
+1. Read the preset. R3 shows the remove "rmv 2.1" waiting in its buffer. Deliver **R1 → R3: add x**. R3 applies the add, then the buffered remove, and its set is empty.
+2. Press **Undo**, and turn off **Causal delivery buffer**. Deliver the add to R3 now, then deliver the rest. R3 keeps x, but R1 and R2 end empty. They will never agree.
+3. Press **Clear**. Click **add x** at R1 and **rmv x** at R2 before you deliver anything. R2 has seen no add, so its remove carries no tags. After all deliveries, x stays everywhere. A remove only removes what it has observed.
+4. Press **Clear**. Make R1 add x, deliver it to R2, and drop it on the way to R3. Then make R2 remove x and deliver that to R3. The remove waits in R3's buffer forever, because nothing sends op 1.1 again.
+
+## Pure op-based CRDTs and causal stability
+
+Classic op-based CRDTs often put metadata inside the ops. An OR-Set remove carries a list of tags, for example. Baquero, Almeida and Shoker asked how small an op can be. In "Making Operation-based CRDTs Operation-based" (DAIS 2014) and "Pure Operation-Based Replicated Data Types" (2017), each op carries only its name and arguments. The delivery layer adds a timestamp, and each replica keeps a **partially ordered log** (PO-Log) of ops. The value is a function of that log.
+
+The log would grow forever. The fix is **causal stability**. In the 2017 paper, an op is causally stable at replica $i$ when every op that $i$ delivers from now on has a larger timestamp. So no op that is concurrent with it can still arrive.
+
+A replica can detect this when it has delivered, from every other replica, an op made after that replica delivered the stable op. Then the stable op can lose its timestamp and fold into a compact state. The middleware in the 2017 paper, **Tagged Causal Stable Broadcast**, reports which ops are stable.
+
+Stability has a cost: it needs to hear from every replica. One replica that is down or cut off stops all stability, and the log grows until it returns. The next lesson shows the same effect on tombstones.
+
+## State-based or op-based?
+
+Shapiro et al. prove that the two kinds are equivalent: each can emulate the other. The choice is about engineering.
+
+| | state-based | op-based |
+|---|---|---|
+| message | the whole state (or a delta) | one op, plus an id and a vector clock |
+| network may | lose, reorder and duplicate | reorder only, if the layer buffers and deduplicates |
+| delivery layer | gossip of any kind | reliable causal broadcast |
+| merge must be | a join (commutative, associative, idempotent) | commutative for concurrent ops |
+| good when | states are small, links are poor, membership changes | states are large, ops are small, links are reliable |
+| recovery after a long partition | one state exchange | replay of every missed op, or a state transfer |
+
+Delta-state CRDTs sit between the two. They send small messages, but keep the join, so the network may still duplicate and reorder them.
+
+## Connect
+
+- [State-based CRDTs](/distributed/crdts/state-based-crdts): the lattice, and why any delivery order is safe there.
+- [Vector clocks](/distributed/time/vector-clocks): the clocks that the causal buffer compares.
+- [Sequential and causal consistency](/distributed/consistency/sequential-and-causal-consistency): causal order as a consistency model.
+- [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency): op ids are the same idea as idempotency keys.
+- [Exactly-once semantics](/distributed/data-systems/exactly-once-semantics): exactly-once delivery is deduplication on top of at-least-once.
+
+<Recall cards={[
+  { q: "Which delivery guarantees does an op-based CRDT need, according to Shapiro et al.?", a: "Reliable causal broadcast: every op reaches every replica exactly once, in an order consistent with happens-before. Also, concurrent ops must commute." },
+  { q: "Why does an op-based counter survive reordering but not duplication?", a: "Addition commutes, so order does not matter. Addition is not idempotent, so a repeated +1 counts twice." },
+  { q: "In an OR-Set, why must a remove not be applied before the add that it removes?", a: "The remove carries the tags that its origin has seen. If it arrives first, the tag is not there, it removes nothing, and the late add then stays forever." },
+  { q: "When does replica j deliver an op with vector V from replica o, given its delivered vector D?", a: "When V[o] = D[o] + 1 and V[k] ≤ D[k] for every other k. Otherwise the op waits; if V[o] ≤ D[o], it is a duplicate." },
+  { q: "What is causal stability, and what is it for?", a: "An op is causally stable at a replica when no op concurrent with it can still be delivered there. Then its metadata (timestamp, tombstone, log entry) can be thrown away." },
+  { q: "Why can one crashed replica stop garbage collection in a pure op-based CRDT?", a: "Stability needs to know that every replica has delivered an op. A replica that is silent never confirms, so no op becomes stable." },
+]} />

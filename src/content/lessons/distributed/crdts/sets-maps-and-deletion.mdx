@@ -1,0 +1,127 @@
+---
+summary: "Removing from a structure that may only grow: G-Set, 2P-Set and its remove-once limit, LWW-element-Set, the observed-remove set with unique tags, tombstones and their garbage collection, the optimized OR-Set, maps of CRDTs, and the choice between add wins and remove wins."
+---
+import { CrdtSetPlaygroundDemo, CrdtTombstoneDemo } from "@/demos/dist/CrdtSetDemos";
+
+A state-based CRDT may only move up in its order. Adding to a set moves up. Removing moves down, and a merge would undo it: the other replica still has the element, and the union brings it back. So every replicated set must answer two questions. How does a replica remember a remove? And what happens when one replica removes an element while another adds it at the same time?
+
+## Four answers
+
+**G-Set.** A grow-only set: add only, and the merge is the union. It is the base for the others.
+
+**2P-Set** (two-phase set). Two G-Sets: $A$ for adds and $R$ for removes. An element is in the set if it is in $A$ and not in $R$. The set $R$ holds **tombstones**: markers that say "this was removed".
+
+Shapiro et al. allow a remove only if the element is in the local set. The INRIA report (RR-7506, 2011) states the limit plainly: an element may be added and removed, but never added again. Remove wins every race.
+
+**LWW-element-Set.** Each element has the time of its latest add and its latest remove. The element is in the set if the add is later. Ties need a fixed rule; the sim lets the add win. Elements can come back, but the answer to a race depends on clocks, not on what the users saw.
+
+**OR-Set** (observed-remove set). Each add creates a unique **tag**, for example (replica, counter). The state is a set of (element, tag) pairs, plus the tags that removes have killed. A remove kills only the tags of the element that its replica has **observed**.
+
+An add that is concurrent with the remove has a new tag, which the remove could not see. So the add survives. The report says that the 2P-Set gives precedence to remove and the OR-Set to add.
+
+```ts
+type OrSet = { adds: Map<string, string>; tombs: Set<string> }; // tag -> element; dead tags
+
+function add(s: OrSet, e: string, tag: string) {
+  s.adds.set(tag, e); // tag = `${replica}.${counter}`, unique
+}
+function remove(s: OrSet, e: string) {
+  for (const [tag, x] of s.adds) if (x === e) s.tombs.add(tag); // only tags this replica has seen
+}
+function merge(a: OrSet, b: OrSet): OrSet {
+  return { adds: new Map([...a.adds, ...b.adds]), tombs: new Set([...a.tombs, ...b.tombs]) };
+}
+const has = (s: OrSet, e: string) => [...s.adds].some(([t, x]) => x === e && !s.tombs.has(t));
+```
+
+<Predict
+  id="race"
+  question="R1 and R2 both hold x. With no sync in between, R1 removes x, and then R2 adds x. After a merge, which sets contain x?"
+  options={["None: remove wins in all three", "LWW-element-Set and OR-Set, but not the 2P-Set", "All three: add always wins"]}
+  answer={1}
+  explain="The 2P-Set already has x in its remove set, and no add can bring it back. The LWW set compares clocks: the add came later, so it wins. The OR-Set sees a new tag from R2's add that R1's remove never observed, so x stays."
+>
+<CrdtSetPlaygroundDemo />
+</Predict>
+
+1. Read the three columns for the preset. The same four ops give three answers. Each set converges, but each has its own semantics.
+2. Drag **R2 clock offset** to −50 ms. Now R2's add carries an earlier time than R1's remove, and the LWW set loses x. The OR-Set does not change, because it does not use clocks.
+3. Press **remove, then add again**. The 2P-Set ends empty: x has a tombstone in R. The other two show x again.
+4. Press **remove after a late add**. R2 adds x a second time, and R1 removes x without seeing that add. The LWW set says the remove is later, so x is gone. The OR-Set keeps x, because tag 2.1 was never observed by the remove.
+5. Press **Clear** and build your own race. Add x on both replicas, sync, and remove it on one. Every tag was observed, so x is gone in all three.
+
+## Add wins or remove wins?
+
+Neither answer is right in general. The question is what users expect when their actions race.
+
+- In a shopping cart, a lost add loses a sale, and a stale item is easy to remove again. Add wins.
+- In an access-control list, a revoked permission that comes back is a security bug. Remove wins.
+- In a set of feature flags, the answer depends on the flag.
+
+Real systems document their choice. Riak KV's sets resolve a concurrent add and remove so that the add wins. In its maps, a concurrent update wins over a remove of the field. Redis Active-Active sets also behave as OR-Sets: a remove removes only the instances that it has seen, and otherwise add wins. A remove-wins set is also possible: a remove keeps a marker that beats every concurrent add. Pick it on purpose, and write the choice down.
+
+## Tombstones and how to collect them
+
+The classic OR-Set keeps every dead tag forever. A replica needs the tombstone to reject the tag when an old state, which still holds it, arrives by gossip. In a busy set, the tombstones soon outnumber the live elements.
+
+You can drop a tombstone once no state that still holds its tag can arrive. That is **causal stability** again. A replica knows that a remove is stable when it has seen, from every replica, a state that includes the remove.
+
+<Predict
+  id="gc"
+  question="Tombstones are collected when every replica has seen the remove. What happens to the number of tombstones at R1 while R3 is cut off for 1.5 seconds?"
+  options={["It stays low: R1 and R2 can still agree with each other", "It grows for the whole partition, and drops after the heal", "It drops to zero: R3 is not counted while it is unreachable"]}
+  answer={1}
+  explain="R1 cannot know that R3 has seen any new remove, so no new tombstone is stable. Collection stalls for the whole partition. After the heal, R3 catches up, gossips its state, and the backlog is collected."
+>
+<CrdtTombstoneDemo />
+</Predict>
+
+1. Read the red line. Without collection, R1 ends with 76 tombstones for 67 removes. A remove kills every live tag of the element, so it can leave more than one tombstone.
+2. Read the blue line. With collection at causal stability, R1 never holds more than 13 tombstones.
+3. Turn on **Cut R3 off**. The blue line climbs to 28 during the partition, then falls after the heal. One slow replica holds back collection for everyone.
+4. Read the green line. The optimized set holds no tombstones at all, only one version-vector entry per replica.
+
+The rules for safe collection are strict. The sim gossips over FIFO links, as TCP gives. Without that, an old state could arrive after a tombstone is gone and bring the tag back. A replica that leaves the cluster for good must also leave the membership, or nothing ever becomes stable again.
+
+## No tombstones: the optimized OR-Set
+
+Bieniusa, Zawirski, Preguiça, Shapiro, Baquero, Balegas and Duarte showed how to avoid tombstones ("An Optimized Conflict-free Replicated Set", INRIA RR-8083, 2012). Each tag is a **dot**: (replica, counter), as in dotted version vectors. Each replica also keeps a version vector of the dots that it has seen. The merge then decides by itself:
+
+- A dot that both sides hold stays.
+- A dot that only one side holds stays if the other side has not seen it yet. That is a new add.
+- If the other side has seen the dot but does not hold it, the other side removed it. The dot goes.
+
+The vector replaces all tombstones, and its size is one entry per replica. The add still wins over a concurrent remove, because the remove could not have seen the new dot. Riak's set type is this design. Its source calls it `riak_dt_orswot`: "Observe Remove Set WithOut Tombstone".
+
+## Maps of CRDTs
+
+A map is a set of keys, where each key holds a nested CRDT: a counter, a register, a set, or another map. The keys form an OR-Set, and the values merge with their own merge. An update to a key also makes the key present, so an update that races with a remove of the key wins. This is how a JSON-like document can be one CRDT.
+
+Removal hides a key, but what happens to its nested state? In the sim, a remove hides the key and keeps the counter inside.
+
+Suppose R1 removes the key "milk" with count 2, while R2 adds 1 to it. After the merge, "milk" is back with 3, not 1. The old increments came back with the key. Designs that reset the nested value on remove need more metadata, such as the dots of every nested update. This choice matters as much as add wins versus remove wins.
+
+| type | remove | re-add | race between add and remove | metadata |
+|---|---|---|---|---|
+| G-Set | no | not needed | not possible | none |
+| 2P-Set | once | never | remove wins | one tombstone per removed element |
+| LWW-element-Set | yes | yes | later clock wins | two times per element |
+| OR-Set | yes | yes | add wins | one tag per add, tombstones until collected |
+| optimized OR-Set | yes | yes | add wins | live dots, one vector entry per replica |
+
+## Connect
+
+- [State-based CRDTs](/distributed/crdts/state-based-crdts): why a merge can only move up.
+- [Operation-based CRDTs](/distributed/crdts/operation-based-crdts): causal stability for op logs.
+- [Vector clocks](/distributed/time/vector-clocks): dots and dotted version vectors, used by the optimized set.
+- [Physical clocks and drift](/distributed/time/physical-clocks-and-drift): why the LWW set loses races to a fast clock.
+- [Sequence CRDTs for collaborative editing](/distributed/crdts/sequence-crdts-for-collaborative-editing): tombstones in text, where they are harder to remove.
+
+<Recall cards={[
+  { q: "Why can a state-based set not simply delete an element on remove?", a: "A remove moves the state down. The next merge with a replica that still has the element would bring it back, because the merge is a union." },
+  { q: "What is the limit of the 2P-Set?", a: "An element can be removed once and never added again, because its tombstone in R beats every later add." },
+  { q: "Why does an OR-Set give add-wins semantics?", a: "Each add has a unique tag, and a remove kills only the tags that its replica observed. A concurrent add has a tag that the remove could not see, so it survives." },
+  { q: "When can a replica drop an OR-Set tombstone safely?", a: "When the remove is causally stable. Every replica has seen it, so no state that still holds the tag can arrive later. The sim also needs FIFO links." },
+  { q: "How does the optimized OR-Set avoid tombstones?", a: "Tags are dots, and each replica keeps a version vector. A dot that the other side has seen but does not hold was removed, so the merge drops it. The vector replaces the tombstones." },
+  { q: "Give one case for add wins and one for remove wins.", a: "Add wins for a shopping cart, where a lost add costs more than a stale item. Remove wins for permissions, where a revoked right must not come back." },
+]} />

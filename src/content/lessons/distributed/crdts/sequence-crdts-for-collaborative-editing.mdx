@@ -1,0 +1,108 @@
+---
+summary: "Collaborative text as a CRDT: why index-based edits diverge, RGA with unique ids and tombstones, Logoot and LSEQ position identifiers, the interleaving anomaly, how Yjs and Automerge work, and how this compares with the operational transformation of Google Docs."
+---
+import { CrdtEditorsDemo, CrdtInterleaveDemo } from "@/demos/dist/CrdtSeqDemos";
+
+Text looks like a simple list of characters. The problem is the index. A user types "!" at index 5. At the same time, another user inserts three characters at index 0. When the first op arrives at the second replica, index 5 points at a different place. Each replica applies the same two ops and gets a different text.
+
+There are two known fixes. **Operational transformation** (OT) rewrites each incoming op against the ops that were concurrent with it, so "insert at 5" becomes "insert at 8". A **sequence CRDT** removes the index from the op. Each character gets a unique, permanent id, and an op says "insert after character X". The id never moves, so there is nothing to transform.
+
+<Predict
+  id="editors"
+  question="Two editors share the text 'hello' over a slow network. Both users type at the end at the same time: A types '!!' and B types '??'. After all ops arrive, what do the two editors show?"
+  options={["Each editor shows its own text first: 'hello!!??' and 'hello??!!'", "The same text in both, in an order that the ids decide", "The text of whoever typed last"]}
+  answer={1}
+  explain="Both inserts name the same left neighbour, the 'o'. RGA orders such siblings by id, and every replica compares the same ids. So both editors end with the same text. Neither user's text is lost."
+>
+<CrdtEditorsDemo />
+</Predict>
+
+1. Type a word in editor A, and watch it appear in B after the delay. Under each editor, every character shows its id: a counter and the replica.
+2. Click at the same place in both editors and type in both quickly. For a moment the texts differ. Then both show the same merge.
+3. Delete some characters. Their chips stay, struck through. These are tombstones: later inserts may still refer to them.
+4. Press **Cut the network** and type in both. Ops sent now are lost. Press **Heal**. Anti-entropy compares delivered vectors and sends the missing ops again, and both texts converge.
+5. Set the delay to 0 ms. The editors feel like one document. The merge rule did not change; only the time that the texts differ did.
+
+## RGA: ids, a left neighbour, and one skip rule
+
+The Replicated Growable Array (RGA) of Roh, Jeon, Kim and Lee (JPDC, 2011) is the simplest sequence CRDT to explain. The paper uses a custom timestamp, the S4Vector. Later presentations use a simpler id, and so does this lesson. Each character has an id (counter, replica). The counter is a Lamport clock: a replica takes one more than the largest counter that it has seen. Ids compare by counter, then by replica.
+
+An insert op is (id, the id of the left neighbour, character). A delete op names an id, and the character stays as a tombstone.
+
+To apply an insert, a replica finds the left neighbour, steps right, and skips every element with a larger id. Then it inserts.
+
+```ts
+function integrate(list: Elem[], op: { id: Id; after: Id | null; ch: string }) {
+  let i = op.after === null ? 0 : indexOf(list, op.after) + 1;
+  while (i < list.length && greater(list[i].id, op.id)) i++; // skip newer siblings and their text
+  list.splice(i, 0, { id: op.id, ch: op.ch, deleted: false });
+}
+```
+
+Why does this converge?
+
+Two inserts after the same neighbour are **siblings**. The rule puts the sibling with the larger id first. Everything typed after a sibling has a larger counter, by the Lamport rule, so the skip moves past that whole run. Every replica therefore builds the same order, whatever the order of arrival. The rule also needs causal delivery: an insert must not arrive before its left neighbour exists. The sim uses the causal broadcast layer from the lesson on operation-based CRDTs.
+
+Tombstones are the cost. A deleted character keeps its id, because a concurrent insert may name it as its left neighbour. A long-lived document can hold more deleted characters than visible ones. They can only be dropped when every replica has seen the delete and no op that names them can still arrive.
+
+## Position identifiers: Logoot and LSEQ
+
+A second family gives each character a **position** from a dense ordered set. There is always room for a new position between two others. The text is the characters sorted by position. Logoot (Weiss, Urso and Molli, ICDCS 2009) uses a list of (digit, site) pairs. LSEQ (Nédelec, Molli, Mostefaoui and Desmontils, DocEng 2013) chooses digits with an adaptive strategy, to keep ids short.
+
+These ids need no tombstones: a delete removes the character and its position. But two users who insert at the same place pick positions in the same gap, independently. Their characters then sort in an order that nobody chose.
+
+<Predict
+  id="interleave"
+  question="The text is 'Hi !'. At the same time, user A types 'cat' and user B types 'dog' just before the '!'. With Logoot-style positions, what is the merge most likely to be?"
+  options={["'Hi catdog!' or 'Hi dogcat!': each word stays whole", "The letters of the two words mixed, such as 'Hi cdatog!'", "The two replicas end with different texts"]}
+  answer={1}
+  explain="Each letter gets a random position in the same gap, close to the previous letter. The positions of the two words overlap, so the letters interleave. In the sim, a word is split in 70.5% of 200 runs."
+>
+<CrdtInterleaveDemo />
+</Predict>
+
+1. Read the three panels. Index-based ops diverge: A shows "Hi dogcat!" and B shows "Hi catdog!". Logoot-style positions converge on "Hi cdatog!". RGA converges on "Hi dogcat!".
+2. Read the RGA table. "c" and "d" were both inserted after the space, so they are siblings. Each other letter was inserted after the letter before it, so each word is a chain.
+3. Select **right to left**. Now each user types the last letter first and moves the cursor left. Every letter is inserted after the space, so all six letters are siblings. RGA gives "Hi dcoagt!".
+4. Move **Logoot run** through some seeds. The split changes with the random digits. Over 200 runs, a word is split in 70.5% of runs when typed left to right, and 94.5% right to left.
+
+## The interleaving anomaly
+
+Kleppmann, Gomes, Mulligan and Beresford named this problem in "Interleaving anomalies in collaborative text editors" (PaPoC 2019). They showed that Logoot and LSEQ interleave text that two users type at the same place. For RGA they found a lesser variant. It appears when a user types with backward cursor moves, as in step 3. A merge like "Hi dcoagt!" converges, but no user would accept it.
+
+Weidner and Kleppmann later defined **maximal non-interleaving** and gave the Fugue algorithm ("The Art of the Fugue", IEEE TPDS, 2025). Their paper proves that the FugueMax variant has this property. Plain Fugue is simpler, but it can interleave more characters when some interleaving cannot be avoided.
+
+## How real editors do it
+
+**Yjs.** Its README says that it implements a modified version of YATA (Nicolaescu, Jahns, Derntl and Klamma, GROUP 2016). YATA is a list CRDT in which each inserted item records its left and right neighbours at the time of the insert. Yjs cannot drop deleted items while it keeps a unique order. Instead it removes their content and keeps small tombstones. This garbage collection is on by default; `doc.gc = false` keeps old content for version history.
+
+**Automerge.** Its documentation says that a list is an RGA sequence. Its text type implements Peritext, a CRDT for rich text that adds formatting marks such as bold to the characters.
+
+**Google Docs** uses OT. A 2010 series on the Google Drive blog explains how Docs merges concurrent changes. The algorithm that shifts concurrent changes is operational transformation. OT dates back to Ellis and Gibbs, "Concurrency control in groupware systems" (SIGMOD 1989).
+
+| | operational transformation | sequence CRDT |
+|---|---|---|
+| op names a place by | index | unique id of a neighbour, or a dense position |
+| concurrent ops | transformed against each other | applied as they are; ids decide the order |
+| typical topology | clients and a central server that orders ops | any: peer to peer, offline, server relay |
+| metadata | small ops, plus the history to transform against | an id per character, plus tombstones (RGA) |
+| hard part | correct transforms for every pair of ops | metadata size, and interleaving |
+
+Neither approach is free. OT keeps documents small but needs the server, or very careful proofs, to stay correct. CRDTs work offline and peer to peer, and pay for it with an id on every character.
+
+## Connect
+
+- [Operation-based CRDTs](/distributed/crdts/operation-based-crdts): the causal delivery that RGA needs.
+- [Sets, maps and deletion](/distributed/crdts/sets-maps-and-deletion): tombstones and their collection.
+- [Lamport clocks](/distributed/time/lamport-clocks): the counters inside RGA ids.
+- [Multi-leader replication](/distributed/replication/multi-leader): conflict resolution in databases, the same problem with rows.
+- [Anti-entropy and Merkle trees](/distributed/replication/anti-entropy-and-merkle-trees): how editors that were offline catch up.
+
+<Recall cards={[
+  { q: "Why do index-based edits diverge when two replicas apply the same ops?", a: "A concurrent insert shifts the text, so the same index points at different places on the two replicas." },
+  { q: "What does an RGA insert op contain, and how is it applied?", a: "A unique id (Lamport counter, replica), the id of its left neighbour, and the character. Start right of the neighbour, skip every element with a larger id, insert there." },
+  { q: "Why does RGA keep deleted characters as tombstones?", a: "A concurrent insert may name the deleted character as its left neighbour. Without it, the replica cannot place that insert." },
+  { q: "Why do Logoot and LSEQ interleave two words typed at the same place?", a: "Each letter gets a position in the same gap, chosen independently by each replica. The positions of the two words overlap, so the letters sort mixed." },
+  { q: "When does RGA interleave?", a: "When users type backwards, for example the last letter first with the cursor moving left. All letters are then siblings of one character, ordered by id." },
+  { q: "Name the algorithm behind Yjs and the one that Automerge uses for lists.", a: "Yjs implements a modified YATA. Automerge's documentation says that lists are an RGA sequence." },
+]} />

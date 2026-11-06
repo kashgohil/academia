@@ -1,0 +1,132 @@
+---
+summary: "Replicas that merge with a least upper bound converge in any order: join-semilattices, G-Counter, PN-Counter, registers, strong eventual consistency, the cost of shipping whole states, and delta-state CRDTs."
+---
+import { CrdtGossipDemo, CrdtLatticeDemo } from "@/demos/dist/CrdtStateDemos";
+
+A replicated counter looks easy. Each replica holds a number, adds to it, and sends it to the others. Then two replicas add 1 at the same time, and each sends "my value is 6". One increment is gone. Locks or a leader would fix this, but they stop working when the network is cut.
+
+A **conflict-free replicated data type** (CRDT) fixes it with math instead. Every replica accepts every update alone, and any two replicas that have seen the same updates hold the same state.
+
+This lesson covers the **state-based** kind. A replica sends its whole state, and the receiver merges it into its own. The trick is to choose states and a merge so that the order of messages, lost messages and duplicates cannot matter.
+
+<Predict
+  id="naive"
+  question="Three replicas run the preset: six updates that sum to 7, a partition, and a heal. The naive counter merges by keeping the value with the latest timestamp. After gossip settles, what does it show?"
+  options={["7, the same as the PN-Counter", "Different values at each replica, forever", "One value that all replicas agree on, but far from 7"]}
+  answer={2}
+  explain="Keeping the latest timestamp is a real merge: it is commutative, associative and idempotent. So the replicas converge. But each increment writes 'old value + d', and concurrent writes overwrite each other. In the preset, all three replicas end at 0."
+>
+<CrdtGossipDemo />
+</Predict>
+
+1. Read the preset with the **PN-Counter**. All replicas show 7. The diagram shows states that overtake each other and orange duplicates, and none of it matters.
+2. Select **naive: last value wins**. The replicas still agree, but on 0. The last write was R2's −1 on a value of 1, and its timestamp beats every other write.
+3. Press **Clear**. Click **+1** on R1, R2 and R3 quickly, then let gossip run. The PN-Counter shows 3. The naive counter shows 1.
+4. Press **Cut R3 off**. Add on both sides, then heal. R3 keeps working during the partition, and nothing is lost after the heal.
+5. Drag **Duplicated messages** to 50%. The PN-Counter does not change. A state that arrives twice is merged twice, and the second merge does nothing.
+
+## Lattices: the rules that make merging safe
+
+A **partial order** $\le$ on states says when one state "knows at least as much" as another. Two states can be **concurrent**: neither is $\le$ the other. A **join-semilattice** is a partial order in which every pair of states $a, b$ has a **least upper bound** $a \sqcup b$. It is a state above both, and below every other state above both.
+
+Shapiro, Preguiça, Baquero and Zawirski defined a state-based CRDT (a CvRDT) with three rules (SSS 2011).
+
+- The states form a join-semilattice.
+- A merge with a remote state computes the least upper bound.
+- An update only moves the state up: $s \le \mathrm{update}(s)$. This is an **inflation**.
+
+The least upper bound has three laws for free:
+
+$$
+a \sqcup b = b \sqcup a \qquad (a \sqcup b) \sqcup c = a \sqcup (b \sqcup c) \qquad a \sqcup a = a
+$$
+
+Commutativity means that the order of delivery does not matter. Associativity means that the grouping of merges does not matter, so gossip through a third replica is fine. Idempotence means that a duplicate does no harm. Together they say that the state of a replica is the join of every update that has reached it, by any path. Two replicas that have seen the same updates hold the same join.
+
+<Predict
+  id="join"
+  question="A G-Counter with two replicas has state [2,0] at R1 and [1,2] at R2. What is the merge?"
+  options={["[3,2]: add the entries", "[2,2]: the larger value of each entry", "[1,2]: the newer state wins"]}
+  answer={1}
+  explain="Each entry counts the increments of one replica, and only that replica writes it. The larger entry has seen more of that replica's increments. Adding the entries would count R1's first increment twice."
+>
+<CrdtLatticeDemo />
+</Predict>
+
+1. Read the default pick. [2,0] and [1,2] are concurrent. Four states are above both, and the join [2,2] is the lowest of them.
+2. Click [1,1] and [2,1]. They are ordered, so the join is simply the larger one.
+3. Select **G-Set over x, y, z**. The order is set inclusion, and the join is the union.
+4. Select **max-register**. The order is a chain, and every pair is ordered.
+
+## The basic types
+
+**G-Counter.** A grow-only counter keeps one entry per replica. Replica $i$ adds only to entry $i$. The value is the sum of the entries, and the merge takes the maximum of each entry. It cannot count down, because a decrement would move entry $i$ down and break the inflation rule.
+
+**PN-Counter.** Two G-Counters: $P$ counts increments and $N$ counts decrements. The value is $\sum P - \sum N$. Both halves only grow, so the pair is a lattice.
+
+```rust
+#[derive(Clone)]
+struct PnCounter { p: Vec<u64>, n: Vec<u64> }
+
+impl PnCounter {
+    fn add(&mut self, me: usize, d: i64) {
+        if d >= 0 { self.p[me] += d as u64 } else { self.n[me] += (-d) as u64 }
+    }
+    fn merge(&mut self, o: &PnCounter) {
+        for i in 0..self.p.len() {
+            self.p[i] = self.p[i].max(o.p[i]);
+            self.n[i] = self.n[i].max(o.n[i]);
+        }
+    }
+    fn value(&self) -> i64 { self.p.iter().sum::<u64>() as i64 - self.n.iter().sum::<u64>() as i64 }
+}
+```
+
+**Max-register.** The state is a number, and the merge is the maximum. It is the simplest useful lattice, a chain.
+
+**LWW-register.** A **last-writer-wins** register holds a value and a timestamp, here (time, replica id). The merge keeps the larger timestamp. It is a lattice, so it converges. But it keeps one of two concurrent writes and silently drops the other.
+
+The naive counter in the first demo is an LWW-register that holds a count. The lattice laws give convergence, not the meaning that you want. For a counter, you must design the lattice so that the join keeps every increment.
+
+## Strong eventual consistency
+
+Eventual consistency only promises that replicas agree after updates stop. Shapiro et al. defined **strong eventual consistency** (SEC) in the same 2011 paper. It adds **strong convergence**: correct replicas that have delivered the same updates have equivalent state. This holds at every moment, not only after a quiet period. A replica never has to roll back or ask anybody, so a CRDT stays available during any partition.
+
+SEC asks little of the network. A state message can be lost, delayed, reordered or duplicated. Convergence needs only that each update reaches each replica by some path, eventually. Periodic gossip of full states gives that, even if most messages are lost.
+
+## The cost: shipping whole states
+
+The price of this freedom is size. A G-Counter has one entry per replica that ever wrote. With an 8-byte id and an 8-byte count per entry (a model input), a state with 100 entries is 1,600 bytes. Every gossip message carries all of it, even if only one entry changed. A set that holds a million elements sends a million elements.
+
+Almeida, Shoker and Baquero proposed **delta-state CRDTs** (JPDC, 2018). A **delta-mutator** returns a small state, the delta, that holds only what an update changed. A delta is itself a state of the lattice, so a receiver joins it like any other state. A replica joins deltas into a **delta-group** and sends that. To keep causal consistency when messages are lost, the paper sends **delta-intervals** and uses acknowledgements.
+
+The sim compares the two. Each replica makes 4 increments in the first 400 ms. Every 40 ms, each replica sends a random peer its full state, or only the entries that it has not yet sent to that peer. Links in the delta run are reliable.
+
+| replicas | full state, bytes per message | delta, bytes per message | full state, total kB | delta, total kB |
+|---|---|---|---|---|
+| 3 | 48 | 29 | 4 | 1 |
+| 10 | 160 | 112 | 39 | 19 |
+| 100 | 1600 | 1135 | 3984 | 2618 |
+
+Deltas also let a replica send nothing when nothing changed. That is where most of the saving comes from. The win grows with the size of the state. A counter is small. A set with many elements is large, but a delta for one add is one element.
+
+## Real systems
+
+Riak KV 2.0 added data types built on CRDTs: counters, sets, maps, registers and flags. Its documentation says that flags and registers must be embedded in maps. Redis Software has Active-Active databases, which use CRDTs and a strong eventual consistency model across regions. Both pick merges per type, because no single merge is right for every kind of data.
+
+## Connect
+
+- [Eventual consistency](/distributed/consistency/eventual-consistency): the weaker promise, and anti-entropy that spreads states.
+- [Vector clocks](/distributed/time/vector-clocks): a G-Counter is a vector clock, and its merge is the same entry-wise maximum.
+- [Anti-entropy and Merkle trees](/distributed/replication/anti-entropy-and-merkle-trees): how replicas find what differs without sending everything.
+- [Operation-based CRDTs](/distributed/crdts/operation-based-crdts): send the update, not the state, and pay with stronger delivery.
+- [Sets, maps and deletion](/distributed/crdts/sets-maps-and-deletion): how to remove from a structure that may only grow.
+
+<Recall cards={[
+  { q: "State the three rules of a state-based CRDT.", a: "The states form a join-semilattice. A merge computes the least upper bound. An update only moves the state up in the order (an inflation)." },
+  { q: "Which law of the join makes duplicates safe, and which makes any delivery order safe?", a: "Idempotence ($a \\sqcup a = a$) makes duplicates safe. Commutativity and associativity make any order and any grouping of merges safe." },
+  { q: "Why does a G-Counter merge take the maximum of each entry instead of the sum?", a: "Only replica i writes entry i, and the larger entry has seen more of its increments. A sum would count increments that both states already contain twice." },
+  { q: "An LWW-register that holds a count is a valid lattice. Why is it still a bad counter?", a: "It converges, but concurrent increments both write old value + d, and the merge keeps only one of them. Increments are lost." },
+  { q: "What does strong eventual consistency add to eventual consistency?", a: "Strong convergence: correct replicas that have delivered the same updates have equivalent state, at every moment, with no rollback." },
+  { q: "What problem do delta-state CRDTs solve, and how?", a: "Full-state messages grow with the state. A delta-mutator returns a small delta that is itself a lattice state, and replicas send joined deltas instead of whole states." },
+]} />

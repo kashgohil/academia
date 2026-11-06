@@ -16,7 +16,7 @@ export function Param({ spec, value, onChange }: { spec: Spec; value: unknown; o
     return (
       <label className="param">
         <span className="param-label">
-          {rich(spec.label)}
+          <span>{rich(spec.label)}</span>
           <span className="param-value">{spec.format ? spec.format(v) : v}</span>
         </span>
         <input
@@ -34,7 +34,7 @@ export function Param({ spec, value, onChange }: { spec: Spec; value: unknown; o
     if (spec.segmented) {
       return (
         <div className="param">
-          <span className="param-label">{rich(spec.label)}</span>
+          <span className="param-label"><span>{rich(spec.label)}</span></span>
           <div className="seg">
             {spec.options.map((o) => (
               <button key={o.value} className={o.value === value ? "on" : ""} onClick={() => onChange(o.value)}>
@@ -47,7 +47,7 @@ export function Param({ spec, value, onChange }: { spec: Spec; value: unknown; o
     }
     return (
       <label className="param">
-        <span className="param-label">{rich(spec.label)}</span>
+        <span className="param-label"><span>{rich(spec.label)}</span></span>
         <select value={value as string} onChange={(e) => onChange(e.target.value)}>
           {spec.options.map((o) => (
             <option key={o.value} value={o.value}>

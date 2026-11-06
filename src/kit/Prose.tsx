@@ -39,5 +39,18 @@ export function Tex({ children, block }: { children: string; block?: boolean }) 
     void katexP.then((k) => live && setHtml(k.renderToString(children, { displayMode: block, throwOnError: false })));
     return () => { live = false; };
   }, [children, block]);
-  return html ? <span dangerouslySetInnerHTML={{ __html: html }} /> : <code>{children}</code>;
+  return html ? <span dangerouslySetInnerHTML={{ __html: html }} /> : <span className="tex-pending">{children}</span>;
 }
+
+/**
+ * Plain text that may hold inline math between dollar signs, for JSX props and demo labels:
+ * "About $(1 - e^{-kn/m})^k$". Write a literal dollar sign as \$. MDX prose uses $…$ directly.
+ */
+export function Rich({ text }: { text: string }) {
+  const parts = text.split(/(?<!\\)\$([^$]+?)(?<!\\)\$/);
+  if (parts.length === 1) return <>{text.replaceAll("\\$", "$")}</>;
+  return <>{parts.map((p, i) => (i % 2 ? <Tex key={i}>{p}</Tex> : p.replaceAll("\\$", "$")))}</>;
+}
+
+/** Renders a string through Rich, and passes any other node through. */
+export const rich = (v: ReactNode) => (typeof v === "string" ? <Rich text={v} /> : v);

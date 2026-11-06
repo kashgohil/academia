@@ -1,3 +1,4 @@
+import { rich } from "./Prose";
 import type { RangeSpec, Schema, Spec, Values } from "./useParams";
 
 const RES = 1000;
@@ -15,7 +16,7 @@ export function Param({ spec, value, onChange }: { spec: Spec; value: unknown; o
     return (
       <label className="param">
         <span className="param-label">
-          {spec.label}
+          {rich(spec.label)}
           <span className="param-value">{spec.format ? spec.format(v) : v}</span>
         </span>
         <input
@@ -33,11 +34,11 @@ export function Param({ spec, value, onChange }: { spec: Spec; value: unknown; o
     if (spec.segmented) {
       return (
         <div className="param">
-          <span className="param-label">{spec.label}</span>
+          <span className="param-label">{rich(spec.label)}</span>
           <div className="seg">
             {spec.options.map((o) => (
               <button key={o.value} className={o.value === value ? "on" : ""} onClick={() => onChange(o.value)}>
-                {o.label}
+                {rich(o.label)}
               </button>
             ))}
           </div>
@@ -46,7 +47,7 @@ export function Param({ spec, value, onChange }: { spec: Spec; value: unknown; o
     }
     return (
       <label className="param">
-        <span className="param-label">{spec.label}</span>
+        <span className="param-label">{rich(spec.label)}</span>
         <select value={value as string} onChange={(e) => onChange(e.target.value)}>
           {spec.options.map((o) => (
             <option key={o.value} value={o.value}>
@@ -60,7 +61,7 @@ export function Param({ spec, value, onChange }: { spec: Spec; value: unknown; o
   return (
     <label className="param" style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
       <input type="checkbox" checked={value as boolean} onChange={(e) => onChange(e.target.checked)} />
-      <span>{spec.label}</span>
+      <span>{rich(spec.label)}</span>
     </label>
   );
 }

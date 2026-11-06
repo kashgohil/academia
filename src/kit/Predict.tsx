@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { usePersisted } from "./progress";
 import { useLesson } from "./LessonContext";
+import { rich } from "./Prose";
 
 /**
  * Commit to an answer first. The explanation and any gated children
@@ -29,7 +30,7 @@ export function Predict({
     <>
       <div className="predict">
         <div className="predict-label">Predict</div>
-        <div className="predict-q">{question}</div>
+        <div className="predict-q">{rich(question)}</div>
         <div className="choices">
           {options.map((o, i) => (
             <button
@@ -38,14 +39,14 @@ export function Predict({
               disabled={answered}
               onClick={() => setPicked(i)}
             >
-              {o}
+              {rich(o)}
             </button>
           ))}
         </div>
         {answered && (
           <div className="feedback">
             <strong>{picked === answer ? "Correct. " : "Not quite. "}</strong>
-            {explain}
+            {rich(explain)}
             <div style={{ marginTop: 8 }}>
               <button className="btn ghost" onClick={() => setPicked(null)}>Try again</button>
             </div>

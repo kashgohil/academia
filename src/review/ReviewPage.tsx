@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Rich } from "../kit/Prose";
 import { Link } from "react-router";
 import { loadDeck, gradeCard, type Card } from "./deck";
 import { findLesson } from "../content/curriculum";
@@ -50,10 +51,10 @@ export default function ReviewPage() {
               <Link to={`/${card.path}`}>{where.track.title} · {where.lesson.title}</Link>
             </div>
           )}
-          <div style={{ fontSize: 17, margin: "6px 0 14px" }}>{card.q}</div>
+          <div style={{ fontSize: 17, margin: "6px 0 14px" }}><Rich text={card.q} /></div>
           {shown ? (
             <>
-              <div className="flash-a" style={{ fontSize: 15 }}>{card.a}</div>
+              <div className="flash-a" style={{ fontSize: 15 }}><Rich text={card.a} /></div>
               <div className="row" style={{ marginTop: 16 }}>
                 {GRADES.map((g) => (
                   <button key={g.q} className="btn" onClick={() => onGrade(g.q)}>{g.label}</button>

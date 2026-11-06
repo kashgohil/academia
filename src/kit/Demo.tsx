@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { rich } from "./Prose";
 
 /** Frame for an interactive demo: title bar, body, controls strip. */
 export function Demo({ title, actions, controls, children }: { title: string; actions?: ReactNode; controls?: ReactNode; children: ReactNode }) {
@@ -29,8 +30,8 @@ export function Stats({ items }: { items: { label: string; value: ReactNode }[] 
     <div className="stats">
       {items.map((i) => (
         <div key={i.label}>
-          <b>{i.value}</b>
-          {i.label}
+          <b>{rich(i.value)}</b>
+          {rich(i.label)}
         </div>
       ))}
     </div>

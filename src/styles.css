@@ -99,7 +99,12 @@ p { margin: 0 0 14px; }
 .crumbs { font-size: 13px; color: var(--muted); margin-bottom: 16px; display: flex; gap: 6px; flex-wrap: wrap; }
 .crumbs a:hover { color: var(--fg); }
 .tag { display: inline-block; font-size: 11.5px; padding: 1px 7px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); }
-.katex-display { overflow-x: auto; overflow-y: hidden; padding: 4px 0; }
+/* Math: the size of the text around it, left-aligned like the text, and words inside \text{} in Inter. */
+.katex { font-size: 1.06em; }
+.katex .text, .katex .textrm, .katex .textsf { font-family: "Inter Variable", system-ui, sans-serif; }
+.katex-display { overflow-x: auto; overflow-y: hidden; padding: 6px 0 6px 1.5em; margin: 14px 0 18px; text-align: left; }
+.katex-display > .katex { text-align: left; }
+.tex-pending { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.88em; color: var(--muted); }
 .page pre { overflow-x: auto; max-width: 100%; }
 /* Lesson tables only: demos style their own tables. display:block lets a wide table scroll inside the page. */
 .page table:not(.demo table) { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 0 0 18px; font-size: 14px; line-height: 1.45; font-variant-numeric: tabular-nums; }

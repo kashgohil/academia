@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router";
 import { useLesson } from "./LessonContext";
 import { registerCards } from "../review/deck";
+import { Rich } from "./Prose";
 
 export interface CardDef { q: string; a: string }
 
@@ -19,8 +20,8 @@ export function Recall({ cards }: { cards: CardDef[] }) {
       <p className="muted">Answer in your head, then click to check. These cards are now in your <Link to="/review" style={{ textDecoration: "underline" }}>review queue</Link>.</p>
       {cards.map((c, i) => (
         <div key={i} className="flash" onClick={() => setOpen((s) => new Set(s).add(i))}>
-          <div>{c.q}</div>
-          {open.has(i) && <div className="flash-a">{c.a}</div>}
+          <div><Rich text={c.q} /></div>
+          {open.has(i) && <div className="flash-a"><Rich text={c.a} /></div>}
         </div>
       ))}
     </div>

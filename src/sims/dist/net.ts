@@ -168,7 +168,8 @@ export class Net<P> {
     return this.now * (1 + this.drift[i]!) + this.offset[i]!;
   }
 
-  send(from: NodeId, to: NodeId, payload: P): Message<P> {
+  /** Sends a message. `delay` fixes this message's latency instead of drawing it from cfg.latency. */
+  send(from: NodeId, to: NodeId, payload: P, opts: { delay?: number } = {}): Message<P> {
     const msg: Message<P> = { id: this.nextMsg++, from, to, sentAt: this.now, payload };
     this.messages.push(msg);
     this.trace.push({ kind: "send", t: this.now, msg });
@@ -177,7 +178,8 @@ export class Net<P> {
     for (let c = 0; c < copies; c++) {
       const m = c === 0 ? msg : { ...msg, id: this.nextMsg++, dupOf: msg.id };
       if (c > 0) this.messages.push(m);
-      let at = this.now + this.cfg.latency.min + this.rng() * (this.cfg.latency.max - this.cfg.latency.min);
+      const drawn = this.cfg.latency.min + this.rng() * (this.cfg.latency.max - this.cfg.latency.min);
+      let at = this.now + (opts.delay ?? drawn);
       if (this.cfg.fifo) {
         const key = `${from}>${to}`;
         at = Math.max(at, (this.linkLast.get(key) ?? -Infinity) + 1e-6);

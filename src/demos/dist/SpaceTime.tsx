@@ -7,6 +7,9 @@ import type { ReactNode } from "react";
 import { useWidth } from "../../kit";
 import type { Message, Net } from "../../sims/dist/net";
 
+/** The diagram's geometry, for a layer drawn on top of it (click targets, highlights). */
+export const SPACETIME_LAYOUT = { left: 54, right: 14, top: 4, rowHeight: 46 } as const;
+
 export interface StMessage {
   from: number;
   to: number;
@@ -38,7 +41,7 @@ export function SpaceTime({
   marks = [],
   cursor,
   tStart = 0,
-  rowHeight = 46,
+  rowHeight = SPACETIME_LAYOUT.rowHeight,
   timeLabel = "time (ms)",
   children,
 }: {
@@ -54,7 +57,7 @@ export function SpaceTime({
   children?: ReactNode;
 }) {
   const [ref, width] = useWidth<HTMLDivElement>();
-  const left = 54, right = 14, top = 4;
+  const { left, right, top } = SPACETIME_LAYOUT;
   const w = Math.max(240, width);
   const h = top + nodes.length * rowHeight + 22;
   const x = (t: number) => left + ((t - tStart) / Math.max(1e-9, tEnd - tStart)) * (w - left - right);

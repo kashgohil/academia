@@ -1,0 +1,117 @@
+---
+summary: "Long-lived transactions as a chain of local transactions with compensations: the 1987 saga, orchestration against choreography, the isolation that sagas lose, semantic locks and other countermeasures, idempotent steps and the transactional outbox."
+---
+import { DistTxnSagaTripDemo, DistTxnSagaStylesDemo } from "@/demos/dist/DistTxnSagaDemos";
+
+[Two-phase commit](/distributed/transactions/two-phase-commit) holds locks on every participant until the decision. That is fine for a transfer of a few milliseconds. It is not fine for a trip booking that calls three companies, or for an order that waits for a payment provider. Locks held for seconds or minutes stop everyone else. Also, the flight company will not join your 2PC.
+
+Garcia-Molina and Salem named the alternative in "Sagas" (SIGMOD 1987). A **saga** is a sequence of local transactions $T_1, T_2, \dots, T_n$. Each one commits at once and releases its locks. For each $T_i$ except the last, the designer writes a **compensating transaction** $C_i$ that semantically undoes it. The system then guarantees one of two results:
+
+$$
+T_1, T_2, \dots, T_n \quad \text{or} \quad T_1, \dots, T_j, C_j, \dots, C_1 \;\text{ for some } 0 \le j < n
+$$
+
+A compensation is not a rollback. $T_i$ committed, and other transactions may have seen its result. $C_i$ is a new transaction, such as "cancel the booking" or "refund the card". It must not fail for a business reason, so it is retried until it succeeds.
+
+The paper calls this **backward recovery**. It also describes **forward recovery**: with save-points, the system can retry the failed step instead of compensating.
+
+## A trip, step by step
+
+The demo books a flight, a hotel and a car for traveller A. An orchestrator sends BOOK to each service in turn. Each service has 2 units of stock. Traveller B books one flight seat at 25 ms, with a plain local transaction. You choose the step that fails, and you move a reader through time.
+
+<Predict
+  id="lost"
+  question="The flight has 2 free seats. A books one, then B books one, then A's saga fails and cancels. A's compensation writes back the seat count that it read before its booking. What does the flight show at the end?"
+  options={["1 free seat: correct, because B still holds one", "2 free seats: B's booking is lost from the count", "0 free seats: the compensation did nothing"]}
+  answer={1}
+  explain="A read 2 before its booking, and its compensation writes 2 back. B's update came in between, so it is overwritten: a lost update. The flight now offers a seat that B holds. A compensation must be a semantic inverse (add one seat), not a restore of an old value."
+>
+<DistTxnSagaTripDemo />
+</Predict>
+
+1. With the defaults, the car step fails. Move the reader to 45 ms. The flight and the hotel show CONFIRMED bookings for A. At 100 ms, the orchestrator has cancelled both. A reader at 45 ms saw a state that never became final.
+2. Count the messages: 10. Three BOOK commands and their replies, and two CANCEL commands and their replies.
+3. Set **Compensation** to "write back the old count". The flight ends with 2 of 2 seats free, while B holds one. This is the lost update of the prediction.
+4. Turn on the **semantic lock**. Bookings now say PENDING until the saga ends. The reader at 45 ms knows that this state can still change.
+5. Set the failing step to none. The saga completes with 6 messages.
+
+## What sagas give up
+
+A saga is atomic in the end: all steps or all compensations. It is not isolated. Every local commit is visible at once to every other transaction. This allows three anomalies, in the terms of [isolation levels and anomalies](/databases/transactions/isolation-levels-and-anomalies):
+
+| Anomaly | In a saga | Example |
+|---|---|---|
+| dirty read | a reader sees a step that a compensation later undoes | in the demo, the hotel shows A's booking from 30 ms to 70 ms, then cancels it |
+| lost update | a compensation overwrites a concurrent change | "write back the old count" erases B's seat |
+| fuzzy read | a saga reads a value twice and gets two results | a price read in step 1 changed before step 3 |
+
+Designers add **countermeasures** for this missing isolation. Three are common in practice:
+
+- **Semantic lock.** A step marks its record with a state such as PENDING. Other transactions see the mark and decide: wait, warn the user, or treat the record as not final. The final step clears the marks.
+- **Commutative updates.** Write compensations as inverse operations, such as "add one seat", not "set seats to 2". Inverse operations commute with concurrent changes, so no update is lost.
+- **Reread value.** Before it acts, a later step reads the value again and checks that it did not change. This is optimistic concurrency at the level of the saga.
+
+Order the steps to reduce the damage, too. Put steps that can fail first, and steps that are hard to compensate last. A card payment that is refunded is visible to the customer. So charge the card after the bookings succeed.
+
+## Orchestration and choreography
+
+There are two ways to run the same saga. In **orchestration**, one orchestrator tells each service what to do and waits for the reply. In **choreography**, no one is in charge. Each service publishes an event when its local transaction commits, and the next service reacts to it.
+
+```ts
+// Orchestration: the saga is one function with a compensation stack.
+async function bookTrip(trip: Trip, id: SagaId) {
+  const undo: (() => Promise<void>)[] = [];
+  try {
+    for (const step of [flight, hotel, car]) {
+      await step.book(trip, { requestId: `${id}:${step.name}` }); // idempotent
+      undo.push(() => retryForever(() => step.cancel(trip, { requestId: `${id}:${step.name}:undo` })));
+    }
+  } catch (e) {
+    for (const c of undo.reverse()) await c(); // backward recovery, in reverse order
+    throw e;
+  }
+}
+```
+
+<DistTxnSagaStylesDemo />
+
+1. With the hotel failing, orchestration uses 6 messages and choreography 4. An event replaces each command and reply pair.
+2. Read the table. With no failure, orchestration uses 6 messages and choreography 4. With the car failing, they use 10 and 6.
+3. Turn on the semantic lock. With no failure, the confirm round adds 6 messages to orchestration and 2 to choreography.
+4. Select **hotel crashes after its commit**. The hotel booked, and then died before it sent its reply. Orchestration retries the command after 60 ms, and the idempotent hotel answers again. It completes at 120 ms. Choreography is stuck: nothing waits for the lost event, so nothing retries it.
+5. Turn off **idempotent steps**. Orchestration still completes, but the hotel now holds two rooms for one trip. The retry ran the booking twice.
+6. Turn on the **transactional outbox**. The hotel's event was stored with its booking, and a relay sends it after the restart. Choreography completes at 80 ms.
+
+Choreography has fewer messages and no central part. But the saga exists only as a pattern of events across services. No single place knows its state, so no one notices when it stops. Orchestration has one place that holds the state, retries, and can be queried. So orchestration is easier to operate once a saga has more than a few steps.
+
+## Idempotency and the outbox
+
+A step commits its local transaction and then sends a message. These are two writes to two systems, with no atomic commit between them. A crash between them loses the message. A retry after a timeout can run the step twice.
+
+The **transactional outbox** fixes the first half. The service writes the message into an outbox table in the same local transaction as the business change. A separate relay reads the outbox and publishes. The relay can publish a message more than once, so every consumer must be **idempotent**. The usual way is a request id per step, stored in the same local transaction as the change. A repeated request then returns the stored result.
+
+```sql
+BEGIN;
+INSERT INTO processed(request_id) VALUES ('saga-42:hotel'); -- fails on a repeat
+UPDATE rooms SET free = free - 1 WHERE hotel = 7 AND free > 0;
+INSERT INTO outbox(topic, payload) VALUES ('hotel-booked', '{"saga":42}');
+COMMIT;
+```
+
+So a reliable saga needs four parts: local transactions, compensations that cannot fail, idempotent steps, and an outbox or an orchestrator that retries. Without them, crashes and retries turn into double bookings and stuck trips.
+
+## Connect
+
+- [Two-phase commit](/distributed/transactions/two-phase-commit): atomic and isolated, but it blocks and holds locks.
+- [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency): why every retried step needs a request id.
+- [Isolation levels and anomalies](/databases/transactions/isolation-levels-and-anomalies): the anomalies that a saga allows across services.
+- [Optimistic concurrency control](/databases/transactions/optimistic-concurrency-control): the idea behind the reread countermeasure.
+
+<Recall cards={[
+  { q: "What does the saga of Garcia-Molina and Salem guarantee?", a: "Either all of T1 … Tn commit, or T1 … Tj commit and then their compensations Cj … C1 run, for some j < n." },
+  { q: "Why is a compensation not the same as a rollback?", a: "The step it undoes has committed, and others may have seen it. The compensation is a new transaction that undoes the effect semantically, such as a refund, and must be retried until it succeeds." },
+  { q: "Which anomalies do sagas allow, and why?", a: "Dirty reads of intermediate states, lost updates and fuzzy reads. Each step commits and releases its locks at once, so other transactions see and change its results before the saga ends." },
+  { q: "Why must a compensation add a seat back instead of writing back the old count?", a: "A concurrent transaction may have changed the count in between. Writing back an old value erases that change (a lost update). An inverse operation commutes with it." },
+  { q: "What is the transactional outbox?", a: "The service writes its outgoing message into an outbox table in the same local transaction as the change. A relay publishes it later, at least once, so consumers must be idempotent." },
+  { q: "What is the main operational risk of choreography?", a: "No single component holds the saga's state. A lost event can stop the saga silently, and nobody retries or even notices it." },
+]} />

@@ -1,0 +1,154 @@
+---
+summary: "Atomic commit across machines: prepare, vote and decide, the logs that make it survive crashes, presumed abort, why a participant that voted YES must block, why three-phase commit fails under partitions, and how Spanner runs 2PC over Paxos groups."
+---
+import { DistTxnTwoPcStepperDemo, DistTxnInDoubtDemo, DistTxnThreePcDemo } from "@/demos/dist/DistTxnTwoPcDemos";
+
+A bank moves 100 from an account on shard A to an account on shard B. Each shard can commit its half on its own, with its own [write-ahead log](/databases/recovery/write-ahead-logging). But the transfer must commit on both shards or on neither. This problem is **atomic commitment**.
+
+Atomic commitment is not the same as consensus. In [consensus](/distributed/consensus/the-consensus-problem), any proposed value can win. Here every participant has a veto. One shard can say "no": a constraint fails, a lock wait times out, or a disk is full. Then the whole transaction must abort.
+
+**Two-phase commit** (2PC) is the standard protocol. Jim Gray described it in "Notes on Data Base Operating Systems" (1978). Lampson and Sturgis described a similar protocol in a Xerox PARC report of the same period, dated 1979. Almost every distributed database uses some form of it.
+
+## The protocol
+
+One node is the **coordinator**. The nodes that hold the data are the **participants**. When the client asks to commit, each participant has done its writes and holds its locks.
+
+1. **Prepare.** The coordinator sends PREPARE to every participant.
+2. **Vote.** A participant that can commit forces a `prepared` record to its log, and then votes YES. A participant that cannot commit votes NO and aborts.
+3. **Decide.** If all votes are YES, the coordinator forces a `commit` record. Otherwise it decides abort.
+4. **Complete.** The coordinator sends the outcome. Each participant logs it, releases its locks and sends ACK.
+
+The forced `commit` record on the coordinator is the **commit point**. Before it, the transaction can still abort. After it, the transaction is committed, even if every machine crashes a moment later.
+
+The YES vote is a promise. After it, the participant must be able to commit even after a crash. So it forces its `prepared` record, with the new values and the list of locks, before it sends the vote. After a crash, recovery finds this record, takes the locks again, and waits for the outcome.
+
+<Predict
+  id="block"
+  question="P1 and P2 both voted YES. The coordinator forced its commit record and then crashed, before it sent COMMIT. P1 hears nothing for a long time. What may P1 do?"
+  options={["Abort after a timeout: no answer means no", "Commit: both participants voted YES", "Nothing: it must keep its locks and wait for the outcome"]}
+  answer={2}
+  explain="P1 does not know P2's vote. P2 may have voted NO, so P1 must not commit. The coordinator may also have decided commit and told P2, so P1 must not abort. P1 is in doubt and blocks."
+>
+<DistTxnTwoPcStepperDemo />
+</Predict>
+
+1. Deliver every message in order: two PREPAREs, two YES votes, two COMMITs, two ACKs. The run uses 8 messages and 5 forced log writes: one for the coordinator, and two for each participant.
+2. Press **Reset**. Deliver the two PREPAREs and the two YES votes. The coordinator forces `commit`. Now drop both COMMITs and crash C. Press **Wait** twice. P1 and P2 ask again and again, and their in-doubt bars grow.
+3. Recover C. It reads `commit` from its log and sends COMMIT again. Deliver the two COMMITs, and the locks are free.
+4. Reset, and set **P2 votes** to NO. Deliver both PREPAREs and P2's NO. Under presumed abort, C sends ABORT to P1 only, forces nothing and waits for no ACK.
+5. Reset, and turn on **cooperative termination**. Deliver PREPARE to P1 only, crash C, and press **Wait**. Deliver P1's QUERY to P2. P2 has not voted, so it can still abort, and it tells P1 to abort too.
+
+## The logs, and presumed abort
+
+Each forced write waits for a disk flush, so the number of forces sets much of the cost of a commit. Mohan, Lindsay and Obermarck counted these costs for IBM's R* system ("Transaction Management in the R* Distributed Database Management System", ACM TODS, 1986). They defined two optimizations: **presumed abort** and **presumed commit**.
+
+The idea of presumed abort is simple. If the coordinator has no record of a transaction, it answers "abort". So an abort record need not be forced, and participants need not acknowledge an abort. Also, a participant that wrote nothing votes READ-ONLY. It releases its locks at once and leaves phase 2.
+
+The sim counts the cost of each case with two participants:
+
+| Case | Coordinator forces | Participant forces | Messages |
+|---|---|---|---|
+| commit, basic 2PC | 1 | 4 | 8 |
+| commit, presumed abort | 1 | 4 | 8 |
+| one NO vote, basic 2PC | 1 | 2 | 6 |
+| one NO vote, presumed abort | 0 | 1 | 5 |
+| one READ-ONLY vote, presumed abort | 1 | 2 | 6 |
+| two READ-ONLY votes, presumed abort | 0 | 0 | 4 |
+
+Presumed commit inverts the rule. The coordinator forces a `collecting` record before phase 1, and then a missing record means commit. Commits need no ACKs then, which helps when most transactions commit. The sim and the demo use presumed abort.
+
+A participant follows four rules. The code below is a sketch in Go:
+
+```go
+func (p *Participant) OnPrepare(tx TxID) {
+	if !p.canCommit(tx) {
+		p.log.Append(AbortRec{tx})        // not forced: "no record" also means abort
+		p.releaseLocks(tx)
+		p.send(p.coord, Vote{tx, No})
+		return
+	}
+	p.log.AppendForced(PreparedRec{tx, p.redo(tx), p.locks(tx)}) // the promise
+	p.state[tx] = InDoubt                                       // no timeout may abort it now
+	p.send(p.coord, Vote{tx, Yes})
+}
+
+func (p *Participant) OnOutcome(tx TxID, commit bool) {
+	if commit {
+		p.log.AppendForced(CommitRec{tx})
+	} else {
+		p.log.Append(AbortRec{tx})
+	}
+	p.releaseLocks(tx)
+	if commit {
+		p.send(p.coord, Ack{tx}) // presumed abort: only a commit is acknowledged
+	}
+}
+```
+
+## The blocking problem
+
+A participant can use a timeout only before it votes. After a YES vote, it is **in doubt**. It does not know the other votes, and it does not know the decision. It cannot decide alone, so it waits and keeps its locks.
+
+Timeouts do not fix this. A timeout tells the participant that something is slow. It does not tell it what the coordinator decided. In [the network model](/distributed/foundations/the-network-model-messages-delays-and-partitions), no number of messages can give two generals certainty. 2PC accepts this, and pays with blocking.
+
+The **cooperative termination protocol** helps in some runs. An in-doubt participant asks the other participants. One that knows the outcome answers. One that has not voted yet aborts, and answers ABORT. But if every participant voted YES and none heard the outcome, nobody can help.
+
+<Predict
+  id="locks"
+  question="The coordinator crashes at the commit point, and every participant has voted YES. A repair takes 2 seconds. How long do the participants hold their locks?"
+  options={["About one network round trip: cooperative termination finds the outcome", "About the repair time: about 2 seconds", "Until a timeout on each participant aborts the transaction"]}
+  answer={1}
+  explain="Every participant is in doubt, so cooperative termination finds nobody who knows. They wait for the coordinator. The sim gives 2,017 ms: the repair time, plus the vote round before the crash and one message after it."
+>
+<DistTxnInDoubtDemo />
+</Predict>
+
+1. With the defaults, the participants hold their locks for 2,017 ms. At 50 writes per second to those rows, about 101 transactions queue behind them.
+2. Move the repair time to 30 s. The red line is a diagonal: blocking time follows repair time, with no limit.
+3. Read the green line. The coordinator's log is now a [Raft](/distributed/consensus/raft-leader-election) group of three nodes. Its election timeout is 150 to 300 ms, the example range in the Raft paper. When its leader crashes, a new leader with the same log answers. Over 8 runs, the participants wait 315 ms on average, from 212 to 516 ms.
+4. Move the write rate to 1,000 per second. The queue behind a 2-second block is now about 2,000 transactions, and the clients start to time out.
+
+Real systems show this problem. In PostgreSQL, `PREPARE TRANSACTION` stores a prepared transaction on disk. The transaction keeps its locks, and it survives a crash, until someone runs `COMMIT PREPARED` or `ROLLBACK PREPARED`. The setting `max_prepared_transactions` is 0 by default, which turns the feature off. An orphaned prepared transaction also stops [VACUUM](/databases/transactions/mvcc-garbage-collection) from removing old row versions. MySQL has the same model, with `XA PREPARE`, `XA COMMIT`, `XA ROLLBACK` and `XA RECOVER`.
+
+## Three-phase commit
+
+Dale Skeen proposed **three-phase commit** (3PC) in "Nonblocking Commit Protocols" (SIGMOD 1981). It adds a state between the vote and the commit. The coordinator first tells every participant that the decision will be commit, and waits for their acknowledgements. Only then does it send the commit itself.
+
+Now no participant can commit while another is still uncertain. So when the coordinator fails, the survivors can always decide. They collect their states. If one is committed, or one received the "will commit" message, they commit. If all are uncertain, nobody can have committed, and they abort.
+
+Skeen states the assumptions clearly: the network never fails, and a timeout reliably reports a crashed site. A partition breaks the second assumption. A silent node is alive on the other side, and each side applies the rule to the states that it sees.
+
+<DistTxnThreePcDemo />
+
+1. Select **2PC, C crashes**. All three participants voted YES, and C crashed at the commit point. They ask every 100 ms and stay prepared.
+2. Select **3PC, C crashes**. Only P1 got the "will commit" message (PRECOMMIT). P2 and P3 time out, ask for states, see P1's, and commit. Nobody blocks.
+3. Select **3PC, partition**. The same PRECOMMIT reaches P1, and then the network splits. C and P1 commit. P2 and P3 see only uncertain states and abort. The transaction is half committed.
+
+So 3PC trades blocking for safety under partitions, and real networks have partitions. It also adds a round trip to every commit. Production databases rarely use it.
+
+## 2PC over consensus groups
+
+A better fix keeps 2PC and makes each party fault tolerant. Gray and Lamport's "Consensus on Transaction Commit" (ACM TODS, 2006) runs one Paxos instance on each participant's vote, with $2F + 1$ coordinators. With $F = 0$, it is classic 2PC.
+
+Spanner does this with Paxos groups. Each participant is a shard with its own Paxos group, and the client picks one group as the coordinator. Each participant leader logs its prepare record through Paxos. The coordinator leader skips the prepare. It logs the commit record through Paxos, and then the participants log the outcome.
+
+A leader crash loses nothing, because a majority of the group has the log. The cost is a consensus round for each log write, instead of a disk flush. The demo shows the gain: a wait for an election instead of a wait for a repair.
+
+CockroachDB and TiDB follow the same pattern with Raft. Each shard is a Raft group. The decision lives in a replicated record: a transaction record in CockroachDB, and the commit record on the primary key in TiDB.
+
+## Connect
+
+- [The consensus problem](/distributed/consensus/the-consensus-problem): why agreement needs a majority, and how atomic commit differs.
+- [Write-ahead logging](/databases/recovery/write-ahead-logging): forced log records and the commit point on one machine.
+- [Two-phase locking and deadlocks](/databases/transactions/two-phase-locking-and-deadlocks): the locks that an in-doubt participant holds.
+- [Sagas](/distributed/transactions/sagas): give up atomic commit, and compensate instead.
+- [Spanner and TrueTime](/distributed/transactions/spanner-and-truetime): 2PC over Paxos groups, with timestamps.
+
+<Recall cards={[
+  { q: "What must a participant do before it votes YES, and why?", a: "Force a prepared record (its changes and its locks) to its log. The YES vote promises that it can commit even after a crash, so the promise must be on disk first." },
+  { q: "Where is the commit point of 2PC?", a: "When the coordinator's commit record is on disk. Before it the transaction can abort; after it the transaction is committed, even if every node crashes." },
+  { q: "Why can an in-doubt participant not use a timeout to abort?", a: "It voted YES, so the coordinator may have decided commit and told others. It does not know the other votes either. Either choice can break atomicity, so it must wait." },
+  { q: "What does presumed abort save?", a: "No forced abort records, no ACKs for aborts, and read-only participants write nothing and leave after phase 1. A coordinator with no record answers abort." },
+  { q: "Why is three-phase commit not used in practice?", a: "It is nonblocking only if timeouts reliably detect crashes. In a partition, the two sides apply the termination rule to different states, and one side can commit while the other aborts." },
+  { q: "How does Spanner remove the blocking problem from 2PC?", a: "Each participant and the coordinator is a Paxos group, and prepare and commit records go through Paxos. A leader crash only causes a new election, and the new leader has the log." },
+]} />

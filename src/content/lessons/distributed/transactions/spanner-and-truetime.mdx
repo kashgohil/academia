@@ -1,0 +1,109 @@
+---
+summary: "How Spanner gets external consistency from clocks: the TrueTime interval API, how Google bounds the uncertainty ε, commit wait and why it waits 2ε, lock-free read-only transactions at a timestamp, the cost of commit wait, and how CockroachDB does without atomic clocks."
+---
+import { DistTxnCommitWaitDemo, DistTxnCommitCostDemo } from "@/demos/dist/DistTxnSpannerDemos";
+
+A user removes a colleague from a document's access list. A second later, the user adds a secret to the document. The two writes go to different shards of a database. A backup job then reads a consistent snapshot of the database at some timestamp. Can the snapshot contain the secret but not the removal?
+
+In many databases it can. Each shard gives its write a timestamp from its own clock. The clocks disagree, so the second write can get the smaller timestamp. Spanner, Google's globally distributed database, promises that this never happens. Corbett and others described how in "Spanner: Google's Globally-Distributed Database" (OSDI 2012).
+
+The promise is **external consistency**. If transaction T1 commits before T2 starts, in real time, then T1's commit timestamp is smaller than T2's. Together with serializable transactions, this is **strict serializability**: one serial order of transactions that also agrees with real time. It is [linearizability](/distributed/consistency/linearizability) for whole transactions.
+
+## TrueTime: time as an interval
+
+Spanner does not pretend that a clock gives the time. Its **TrueTime** API returns an interval that contains the true time:
+
+| Method | Returns |
+|---|---|
+| `TT.now()` | an interval `[earliest, latest]` that contains the true time |
+| `TT.after(t)` | true if $t$ has definitely passed: `t < TT.now().earliest` |
+| `TT.before(t)` | true if $t$ has definitely not arrived: `t > TT.now().latest` |
+
+The half-width of the interval is the uncertainty $\varepsilon$. Google keeps it small with hardware. Each datacenter has time masters. Most have GPS receivers, and the others, which the paper calls Armageddon masters, have atomic clocks. A daemon on every machine polls several masters every 30 seconds.
+
+Between polls, the daemon assumes that the local clock drifts at most 200 microseconds per second. Over 30 seconds that adds up to 6 ms. The delay to the time masters adds about 1 ms. So $\varepsilon$ is a sawtooth from about 1 ms to 7 ms over each poll interval. The paper reports an average $\bar\varepsilon$ of 4 ms most of the time.
+
+## Commit wait
+
+A read-write transaction in Spanner takes locks and runs [two-phase commit](/distributed/transactions/two-phase-commit) over Paxos groups. When the coordinator leader has the locks, it picks a commit timestamp $s$. The rules are:
+
+1. **Start.** $s$ is not less than `TT.now().latest` when the commit request arrives. So $s$ is not earlier than the true time of the commit.
+2. **Commit wait.** No client can see the commit until `TT.after(s)` is true. Then the true time is surely past $s$.
+
+<Steps>
+<div>T1 commits before T2 starts, in real time.</div>
+<div>By commit wait, T1's commit became visible at a true time after $s_1$. So T2 starts at a true time after $s_1$.</div>
+<div>By the start rule, $s_2$ is not less than T2's start in true time.</div>
+<div>So $s_1 < s_2$.</div>
+</Steps>
+
+How long is the wait? The leader picks $s = \text{latest} = c + \varepsilon$, where $c$ is its clock reading. `TT.after(s)` needs $\text{earliest} = c' - \varepsilon > s$, so $c' > c + 2\varepsilon$. The wait is $2\varepsilon$ with no drift, and the paper says the expected wait is at least $2\bar\varepsilon$. The wait runs at the same time as the Paxos write of the commit record, so it often costs little.
+
+<Predict
+  id="nowait"
+  question="ε = 4 ms. Server A's clock is 4 ms fast and server B's is 4 ms slow. T1 commits on A, and 1 ms after its ack the client starts T2 on B. With no commit wait, which timestamp is larger?"
+  options={["s2: T2 started later, so it always gets a later timestamp", "s1: A's fast clock gives T1 a timestamp above T2's", "They are equal"]}
+  answer={1}
+  explain="A picks s1 = its clock + ε, and its clock is 4 ms ahead. B picks s2 = its clock + ε, and its clock is 4 ms behind. T2 started only 5 ms of true time after T1 picked s1, less than the 8 ms gap between the clocks. In the demo s1 = 9 and s2 = 6."
+>
+<DistTxnCommitWaitDemo />
+</Predict>
+
+1. With the defaults, commit wait is on. T1 picks $s_1 = 9$ and waits 8 ms, which is $2\varepsilon$. Its ack leaves after true time 9. T2 picks $s_2 = 12$, and the order holds.
+2. Turn off **commit wait**. T1 is visible after its 2 ms Paxos write (a model input), and T2 picks $s_2 = 6 < s_1$. A snapshot read at 6 sees T2 but not T1: the backup with the secret and no removal.
+3. Keep commit wait off, and raise the client's gap above 4 ms. Now $s_2 > s_1$ again. Without the wait, correctness depends on how fast the client is.
+4. Select **both exact**. With true clocks, the order holds even with no wait. Commit wait pays for the uncertainty, not for the clock.
+5. Turn commit wait on, and set $\varepsilon$ to 20 ms. T1 now waits 40 ms. Over 500 random runs at $\varepsilon = 4$ ms, the sim finds 19 inversions with no wait and 0 with it.
+
+## Reads without locks
+
+Commit timestamps give Spanner cheap reads. A **read-only transaction** declares that it will not write. Spanner gives it a timestamp, $s_{read} = $ `TT.now().latest` in the simple case, and reads every shard as of that timestamp. It takes no locks, so it never blocks writers, and writers never block it.
+
+Any replica can serve such a read, if it is up to date enough. Each replica tracks a safe time $t_{safe}$, below which it knows every write. It can serve a read at $t$ when $t \le t_{safe}$; otherwise it waits. A **snapshot read** at a timestamp in the past, such as "10 seconds ago", is then served by the nearest replica, often with no wait.
+
+This works because commit timestamps match the serial order and real time. A snapshot at any timestamp is a consistent cut of the whole database. The same idea makes [MVCC](/databases/transactions/mvcc) snapshots work on one machine. TrueTime extends it to many machines.
+
+## The cost of commit wait
+
+A transaction holds its locks during commit wait. So the wait is invisible only while $2\varepsilon$ is shorter than the Paxos write. Beyond that, it lengthens every commit, and it limits throughput on a hot row: one commit per lock hold time.
+
+<DistTxnCommitCostDemo />
+
+1. The Paxos write is 9 ms here, a model input near the 9 ms that the paper measured in its single-replica experiments. Up to $\varepsilon = 4.5$ ms, the wait hides inside it. The hot row commits 111 times per second either way.
+2. Move the mark to $\varepsilon = 7$ ms, the top of Spanner's sawtooth. The row is locked for 14 ms per commit, and throughput falls to 71 per second.
+3. Move it to 250 ms, a bound that an ordinary NTP setup might need. Each commit waits 500 ms, and the hot row manages fewer than 2 commits per second.
+4. Set the Paxos write to 50 ms, as for replicas on different continents. Now $\varepsilon$ up to 25 ms is free.
+
+So commit wait is practical only with a small $\varepsilon$. That is why Google built TrueTime with GPS and atomic clocks. The paper's measurements fit: about 5 ms of commit wait and 9 ms of Paxos latency in its single-replica experiments.
+
+## CockroachDB: no atomic clocks
+
+CockroachDB runs on ordinary servers with NTP. Its clocks have a much larger bound: `--max-offset` defaults to 500 ms. A commit wait of a second per write is too slow, so CockroachDB does not wait at commit for normal transactions. It uses a [hybrid logical clock](/distributed/time/hybrid-logical-clocks) for timestamps instead.
+
+The uncertainty moves to reads. A read at timestamp $r$ that finds a value with a timestamp in $(r, r + \text{max offset}]$ cannot know if that write came first in real time. It restarts at a higher timestamp, and the error behind it is the `ReadWithinUncertaintyIntervalError`. So Spanner always waits after writes, and CockroachDB sometimes retries reads.
+
+The guarantee is weaker, too. CockroachDB claims serializability, not strict serializability. Its blog "Living without atomic clocks" describes the anomaly that remains, the "causal reverse". Two transactions on disjoint keys, with no causal link, can get timestamps in the reverse order of real time. The docs also warn that a clock skew beyond the maximum offset can break single-key linearizability.
+
+| | Spanner | CockroachDB |
+|---|---|---|
+| clock | TrueTime: GPS and atomic clocks, $\varepsilon$ about 1–7 ms | HLC on NTP, max offset 500 ms by default |
+| who pays for uncertainty | every read-write commit: wait $2\varepsilon$ | reads that meet an uncertain value: restart |
+| guarantee | external consistency (strict serializability) | serializability |
+| commit wait | always | only for global tables and other non-blocking ranges |
+
+## Connect
+
+- [Physical clocks and drift](/distributed/time/physical-clocks-and-drift): where the uncertainty comes from.
+- [Hybrid logical clocks](/distributed/time/hybrid-logical-clocks): CockroachDB's timestamps and uncertainty restarts.
+- [Linearizability](/distributed/consistency/linearizability): the single-object version of external consistency.
+- [Two-phase commit](/distributed/transactions/two-phase-commit): the commit protocol that Spanner runs over Paxos groups.
+- [Serializable snapshot isolation](/databases/transactions/serializable-snapshot-isolation): serializability on one machine, with no real-time promise.
+
+<Recall cards={[
+  { q: "What does TT.now() return, and what does TT.after(t) mean?", a: "TT.now() returns an interval [earliest, latest] that contains the true time. TT.after(t) is true when t < earliest, so t has surely passed." },
+  { q: "State external consistency.", a: "If T1 commits before T2 starts in real time, then T1's commit timestamp is smaller than T2's." },
+  { q: "Why does commit wait last about 2ε?", a: "The leader picks s = latest = c + ε. TT.after(s) needs earliest = c' − ε > s, so the clock must pass c + 2ε." },
+  { q: "How does Google keep ε small, and how large is it?", a: "Time masters have GPS receivers or atomic clocks, and machines poll them every 30 s and assume a drift of 200 µs/s. The bound is a sawtooth of about 1 to 7 ms, 4 ms on average." },
+  { q: "Why can Spanner serve read-only transactions without locks?", a: "Commit timestamps follow the serial order and real time, so the data as of any timestamp is a consistent snapshot. A replica serves it once its safe time passes that timestamp." },
+  { q: "How does CockroachDB handle clock uncertainty instead of commit wait?", a: "Reads that find a value inside (r, r + max offset] restart at a higher timestamp. Writes do not wait, and the guarantee is serializability, not strict serializability." },
+]} />

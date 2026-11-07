@@ -1,0 +1,134 @@
+---
+summary: "Distributed snapshot isolation on a key-value store with only single-row transactions: Percolator's timestamp oracle, data, lock and write columns, the primary lock as the commit point, lock cleanup by readers, what snapshot isolation still allows, and how TiDB and TiKV use the same model."
+---
+import { DistTxnPercolatorStepperDemo, DistTxnWriteSkewDemo } from "@/demos/dist/DistTxnPercolatorDemos";
+
+Google's web index once came from a long chain of MapReduce jobs. A new page waited for the next full run. Peng and Dabek replaced the batch with incremental updates in "Large-scale Incremental Processing Using Distributed Transactions and Notifications" (OSDI 2010). The system, **Percolator**, powers the Caffeine indexing system. The paper reports that the average age of documents in search results fell by about 50%.
+
+Incremental updates need transactions across many rows and machines. Percolator builds them on Bigtable, a versioned key-value store. Bigtable gives atomic changes to one row, but nothing across rows. It has no coordinator process and no transaction manager. Every transaction is run by the client library, and the coordination state lives in the table itself.
+
+## The table and the oracle
+
+The transaction protocol uses three columns for each key. Each column is a map from a timestamp to a value, because Bigtable keeps versions.
+
+| Column | Entry | Meaning |
+|---|---|---|
+| `data` | `data[start_ts] = value` | a value written by the transaction that started at `start_ts` |
+| `lock` | `lock[start_ts] = primary` | an uncommitted write; it names the transaction's primary key |
+| `write` | `write[commit_ts] = start_ts` | a commit: from `commit_ts` on, readers see `data[start_ts]` |
+
+A **timestamp oracle** hands out timestamps in strictly increasing order. Every transaction gets a start timestamp and a commit timestamp from it. One machine serves about 2 million timestamps per second, because each client batches its requests into one pending call.
+
+A read at `start_ts` is a [snapshot](/databases/transactions/mvcc) read. It finds the newest `write` entry at or below `start_ts`, and follows it to the data. If it finds a lock at or below `start_ts`, it cannot know yet if that write will be in its snapshot. It must wait, or clean up the lock.
+
+## The two-phase write
+
+A transaction buffers its writes on the client. At commit, it picks one written key as the **primary**, and writes in two phases.
+
+1. **Prewrite**, the primary first, then each secondary. In one row transaction per key: abort if a `write` entry exists at or after `start_ts`, or a lock exists at any timestamp. Otherwise write `data[start_ts]` and `lock[start_ts]`, which points at the primary.
+2. **Commit.** Get `commit_ts` from the oracle. On the primary, in one row transaction: check that its lock is still there, write `write[commit_ts] = start_ts`, and erase the lock. This is the **commit point**. Then do the same on each secondary.
+
+The first check is **first-committer-wins**: a newer committed write means a write-write conflict, and the transaction aborts. The second stops two transactions from prewriting the same key at once.
+
+```go
+func (t *Txn) Commit() error {
+	primary, secondaries := t.writes[0], t.writes[1:]
+	if !t.prewrite(primary, primary) {
+		return ErrConflict
+	}
+	for _, w := range secondaries {
+		if !t.prewrite(w, primary) {
+			return ErrConflict // leftover locks are cleaned up later by readers
+		}
+	}
+	commitTs := oracle.Next()
+	// One Bigtable row transaction: the whole commit decision is this one row.
+	ok := bigtable.RowTxn(primary.Key, func(r *Row) bool {
+		if !r.Lock.Has(t.startTs) {
+			return false // a reader rolled us back
+		}
+		r.Write.Put(commitTs, t.startTs)
+		r.Lock.Erase(t.startTs)
+		return true
+	})
+	if !ok {
+		return ErrAborted
+	}
+	for _, w := range secondaries { // after the commit point: best effort
+		bigtable.RowTxn(w.Key, func(r *Row) bool { r.Write.Put(commitTs, t.startTs); r.Lock.Erase(t.startTs); return true })
+	}
+	return nil
+}
+```
+
+This is [two-phase commit](/distributed/transactions/two-phase-commit) with the coordinator's log in the primary row. The prewrite is the prepare. The primary's `write` entry is the coordinator's commit record. Bigtable stores its data in GFS, which keeps several copies, so the "log" survives a crash of any one server.
+
+## Who finishes a dead client's work?
+
+The client is the coordinator, and clients crash. A crashed client leaves locks in the table. Percolator cleans them lazily: a reader that meets an old lock checks the primary.
+
+- The primary still has its lock: the transaction did not reach its commit point. The reader erases the primary's lock first, and then the lock it met. This is a **roll back**. Erasing the primary first matters. A late commit attempt by the owner finds no lock and fails.
+- The primary has a `write` entry that points at the lock's `start_ts`: the transaction committed. The reader writes the same `write` entry on its key and erases the lock. This is a **roll forward**.
+
+A reader must not roll back the lock of a live, slow client. Percolator's workers hold a token in Chubby, a lock service, and write their wall time into each lock. A reader cleans up only if it suspects that the owner is dead or stuck. Otherwise it waits.
+
+<Predict
+  id="rollforward"
+  question="The writer moves 7 from Bob to Joe. It committed the primary Bob, then crashed before it committed Joe. A reader finds Joe's lock. What does it do?"
+  options={["Roll back Joe's write: the writer is dead", "Roll forward: copy the commit to Joe, because Bob's write entry shows the commit", "Wait until the writer comes back"]}
+  answer={1}
+  explain="The commit point is the primary's write entry, and it is there. So the transaction committed, and Joe must show it too. Rolling back would leave Bob at 3 and Joe at 2: 7 would disappear."
+>
+<DistTxnPercolatorStepperDemo />
+</Predict>
+
+1. Press the writer's button five times. Bob gets `data[3] = 3` and Joe `data[3] = 9`, then both get `write[4]`. Start the reader, at timestamp 5. It reads Bob = 3 and Joe = 9.
+2. Reset. Run the writer through its two prewrites, then start the reader at 4 and read Bob. The lock at 3 is below the reader's timestamp, and the writer is alive, so the reader waits.
+3. Reset. Run the two prewrites, crash the writer, start the reader, and read Bob. Bob's own lock is the primary, and it is still there, so the reader rolls back: Bob = 10. Read Joe: its primary is gone with no commit, so Joe = 2. The sum is still 12.
+4. Reset. Run the writer four steps, through the commit of Bob, and crash it. Read Joe first. The reader finds `write[4] = 3` on Bob and rolls Joe forward: Joe = 9.
+5. In each run, add Bob and Joe as the reader saw them. The sum is always 12. Every read comes from one snapshot.
+
+## Snapshot isolation, and what it still allows
+
+Percolator gives **snapshot isolation** (SI). Each transaction reads one consistent snapshot, at `start_ts`. Among concurrent transactions that write the same key, only one can commit. The tests of this module check both rules on random runs. Clients make transfers and audits, some clients crash, and readers clean up. Every committed history passes the SI checker, every audit sees the right total, and no transfer is half applied.
+
+But SI is not [serializable](/databases/transactions/serializable-snapshot-isolation). The paper says so: transactions under SI are subject to **write skew**. Two transactions read overlapping data and write different keys. No key gets two writes, so first-committer-wins sees nothing.
+
+<DistTxnWriteSkewDemo />
+
+1. With the defaults, both transactions read x = 1 and y = 1, and both commit. Nobody is on call. The graph has a cycle of rw edges: each transaction read a version that the other replaced.
+2. Turn on **materialize the conflict**. Both now write the row `shift`. T2's prewrite finds T1's newer write entry and aborts. One doctor stays on call.
+3. Select **T1, then T2**. T2 starts after T1 committed, sees x = 0, and writes nothing.
+
+The fix on Percolator is the same as on one machine. Turn the hidden read-write conflict into a write-write conflict, by writing a row that stands for the rule. Or lock the rows read, as `SELECT ... FOR UPDATE` does.
+
+## Percolator today: TiDB and TiKV
+
+TiKV, the storage layer of TiDB, describes its distributed transactions as inspired by Google's Percolator. Each TiKV region is a Raft group, so the table survives crashes as Bigtable's does. The Placement Driver (PD) acts as the timestamp oracle. A TiDB timestamp has 46 bits of physical time in milliseconds and 18 bits of logical counter.
+
+TiDB 5.0 added two optimizations of the basic protocol. **Async commit** runs the second phase in the background, so the client does not wait for it. It is on by default for new clusters, and off for upgraded ones. **One-phase commit** skips the second phase when all the writes fall in one region. Both reduce the latency that the two-phase write adds to every transaction.
+
+| | Percolator | 2PC with a coordinator |
+|---|---|---|
+| coordinator | the client library | a server process |
+| commit record | the primary's `write` entry | the coordinator's log |
+| in-doubt cleanup | any reader, through the primary | the coordinator after recovery |
+| timestamps | one oracle, strictly increasing | none, or local clocks |
+| isolation | snapshot isolation | depends on the locking |
+
+## Connect
+
+- [MVCC](/databases/transactions/mvcc): versions and snapshots on one machine.
+- [Serializable snapshot isolation](/databases/transactions/serializable-snapshot-isolation): how to detect write skew instead of allowing it.
+- [Two-phase commit](/distributed/transactions/two-phase-commit): the protocol that Percolator hides in the primary row.
+- [Spanner and TrueTime](/distributed/transactions/spanner-and-truetime): timestamps from clocks instead of an oracle.
+- [Hot keys](/distributed/partitioning/hot-keys): a single oracle is a hot spot, and batching is how it copes.
+
+<Recall cards={[
+  { q: "What do Percolator's lock and write columns hold?", a: "lock[start_ts] marks an uncommitted write and names the primary key. write[commit_ts] = start_ts makes the data written at start_ts visible from commit_ts on." },
+  { q: "What is the commit point of a Percolator transaction?", a: "The row transaction on the primary that checks its lock, writes write[commit_ts] = start_ts and erases the lock." },
+  { q: "A reader meets a lock of a dead client. How does it decide what to do?", a: "It checks the primary. If the primary's lock is still there, it rolls back (primary first). If the primary has a write entry for that start_ts, it rolls forward." },
+  { q: "Why does a prewrite abort if any write entry exists at or after its start_ts?", a: "A transaction committed a write to that key after this one took its snapshot. Committing too would lose that update. This is first-committer-wins." },
+  { q: "Which anomaly does Percolator still allow, and how do you prevent it?", a: "Write skew: two transactions read overlapping data and write different keys. Prevent it by also writing a row that stands for the rule, which turns it into a write-write conflict." },
+  { q: "Which component is TiDB's timestamp oracle?", a: "The Placement Driver (PD). A timestamp has 46 bits of physical time in ms and 18 bits of logical counter." },
+]} />

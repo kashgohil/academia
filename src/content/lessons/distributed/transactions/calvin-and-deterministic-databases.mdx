@@ -1,0 +1,111 @@
+---
+summary: "Order first, then execute: Calvin's sequencer and 10 ms epochs, deterministic locking that makes every replica reach the same state with no two-phase commit, what it costs (declared read and write sets, OLLP for dependent transactions), and Fauna as a Calvin-inspired system."
+---
+import { DistTxnCalvinReplicasDemo, DistTxnCalvinVs2pcDemo } from "@/demos/dist/DistTxnCalvinDemos";
+
+[Two-phase commit](/distributed/transactions/two-phase-commit) exists because a participant can say no at the last moment. A deadlock, a crash or a lock timeout can abort its part of the transaction. So the participants must agree on the outcome after they execute, while they hold their locks.
+
+Calvin asks a different question. What if the participants could never disagree? Then there would be nothing to agree on at the end. Thomson, Diamond, Weng, Ren, Shao and Abadi built this idea into "Calvin: Fast Distributed Transactions for Partitioned Database Systems" (SIGMOD 2012). It follows Thomson and Abadi's "The Case for Determinism in Database Systems" (VLDB 2010).
+
+## Order first, then execute
+
+Calvin splits the work into two layers.
+
+1. **Sequencing.** Clients send transactions to a sequencer. The sequencer collects them into batches, one batch per **epoch** of 10 ms. It replicates each batch, then sends it to every partition. The batches form one global input log.
+2. **Deterministic execution.** Each partition runs the transactions in the order of the log. A transaction's result depends only on the database state and the log, never on thread timing or on which message came first.
+
+Agreement happens before execution, on the input, with a replication protocol such as Paxos. After that, every replica of a partition runs the same transactions in the same order from the same state. So all replicas reach the same state without talking to each other.
+
+<Predict
+  id="race"
+  question="Three replicas get the same batch: T1 is x := x × 2, and T2 is x := x + 10, with x = 1. Each replica runs the batch on two threads, and lets them take the lock on x in whatever order they arrive. Do the replicas end with the same x?"
+  options={["Yes: they got the same input", "Not always: one order gives 12, the other gives 22", "Yes: the lock on x makes the order safe"]}
+  answer={1}
+  explain="T1 then T2 gives 1 × 2 + 10 = 12. T2 then T1 gives (1 + 10) × 2 = 22. A lock makes each transaction atomic, but it does not fix the order. Only an order fixed in advance, the same on every replica, makes the result the same."
+>
+<DistTxnCalvinReplicasDemo />
+</Predict>
+
+1. With the defaults, the sequencer makes 4 batches from the 6 requests. Every replica executes T1 to T6 in order and ends with x = 10 and y = 27.
+2. Move the epoch length to 20 ms. There are now 2 larger batches, but the order of the transactions is the same, and so is the result.
+3. Turn on **nondeterministic execution** with a 10 ms epoch. Inside each batch, each replica runs the transactions in its own thread order. Replica 2 ends with x = 10, but replicas 1 and 3 end with x = 13.
+4. Set the epoch to 20 ms with the race still on. All three replicas end in different states. Press **Run the threads again** to get other orders.
+5. Turn the race off, and delay the batches to replica 3. It executes 25 ms later, and ends in the same state. A slow replica falls behind, but it never diverges.
+
+## Deterministic locking
+
+Calvin still uses locks, so that it can run many transactions at once. But its lock manager grants locks in the order of the log. A transaction asks for all its locks at once, before it runs. If T1 comes before T2 in the log and both want x, T1 gets x first on every replica.
+
+Two consequences follow. There are no deadlocks, because every transaction takes its locks in one global order. And no transaction can abort for a reason that differs between replicas. A transaction can still abort for a deterministic reason, such as a failed check on the data. Every replica then makes the same decision.
+
+## A transaction across partitions
+
+Each partition runs the batch, but a transaction may read data on several partitions. Calvin handles this with one round of messages:
+
+1. Every participant partition takes its locks, in log order.
+2. It reads its local rows and sends the values to the other active participants.
+3. When a participant has every remote read, it runs the transaction's logic and writes its own rows.
+4. It releases its locks.
+
+No participant can vote no. They all run the same logic on the same values, so they all reach the same decision. There is no prepare, no vote and no commit round.
+
+<DistTxnCalvinVs2pcDemo />
+
+1. With 3 partitions, a one-way latency of 1 ms and a 10 ms epoch, 2PC answers the client in 9 ms. Calvin needs 11 ms, because a request waits half an epoch on average for its batch.
+2. Read the lock times. 2PC holds the locks for 8 ms: across the reads, the prepare write, the vote, the commit write and the COMMIT message. Calvin holds them for 1 ms, the exchange of reads.
+3. Move the latency to 10 ms, as between regions. 2PC takes 90 ms and Calvin 65 ms. The epoch wait is now small next to the network delays.
+4. Set 1 partition. Now 2PC has nothing to agree on, and it holds its locks for 4 ms. Calvin still waits for the epoch.
+
+The lock time matters most. A contended row is unavailable while it is locked. Under 2PC a hot row is locked across network round trips and log writes. Under Calvin it is locked only while the data moves between partitions. The paper reports nearly half a million TPC-C transactions per second on a 100-node cluster, with a workload of 100% New Order transactions.
+
+## The cost: read and write sets in advance
+
+A deterministic lock manager must know a transaction's locks before the transaction runs. So Calvin needs each transaction's **read set** and **write set** in advance. A stored procedure such as "move 10 from account 7 to account 9" declares them easily.
+
+A **dependent transaction** is harder. Its write set depends on what it reads: "give a raise to every employee whose manager is Ann". Calvin uses **optimistic lock location prediction** (OLLP). First it runs a cheap, unreplicated, read-only **reconnaissance query** to find the rows. Then it submits the real transaction with those rows as its declared sets.
+
+At execution, the transaction checks that the sets are still correct. If the data changed in between, it aborts deterministically and goes back to the sequencer.
+
+```ts
+async function submitDependent(db: Calvin, managerId: string) {
+  for (;;) {
+    // 1. Reconnaissance: a plain snapshot read, outside the log.
+    const ids = await db.snapshotQuery((s) => s.employees.filter((e) => e.manager === managerId).map((e) => e.id));
+    // 2. The real transaction declares what reconnaissance found.
+    const res = await db.submit({
+      reads: [`idx:manager:${managerId}`, ...ids], writes: ids,
+      run: (s) => {
+        const now = s.index("manager", managerId);
+        if (!sameSet(now, ids)) return { abort: "stale prediction" }; // the same decision on every replica
+        for (const id of ids) s.update(id, (e) => ({ ...e, salary: e.salary * 1.05 }));
+        return { ok: true };
+      },
+    });
+    if (res.ok) return res;
+  }
+}
+```
+
+Other costs follow from the design. Every transaction waits for an epoch. Interactive transactions, where the client reads, thinks and then writes, do not fit. They must become one request with all their logic. And the sequencing layer is a component on the critical path of every write.
+
+## Calvin in practice
+
+Calvin's paper uses ZooKeeper to replicate the input log in its implementation. The design allows asynchronous replication or Paxos-based synchronous replication. Because execution is deterministic, a replica can rebuild its state from a checkpoint and the input log, as a [Raft](/distributed/consensus/raft-log-replication) state machine does.
+
+Fauna, a commercial database, described its transaction protocol as "inspired by Calvin" in a 2018 company blog post. Like Calvin, it decides the serial order before it does any writes. Fauna shut down its service on 30 May 2025. The core idea remains useful. Agree on the input, make execution deterministic, and replication needs no commit protocol at all.
+
+## Connect
+
+- [Two-phase commit](/distributed/transactions/two-phase-commit): the agreement after execution that Calvin removes.
+- [Raft log replication](/distributed/consensus/raft-log-replication): a replicated state machine is the same idea for one partition.
+- [Deterministic simulation testing](/distributed/capstone/deterministic-simulation-testing): determinism as a tool for testing distributed systems.
+- [Two-phase locking and deadlocks](/databases/transactions/two-phase-locking-and-deadlocks): why a fixed lock order removes deadlocks.
+
+<Recall cards={[
+  { q: "What are Calvin's two layers?", a: "A sequencing layer batches transactions into a replicated global input log, one batch per 10 ms epoch. A deterministic execution layer runs them in log order on every partition and replica." },
+  { q: "Why does Calvin need no two-phase commit?", a: "Execution is deterministic, so no participant can decide differently from another. All replicas and partitions run the same transactions in the same order on the same state." },
+  { q: "How does Calvin's lock manager avoid deadlocks?", a: "Each transaction requests all its locks at once, and locks are granted in the order of the global log. Every transaction takes its locks in one global order, so no wait cycle can form." },
+  { q: "What does Calvin require from each transaction, and why?", a: "Its read and write sets in advance, because the deterministic lock manager must take all locks before the transaction runs." },
+  { q: "What is OLLP?", a: "Optimistic lock location prediction. A reconnaissance query finds the rows a dependent transaction will touch. The real transaction declares them, checks them at execution, and restarts if they changed." },
+  { q: "Why does Calvin hold locks for less time than 2PC on a multi-partition transaction?", a: "2PC holds locks across reads, prepare, votes, the commit log write and the commit message. Calvin holds them only during the exchange of reads between participants." },
+]} />

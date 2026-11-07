@@ -1,0 +1,133 @@
+---
+summary: "A VPN wraps whole IP packets in other packets: the bytes each tunnel adds and the MTU trouble they cause, IPsec ESP and IKEv2, WireGuard's handshake, cryptokey routing, timers and roaming, OpenVPN and the TCP-over-TCP meltdown, split tunnels, and what a VPN does not hide."
+---
+import { NetSecTunnelDemo, NetSecMeltdownDemo, NetSecWireGuardDemo, NetSecRoutingDemo } from "@/demos/net/NetSecVpnDemos";
+
+A **VPN** (virtual private network) carries IP packets inside other IP packets. A gateway takes an **inner packet**, encrypts it, adds new headers, and sends the result as an **outer packet** to a second gateway. The second gateway removes the outer headers, checks and decrypts the inner packet, and forwards it. This is **tunnelling**.
+
+Two uses are common. A **site-to-site** VPN joins two networks, for example two offices. A **remote-access** VPN joins one laptop to a network, or sends all of its traffic through a VPN provider. Both protect the packets on the path between the two ends of the tunnel, and nowhere else.
+
+## The bytes a tunnel adds
+
+Every tunnel adds headers, and the path MTU does not grow. An inner packet that filled a 1500-byte Ethernet frame no longer fits after encapsulation.
+
+| Tunnel | Added bytes | Parts |
+|---|---|---|
+| GRE (RFC 2784) | 24 | outer IPv4 20, GRE 4; no encryption |
+| WireGuard over IPv4 | 60 + padding | IPv4 20, UDP 8, header 16, Poly1305 tag 16 |
+| IPsec ESP, tunnel mode | 54–57 | IPv4 20, SPI 4, sequence 4, IV 8, padding 0–3, trailer 2, ICV 16 |
+| IPsec ESP, transport mode | 34–37 | the same, but the original IP header stays |
+| ESP with NAT traversal | + 8 | a UDP header, port 4500 (RFC 3948) |
+
+The ESP sizes are for AES-GCM (RFC 4106): an 8-byte IV and a 16-byte ICV. WireGuard pads the inner packet with zeros to a multiple of 16 bytes, but never past the MTU. The padding hides the exact size, so its cost changes with the packet.
+
+<Predict
+  id="vpn-mtu"
+  question="A laptop sends a 1,500-byte packet into a WireGuard tunnel over IPv4. The path MTU is 1500 and the outer packet has DF set. What happens to the packet?"
+  options={["It arrives: the tunnel compresses the headers", "A router fragments the outer packet, and the far gateway reassembles it", "A router drops it, and the ICMP error goes to the tunnel gateway, not to the laptop's application"]}
+  answer={2}
+  explain="The outer packet is 1,560 bytes. With DF set, a router drops it and sends 'fragmentation needed' to the source of the outer packet: the tunnel gateway. The inner sender hears nothing, so TCP retransmits the same size again: a black hole."
+>
+<NetSecTunnelDemo />
+</Predict>
+
+Things to try:
+
+1. Move the inner packet down until the banner turns green. With WireGuard over IPv4, 1,440 bytes is the largest inner packet that fits. A TCP sender should then use an MSS of 1,400.
+2. Clear DF. The router cuts the 1,560-byte outer packet into fragments of 1,500 and 80 bytes. The far gateway must reassemble them, and the loss of either fragment loses the packet.
+3. Select **WireGuard over IPv6**. Routers never fragment IPv6, so a packet that is too big always dies. The largest inner packet is now 1,420.
+4. Select the 1492-byte PPPoE path. The largest inner packet shrinks by 8 bytes, or by a little more with WireGuard over IPv6, because of the padding.
+5. Compare the table. IPsec in transport mode costs the least of the encrypted tunnels, because it keeps the original IP header.
+
+The Linux WireGuard driver sets a new interface's MTU to 1500 − 80 = 1420. The 80 bytes are the 32-byte message overhead, the 8-byte UDP header and the larger 40-byte IPv6 header. So the default MTU is safe on a 1500-byte path with either outer IP version.
+
+Two fixes are common. **MSS clamping** rewrites the MSS option in TCP SYNs that cross the tunnel, so TCP never builds a packet that is too big. A lower **tunnel MTU** lets the inner sender's own path MTU discovery work. UDP traffic has no MSS, so only the second fix helps it. See [ICMP](/networking/ip/icmp) for path MTU discovery and its black holes.
+
+## IPsec
+
+**IPsec** protects IP packets in the kernel. ESP (Encapsulating Security Payload, RFC 4303) encrypts and authenticates. Each direction of a connection is a **security association** (SA). A 32-bit SPI (security parameter index) names it, and it holds the keys and a sequence number against replay. Linux keeps SAs and policies in the XFRM framework.
+
+In **tunnel mode**, ESP wraps the whole inner packet, and a new IP header goes outside. Gateways use it for site-to-site VPNs. In **transport mode**, ESP protects only the payload, and the original header stays. Hosts use it to protect traffic between themselves.
+
+**IKEv2** (RFC 7296) negotiates the SAs. Two exchanges set up the first SA: IKE_SA_INIT (Diffie-Hellman and nonces) and IKE_AUTH (identities and certificates or pre-shared keys). That is four messages, two round trips. IKE runs on UDP port 500. When it finds a NAT on the path, it moves to UDP port 4500 and wraps ESP in UDP. A NAT cannot map ports for bare ESP.
+
+## WireGuard
+
+**WireGuard** is a small VPN. Its paper reports an implementation in less than 4,000 lines of code, and the driver has been in mainline Linux since version 5.6. It has no cipher negotiation: it always uses the Noise protocol framework pattern `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s`. So it uses X25519, ChaCha20-Poly1305 and BLAKE2s, plus an optional pre-shared key.
+
+Each peer is a static Curve25519 public key. The handshake is one round trip: an initiation of 148 bytes and a response of 92 bytes. In the IK pattern the initiator already knows the responder's static key. Each data message adds a 16-byte header (type, reserved bytes, receiver index, 64-bit counter) and a 16-byte tag.
+
+**Cryptokey routing** replaces most of the configuration of IPsec. Each peer has a list of **AllowedIPs**. To send, the interface picks the peer whose AllowedIPs hold the destination, with the longest prefix. On receipt, it drops a decrypted packet unless the inner source address is in the AllowedIPs of the peer whose key decrypted it. So the key of a peer also decides which addresses it may use.
+
+A WireGuard interface is silent when nobody sends. Timers create sessions only when traffic needs them. The constants come from the paper:
+
+| Timer | Value | Rule |
+|---|---|---|
+| Rekey-After-Time | 120 s | the initiator starts a new handshake when it sends on an older session |
+| Reject-After-Time | 180 s | keys older than this are never used |
+| Rekey-Timeout | 5 s | send a new initiation if no response came |
+| Rekey-Attempt-Time | 90 s | give up retrying after this |
+| Keepalive-Timeout | 10 s | after data arrives, send an empty keepalive if nothing else went back |
+
+A peer that sent data and received nothing for 15 s (Keepalive-Timeout + Rekey-Timeout) starts a new handshake. **Roaming** is simple: a peer sends replies to the outer address of the last authenticated packet from the other peer. A phone can move from Wi-Fi to LTE, and the tunnel follows it after its next packet.
+
+<NetSecWireGuardDemo />
+
+Things to try:
+
+1. Keep the defaults. The laptop leaves Wi-Fi at 155 s, just after it sent a keepalive. The server keeps sending to the old address, and only 8 of 15 pushes arrive.
+2. Set PersistentKeepalive to 25 s. The laptop sends a keepalive over LTE at 178 s, the server learns the new endpoint, and 14 of 15 pushes arrive.
+3. Set the roam time to "never" and the push interval to 45 s. Pushes now die at the Wi-Fi NAT, which forgets the mapping after 30 s of silence: 2 of 7 arrive. A keepalive every 25 s fixes it.
+4. With the keepalive on, count the handshakes: at 1 s and at 183 s. The laptop sends no data after the first minute, so it never rekeys at 120 s. The server starts a handshake when its keys pass 180 s.
+
+The wg(8) manual suggests a persistent keepalive of 25 seconds for a peer behind NAT that rarely sends but must receive. The interval must be shorter than the NAT's idle timeout.
+
+## OpenVPN and TCP over TCP
+
+**OpenVPN** runs its control channel in user space. Its data channel runs there too, unless the ovpn kernel module (in Linux since 6.16) carries it. It uses TLS for its control channel (authentication and key exchange) and its own format for the data channel. The default port is 1194, and it can run over UDP or TCP. TCP gets through firewalls that block UDP, but then the tunnel carries TCP inside TCP.
+
+Two reliable transports then stack. When the outer TCP loses a segment, it holds every later byte until the retransmission arrives. All inner packets wait, from every flow in the tunnel. The inner TCP sees its RTT jump, and its own retransmission timer can fire for data that was never lost. Honda and co-authors studied these effects with simulations in 2005 ("Understanding TCP over TCP"). A TCP tunnel usually lowered the inner goodput.
+
+<NetSecMeltdownDemo />
+
+Things to try:
+
+1. Keep 2% loss. Through the UDP tunnel, 1.6% of the voice packets are lost and none is late. Through the TCP tunnel, 0.7% are lost, but 67.6% arrive more than 150 ms late.
+2. Look at the curves. Each outer loss holds back the voice packets behind it for an outer retransmission, while the bulk transfer keeps the outer TCP's queue full.
+3. Read the retransmission rows. Through the TCP tunnel, the inner TCP retransmits 8 segments that were never lost.
+4. Turn off the bulk download. With the voice stream alone, the worst delay through the TCP tunnel stays at 141 ms, and the UDP tunnel loses 2% of the packets.
+5. Set the loss to 0. Both tunnels now carry the voice on time.
+
+The bulk goodput is about the same in both tunnels in this model: 1.52 Mbit/s over UDP and 1.63 Mbit/s over TCP at 2% loss. The cost of TCP over TCP is latency and wasted retransmissions, and it hits every flow in the tunnel. Use a UDP transport when the network allows it.
+
+## Split tunnels and what a VPN hides
+
+A **full tunnel** sends every packet through the VPN: AllowedIPs = 0.0.0.0/0. A **split tunnel** sends only some prefixes, for example the office's 10.0.0.0/8, and everything else goes out directly. A split tunnel saves the VPN's bandwidth and latency for traffic that does not need it. The risk is a leak: a DNS query that goes to the local resolver tells the local network every name that the user looks up.
+
+<NetSecRoutingDemo />
+
+Things to try:
+
+1. With the full tunnel, the café and the ISP see only UDP packets to the VPN server. The VPN server now sees what they saw before: the DNS name, the SNI and any plain HTTP.
+2. Select the split tunnel with DNS outside. The office wiki goes through the tunnel, but the DNS query for bank.example goes to the café's resolver in clear text.
+3. Type an address in "Send to". The longest AllowedIPs prefix decides. In a split tunnel, type the inner source 8.8.8.8: it is outside 10.0.0.0/8, so the receive check drops it.
+4. Read the last column. The destination always sees the request, and with a VPN it sees the VPN's address instead of yours.
+
+A VPN does not make the user anonymous: the VPN operator knows the user's address and sees the inner traffic. It does not protect data from the destination, and it adds nothing to HTTPS on the part of the path behind the VPN server. It does protect against the local network and the ISP, and it lets a laptop reach private addresses as if it were in the office.
+
+## Connect
+
+- [TLS handshake](/networking/security/tls-handshake): OpenVPN's control channel, and the key-exchange ideas that WireGuard's Noise handshake shares.
+- [ICMP](/networking/ip/icmp): path MTU discovery and the black holes that tunnels create.
+- [NAT](/networking/ip/nat): why UDP tunnels need keepalives, and why ESP needs UDP encapsulation behind a NAT.
+- [Reliability and retransmission](/networking/transport/reliability-and-retransmission): the RTO that fires too early in TCP over TCP.
+- [Subnetting and CIDR](/networking/ip/subnetting-and-cidr): the longest-prefix match behind cryptokey routing.
+
+<Recall cards={[
+  { q: "Why does a 1,500-byte inner packet in an IPv4 WireGuard tunnel with DF set disappear without an error at the sender?", a: "The outer packet is 1,560 bytes. A router drops it and sends 'fragmentation needed' to the outer source, the tunnel gateway. The inner sender never hears about it: a black hole. MSS clamping or a tunnel MTU of 1420 avoids it." },
+  { q: "What is the difference between ESP tunnel mode and transport mode?", a: "Tunnel mode wraps the whole inner IP packet and adds a new outer IP header; gateways use it for site-to-site VPNs. Transport mode protects only the payload and keeps the original IP header; hosts use it between themselves." },
+  { q: "State WireGuard's two rules of cryptokey routing.", a: "Sending: the peer whose AllowedIPs hold the destination with the longest prefix gets the packet. Receiving: a decrypted packet is dropped unless its inner source address is in the AllowedIPs of the peer whose key decrypted it." },
+  { q: "How does a WireGuard server learn a roaming client's new address, and when does PersistentKeepalive matter?", a: "It sends to the outer address of the last authenticated packet. An idle client behind NAT sends nothing, so the server cannot reach it after a move or after the NAT mapping expires. A keepalive every 25 s helps." },
+  { q: "Why does a TCP tunnel hurt a voice call that shares it with a download, even though it loses fewer packets?", a: "The outer TCP delivers in order. Every WAN loss holds back all later inner packets until the outer retransmission arrives, so voice packets arrive too late to play. The inner TCP also retransmits data that was never lost." },
+  { q: "Name two things a VPN does not hide.", a: "Everything from the VPN operator, which sees the inner traffic and the user's address; and the request itself from the destination. A split tunnel can also leak DNS names to the local network." },
+]} />

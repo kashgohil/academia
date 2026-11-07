@@ -1,0 +1,132 @@
+---
+summary: "How a TLS client decides to trust a key: X.509 fields, the chain to a root, the RFC 5280 validation steps, revocation and why it fails open, Certificate Transparency and its Merkle proofs, ACME and short-lived certificates, the CA/Browser Forum validity schedule, and the CA failures that shaped all of it."
+---
+import { NetSecChainDemo, NetSecCtDemo, NetSecRevocationDemo } from "@/demos/net/NetSecPkiDemos";
+
+The [TLS handshake](/networking/security/tls-handshake) proves one thing: the server holds the private key that signed CertificateVerify. It does not say whose key that is. A **certificate** binds a name to a public key, and a **certificate authority** (CA) signs that binding. The client trusts a small set of CA keys, the **roots**, and checks a chain of signatures from a root down to the server.
+
+This system is the **Web PKI** (public key infrastructure). Its format is X.509, profiled for the Internet in RFC 5280 (2008). Its rules come from the CA/Browser Forum's Baseline Requirements and from the root programs of browsers and operating systems.
+
+## What a certificate holds
+
+A certificate is a signed structure. The signed part is **TBSCertificate** ("to be signed"), encoded in DER. The CA hashes those bytes and signs the hash.
+
+| Field | Meaning |
+|---|---|
+| serialNumber | unique per CA; revocation lists name certificates by it |
+| issuer, subject | distinguished names: who signed, and who this is about |
+| validity | `notBefore` and `notAfter` |
+| subjectPublicKeyInfo | the algorithm and the public key |
+| subjectAltName (SAN) | the DNS names and IP addresses the certificate covers |
+| basicConstraints | `cA` TRUE or FALSE, and an optional `pathLenConstraint` |
+| keyUsage, extKeyUsage | what the key may do: `keyCertSign`, `digitalSignature`, `serverAuth` |
+| authorityInfoAccess | where to fetch the issuer's certificate (and, for some CAs, an OCSP URL) |
+| SCT list | Certificate Transparency receipts, see below |
+
+A typical chain has three certificates. The **leaf** names the server. An **intermediate** signs the leaf. A **root** signs the intermediate. The server sends the leaf and the intermediates; the root is already in the client's trust store. CAs usually keep root keys offline and sign day-to-day with intermediate keys.
+
+<Predict
+  id="pki-leaf-signs"
+  question="An attacker owns a valid certificate for evil.example. With its private key, the attacker signs a new certificate for example.com, and the signature is mathematically valid. What stops a correct client?"
+  options={["Nothing: the chain of signatures goes back to a trusted root", "The name check: example.com is not in the attacker's certificate", "basicConstraints: the evil.example certificate says it is not a CA, so it may not sign certificates"]}
+  answer={2}
+  explain="Every signature verifies, and the forged leaf even names example.com. The client stops at the issuer checks: the certificate that signed the forged leaf has cA = FALSE. Select A leaf signs another leaf in the demo."
+>
+<NetSecChainDemo />
+</Predict>
+
+Things to try:
+
+1. Move the day to 90. The leaf expires: `notAfter` is day 90, and at day 89 the chain is still valid.
+2. Select **Leaf edited after signing**. Someone added a name to the SAN list. The CA's signature covers the old bytes, so the signature check fails.
+3. Select **Server omits the intermediate**. The client cannot build a path from the leaf to a root. Some clients fetch the missing certificate from the authorityInfoAccess URL; many do not.
+4. Select **Self-made root**. The chain is consistent, but its root is not in the trust store. A corporate TLS proxy signs with a root like this. Its certificates pass only on company laptops, where the company installed that root in the trust store.
+5. Ask for api.example.com. The leaf names only example.com and www.example.com. A wildcard `*.example.com` would match api.example.com, but not a.b.example.com and not example.com itself.
+
+## The validation algorithm
+
+RFC 5280 section 6.1 checks a path from the trust anchor down. The working public key starts as the root's key. For each certificate, the client:
+
+1. verifies the signature with the working key;
+2. checks that the current time lies between `notBefore` and `notAfter`;
+3. checks that the certificate is not revoked;
+4. checks that its issuer name equals the subject of the certificate above it.
+
+A certificate that signs the next one must also have `cA` = TRUE, a path length within every `pathLenConstraint` above it, and `keyCertSign`. Then the subject key becomes the working key. At the leaf, the client matches the host name against the SAN entries (RFC 9525) and requires `serverAuth`. Browsers no longer use the subject's common name for this.
+
+**Path building** comes first and is harder than it looks. A server may send intermediates in the wrong order, too many, or too few. Cross-signed intermediates give several possible paths to different roots, so a client must search.
+
+## Revocation
+
+A CA revokes a certificate when its key leaks or when the CA misissued it. The Baseline Requirements give the CA 24 hours for a key compromise. The hard part is telling every client.
+
+- **CRL** (certificate revocation list, RFC 5280): a signed list of revoked serial numbers. For subscriber certificates, `nextUpdate` may be at most 10 days after `thisUpdate`.
+- **OCSP** (RFC 6960): the client asks the CA about one certificate. A response may be valid for 8 hours to 10 days. Each query tells the CA which site the user visits.
+- **OCSP stapling** (the `status_request` extension, RFC 6066): the server fetches the response and sends it in the handshake.
+- **Must-Staple** (the TLS Feature extension, RFC 7633): the certificate itself demands a stapled response.
+
+The weak point is the failure mode. If a client cannot reach the CA, it usually goes on ("soft-fail"). Otherwise one CA outage would break most of the web. But an attacker that uses a stolen key is often on the client's path, and it can block the check.
+
+<NetSecRevocationDemo />
+
+Things to try:
+
+1. Keep the defaults: a 90-day certificate, the key stolen at 25% of its life, the attacker on the path. Soft-fail CRL, OCSP and plain stapling all protect nobody: the key stays useful for 67.5 days.
+2. Must-Staple limits the attacker to the last good response: 24 h for the CA to revoke plus 168 h of validity, 8 days.
+3. A list that the browser vendor pushes cannot be blocked on the path. It ends the exposure after 2 days.
+4. A short-lived certificate of 160 hours needs no revocation. Stolen at 25% of its life, it expires 120 hours later.
+5. Turn off the on-path attacker. CRL and OCSP now work, but the cached "good" status still gives 8 days.
+
+Browsers moved away from online checks. Chrome pushes **CRLSets**: emergency blocks, plus some revocations that Google collects from the CAs' CRLs. Firefox uses **CRLite**, which pushes a compressed set of all revocations, built from CT logs and CRLs. Let’s Encrypt removed OCSP URLs from its certificates on 7 May 2025. It turned its OCSP responders off on 6 August 2025 and now publishes only CRLs.
+
+## Certificate Transparency
+
+A CA can sign a certificate for any name. In 2011 an attacker broke into the Dutch CA **DigiNotar** and, on 10 July 2011, issued a wildcard certificate for Google. Someone used it in Iran to intercept Google traffic. At least 531 certificates were misissued, browsers removed DigiNotar's roots around 29 August, and the company went bankrupt in September 2011.
+
+**Certificate Transparency** (CT, RFC 6962 from 2013, version 2 in RFC 9162) makes misissuance visible. Before a CA issues a certificate, it submits a precertificate to public append-only logs. Each log returns a **signed certificate timestamp** (SCT), a promise to add the entry. The CA embeds the SCTs in the certificate.
+
+Most CAs embed the SCTs. Chrome then requires SCTs from 2 or more distinct logs for a certificate of 180 days or less, and from 3 for a longer one. At least two log operators must sign. Domain owners and researchers then watch the logs for names they did not request.
+
+A log is a Merkle tree. A leaf hash is SHA-256 of a 0x00 byte and the entry; an inner node is SHA-256 of a 0x01 byte and its two children. The log signs the tree head: the root hash, the tree size and a timestamp. It also signs each SCT.
+
+<NetSecCtDemo />
+
+Things to try:
+
+1. Click leaf 1. Its **inclusion proof** is 3 hashes: the siblings on the way up. With them, anyone can recompute the root of the 7-entry tree.
+2. Raise the log to 16 entries. A proof has $\lceil \log_2 n \rceil$ hashes or fewer: 20 for a million entries, 30 for $2^{30}$, under 1 KB.
+3. Keep an old tree size of 4. The **consistency proof** from 4 to 7 entries is 1 hash: the old tree is a complete left subtree.
+4. Make the log rewrite entry 2. The root changes, and no consistency proof can link the old head to the new tree. Monitors that compare heads catch the log.
+
+Browsers can also distrust a CA without breaking every old certificate. Chrome distrusted Symantec by issue date, in two steps in 2018. Chrome 66 rejected Symantec certificates issued before 1 June 2016, and Chrome 70 removed the rest. For Entrust, Chrome 131 used CT instead: it stopped trusting certificates whose earliest SCT is after 11 November 2024. The SCT gives a time that the CA cannot backdate.
+
+## ACME and short lifetimes
+
+**ACME** (RFC 8555, 2019) automates issuance. A client creates an account key, places an order for some names, and proves control of each name with a challenge. With `http-01`, it serves a token over HTTP. With `dns-01`, it publishes a TXT record. With `tls-alpn-01` (RFC 8737), it answers a special TLS handshake. Then it sends a certificate signing request and downloads the chain.
+
+Automation makes short lifetimes possible, and short lifetimes make revocation less important. Ballot SC-081 of the CA/Browser Forum cuts the maximum validity of a subscriber certificate in steps:
+
+| Issued on or after | Maximum validity | Reuse of domain validation |
+|---|---|---|
+| (before 2026-03-15) | 398 days | 398 days |
+| 2026-03-15 | 200 days | 200 days |
+| 2027-03-15 | 100 days | 100 days |
+| 2029-03-15 | 47 days | 10 days |
+
+A client that renews after two thirds of each lifetime renews 6.1 times a year with 90-day certificates and 11.6 times with 47-day certificates. Let’s Encrypt plans to move from 90 to 45 days by February 2028. Its six-day certificates (160 hours, the `shortlived` profile) became generally available in January 2026. Today they still carry a CRL URL. At 160 hours, a client renews about 82 times a year.
+
+## Connect
+
+- [TLS handshake](/networking/security/tls-handshake): where the certificate and CertificateVerify travel.
+- [VPNs](/networking/security/vpns): IPsec can use certificates; WireGuard uses bare public keys instead.
+- [DNS](/networking/apps/dns): ACME's `dns-01` challenge and the records that publish ECH keys.
+- [BGP](/networking/ip/bgp): RPKI uses certificates to bind address blocks to networks, a PKI for routing.
+
+<Recall cards={[
+  { q: "Name the checks that RFC 5280 makes for each certificate on the path, and the extra checks for a certificate that signs another.", a: "Signature with the working key, validity period, revocation, issuer name equals the subject above. For a signer: cA = TRUE, path length within pathLenConstraint, and keyCertSign." },
+  { q: "Why does a valid leaf for evil.example not let its owner issue a certificate for example.com?", a: "Its basicConstraints says cA = FALSE. A correct client rejects any certificate that it signed. Clients that skip this check accept such forgeries." },
+  { q: "Why does soft-fail revocation checking give little protection against an attacker with a stolen key?", a: "The attacker is often on the client's path and can block the CRL or OCSP fetch. A soft-fail client then accepts the certificate until it expires." },
+  { q: "What does an SCT promise, and what do monitors do with CT logs?", a: "A signed promise from a log to add the (pre)certificate to its append-only Merkle tree. Monitors read the logs, look for certificates for their names that they did not request, and check consistency proofs between tree heads." },
+  { q: "How many hashes does an inclusion proof need in a log of a million entries, and why so few?", a: "20: one sibling hash per level of the Merkle tree, about $\\log_2 n$ hashes." },
+  { q: "State the CA/Browser Forum validity schedule from ballot SC-081.", a: "398 days before 15 March 2026, then 200 days, then 100 days from 15 March 2027, and 47 days from 15 March 2029. Domain validation reuse falls to 10 days." },
+]} />

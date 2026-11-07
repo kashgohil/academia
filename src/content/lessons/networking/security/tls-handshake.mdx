@@ -1,0 +1,155 @@
+---
+summary: "TLS 1.3 message by message on a real TCP connection: key shares and forward secrecy, the HKDF key schedule computed from the RFC 8448 trace, the AEAD record layer, resumption and 0-RTT, and the checks that stop an attacker on the path."
+---
+import { NetSecHandshakeDemo, NetSecKeyScheduleDemo, NetSecForwardSecrecyDemo, NetSecRecordDemo, NetSecTamperDemo } from "@/demos/net/NetSecTlsDemos";
+
+**TLS** (Transport Layer Security) runs on top of a byte stream such as [TCP](/networking/transport/tcp-handshake-and-teardown). It gives three guarantees. An observer cannot read the data (confidentiality). Nobody can change it without detection (integrity). The client knows which server it talks to (authentication).
+
+TLS 1.2 is RFC 5246 (2008). TLS 1.3 is RFC 8446 (August 2018). RFC 8996 (2021) deprecates TLS 1.0 and 1.1.
+
+This lesson uses real cryptography. The demos run SHA-256, HKDF, X25519, AES-128-GCM and RSA-PSS, written in TypeScript and tested against the vectors of their standards. The inputs come from RFC 8448, which publishes every byte and every secret of example TLS 1.3 handshakes.
+
+## The handshake, message by message
+
+TLS 1.3 needs one round trip before the client can send data. The client guesses the key exchange that the server will accept, and sends its public key at once.
+
+| Message | From | What it carries |
+|---|---|---|
+| ClientHello | client | a 32-byte random, cipher suites, and extensions: `key_share`, `supported_versions`, `server_name` (SNI), ALPN, `signature_algorithms` |
+| ServerHello | server | its random, the chosen suite, its own `key_share` |
+| EncryptedExtensions | server | the other negotiated extensions, such as ALPN; encrypted |
+| Certificate | server | the certificate chain; encrypted |
+| CertificateVerify | server | a signature over the hash of every message so far |
+| Finished | both | an HMAC over the hash of every message so far |
+
+After ServerHello, both sides have the other's public key, so both compute the same shared secret. Everything after ServerHello is encrypted. In the RFC 8448 trace, the ClientHello is 196 bytes and the ServerHello is 90 bytes. The server's encrypted flight (EncryptedExtensions, Certificate, CertificateVerify, Finished) is one record of 679 bytes.
+
+TLS 1.2 needs two round trips. Its ServerHello flight carries the certificate in clear text, and the key exchange finishes only in the client's second flight. TLS 1.3 also removed static RSA key transport, so every full handshake has forward secrecy.
+
+<Predict
+  id="tls-rtt"
+  question="The round-trip time is 50 ms and the server sends a 4 KB certificate chain. The client opens a new TCP connection and sends one request. How much later does the response arrive with TLS 1.2 than with TLS 1.3?"
+  options={["At the same time: both handshakes send the same messages", "50 ms later: TLS 1.2 needs one more round trip", "100 ms later: TLS 1.2 needs two more round trips"]}
+  answer={1}
+  explain="TCP takes one round trip, TLS 1.3 one more, and the request one more: the response is complete at 151 ms. TLS 1.2 needs two round trips for its handshake, so the response is complete at 201 ms."
+>
+<NetSecHandshakeDemo />
+</Predict>
+
+Things to try:
+
+1. Read the table. The ClientHello is 201 bytes on the wire: the 196-byte message plus a 5-byte record header. The path can read its SNI, its cipher suites and its key share.
+2. Select **TLS 1.2, full**. The certificate now crosses the path in clear text, and the response is complete at 201 ms instead of 151 ms.
+3. Return to TLS 1.3 and move the certificate chain to 16 KB. The response now needs 201 ms. The server's TCP may send only 10 segments of 1460 bytes (14,600 bytes) before the first ACK returns: the initial window of RFC 6928.
+4. Turn on the hybrid post-quantum key share. The ClientHello grows from 201 to 1,423 bytes, and it still fits in one segment.
+5. Select **TLS 1.3, HelloRetryRequest**. The client offered a key share for a group that the server does not accept. The server asks again, and the handshake costs one more round trip: 201 ms.
+6. Lose the first segment of the server's flight. The later segments bring three duplicate ACKs, TCP retransmits, and the response needs one more round trip.
+
+## Key exchange and forward secrecy
+
+The `key_share` extension carries an ephemeral public key. With **X25519** (RFC 7748), a private key is 32 random bytes, and the public key is 32 bytes. Each side combines its own private key with the other's public key and gets the same 32-byte shared secret. An observer sees both public keys but cannot compute the secret.
+
+Both sides delete the private keys after the handshake. This gives **forward secrecy**: if the server's long-term key leaks later, the recorded traffic stays secret. The certificate key in TLS 1.3 only signs; it never encrypts a secret.
+
+Chrome now sends a hybrid post-quantum key share by default. The group X25519MLKEM768 (codepoint 0x11EC) runs X25519 and ML-KEM-768 together. The client key share is 1,216 bytes and the server share is 1,120 bytes. Chrome 131 moved its hybrid key share to this group in 2024.
+
+<NetSecForwardSecrecyDemo />
+
+Things to try:
+
+1. With **RSA key transport**, the client encrypts the premaster secret with the certificate key. When that key leaks, all 12 recorded connections can be decrypted.
+2. Select **TLS 1.2, ECDHE + session tickets**. A certificate key leak now exposes nothing. Then choose **Ticket key (STEK)**: a TLS 1.2 ticket carries the master secret, and 3 connections fall.
+3. Set the ticket key rotation to "never". One leaked ticket key now exposes all 12 connections.
+4. Compare the two TLS 1.3 resumption modes. With `psk_ke`, the ticket key exposes the 2 resumed connections that used it. With `psk_dhe_ke`, the fresh key exchange protects every connection.
+
+## The key schedule
+
+TLS 1.3 derives every key with **HKDF** (RFC 5869). HKDF has two parts. Extract turns input keying material into a uniform pseudorandom key. Expand stretches that key into as many output bytes as needed, bound to a label.
+
+$$
+\text{HKDF-Extract}(\text{salt}, \text{IKM}) = \text{HMAC-SHA256}(\text{salt}, \text{IKM})
+$$
+
+$$
+\text{Derive-Secret}(S, \text{label}, M) = \text{HKDF-Expand}(S, \text{len} \,\|\, \text{"tls13 "} \,\|\, \text{label} \,\|\, H(M), 32)
+$$
+
+Here $H(M)$ is the SHA-256 hash of the handshake messages so far: the **transcript hash**. In the HKDF label, $\text{len}$ is the output length in 2 bytes, and the label and $H(M)$ each carry a 1-byte length prefix. The schedule has three stages. The PSK (or zeros) goes into the Early Secret, the (EC)DHE shared secret goes into the Handshake Secret, and zeros go into the Master Secret. Each traffic secret then gives an AEAD key and an IV.
+
+<NetSecKeyScheduleDemo />
+
+Things to try:
+
+1. Click the nodes from the top. Compare the Handshake Secret, `1d c8 26 e9 …`, with section 3 of RFC 8448. The tests check all of these values.
+2. Flip one bit of the shared secret. 15 of the 21 values change: everything from the Handshake Secret down. The Early Secret and its branches do not depend on the key exchange.
+3. Select **Resumed, psk_dhe_ke**. The PSK comes from the earlier connection's `resumption_master_secret`, so now 20 values differ, from the Early Secret down.
+4. Read the formulas of the two traffic secrets. They hash ClientHello…ServerHello, so a change to either hello gives different keys.
+
+## The record layer
+
+After the handshake, data travels in **records**. TLS 1.3 uses only AEAD ciphers (authenticated encryption with associated data). The common ones are AES-GCM and ChaCha20-Poly1305, and RFC 8446 also defines two AES-CCM suites. A record has a 5-byte header, the ciphertext and a 16-byte tag.
+
+The plaintext is TLSInnerPlaintext: the content, then one byte with the real content type, then optional zero padding. The outer header always says `application_data` and version 0x0303, so the path learns neither the type nor the true length. A record holds at most $2^{14}$ bytes of plaintext. The per-record nonce needs no bytes on the wire:
+
+$$
+\text{nonce} = \text{IV} \oplus \text{pad}_{12}(\text{seq})
+$$
+
+The sequence number counts records from 0 in each direction. A replayed, dropped or reordered record therefore fails the tag check. TCP already delivers records in order, so TLS needs no explicit number.
+
+<NetSecRecordDemo />
+
+Things to try:
+
+1. Read the bytes. A 14-byte request becomes a 36-byte record: 5 bytes of header, 15 of ciphertext and 16 of tag.
+2. Choose **Flip a ciphertext bit**. GCM is a stream mode, so the bit would flip the same plaintext bit. The tag detects it, and the receiver closes the connection.
+3. Choose **Edit the length**. The header is the additional data of the AEAD, so the tag fails here too.
+4. Choose **Replay**. The record is untouched, but the receiver expects the next sequence number, so its nonce differs.
+5. Add padding. The record grows and its true length is hidden. The receiver strips the zeros from the end.
+
+Linux can run this record layer in the kernel: after the handshake, a program passes the keys with `setsockopt(SOL_TLS, TLS_TX)`. See [zero-copy](/networking/programming/zero-copy) for why that helps `sendfile`.
+
+## Resumption and 0-RTT
+
+After the handshake, the server can send a NewSessionTicket. The ticket lets the client derive a **PSK** (pre-shared key) for a later connection. A ticket lives at most 7 days (604,800 seconds). A resumed handshake skips Certificate and CertificateVerify: in the first demo, the server's first flight shrinks from 4,467 to 199 bytes.
+
+With `psk_dhe_ke`, the resumed connection still runs a fresh key exchange and keeps forward secrecy. With `psk_ke`, it uses the PSK alone. A client can also send **0-RTT** data in its first flight, encrypted with keys from the PSK. In the first demo, 0-RTT gets the response at 100 ms instead of 151 ms. An attacker can replay 0-RTT data, so a server should accept it only for safe requests; the [QUIC lesson](/networking/transport/quic) shows the replay.
+
+## What an attacker on the path can do
+
+An attacker that sits on the path can drop, change or inject packets. TLS cannot stop a drop. It must detect every change.
+
+<NetSecTamperDemo />
+
+Things to try:
+
+1. Choose **rewrites the SNI**. The server hashes a different ClientHello, so it derives different handshake keys. The client cannot open the first encrypted record.
+2. Choose **swaps in its own key share**. Now the attacker shares a secret with the client and can decrypt the flight. But the server's CertificateVerify signs the real transcript, so the RSA-PSS check fails.
+3. Choose **strips TLS 1.3**. The server falls back to TLS 1.2 and writes `44 4F 57 4E 47 52 44 01` ("DOWNGRD" and 01) into the last 8 bytes of its random. A TLS 1.3 client that sees these bytes aborts.
+
+The **CertificateVerify** signature covers 64 space bytes, the string "TLS 1.3, server CertificateVerify", a zero byte and the transcript hash. The **Finished** message is an HMAC of the transcript hash with a key from the handshake secret. Together, they bind the whole conversation to the server's key and to the shared secret. The downgrade sentinel matters because a TLS 1.2 server signs both randoms in its key exchange.
+
+Middleboxes caused a problem for TLS 1.3. Some of them dropped connections whose handshake did not look like TLS 1.2. RFC 8446 appendix D.4 therefore defines a **compatibility mode**. In this mode, the client sends a non-empty session ID, and both sides send a dummy ChangeCipherSpec record. Every TLS 1.3 ClientHello also keeps `legacy_version` 0x0303 and puts the real version in `supported_versions`.
+
+## What the path still sees
+
+TLS 1.3 encrypts the certificate, but the ClientHello is still clear text. Its SNI names the site, and ALPN names the protocol. **Encrypted Client Hello** (ECH, RFC 9849, March 2026) fixes this. The client encrypts an inner ClientHello with HPKE under a public key that the site publishes in DNS (SVCB or HTTPS records). The outer ClientHello names only a shared "client-facing" server.
+
+Even with ECH, the path sees the server's IP address, record sizes and timing. Padding hides sizes at a cost in bandwidth.
+
+## Connect
+
+- [QUIC](/networking/transport/quic): the same TLS 1.3 handshake inside QUIC's CRYPTO frames, with 0-RTT and its replay.
+- [TCP handshake and teardown](/networking/transport/tcp-handshake-and-teardown): the round trip that TLS over TCP pays first.
+- [Certificates and PKI](/networking/security/certificates-and-pki): how the client decides to trust the key that signed CertificateVerify.
+- [VPNs](/networking/security/vpns): WireGuard uses a related design, a Noise handshake with X25519 and an AEAD.
+- [Zero-copy](/networking/programming/zero-copy): kernel TLS and `sendfile`.
+
+<Recall cards={[
+  { q: "Which TLS 1.3 messages are encrypted, and why can the server encrypt them before the client says anything more?", a: "Everything after ServerHello: EncryptedExtensions, Certificate, CertificateVerify, Finished. The ClientHello already carried the client's key share, so after ServerHello both sides have the shared secret." },
+  { q: "Why does TLS 1.3 give forward secrecy by default, and when can a resumed connection lose it?", a: "Static RSA key transport was removed, so every full handshake uses ephemeral (EC)DHE keys that are deleted. A psk_ke resumption uses only the PSK from a ticket, so a leaked ticket key exposes it; psk_dhe_ke adds a fresh key exchange." },
+  { q: "How is the per-record nonce built, and what does that buy?", a: "The 64-bit record sequence number, padded to 12 bytes, XOR the IV from the key schedule. No nonce bytes go on the wire, and a replayed, dropped or reordered record fails the AEAD tag." },
+  { q: "An attacker replaces the server's key share with its own. Which check stops it?", a: "CertificateVerify: the server signed the hash of the real transcript. The client hashes a transcript with the attacker's key share, so the signature fails. The attacker has no private key to sign a new one." },
+  { q: "What does the downgrade sentinel do?", a: "A TLS 1.3 server that negotiates TLS 1.2 puts DOWNGRD 01 in the last 8 bytes of ServerHello.random. A TLS 1.2 server signs the randoms, so an attacker cannot remove it, and a TLS 1.3 client aborts." },
+  { q: "What does an observer still learn from a TLS 1.3 connection, and what does ECH remove?", a: "The IP addresses, the SNI and ALPN in the ClientHello, record sizes and timing. ECH encrypts the inner ClientHello, so the SNI the observer sees is only the client-facing server's public name." },
+]} />

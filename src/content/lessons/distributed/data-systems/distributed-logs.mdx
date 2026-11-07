@@ -1,0 +1,110 @@
+---
+summary: "The log as the core abstraction of data systems, and how Kafka distributes it: topics, partitions, offsets, consumer groups and rebalances, leader replication with the ISR and the high watermark, acks and min.insync.replicas, unclean election, retention, compaction and KRaft."
+---
+import { ConsumerGroupDemo, IsrReplicationDemo } from "@/demos/dist/DataSysLogDemos";
+
+A **log** is an append-only sequence of records, each with a position number called its **offset**. Readers do not remove records. Each reader keeps its own offset and moves forward at its own speed. Jay Kreps described this idea in "The Log: What every software engineer should know about real-time data's unifying abstraction" (LinkedIn Engineering, December 2013). His point was that a database's write-ahead log, a replication stream and an event bus are the same thing. If all writes go into one ordered log, every downstream system can build its own view by replaying it.
+
+You have met the log before. The [write-ahead log](/databases/recovery/write-ahead-logging) makes one database durable. [Raft](/distributed/consensus/raft-log-replication) makes a log that all replicas agree on. **Apache Kafka** (Kreps, Narkhede and Rao, NetDB 2011) turns the log into a shared service for many writers and many readers.
+
+## Topics, partitions and offsets
+
+A **topic** is a named stream, such as `payments`. One log cannot hold a busy topic, so a topic is split into **partitions**. Each partition is a separate log with its own offsets, stored on a few brokers. A producer chooses the partition, usually by a hash of the record key. So all records with one key stay in order, and records with different keys have no order between them.
+
+A consumer reads a partition from an offset and then sends a **commit** of its position. If it restarts, it continues from the committed offset. The broker does not track which records were "used". Records stay until the retention rule deletes them, so a new reader can replay history.
+
+## Consumer groups
+
+A **consumer group** shares the work of reading a topic. Each partition is assigned to exactly one consumer in the group. That rule keeps per-partition order. It also means that a group cannot use more consumers than the topic has partitions. The **lag** of a partition is its log end offset minus the group's position. Lag that grows means the group reads slower than producers write.
+
+<Predict
+  id="group-idle"
+  question="A topic has 6 partitions. Each consumer can read 250 records/s. The group grows from 2 to 8 consumers. How much can the group now read per second?"
+  options={["2000 records/s: 8 consumers × 250", "1500 records/s: only 6 consumers get a partition", "1000 records/s: rebalances halve the throughput"]}
+  answer={1}
+  explain="One partition goes to one consumer of the group. With 8 consumers and 6 partitions, 2 consumers have nothing to do. Set the slider to 8 and look at the last assignment row."
+>
+<ConsumerGroupDemo />
+</Predict>
+
+1. With the defaults, lag grows by 100 records/s until 20 s. Two consumers read 500/s, but producers write 600/s.
+2. Read the second row of chips. With the range assignor, 3 partitions move to other consumers. With **eager** rebalancing, all 6 partitions stop for 3 s, and the lag peaks at 3800.
+3. Select **sticky** and **cooperative**. Only 2 partitions move, only they stop, and the peak falls to 2600. The lag is gone by 33 s instead of 48 s.
+4. Turn on the crash. The crashed consumer's partitions are not read for 45 s, until the session timeout expires. Then they move, and the lag peaks at 6300.
+5. Set 8 consumers. Two are idle, as the Predict said.
+
+A **rebalance** moves partitions between consumers. The original protocol was **eager**: every consumer gave up all its partitions, and the group waited for a new plan. Kafka 2.4 added **incremental cooperative** rebalancing (KIP-429): consumers keep partitions that do not move. Since Kafka 3.0, the default `partition.assignment.strategy` is `[RangeAssignor, CooperativeStickyAssignor]`. Kafka 4.0 made a new protocol generally available (KIP-848), in which the broker computes assignments. Consumers opt in with `group.protocol=consumer`.
+
+A crashed consumer is found by missed heartbeats. In the classic protocol, `session.timeout.ms` is 45 s by default. A short timeout finds crashes fast but causes rebalances after a long garbage-collection pause. This is the trade-off from the [failure detectors lesson](/distributed/foundations/failure-detectors).
+
+## Replication: leader, followers and the ISR
+
+Each partition has a **replication factor**, often 3. One replica is the **leader**: it takes all writes. The others are **followers**: they send fetch requests to the leader and append what they get. Kafka uses a pull design, so a follower's fetch offset also tells the leader how far that follower has come.
+
+The leader keeps the **in-sync replica set (ISR)**. A follower leaves the ISR if it has not caught up to the leader's log end within `replica.lag.time.max.ms`. That is 30 s by default since Kafka 2.5, raised from 10 s by KIP-537. A follower that catches up joins again.
+
+The **high watermark (HW)** is the offset after the last record that every ISR member has. Records below the HW are **committed**, and only committed records are given to consumers. A follower learns the HW from the leader's fetch responses.
+
+```rust
+/// The leader's high watermark: the smallest log end offset in the ISR (the leader included).
+/// Offsets below it are on every in-sync replica, so any ISR member can become leader without losing them.
+fn high_watermark(isr: &[BrokerId], leo: &HashMap<BrokerId, u64>) -> u64 {
+    isr.iter().map(|b| leo[b]).min().unwrap_or(0)
+}
+```
+
+## acks, min.insync.replicas and unclean election
+
+A producer chooses when a write counts as done with `acks`:
+
+| `acks` | The leader answers | A record is lost if |
+|---|---|---|
+| `0` | never (the producer does not wait) | anything goes wrong |
+| `1` | after its own append | the leader dies before a follower copies it |
+| `all` | when the record is below the HW | every ISR member dies (or an unclean election) |
+
+`acks=all` is the producer default since Kafka 3.0 (KIP-679); before that, the default was 1. But `acks=all` waits only for the *current* ISR. If the ISR has shrunk to the leader alone, "all" means one copy. The broker setting `min.insync.replicas` (default 1) closes that gap. With `acks=all`, the leader refuses a write while the ISR is smaller than this number. The error is `NotEnoughReplicas`, or `NotEnoughReplicasAfterAppend` if the ISR shrank while the write waited.
+
+When the leader dies, the controller picks a new leader from the ISR. If no ISR member is alive, it has two choices. It can wait for an ISR member to come back, so the partition is offline. Or, with `unclean.leader.election.enable=true`, it can pick any live replica and lose what that replica never had. The default has been `false` since Kafka 0.11.0 (KIP-106).
+
+<Predict
+  id="isr-acks1"
+  question="acks=1. Both followers pause for 40 ms, short enough to stay in the ISR. Then the leader crashes, and the controller picks a follower from the ISR. Are acknowledged records lost?"
+  options={["No: the new leader came from the ISR, so it has every acknowledged record", "Yes: the records the leader acknowledged during the pause", "Yes: all 20 records"]}
+  answer={1}
+  explain="ISR membership means 'caught up recently', not 'has every record'. With acks=1 the leader confirmed records 8 and 9 that no follower had fetched. A clean election still loses them. With acks=all, those records would not have been confirmed."
+>
+<IsrReplicationDemo />
+</Predict>
+
+1. Play the default run. Broker 1 confirms records 8 and 9, crashes, and broker 2 leads without them. Two acknowledged records are lost.
+2. Select `acks=all`. No acknowledged record is lost. The price: 8 records are refused while the ISR has only one member.
+3. Select a 100 ms pause and `min.insync.replicas` = 1. The followers leave the ISR, and the leader alone confirms records. When it crashes, no ISR member is alive: the partition is offline until broker 1 restarts. Nothing is lost.
+4. Now turn on unclean election. Broker 2 leads without records 5 to 9. Five acknowledged records are lost, and consumers had already read them.
+5. Select `acks=all`, set `min.insync.replicas` = 2 and keep unclean election on. No acknowledged record is lost, because the leader refused to confirm. But consumers read records 5 to 8, which then vanish.
+
+The rule that the property test checks: with `acks=all`, `min.insync.replicas` ≥ 2 and no unclean election, a single crash never loses an acknowledged record. A confirmed record is on at least 2 replicas and on every ISR member. Any new leader comes from the ISR. Replication factor 3 with `min.insync.replicas=2` is the usual production choice, because it survives one broker down without refusing writes.
+
+After a leader change, an old leader that comes back may hold records that the new leader never had. It must cut its log to match. Kafka once truncated to the high watermark, which could lose or diverge data in rare cases. KIP-101 added **leader epochs**: a follower asks where its last epoch ended in the leader's log and truncates there. The sim uses the same idea.
+
+## Retention, compaction and KRaft
+
+Each topic has a `cleanup.policy`. With `delete`, segments older than the retention time are removed: `log.retention.hours` is 168, one week, by default. With `compact`, Kafka keeps at least the latest record for each key and removes older ones. A compacted topic is a table in log form. A new reader can rebuild the latest state of every key from it. Kafka Streams stores its state changes this way.
+
+A Kafka cluster needs metadata: which brokers exist, which replica leads each partition, and the ISRs. For years this lived in ZooKeeper. KIP-500 replaced it with **KRaft**, a Raft quorum of controller nodes that keeps the metadata in a Kafka log. KRaft became production-ready for new clusters in Kafka 3.3.1 (KIP-833). Kafka 4.0, released in March 2025, is the first major release that runs without ZooKeeper.
+
+## Connect
+
+- [Raft log replication](/distributed/consensus/raft-log-replication): a majority quorum, where Kafka uses the ISR.
+- [Leader-follower replication](/distributed/replication/leader-follower): synchronous and asynchronous followers and failover.
+- [Rebalancing](/distributed/partitioning/rebalancing): moving partitions between nodes at the storage level.
+- [Exactly-once semantics](/distributed/data-systems/exactly-once-semantics): idempotent producers and transactions on top of this log.
+
+<Recall cards={[
+  { q: "Why can a consumer group not use more consumers than partitions?", a: "Each partition goes to exactly one consumer in the group, to keep per-partition order. Extra consumers get nothing." },
+  { q: "Define the ISR and the high watermark.", a: "The ISR is the set of replicas that caught up to the leader's log end recently, within replica.lag.time.max.ms. The HW is the offset after the last record that every ISR member has; only records below it go to consumers." },
+  { q: "Why can acks=1 lose an acknowledged record even with a clean election?", a: "The leader confirms after its own append. If it dies before any follower fetches the record, the new leader from the ISR does not have it." },
+  { q: "What does min.insync.replicas add to acks=all?", a: "A floor on the ISR size. With fewer in-sync replicas, the leader refuses acks=all writes (NotEnoughReplicas), so a confirmed record is always on at least that many replicas." },
+  { q: "What is the trade-off of unclean leader election?", a: "Availability against data. The partition gets a leader at once, but committed records that the new leader lacks are lost, even ones that consumers read." },
+  { q: "What does log compaction keep, and what is it for?", a: "At least the latest record for each key. It turns a topic into a table that a new reader can rebuild by replaying it." },
+]} />

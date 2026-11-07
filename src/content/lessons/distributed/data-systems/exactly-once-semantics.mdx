@@ -1,0 +1,150 @@
+---
+summary: "At-most-once, at-least-once and exactly-once: why exactly-once delivery is impossible but exactly-once effects are not, Kafka's idempotent producer (producer id, epoch, sequence numbers) and transactions with read_committed consumers, and end-to-end exactly-once with idempotent or two-phase-commit sinks."
+---
+import { PipelineCrashDemo, IdempotentProducerDemo } from "@/demos/dist/DataSysEosDemos";
+
+A pipeline reads payments from a log, processes them, and adds each amount to an account in a database. The processor can crash, and the network can lose a request or its answer. After a crash, each payment must change the balance exactly once: not zero times and not twice. Vendors call this "exactly-once". The term is easy to misread, so this lesson starts with what it can and cannot mean.
+
+## Three guarantees
+
+- **At-most-once**: each record has its effect zero or one times. Send without retry, or move the position before doing the work. A crash can lose a record.
+- **At-least-once**: each record has its effect one or more times. Do the work, then move the position, and retry until an acknowledgement comes. A crash or a lost acknowledgement can repeat a record.
+- **Exactly-once**: each record has its effect exactly once, under crashes and retries.
+
+Exactly-once **delivery** is impossible over an unreliable network. A sender that gets no acknowledgement cannot tell a lost message from a lost acknowledgement. This is the problem of the [two generals](/distributed/foundations/the-network-model-messages-delays-and-partitions). If it resends, the receiver may get two copies. If it does not resend, the receiver may get none.
+
+What is possible is exactly-once **processing**, or exactly-once **effects**. Messages can still arrive twice, but the second copy changes nothing.
+
+There are two ways to make a repeat harmless. One is to make the effect **idempotent**: apply it in a way that a second application leaves the result the same. The other is to make the effect and the record of progress **atomic**: one transaction holds both, so they happen together or not at all. Real systems use both.
+
+## A pipeline with crash points
+
+The processor below does two writes per record. With at-most-once it commits the offset, then sends the effect once. With at-least-once it applies the effect, then commits the offset. With exactly-once, one sink transaction applies the effect and stores the next offset. On restart, it reads its position from the sink, and the sink skips a record that it already applied.
+
+<Predict
+  id="pipe-crash"
+  question="The processor crashes right after its first write for record 2 and restarts. Which modes give a wrong balance?"
+  options={["Only at-most-once", "At-most-once and at-least-once, in opposite directions", "None: the restart reads the committed offset"]}
+  answer={1}
+  explain="At-most-once had committed offset 3 but not applied the effect: record 2 is lost, and the balance is 180 instead of 210. At-least-once had applied the effect but not committed: record 2 runs again, and the balance is 240. Exactly-once wrote both in one transaction, so the balance is 210."
+>
+<PipelineCrashDemo />
+</Predict>
+
+1. Read the table for the default crash: one lost effect, one duplicate, and one correct run.
+2. Click **after read** for r4, as a second crash. No mode changes: a crash before any write only repeats the read.
+3. Set **at-least-once** in the diagram and click **after 2nd sent** for r3. The commit was already on its way, so the broker stores it, and there is no duplicate.
+4. Click **No crashes** and set the loss to 20%. With no crash at all, at-most-once loses one effect and at-least-once applies 7 extra effects. A lost "ok" leads to a retry.
+5. Keep the loss and select exactly-once in the diagram. Some requests are lost and resent, but every record still shows exactly 1 effect.
+
+The sim ran 300 runs, each with 1 to 3 random crash points and 10% message loss. At-most-once lost 338 effects, and at-least-once duplicated 411. Exactly-once has none of either. The property test checks that exactly-once mode applies each effect exactly once under random crash points.
+
+## Kafka's idempotent producer
+
+The same problem appears one level down, between a producer and a Kafka broker. A producer sends a batch, the broker appends it, and the acknowledgement is lost. The producer retries, and the broker appends the batch a second time. Retries can also reorder batches when several requests are in flight.
+
+KIP-98 ("Exactly Once Delivery and Transactional Messaging", Kafka 0.11.0, June 2017) fixed this with three numbers:
+
+- a **producer id** (PID) that the broker gives to the producer;
+- a **producer epoch**, which grows each time a producer with the same transactional id starts again;
+- a **sequence number** per partition, starting at 0, on every batch.
+
+The broker keeps the last sequence number per producer and partition. A batch with the next number is appended. A batch with an old number is a duplicate. The broker does not append it, and answers with success. A batch that skips a number gets `OutOfOrderSequenceException`. The broker remembers the last 5 batches per producer, so idempotence needs `max.in.flight.requests.per.connection` ≤ 5.
+
+```text
+broker state for (PID 4000, partition 0): last seq = 1, recent = [0 -> offset 0, 1 -> offset 1]
+batch seq 2   -> 2 = last + 1: append at offset 2
+batch seq 0   -> 0 <= last, in recent: duplicate, answer "offset 0", append nothing
+batch seq 4   -> gap after 2: OutOfOrderSequence, the producer resends in order
+```
+
+<Predict
+  id="idem-ack"
+  question="With idempotence on, the broker appends batch 0, and you lose its ack. The producer times out and sends batch 0 again. What does the partition log hold at the end?"
+  options={["Batch 0 twice, then batches 1 and 2", "Batches 0, 1 and 2, each once", "Batches 1 and 2 only, because the first copy was rolled back"]}
+  answer={1}
+  explain="The retry carries the same producer id and sequence number 0. The broker sees that 0 is not last + 1 but is in its recent batches, so it answers with the original offset and appends nothing."
+>
+<IdempotentProducerDemo />
+</Predict>
+
+1. Press **Play: lost ack, then retry**. Read the broker's lines: the retry of batch 0 is a duplicate and is not appended.
+2. Turn off `enable.idempotence` and press the same button. The log now holds batch 0 twice.
+3. Press **Reset**, turn idempotence on, and lose batch 0 itself. Deliver batch 1. The broker rejects it as out of order, and both batches are sent again in order.
+4. Do the same with idempotence off. The log ends in the order 1, 2, 0.
+
+`enable.idempotence=true` and `acks=all` became producer defaults in Kafka 3.0. A bug kept the idempotence default from taking effect in 3.0.0 and 3.1.0; it was fixed in 3.0.1, 3.1.1 and 3.2.0. The Confluent post that announced the feature (June 2017) reports that idempotence has a negligible cost in throughput.
+
+## Transactions across partitions
+
+Idempotence covers one producer session and one partition. A stream job does more: it reads input, writes to several output partitions, and commits its input offsets. KIP-98 added **transactions** that make all of these atomic.
+
+- A producer sets a `transactional.id`. `initTransactions()` registers it with a **transaction coordinator**, a broker that keeps state in the internal topic `__transaction_state`. The call raises the epoch, so an older "zombie" instance with the same id is fenced off.
+- The producer calls `beginTransaction()`, sends records to any partitions, and adds its consumer offsets with `sendOffsetsToTransaction()`.
+- `commitTransaction()` makes the coordinator run a two-phase commit. It writes a COMMIT **control marker** into every partition that the transaction touched. `abortTransaction()` writes ABORT markers.
+- A consumer with `isolation.level=read_committed` reads only up to the **last stable offset** (LSO), the first offset of a transaction that is still open. It skips records of aborted transactions. The default is `read_uncommitted`.
+
+```ts
+// The consume-transform-produce loop (Java client names, in TS syntax).
+producer.initTransactions(); // fences an older instance with the same transactional.id
+for (;;) {
+  const records = consumer.poll(100);
+  producer.beginTransaction();
+  for (const r of records) producer.send(transform(r));
+  producer.sendOffsetsToTransaction(nextOffsets(records), consumer.groupMetadata());
+  producer.commitTransaction(); // outputs and input offsets: all or nothing
+}
+```
+
+The cost is small at moderate commit rates. In the Confluent post's test, with 1 KB messages and transactions every 100 ms, producer throughput fell only 3% compared with an in-order at-least-once producer. Kafka Streams wraps this loop behind `processing.guarantee=exactly_once_v2`, the name since Kafka 3.0.
+
+## End to end: idempotent and transactional sinks
+
+Transactions end at the edge of Kafka. A database, a search index or an e-mail service is outside. The [stream processing lesson](/distributed/data-systems/stream-processing) showed that exact state inside the job still sends output twice after a replay. Two designs close the gap.
+
+An **idempotent sink** writes each effect under a key derived from the input, so a replay overwrites instead of adding. A **transactional sink** stores the effect and the input position in one transaction of the external system, as the pipeline above does:
+
+```sql
+-- Idempotent: the (partition, offset) of the source record is the key.
+INSERT INTO credits (src_partition, src_offset, account, amount)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (src_partition, src_offset) DO NOTHING;
+
+-- Transactional: effect and progress commit together; restart reads progress here.
+BEGIN;
+UPDATE accounts SET balance = balance + $amount WHERE id = $account;
+UPDATE progress SET next_offset = $offset + 1 WHERE src_partition = $p AND next_offset = $offset;
+COMMIT;
+```
+
+Flink generalizes the transactional sink with a **two-phase commit sink**. The `TwoPhaseCommitSinkFunction` came in Flink 1.4.0 (December 2017). A Flink blog post by Piotr Nowojski and Mike Winters (February 2018) describes its four methods:
+
+- `beginTransaction` opens a transaction in the external system;
+- `preCommit` flushes it when the checkpoint barrier arrives: this is the vote;
+- `commit` runs only after the job manager reports that the whole checkpoint succeeded;
+- `abort` throws the transaction away on failure.
+
+The current `KafkaSink` with `DeliveryGuarantee.EXACTLY_ONCE` needs a `transactionalIdPrefix`. Its transaction timeout is 1 hour by default. The broker caps transactions with `transaction.max.timeout.ms`, 15 minutes by default, so one of the two settings must change. The Flink docs warn that the timeout must be much longer than the maximum checkpoint duration plus the restart time, or data can be lost. Output also becomes visible to `read_committed` readers only at each checkpoint, so the checkpoint interval adds latency.
+
+| Guarantee | How | Fails when |
+|---|---|---|
+| at-most-once | commit first, no retry | any crash between the two steps, or any loss |
+| at-least-once | effect first, retry until acked | crash after the effect, or a lost ack |
+| exactly-once, idempotent sink | dedup by source key | the key is not stable, or the dedup table expires |
+| exactly-once, transactional | effect and offset in one transaction | the sink has no transactions, or a transaction times out |
+
+## Connect
+
+- [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency): idempotency keys for a single request.
+- [Two-phase commit](/distributed/transactions/two-phase-commit): the protocol inside Kafka transactions and Flink's sink.
+- [Distributed logs](/distributed/data-systems/distributed-logs): acks and the ISR, under the idempotent producer.
+- [Stream processing](/distributed/data-systems/stream-processing): the checkpoints that define when a two-phase sink commits.
+
+<Recall cards={[
+  { q: "Why is exactly-once delivery impossible, and what is possible instead?", a: "A sender cannot tell a lost message from a lost acknowledgement, so it must risk a duplicate or a loss. Exactly-once effects are possible: duplicates arrive, but they change nothing." },
+  { q: "In which order do at-most-once and at-least-once do their two writes, and what does a crash between them cause?", a: "At-most-once commits the offset, then does the effect: a crash loses the effect. At-least-once does the effect, then commits: a crash repeats it." },
+  { q: "What three values make a Kafka producer idempotent, and what does the broker do with a duplicate?", a: "A producer id, an epoch, and a sequence number per partition. For an old sequence number in its recent batches, the broker appends nothing and answers with the original offset." },
+  { q: "Why must max.in.flight.requests.per.connection be at most 5 with idempotence?", a: "The broker remembers only the last 5 batches per producer and partition, so it can recognize duplicates only among those." },
+  { q: "What does read_committed change for a consumer?", a: "It reads only up to the last stable offset and skips records of aborted transactions. So it never sees output of an open or aborted transaction." },
+  { q: "Name the four methods of Flink's two-phase commit sink and when commit runs.", a: "beginTransaction, preCommit, commit, abort. preCommit runs at the barrier; commit runs only after the whole checkpoint is complete." },
+]} />

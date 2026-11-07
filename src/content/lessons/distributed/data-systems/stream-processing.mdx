@@ -1,0 +1,117 @@
+---
+summary: "Streams versus batch, event time versus processing time, tumbling, sliding and session windows, watermarks and late data, and fault-tolerant state with checkpoint barriers (Chandy-Lamport, and the aligned form that Flink uses)."
+---
+import { WatermarkDemo, CheckpointBarrierDemo } from "@/demos/dist/DataSysStreamDemos";
+
+A **batch** job reads a finished data set, computes, and stops. A **stream** job runs forever on data that never ends: clicks, payments, sensor readings. It must give answers before all the data is in. So two questions that batch never asks become central. When is a result complete enough to emit? And how does a job that runs for months survive crashes without counting anything twice?
+
+The [log lesson](/distributed/data-systems/distributed-logs) gave the input: a partitioned, replayable log. This lesson builds the processor on top of it. The ideas come from Google's MillWheel (VLDB 2013) and the Dataflow Model (Akidau et al., VLDB 2015). Apache Flink, Kafka Streams and Apache Beam implement them.
+
+## Event time and processing time
+
+Every record has two times. **Event time** is when the event happened, as the device recorded it. **Processing time** is when the stream job sees it. They differ by network delay, retries, batching, and phones that were offline for an hour. Records also arrive out of order. So a question such as "how many payments per minute?" must say which minute it means.
+
+A **window** groups records by event time:
+
+- **tumbling**: fixed, non-overlapping intervals, for example each whole minute;
+- **sliding** (Flink) or **hopping** (Kafka Streams): fixed size with a smaller step, so windows overlap and one record falls into several;
+- **session**: per key, a window that grows while events come closer together than a **gap**, and closes after a quiet gap.
+
+## Watermarks
+
+A window for 12:00 to 12:01 cannot wait forever for stragglers. A **watermark** is the job's statement that no event older than a time $W$ is still to come. A window $[s, e)$ fires when $W \ge e$. The simplest watermark trusts a fixed bound on disorder, the **bounded out-of-orderness** delay $d$:
+
+$$
+W = \max(\text{event time seen so far}) - d
+$$
+
+Flink's `BoundedOutOfOrdernessWatermarks` computes exactly this, minus 1 ms. A job with several inputs takes the minimum of their watermarks, so one slow input holds back every window.
+
+An event that arrives after its window fired is **late**. The job can drop it, send it to a side output (Flink's `sideOutputLateData`), or update the result if it is within an **allowed lateness**. Flink's allowed lateness is 0 by default. Kafka Streams calls this the **grace period**. Since Kafka 3.0 it has no default, so each window must state it.
+
+<Predict
+  id="wm-delay"
+  question="Events usually take 20 to 80 ms, but stragglers take seconds. The watermark delay is 200 ms. What happens to a straggler that arrives 2 s after it happened?"
+  options={["It is counted in its window, because the window waits for it", "Its window already fired; the event is dropped and the result stays wrong", "The watermark moves back to include it"]}
+  answer={1}
+  explain="The watermark passed the end of its window long ago, so the window fired without it. With no allowed lateness, the event is dropped. In the demo, a 200 ms delay drops 4 events and leaves 3 of 8 windows wrong."
+>
+<WatermarkDemo />
+</Predict>
+
+1. Read the plot. Blue dots near the diagonal are on time. Red dots far to the right of the diagonal are stragglers that came after the orange watermark passed their window.
+2. Raise the delay to 1000 ms. Two events are still dropped. The mean wait after a window ends grows from 321 ms to 1092 ms.
+3. Raise it to 2000 ms. The delay now covers the worst disorder in this input (2019 ms), and every window equals the batch answer. The price is a wait of 2094 ms.
+4. Go back to 200 ms and set the allowed lateness to 1000 ms. Every window is right again. Results come early, and 4 windows are corrected later.
+5. Try sliding and session windows. A dropped event changes every window that it belongs to. In session windows, it can split one session into two.
+
+The trade-off is plain. A short delay gives fast results that may be wrong. A long delay gives right results late. Allowed lateness gives both, but then a result is not final when it first appears, and downstream systems must accept updates. The Dataflow paper calls the rule for when to emit and re-emit a **trigger**.
+
+A heuristic watermark can never be perfect for real data. But one half can be proved, and a property test pins it. When the delay is at least the largest disorder in the input, every streaming result equals the batch result.
+
+## State and why it must survive
+
+A window count, a join buffer or a running total is **state**. A job may hold gigabytes of it, spread over many parallel tasks. If a task crashes, the job must restore the state and continue reading the input from a matching position. "Matching" is the hard part. The restored state must contain exactly the records before that position: no more and no less.
+
+Chandy and Lamport solved this in "Distributed Snapshots: Determining Global States of Distributed Systems" (ACM TOCS, 1985). Their algorithm records a consistent global state while the system runs. It needs FIFO channels:
+
+- An initiator records its state and sends a **marker** on each outgoing channel, before any further message.
+- A process that receives its first marker records its state and sends markers on all its outgoing channels.
+- For every other incoming channel, it records the messages that arrive after its own snapshot and before that channel's marker. They are the state of that channel.
+
+## Barriers in Flink
+
+Carbone, Fóra, Ewen, Haridi and Tzoumas adapted this to dataflows in "Lightweight Asynchronous Snapshots for Distributed Dataflows" (2015). That paper is the basis of Flink's checkpoints. The marker is a **barrier** that flows in line with records:
+
+1. The coordinator (the JobManager) asks every source for checkpoint $n$. Each source records its read offset and emits barrier $n$.
+2. An operator with several inputs **aligns** them. When barrier $n$ comes on one input, it stops reading that input and buffers what follows. When barrier $n$ has come on every input, it records its state, forwards the barrier and reads on.
+3. Each task acknowledges with a handle to its state. Checkpoint $n$ is complete when every task has done so.
+4. On a failure, every task restarts from the last complete checkpoint. Sources seek back to the recorded offsets and replay.
+
+Alignment means that the state never contains a record from after the barrier. So on an acyclic graph, no channel state needs to be stored. Only operator state and source offsets are stored.
+
+<Predict
+  id="ck-sink"
+  question="Barriers are aligned. Operator C crashes at 100 ms, and the job restarts from checkpoint 1. Afterwards, are C's counts exact, and does the sink see each record once?"
+  options={["Both: the checkpoint makes the whole job exactly-once", "C's counts are exact, but the sink sees some records twice", "C's counts are too high, and the sink is correct"]}
+  answer={1}
+  explain="Restored state plus replay gives exact state inside the job: 16 and 6. But C had already sent records after checkpoint 1 to the sink, and the replay sends them again. The sink gets 6 records twice. The sink is outside the snapshot."
+>
+<CheckpointBarrierDemo />
+</Predict>
+
+1. Step through the default run. Barrier 1 from B reaches C first, and C blocks input B. Records from B wait in the buffer until barrier 1 from A arrives.
+2. Step to the crash and the restart. A rewinds to offset 6, B to offset 2, and C restores the counts 6 and 2. The final counts are 16 and 6, which is exact.
+3. Select **alignment skipped**. This is Flink's at-least-once mode, not an unaligned checkpoint. C counts record b3, which came after B's barrier, before it records its state. After the restart, B replays b3, and the final count for B is 7: one record is counted twice.
+4. Move the crash to 250 ms. Checkpoint 3 is already complete, so nothing is replayed and the sink sees no duplicates.
+5. In every aligned run, look at the sink. Its duplicates are the topic of the [next lesson](/distributed/data-systems/exactly-once-semantics).
+
+Alignment has a cost. While an operator waits for the slow input's barrier, the fast input is blocked. Under backpressure, barriers wait behind full buffers, and checkpoints become slow. Since Flink 1.11, checkpoints can be **unaligned**. The barrier overtakes buffered records, and those in-flight records are stored as part of the checkpoint, the "channel state" of Chandy and Lamport. Flink's at-least-once mode skips alignment, which gives exactly the double count of step 3.
+
+| Mode | Blocks inputs | Stores in-flight data | State after recovery |
+|---|---|---|---|
+| aligned (default) | yes | no | exact |
+| unaligned | no | yes | exact |
+| at-least-once | no | no | may count records twice |
+
+Large state makes snapshots expensive, so Flink with RocksDB can make **incremental** checkpoints that upload only the changed files. The [checkpoints lesson in databases](/databases/recovery/checkpoints) solves the same problem for one machine.
+
+## Joins on streams
+
+A join of two unbounded streams needs a bound, or its state grows forever. A **window join** matches records of both streams in the same window. An **interval join** matches a record with records of the other stream in a time range. An example is a payment within 10 minutes after its order. A **stream-table join** looks up the current value of a key in a table, often a compacted topic. In each case, the watermark tells the job when it can drop buffered records that can no longer match.
+
+## Connect
+
+- [Distributed logs](/distributed/data-systems/distributed-logs): the replayable input that makes rewind and replay possible.
+- [Exactly-once semantics](/distributed/data-systems/exactly-once-semantics): extending exactly-once state to exactly-once effects at the sink.
+- [Lamport clocks](/distributed/time/lamport-clocks): ordering events without a global clock, the problem behind consistent snapshots.
+- [Physical clocks and drift](/distributed/time/physical-clocks-and-drift): why event times from devices are not fully trustworthy.
+
+<Recall cards={[
+  { q: "What is a watermark, and when does a window fire?", a: "A watermark W is the job's claim that no event older than W will still arrive. A window [s, e) fires when W reaches e." },
+  { q: "Give the bounded out-of-orderness watermark, and its trade-off.", a: "W = largest event time seen − d. A small d gives fast but possibly wrong results; a d at least as large as the real disorder gives right results later." },
+  { q: "Name three things a job can do with a late event.", a: "Drop it, send it to a side output, or update the window's result if it is within the allowed lateness (grace period)." },
+  { q: "Why does an operator with two inputs block one input during barrier alignment?", a: "So that its snapshot contains only records from before the barrier on every input. Then no channel state is needed, and replay after a restore counts nothing twice." },
+  { q: "What do unaligned checkpoints store, and what do they avoid?", a: "They store the in-flight records that the barrier overtook. They avoid blocking inputs, so checkpoints stay fast under backpressure." },
+  { q: "Why does an exact checkpoint not make the sink exactly-once?", a: "The sink is outside the snapshot. Output sent after the last checkpoint is sent again during replay, unless the sink is transactional or idempotent." },
+]} />

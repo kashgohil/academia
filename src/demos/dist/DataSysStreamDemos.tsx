@@ -86,7 +86,7 @@ export function WatermarkDemo() {
 
 const CKP = {
   crashAt: range({ label: "C crashes at", min: 60, max: 300, step: 5, default: 100, format: (v) => `${v} ms` }),
-  aligned: seg<"yes" | "no">("Barrier alignment", [["yes", "aligned (exactly-once state)"], ["no", "not aligned (at-least-once)"]], "yes"),
+  aligned: seg<"yes" | "no">("Barrier alignment", [["yes", "aligned (exactly-once state)"], ["no", "alignment skipped (at-least-once)"]], "yes"),
 };
 
 export function CheckpointBarrierDemo() {

@@ -1,0 +1,172 @@
+---
+summary: "Epidemic dissemination (push, pull, push-pull) and why it takes O(log n) rounds, anti-entropy versus rumor mongering, and SWIM membership with ping-req, suspicion and piggybacked updates, as HashiCorp memberlist runs it with Lifeguard."
+---
+import { GossipSpreadDemo, SwimDemo } from "@/demos/dist/DataSysGossipDemos";
+
+A cluster of 1000 nodes must spread news: a new configuration, a schema change, the fact that node 17 is dead. A broadcast from one node costs that node 999 messages and fails if it crashes halfway. A tree is fragile in the same way. **Gossip** takes another path: every node talks to a few random peers, often, and the news spreads like an infection. No node is special, the load per node is constant, and lost messages do not matter much.
+
+Demers and colleagues at Xerox PARC described this family of protocols in "Epidemic Algorithms for Replicated Database Maintenance" (PODC 1987). They needed it for the Clearinghouse name service. They also borrowed the words of epidemiology. A node is **susceptible** if it does not have the update. It is **infective** if it has the update and spreads it, and **removed** if it has it but no longer spreads it.
+
+## Push, pull and push-pull
+
+In each **round** every node picks a random peer. The **fanout** is the number of peers per round. Three styles of exchange exist:
+
+- **push**: an infective node sends the update to its peer.
+- **pull**: every node asks its peer for news, and an infective peer answers with the update.
+- **push-pull**: the two nodes exchange state, so the update moves in whichever direction it is missing.
+
+<Predict
+  id="gossip-rounds"
+  question="1024 nodes use push with fanout 1. One node has the rumor. About how many rounds pass before every node has it?"
+  options={["About 10, because each round doubles the informed nodes and $\log_2 1024 = 10$", "About 18", "About 500: half the nodes must be contacted one by one"]}
+  answer={1}
+  explain="Doubling holds only at the start. At the end, most pushes hit nodes that already know, and the last few nodes take many rounds to hit. The sim measures a mean of 18.1 rounds over 1000 seeds, close to $\log_2 n + \ln n = 16.9$."
+>
+<GossipSpreadDemo />
+</Predict>
+
+1. Press **Play** with the defaults (64 nodes, push). Orange nodes learn the rumor in this round, and the orange lines show who told them. Watch the fast middle and the slow tail.
+2. Select **push-pull**. The same 64 nodes finish in fewer rounds. In the plot, push-pull follows the green $\log_3 n$ line, and push follows the grey $\log_2 n + \ln n$ line.
+3. Set the loss to 20%. All modes still finish, a few rounds later. A lost message is just one contact that did not happen.
+4. Set fanout to 2 with push. The rounds drop, because each node infects two peers per round.
+5. Select push and set rumor mongering to stop after 1 useless contact. Some nodes never learn the rumor. Try 2 and 3.
+
+## Why it takes log n rounds
+
+Let $s_r$ be the fraction of nodes that are still susceptible after round $r$, in a large cluster with fanout 1 and no loss.
+
+<Steps>
+
+**Start.** While few nodes know, each push almost always hits a susceptible node. The number of informed nodes roughly doubles per round, so reaching $n/2$ takes about $\log_2 n$ rounds.
+
+**Push end game.** A susceptible node stays susceptible if none of the $n(1 - s_r)$ pushes hits it. Each push misses it with probability $1 - 1/n$, so $s_{r+1} = s_r (1 - 1/n)^{n(1 - s_r)} \approx s_r e^{-1}$ when $s_r$ is small. The tail shrinks by a factor of e per round, which adds about $\ln n$ rounds.
+
+**Pull end game.** A susceptible node stays susceptible only if the peer it asks is also susceptible: $s_{r+1} = s_r^2$. The tail squares each round. From 1% susceptible, one round leaves 0.01% and the next leaves $10^{-8}$.
+
+**Push-pull.** Push is fast at the start and pull is fast at the end. Combined, the count roughly triples per round in the middle, and the tail collapses quadratically.
+
+</Steps>
+
+Pittel (1987) showed that push needs $\log_2 n + \ln n + O(1)$ rounds, and Demers et al. cite that result. Karp, Schindelhauer, Shenker and Vöcking ("Randomized Rumor Spreading", FOCS 2000) showed that push-pull needs $\log_3 n + O(\log \log n)$ rounds. They also showed that, with a good rule for when to stop, only $O(n \log \log n)$ messages are needed in total.
+
+| Exchange, 1024 nodes, fanout 1 | Mean rounds (sim) | Worst of 1000 runs | Classic estimate |
+|---|---|---|---|
+| push | 18.1 | 26 | $\log_2 n + \ln n = 16.9$ |
+| push-pull | 8.2 | 10 | $\log_3 n = 6.3$, plus $O(\log \log n)$ |
+
+In the sim, push-pull reached every node within $\lceil \log_3 n \rceil + 3$ rounds in all 1000 runs, for each $n$ from 16 to 1024. Rounds grow with log n. From 16 to 1024 nodes, 64 times more, the push-pull mean grows only from 3.7 to 8.2 rounds. With 20% loss, push-pull at 1024 nodes needs a mean of 12.0 rounds instead of 8.2.
+
+## Anti-entropy and rumor mongering
+
+Demers et al. compared two ways to run an epidemic. In **anti-entropy**, every node exchanges its whole state (or a digest of it) with a random peer, forever. It always converges, but each exchange costs a comparison of two replicas. The [Merkle tree lesson](/distributed/replication/anti-entropy-and-merkle-trees) shows how to make that comparison cheap. In **rumor mongering**, a node spreads a new update only while it is "hot". It stops after it meets peers that already know.
+
+The stopping rule makes rumor mongering cheap, but it can stop too early. With push, fanout 1 and the rule "stop after k contacts that already knew", the sim gives these results for 1024 nodes:
+
+| k | Nodes that never learn (residue) | Messages per node |
+|---|---|---|
+| 1 | 20.5% | 3.2 |
+| 2 | 6.0% | 5.6 |
+| 3 | 2.0% | 7.8 |
+| 4 | 0.79% | 9.9 |
+
+The residue falls about exponentially with k, but it is never zero. So real systems combine both. Rumor mongering spreads updates fast, and a slow anti-entropy pass repairs what it missed. HashiCorp memberlist, for example, piggybacks updates on its probes and also syncs its full state with one random node every 30 s.
+
+## Membership: SWIM
+
+A failure detector in which every node sends heartbeats to every other node costs $O(n^2)$ messages per interval. At 1000 nodes that is a million messages each period. **SWIM** (Das, Gupta and Motivala, DSN 2002) keeps the load per member constant. Each member checks one random member per **protocol period** $T$:
+
+1. Send `ping` to the target and wait a timeout for an `ack`.
+2. If no ack came, send `ping-req` to $k$ other random members. Each of them pings the target and forwards any ack.
+3. If no ack came by the end of the period, the target failed this probe.
+
+The target is chosen from a shuffled list, round robin, so each member is probed at least once in a bounded time. The paper shows that successive probes of a member by one prober are at most $2n - 1$ periods apart. Expected detection takes about $e/(e - 1) \approx 1.6$ periods.
+
+<Predict
+  id="swim-slow"
+  question="Member 3 is slow: every message it sends waits an extra 300 ms on average (an exponential delay). The ack timeout is 500 ms and the period is 1 s. With direct pings only (k = 0), how many probes of live members fail in 300 s?"
+  options={["Never, because the mean delay is shorter than the timeout", "A few times", "About 100 times"]}
+  answer={2}
+  explain="The delay has a long tail, so some acks come after the timeout. The sim counts 103 false suspicions in 300 s with k = 0, and none with k = 3. Each helper is another chance to get an ack before the period ends."
+>
+<SwimDemo />
+</Predict>
+
+1. Start with the defaults: member 3 is slow and k = 3. The rows stay grey: nobody suspects member 3. Move **Probe shown** to see a probe that ping-req rescued.
+2. Set k to 0. Orange spans appear: members suspect member 3, and member 3 refutes the suspicion. In 300 s there are 103 false suspicions.
+3. Keep k = 0 and turn off **Suspicion**. Live members are now declared dead at once, 608 times in 300 s.
+4. Select **healthy** and set the loss to 5%. Compare the measured failed probes with the formula: 244 against 234 for k = 0, and 2 against 1.5 for k = 3.
+5. Select **crashed**. The first suspicion comes 1.9 s after the crash, and every member marks it dead 6.8 s after the crash. Most of that is the 4 s suspicion timeout.
+
+## Suspicion, incarnations and piggybacking
+
+A failed probe is weak evidence, because the prober may be slow itself, or one link may be bad. So SWIM adds a **suspicion** state between alive and dead. The prober spreads `suspect(M, i)`, where `i` is M's **incarnation number**. If M is alive, it soon hears that it is suspected. Only M can increment its own incarnation, so it spreads `alive(M, i + 1)`, which overrides the suspicion. If no refutation comes within the suspicion timeout, the suspicion becomes `confirm` (dead).
+
+The order of precedence is short. `alive(M, j)` overrides `suspect(M, i)` if $j > i$. `suspect(M, j)` overrides `alive(M, i)` if $j \ge i$. A confirm overrides everything.
+
+These updates do not get their own messages. Each member keeps a buffer of recent updates and attaches a few of them to every ping, ack and ping-req that it sends. This is **piggybacking**. An update reaches all members in $O(\log n)$ periods, by the same epidemic math as above, with no extra packets.
+
+The cost per member stays constant. In the sim, a healthy group of 8 sends 2.06 messages per member per period. These are a ping, an ack and a share of the state syncs. With a slow member and k = 3, it sends 2.64, because of the ping-req traffic.
+
+## Lifeguard and memberlist
+
+HashiCorp's **memberlist** is a Go library that implements SWIM. The Lifeguard paper names Consul, Nomad and Serf as tools that use it. Its LAN defaults:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ProbeInterval` | 1 s | the protocol period |
+| `ProbeTimeout` | 500 ms | wait for a direct ack |
+| `IndirectChecks` | 3 | k, the ping-req helpers |
+| `SuspicionMult` | 4 | suspicion timeout, scaled by log n and the period |
+| `GossipInterval`, `GossipNodes` | 200 ms, 3 | extra gossip of updates, outside probes |
+| `PushPullInterval` | 30 s | full-state sync with one random node (anti-entropy) |
+
+The Lifeguard authors observed that many false positives start at a slow *prober*, not at a slow target. A member starved of CPU handles acks late and accuses healthy peers. **Lifeguard** (Dadgar, Phillips and Currey, arXiv 2017) adds local health awareness:
+
+- **Local Health Aware Probe**: a member counts its own failed probes and missed nacks in a Local Health Multiplier. While that count is high, it stretches its own timeouts.
+- **Local Health Aware Suspicion**: the suspicion timeout starts long and shrinks as more members independently confirm the suspicion.
+- **Buddy System**: a member that probes a suspect tells it directly that it is suspected, so it can refute at once.
+
+The paper reports 10 to 100 times fewer false positives than plain SWIM, and more than 50 times fewer on average. The sim in this lesson has a simple form of the third idea, but not the first two.
+
+```go
+// A sketch of one SWIM probe, in the style of memberlist's probeNode.
+func (m *Member) probe(target Node) {
+	if m.ping(target, m.cfg.ProbeTimeout) {
+		return // direct ack
+	}
+	acks := make(chan bool, m.cfg.IndirectChecks)
+	for _, h := range m.randomMembers(m.cfg.IndirectChecks, target) {
+		go func(h Node) { acks <- m.pingReq(h, target) }(h)
+	}
+	deadline := time.After(m.cfg.ProbeInterval - m.cfg.ProbeTimeout)
+	for i := 0; i < m.cfg.IndirectChecks; i++ {
+		select {
+		case ok := <-acks:
+			if ok {
+				return // some helper reached the target
+			}
+		case <-deadline:
+			i = m.cfg.IndirectChecks
+		}
+	}
+	m.broadcast(Suspect{Node: target.Name, Incarnation: target.Incarnation})
+}
+```
+
+Gossip has limits. It gives no order and no agreement: two members can have different views for a while. That is fine for membership and for "who owns which key range". It is not enough to choose one leader or to commit a transaction. For those, use [consensus](/distributed/consensus/raft-leader-election).
+
+## Connect
+
+- [Failure detectors](/distributed/foundations/failure-detectors): heartbeats, timeouts and phi accrual, which SWIM spreads over the cluster.
+- [Anti-entropy and Merkle trees](/distributed/replication/anti-entropy-and-merkle-trees): the repair pass that rumor mongering needs.
+- [Eventual consistency](/distributed/consistency/eventual-consistency): what gossip guarantees about replicas.
+- [Consistent hashing](/distributed/partitioning/consistent-hashing): the ring that gossiped membership usually feeds.
+
+<Recall cards={[
+  { q: "Why does pull end the epidemic faster than push?", a: "With pull, a susceptible node stays susceptible only if its own peer is susceptible: $s' = s^2$, a quadratic fall. With push, the tail shrinks only by a factor of e per round." },
+  { q: "How many rounds do push and push-pull need for n nodes?", a: "Push: $\\log_2 n + \\ln n + O(1)$ (Pittel). Push-pull: $\\log_3 n + O(\\log \\log n)$ (Karp et al., 2000)." },
+  { q: "What is the residue in rumor mongering, and how do real systems handle it?", a: "The fraction of nodes that never learn an update because spreaders stopped too early. A slow anti-entropy pass repairs it." },
+  { q: "What does ping-req add to a SWIM probe?", a: "After a missed direct ack, k other members ping the target and relay the ack. Each one is an independent path, so a lossy link or a brief stall rarely causes a false suspicion." },
+  { q: "How does a suspected member refute a suspicion, and why can nobody else do it?", a: "It increments its own incarnation number and spreads alive with the new number, which overrides suspect with the older number. Only the member itself increments its incarnation, so a stale alive cannot hide a real failure." },
+  { q: "What problem does Lifeguard address?", a: "False positives caused by a slow prober. The member measures its own health and stretches its timeouts, suspicion timeouts shrink with independent confirmations, and a suspect is told directly." },
+]} />

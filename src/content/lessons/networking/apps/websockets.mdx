@@ -1,0 +1,121 @@
+---
+summary: "WebSockets turn an HTTP request into a full-duplex message channel: an Upgrade handshake proved with SHA-1 and base64, small frames with a 2-byte header, client-side masking that protects proxies from cache poisoning, ping and pong, and backpressure that TCP alone does not give you. Compared with long polling and Server-Sent Events, and run over HTTP/2 with extended CONNECT."
+---
+import { NetAppWsHandshakeDemo, NetAppWsFrameDemo, NetAppBackpressureDemo, NetAppPushDemo } from "@/demos/net/NetAppWsDemos";
+
+HTTP is request-response: the server speaks only when the client asks. Chat, live prices, games and collaborative editors need the server to send at any time. Before 2011, browsers faked this with **long polling**: the client sends a request, and the server holds it open until it has something to say. A **WebSocket** (RFC 6455, December 2011) gives a real full-duplex channel instead. It starts as an HTTP request on port 80 or 443 and then becomes a stream of messages in both directions.
+
+## The opening handshake
+
+The client sends an ordinary GET with `Upgrade: websocket` and `Connection: Upgrade`. It adds `Sec-WebSocket-Key`, 16 random bytes in base64, and `Sec-WebSocket-Version: 13`. A server that agrees answers `101 Switching Protocols`. From then on, the bytes on the TCP connection are WebSocket frames, not HTTP.
+
+The server must prove that it understood the request. It appends the fixed GUID `258EAFA5-E914-47DA-95CA-C5AB0DC85B11` to the key, takes the SHA-1 digest, and returns it in base64 as `Sec-WebSocket-Accept`. The proof is not about secrecy. It shows that the server is a WebSocket server, and not an HTTP server or cache that echoed the request by accident.
+
+<NetAppWsHandshakeDemo />
+
+1. The default key is the example of RFC 6455 section 1.3. The 60-byte string hashes to `b3 7a 4f 2c …`, and the accept value is `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`, as in the RFC.
+2. Press **New random key**. Every bit of the accept value changes: a server cannot reuse an old answer.
+3. Edit the key so that it is not 16 bytes of base64. A server must reject it.
+4. Turn on HTTP/2. RFC 8441 runs the WebSocket on one HTTP/2 stream with an **extended CONNECT**. The server first allows it with `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x8) = 1. There is no key and no accept value: the `:protocol` pseudo-header replaces them.
+
+The sim computes SHA-1 with a short TypeScript function that follows FIPS 180-4, and a test checks it against the RFC example. A sketch of the same check in Go:
+
+```go
+func accept(key string) string {
+	h := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+	return base64.StdEncoding.EncodeToString(h[:])
+}
+```
+
+## Frames
+
+After the handshake, each side sends **frames**. A message can span several frames; the FIN bit marks the last one. The header is small:
+
+| Field | Bits | Meaning |
+|---|---|---|
+| FIN | 1 | last frame of the message |
+| RSV1-3 | 3 | for extensions; permessage-deflate (RFC 7692) uses RSV1 |
+| Opcode | 4 | 0 continuation, 1 text (UTF-8), 2 binary, 8 close, 9 ping, 10 pong |
+| MASK | 1 | 1 on every frame from the client |
+| Payload len | 7 | 0 to 125; 126: a 16-bit length follows; 127: a 64-bit length follows |
+| Masking key | 0 or 32 | present when MASK is 1 |
+
+A short server message therefore costs 2 bytes of header, and a short client message 6. **Control frames** (close, ping, pong) carry at most 125 bytes and are never fragmented, so they can go between the frames of a long message. A **close** frame carries a 2-byte status code such as 1000 (normal closure). Either side can send a **ping**, and the other side answers with a **pong** that echoes its payload. Servers use pings to detect dead peers and to keep NAT and proxy state alive. The browser API cannot send pings; the browser answers them on its own.
+
+<Predict
+  id="ws-mask"
+  question="A browser script sends the text of an HTTP request (GET /lib/jquery.js, Host: cdn.example.net) as a WebSocket message. A transparent proxy on the path did not understand the Upgrade and still parses the connection as HTTP. What does the proxy see?"
+  options={["A request for /lib/jquery.js, which it may answer from its cache or cache the reply to", "Random-looking bytes that do not parse as HTTP", "The frame header, which tells it to stop parsing"]}
+  answer={1}
+  explain="The client masks every frame with a fresh random 4-byte key, so the bytes on the wire are the text XOR the key. The script chooses the text, but not the bytes. Unmasked, the proxy would parse the request; this is the attack that led to masking."
+>
+<NetAppWsFrameDemo />
+</Predict>
+
+1. The client frame for `Hello` is 11 bytes: `81 85`, the key `37 fa 21 3d`, and 5 masked bytes. This is the example of RFC 6455 section 5.7.
+2. Press **New masking key**. The payload bytes change; the text does not.
+3. Select 300 bytes, then 70,000 bytes. The 7-bit length becomes 126 with a 16-bit length, then 127 with a 64-bit length.
+4. Select **Attacker's payload** and the server as sender (no mask). The proxy finds a complete request for `/lib/jquery.js` with `Host: cdn.example.net`.
+5. Switch back to the client. The proxy sees noise.
+
+### Why clients mask
+
+Huang, Chen, Barth, Rescorla and Jackson tested early versions of the protocol in "Talking to Yourself for Fun and Profit" (W2SP 2011). Some transparent proxies ignored the Upgrade and kept parsing the connection as HTTP. A script could send bytes that looked like a request for a popular script on another host. The attacker's own server answered it, and the proxy cached that answer for all its users.
+
+Masking removes the attacker's control over the bytes. The browser picks a new random key for each frame, and the script never sees it. The cost is 4 bytes per frame and an XOR, so a server must mask nothing and unmask every client frame. A server must close the connection if a client frame is not masked.
+
+## Backpressure
+
+A WebSocket sits on TCP, and TCP has [flow control](/networking/transport/flow-control). When the client's receive buffer is full, the window closes and the server stops sending. But the server application can still call `send`. The data then waits in the server's own buffers: the browser API calls this `bufferedAmount`, and Node.js's `socket.write` returns false. Nothing stops an application that ignores these signals.
+
+<NetAppBackpressureDemo />
+
+1. The server produces 102 KB/s; the client reads 50 KB/s. The client's 64 KB receive buffer fills first. Then the server's send buffer grows without limit: 193 KB after 5 s. The message the client reads is 2.5 s old.
+2. Turn on backpressure. The server checks its buffer before each send and keeps only the newest message while it is paused. The buffer stays at 16 KB, and 888 messages are replaced by newer ones.
+3. The client still reads data that is 1.55 s old, because its 64 KB receive buffer is full of it. Set the receive buffer to 16 KB: the age falls to 576 ms.
+4. Set the high-water mark to 4 KB as well: 336 ms. Every buffer on the path adds latency: TCP's, the kernel's and the application's.
+5. Raise the read speed above 102 KB/s. Nothing builds up, with or without backpressure.
+
+For live data the newest value is what matters, so dropping or merging old messages is right. For a chat or a file transfer every message matters. The sender must then slow its producer: pause reading from the database, or tell the user. A protocol on top of WebSockets must choose one of these; WebSockets do not choose for it.
+
+## Long polling, Server-Sent Events, WebSockets
+
+**Server-Sent Events** (SSE) are part of the HTML standard. The browser's `EventSource` makes one GET request, and the server answers with `Content-Type: text/event-stream` and never ends the response. Each event is a few lines such as `data: …` and a blank line. The browser reconnects by itself and sends `Last-Event-ID`, so the server can resume. SSE only goes from server to client, and it is plain HTTP, so proxies and HTTP/2 handle it well.
+
+<NetAppPushDemo />
+
+1. At 20 events per second and an 80 ms RTT, SSE and WebSockets deliver each event in 40 ms, the one-way delay. Long polling averages 77 ms and reaches 120 ms at the 99th percentile.
+2. Read the bytes per event: 97 for a WebSocket frame, 109 for an SSE event in a chunk, and 332 for long polling. Each long poll costs a full request and response head.
+3. Lower the rate to 1 event per second. Long polling is now almost as fast, 45 ms on average, but each event costs 573 bytes.
+4. Raise the rate to 100 per second. Long polling batches several events per response, so bytes per event fall, but every batch waits for the next poll.
+
+The model counts 40 bytes of TCP/IP header per packet and no TLS, as model inputs. The event is a 55-byte JSON text. Long polling's delay comes from the gap after each response. The next request needs half an RTT to reach the server, and events in that gap wait.
+
+| | Long polling | SSE | WebSocket |
+|---|---|---|---|
+| Direction | server to client (plus normal requests) | server to client | both |
+| Framing per event | full HTTP response | `data:` lines | 2 to 14 bytes |
+| Reconnection | the client's code | built in, with `Last-Event-ID` | the client's code |
+| Binary data | yes | no (text only) | yes |
+| Over HTTP/1.1 | one of 6 connections per host | one of 6 connections per host | separate limit (Chromium: 255) |
+| Over HTTP/2, HTTP/3 | a stream | a stream | RFC 8441, RFC 9220 |
+
+Choose SSE when only the server pushes, such as notifications or a live feed. Choose WebSockets when both sides talk often, such as games or editors. Long polling remains a fallback for networks that break both.
+
+## Connect
+
+- [HTTP/1.1](/networking/apps/http-1-1): the Upgrade request, the 6-connection limit, and proxies that parse HTTP.
+- [HTTP/2](/networking/apps/http-2): extended CONNECT puts a WebSocket on one stream.
+- [Flow control](/networking/transport/flow-control): the TCP window under backpressure.
+- [Load balancers](/networking/infrastructure/load-balancers): long-lived connections and sticky routing.
+- [Select, poll and epoll](/networking/programming/select-poll-and-epoll): how a server holds a million idle WebSockets.
+- [Queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law): why every buffer on the path adds delay.
+
+<Recall cards={[
+  { q: "How does a server compute Sec-WebSocket-Accept, and what does it prove?", a: "base64(SHA-1(key + the GUID 258EAFA5-E914-47DA-95CA-C5AB0DC85B11)). It proves that the server understood the WebSocket handshake, not that anyone is who they say." },
+  { q: "How is the payload length of a frame encoded?", a: "7 bits for 0 to 125; the value 126 means a 16-bit length follows, 127 means a 64-bit length follows." },
+  { q: "Why must clients mask frames, and why do servers not?", a: "A script chooses the client's data, and an unmasked payload could look like HTTP to a confused proxy and poison its cache. A random per-frame key hides the bytes. The server's data does not come from an untrusted script in the browser." },
+  { q: "Where does data go when a WebSocket sender is faster than the receiver?", a: "TCP's window fills, then the sender's own buffer grows (bufferedAmount). The application must check it and slow down, drop or merge messages." },
+  { q: "Why is long polling slower than SSE when events come often?", a: "After each response the client must send a new request. Events in that gap wait for it, and each delivery pays a full request and response head." },
+  { q: "How does a WebSocket run over HTTP/2?", a: "With RFC 8441: the server sends SETTINGS_ENABLE_CONNECT_PROTOCOL = 1, and the client opens a stream with :method CONNECT and :protocol websocket. Frames travel in DATA frames on that stream." },
+]} />

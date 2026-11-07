@@ -277,7 +277,7 @@ export function dnsRun(o: DnsRunOpts): DnsRun {
       const r = reply;
       put(r.answer);
       put(r.authority.filter((x) => x.data.t === "NS"));
-      // Accept glue only for names under the delegated zone ("in bailiwick"), as resolvers do since 2008.
+      // Accept glue only for names under the delegated zone ("in bailiwick"), as resolvers have done since about 1997.
       const cutZone = r.authority.find((x) => x.data.t === "NS")?.name;
       put(r.additional.filter((x) => x.data.t === "A" && (cutZone === undefined || under(x.name, zone))));
       if (r.flags.rcode === RCODE.NXDOMAIN || (r.flags.rcode === 0 && !r.answer.length && r.authority.some((x) => x.data.t === "SOA"))) {

@@ -1,0 +1,122 @@
+---
+summary: "HTTP/2 keeps HTTP's meaning and changes its bytes: binary frames with a 9-byte header, many streams on one TCP connection, HPACK header compression with static and dynamic tables, per-stream flow control, and priorities. It also inherits TCP's head-of-line blocking, and its cheap stream cancellation enabled the Rapid Reset attack."
+---
+import { NetAppHpackDemo, NetAppH2LossDemo, NetAppPriorityDemo, NetAppRapidResetDemo } from "@/demos/net/NetAppHttp2Demos";
+
+**HTTP/2** carries the same requests and responses as [HTTP/1.1](/networking/apps/http-1-1), with a new wire format. Google's SPDY protocol (2009) was its starting point. The IETF published HTTP/2 as RFC 7540 in 2015 and revised it as RFC 9113 in 2022. Header compression has its own RFC: HPACK, RFC 7541.
+
+HTTP/2 fixes three problems of HTTP/1.1. Header fields repeat as text on every request. A connection carries one response at a time, so browsers open six. And each of those connections pays its own handshakes and slow start. HTTP/2 sends **binary frames**, puts all requests to a server on **one connection** as concurrent **streams**, and compresses header fields.
+
+## Frames and streams
+
+A client starts with a 24-byte **connection preface**, `PRI * HTTP/2.0` followed by `SM` and line breaks, then a SETTINGS frame. Everything after that is frames. Every frame starts with the same 9 bytes:
+
+| Field | Bits | Meaning |
+|---|---|---|
+| Length | 24 | payload bytes; at most 16,384 unless the peer allows more in SETTINGS |
+| Type | 8 | DATA 0, HEADERS 1, PRIORITY 2, RST_STREAM 3, SETTINGS 4, PUSH_PROMISE 5, PING 6, GOAWAY 7, WINDOW_UPDATE 8, CONTINUATION 9 |
+| Flags | 8 | END_STREAM 0x1, END_HEADERS 0x4, PADDED 0x8, PRIORITY 0x20 |
+| R | 1 | reserved |
+| Stream Identifier | 31 | 0 for the connection; odd for client streams, even for server streams |
+
+A **stream** is one request and its response. The client opens streams 1, 3, 5 and so on, and never reuses an id. A request is a HEADERS frame, then DATA frames for a body; END_STREAM marks the last frame of each side. The frames of different streams can interleave on the connection, so a large response no longer blocks a small one at the HTTP layer.
+
+## HPACK
+
+HTTP/2 writes the request line as **pseudo-header fields**: `:method`, `:scheme`, `:authority` and `:path`. All field names are lower case. HPACK then encodes each field as one of four representations:
+
+- **Indexed** (first bit 1): the whole field is an index into a table, usually one byte.
+- **Literal with incremental indexing** (01): a name (an index or a string) and a value; both sides then add the field to their dynamic table.
+- **Literal without indexing** (0000) and **never indexed** (0001): for values that change each time, or that are secrets such as `authorization`.
+
+There are two tables. The **static table** has 61 fixed entries, such as `:method: GET` at 2 and `:path: /` at 4. The **dynamic table** holds fields this connection has sent, newest first from index 62. Each entry costs its name and value plus 32 bytes, and the table holds 4,096 bytes by default (`SETTINGS_HEADER_TABLE_SIZE`). String literals can use a static **Huffman code** that RFC 7541 built from real header traffic: common characters take 5 or 6 bits.
+
+<Predict
+  id="h2-hpack"
+  question="A browser sends three requests to one site. The first HPACK block is 183 bytes. The second request differs from the first only in its path. How big is its HPACK block?"
+  options={["About 180 bytes: each request is encoded on its own", "About 90 bytes: Huffman halves it", "18 bytes: every field except the path is one index byte"]}
+  answer={2}
+  explain="After the first request, the dynamic table holds the authority, user agent, cookie and the other fields. Each becomes a 1-byte index. Only the new path goes as a literal: 9 bytes. The same request as HTTP/1.1 text is 334 bytes."
+>
+<NetAppHpackDemo />
+</Predict>
+
+1. Step to request 1. Its 183-byte block adds 7 fields to the dynamic table. Their entries take 509 bytes of the 4,096.
+2. Step to request 2. Nine fields are one byte each; the path is a literal with the static name `:path` (index 4).
+3. Turn Huffman off. The first block grows from 183 to 233 bytes, and the later ones barely change.
+4. Turn the dynamic table off. Each request now costs about 190 bytes: Huffman alone saves less than the table.
+5. Compare the totals: the three requests take 245 bytes as HTTP/2 frames and 990 bytes as HTTP/1.1 text.
+
+HPACK was designed against **CRIME** (2012). That attack compressed secrets together with text that the attacker chose, and read the secret from the compressed size. HPACK does not compress across fields. A guess must match a whole field value to make the block shorter, and a "never indexed" field is never added to a table.
+
+## Flow control
+
+Each stream and the connection as a whole have a **flow-control window**, and only DATA frames count against it. The receiver opens the window with WINDOW_UPDATE frames as it consumes data. The initial window is 65,535 bytes for every stream and for the connection. A window of $W$ bytes allows at most $W$ per round trip:
+
+$$
+\text{rate} \le \frac{W}{\text{RTT}}
+$$
+
+At 100 ms, 65,535 bytes allow only 5.24 Mbit/s; at 20 ms, 26.2 Mbit/s. Servers and browsers therefore raise the windows at once with SETTINGS and WINDOW_UPDATE, often to several megabytes. A 16 MB window allows 1,342 Mbit/s at 100 ms. This is the same bandwidth-delay arithmetic as [TCP flow control](/networking/transport/flow-control), one layer up.
+
+## Head-of-line blocking moves to TCP
+
+All streams share one TCP connection, and TCP delivers one ordered byte stream. When a segment is lost, the data of every stream behind it waits for the retransmission. HTTP/1.1 with six connections loses only one connection's progress.
+
+<NetAppH2LossDemo />
+
+1. Without loss, HTTP/2 loads the page in 833 ms and six HTTP/1.1 connections in 896 ms. One connection with one slow start is as fast as six.
+2. Raise the loss to 1%. The median over 10 runs is 2,252 ms for HTTP/2 and 1,364 ms for HTTP/1.1.
+3. At 4% loss the medians are 6,526 ms and 2,587 ms. In the waterfalls, HTTP/2 rows stall together.
+4. Change the run. Each seed loses different packets, so single runs vary; the medians do not.
+
+Loss hurts the single connection twice. Every stream waits for each retransmission, and one loss halves the congestion window of the whole page. Six connections lose a sixth of their window. The model uses Reno and random loss on both directions of an 80 ms, 10 Mbit/s path, as model inputs. On low-loss networks HTTP/2 wins; on lossy mobile networks it can lose. [HTTP/3](/networking/apps/http-3) moves the streams into QUIC to remove this coupling.
+
+## Priorities
+
+With many streams on one connection, the server must decide whose frame goes next. A browser needs the style sheet and the scripts in the head before it can draw anything, and images can wait.
+
+<NetAppPriorityDemo />
+
+1. Round-robin gives every stream the same share. style.css finishes at 99 ms and app.js at 302 ms, so the first paint waits until 302 ms.
+2. RFC 7540 weights give a stream a share in proportion to its weight. The first paint moves to 213 ms.
+3. RFC 9218 sends the lowest urgency first and, at one urgency, one non-incremental response at a time. The first paint comes at 84 ms. The total time stays 332 ms: priorities change the order, not the sum.
+
+RFC 7540 had a **dependency tree**: each stream could depend on a parent and carry a weight from 1 to 256. Browsers built very different trees, and many servers ignored them or got them wrong. RFC 9113 deprecated this scheme.
+
+RFC 9218 (2022) replaced it with **Extensible Priorities**: a `Priority` header field, such as `u=1, i`, and a PRIORITY_UPDATE frame. The **urgency** `u` runs from 0 (most urgent) to 7, default 3. The **incremental** flag `i` says that the client can use partial data, as with a progressive image. The same scheme works for HTTP/3.
+
+## Server push, and why it went away
+
+**Server push** let a server send a response before the client asked. A PUSH_PROMISE frame announced it, for example the style sheet of the page being sent. In practice, servers pushed resources that browsers already had in their cache, and the gains did not appear. The HTTP Archive found in 2021 that only 1.25% of HTTP/2 sites used push. A later rerun by the Chrome team found 0.7%, and Chrome 106 (2022) disabled push by default. The replacement is the `103 Early Hints` status (RFC 8297): the server tells the browser what to fetch, and the browser decides.
+
+## Rapid Reset (CVE-2023-44487)
+
+A client may cancel a stream at any time with RST_STREAM, a 13-byte frame. A cancelled stream no longer counts against `SETTINGS_MAX_CONCURRENT_STREAMS`, which RFC 9113 recommends to be at least 100. But the server may already have started work on the request: parsed it, routed it, and passed it to a back end.
+
+<NetAppRapidResetDemo />
+
+1. An honest client with 100 streams, each open for one RTT plus 20 ms of work, makes 1,430 requests per second. The attacker sends HEADERS and RST_STREAM back to back: 32 bytes per request. At 100 Mbit/s that is 391,000 requests per second, 273 times more.
+2. Lower the server work to 1 ms. The honest rate rises, but the attacker's rate stays the same: only its uplink limits it.
+3. Set the work back to 20 ms and select the server that counts a stream until its work stops. The attacker gets 5,000 requests per second, and at most 100 requests are in progress.
+4. Select GOAWAY after 1,000 resets. Each reconnection costs two round trips, which limits the attacker to 9,750 requests per second.
+
+The attack was disclosed on October 10, 2023. Google reported a peak above 398 million requests per second, and Cloudflare a peak above 201 million. The fixes limit how many streams a client may reset, count cancelled streams until their work ends, and close connections that misbehave with GOAWAY.
+
+## Connect
+
+- [HTTP/1.1](/networking/apps/http-1-1): the semantics HTTP/2 keeps and the six connections it replaces.
+- [Reliability and retransmission](/networking/transport/reliability-and-retransmission): the single byte stream behind head-of-line blocking.
+- [Flow control](/networking/transport/flow-control): TCP's window under HTTP/2's windows.
+- [HTTP/3](/networking/apps/http-3): the same frames on QUIC streams, with QPACK instead of HPACK.
+- [Load balancers](/networking/infrastructure/load-balancers): where Rapid Reset hit hardest.
+- [Queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law): requests in progress = rate × work time.
+
+<Recall cards={[
+  { q: "What are the fields of the HTTP/2 frame header, and their sizes?", a: "Length 24 bits, Type 8, Flags 8, a reserved bit, and the Stream Identifier 31 bits: 9 bytes in all." },
+  { q: "Why is the second request to a site only about 18 bytes in HPACK?", a: "The first request added its fields to the dynamic table, so each repeated field is a 1-byte index. Only changed fields, such as the path, go as literals." },
+  { q: "How does one lost TCP segment affect HTTP/2 and HTTP/1.1 with six connections?", a: "In HTTP/2 every stream waits for the retransmission and the whole page's congestion window halves. With six connections only one connection stalls and loses window." },
+  { q: "What limit does a default HTTP/2 flow-control window put on a stream at 100 ms RTT?", a: "65,535 bytes per round trip: about 5.24 Mbit/s. Implementations raise the windows with SETTINGS and WINDOW_UPDATE." },
+  { q: "How do RFC 9218 priorities work?", a: "Urgency 0 to 7 (default 3) and an incremental flag, sent in a Priority header field or a PRIORITY_UPDATE frame. The server sends the most urgent first; incremental responses share bandwidth." },
+  { q: "Why did Rapid Reset work, and how was it fixed?", a: "Cancelled streams stop counting against the concurrency limit, but the server's work continues, so a client could start requests as fast as its uplink allowed. Servers now count such streams until the work ends, limit resets and send GOAWAY." },
+]} />

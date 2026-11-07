@@ -1,0 +1,133 @@
+---
+summary: "DNS turns names into records: a 12-byte header and compressed names in one UDP datagram, a chain of referrals from the root to the authoritative server, caches that keep answers for their TTL, a fallback to TCP for large answers, and the attacks and defences around it: cache poisoning, port randomization, DNSSEC, DNS over TLS and HTTPS."
+---
+import { NetAppDnsMessageDemo, NetAppDnsResolveDemo, NetAppDnsPoisonDemo } from "@/demos/net/NetAppDnsDemos";
+
+The **Domain Name System** (DNS) maps names such as `www.example.com` to **resource records**. Examples are addresses (A, AAAA), aliases (CNAME), mail servers (MX) and name servers (NS). Paul Mockapetris defined it in 1987 in RFC 1034 (concepts) and RFC 1035 (implementation). Almost every connection on the Internet starts with a DNS lookup, so its latency is part of every page load.
+
+DNS is a distributed database. The name space is a tree of **labels**, and each subtree that one operator controls is a **zone**. The root zone delegates `com`, the `com` zone delegates `example.com`, and so on. An **authoritative server** answers for its zones. A **recursive resolver** answers for any name: it asks authoritative servers and caches their answers. Your machine runs only a **stub resolver**, which sends one question to a recursive resolver and waits.
+
+## The message
+
+A DNS message has a 12-byte header and four sections: question, answer, authority and additional. The same format serves queries and responses. Over UDP the whole message is one datagram, so a lookup costs one round trip.
+
+<Predict
+  id="dns-size"
+  question="The answer for big.example.com has 40 A records. Without name compression the message is 1,273 bytes. With compression, does it fit in the 512 bytes that plain DNS over UDP allows?"
+  options={["Yes: compression shrinks it below 512 bytes", "No: it is 673 bytes, so the server sets TC and the client must use TCP", "Compression does not apply to answers, only to the question"]}
+  answer={1}
+  explain="Each owner name becomes a 2-byte pointer to the question, so each A record shrinks from 31 to 16 bytes. The message is 673 bytes: still above 512, so it needs EDNS(0) or TCP."
+>
+<NetAppDnsMessageDemo />
+</Predict>
+
+1. Read the referral from the com server. It is 67 bytes; without compression it would be 104. The 3 red pairs of bytes are pointers.
+2. Click a pointer byte. `c0 10` points to offset 16, where `example.com` starts inside the question name.
+3. Select the 40 A records. Turn compression off and on, and watch the size and the "fits in 512 B" readout.
+4. Click the TC field and flip it. One bit changes in byte 2: this bit tells the client to retry over TCP.
+5. Turn on the EDNS(0) record. An 11-byte OPT pseudo-record in the additional section carries the client's buffer size.
+
+The header starts with a 16-bit **ID** that matches a reply to its query. Then come the flags: QR (response), Opcode, AA (authoritative answer) and TC (truncated). RD (recursion desired), RA (recursion available), AD and CD (DNSSEC, RFC 4035) and a 4-bit RCODE follow. RCODE 3 is NXDOMAIN: the name does not exist. Four 16-bit counts give the number of entries in each section.
+
+A name is a list of labels. Each label is a length byte and up to 63 bytes, and a zero byte ends the name. A whole name is at most 255 bytes. **Name compression** (RFC 1035 section 4.1.4) replaces the end of a name with a 2-byte pointer. The top two bits are 11, and the other 14 bits are an offset into the message. A resource record is an owner name, TYPE (16 bits), CLASS (16), TTL (32, in seconds), RDLENGTH (16) and the data.
+
+```text
+offset  bytes                     meaning
+0       1a 2b 80 00 00 01 ...     ID 0x1a2b, QR=1, 1 question, 0 answers, 1 authority, 1 additional
+12      03 77 77 77 07 65 78 ...  www . example . com . (question name, 17 bytes)
+33      c0 10 00 02 00 01 ...     owner = pointer to offset 16 ("example.com"), TYPE NS, CLASS IN
+```
+
+## Resolution, step by step
+
+<Predict
+  id="dns-cache"
+  question="A lookup of www.example.com with an empty cache takes 124 ms. The record has a TTL of 300 s. You look it up again 400 s later. How many queries does the resolver send?"
+  options={["3 again: root, com and example.com, because the record expired", "1: only example.com, because the NS records for example.com are still cached", "0: the resolver serves the old record"]}
+  answer={1}
+  explain="The A record expired after 300 s, but the delegation records have a TTL of 172,800 s (2 days). The resolver goes straight to example.com's server: one query, and the lookup takes 88 ms instead of 124 ms."
+>
+<NetAppDnsResolveDemo />
+</Predict>
+
+1. The first lookup asks three servers. The root and com servers send **referrals**: NS records in the authority section and the addresses of those servers (**glue**) in the additional section.
+2. Press **Look it up** again with a 10 s wait. The answer comes from the cache in 8 ms: one round trip to the resolver.
+3. Set the wait to 400 s and look it up. The A record expired, but the NS records did not. One upstream query, 88 ms.
+4. Look up `shop.example.com`. The answer is a CNAME into `edgecdn.net`. The resolver starts again at the new name and must ask the root about `net`. The lookup takes 140 ms.
+5. Set the wait to 10 s and look up `nope.example.com` twice. The first answer is NXDOMAIN with the zone's SOA record. The second comes from the **negative cache**.
+6. Look up `big.example.com` without EDNS. The UDP reply is truncated, so the resolver asks again over TCP: 248 ms. Turn on EDNS(0): the reply fits in UDP, and the lookup takes 88 ms.
+7. Press **Restart** and turn glue off. The name server of `example.com` is now `ns1.dnshost.net`, so the resolver must resolve that name first: 160 ms.
+8. Turn glue on, press **Restart** and lose the first query to the com server. The resolver waits for its retry timer (800 ms here, a model input), and the lookup takes 924 ms.
+
+The resolver follows RFC 1034 section 5.3.3. It looks for the answer in its cache, then for a CNAME, then for the closest zone whose name servers it knows. It starts from **root hints**: a built-in list of the 13 root server names, `a.root-servers.net` to `m.root-servers.net`. Twelve organizations operate them. Anycast spreads each name over many sites: about 2,000 instances in November 2026.
+
+**Glue** solves a loop. The server for `example.com` is `ns1.example.com`, but the resolver cannot look up that name without the server. So the parent zone also holds the address of `ns1.example.com`. A delegation to a name in another zone needs no glue, but it costs a separate lookup.
+
+### Caching and TTLs
+
+Every record carries a **TTL**: the seconds a cache may keep it. Delegations in `com` have a TTL of 2 days, so a busy resolver rarely asks the root or the com servers. Records for a web site often have a TTL of 5 minutes or less, so that the operator can move traffic quickly. A short TTL buys agility and costs latency and load.
+
+**Negative caching** (RFC 2308) keeps the knowledge that a name does not exist. The time comes from the zone's SOA record: the smaller of the SOA record's TTL and its MINIMUM field. In the demo the SOA has a TTL of 3,600 s and a MINIMUM of 300 s, so NXDOMAIN is cached for 300 s.
+
+The resolver in glibc does not cache answers. Unless NSS sends the lookup elsewhere, `getaddrinfo` asks the servers in `/etc/resolv.conf`. Distributions often add a local cache, such as `systemd-resolved` on 127.0.0.53 or `nscd`.
+
+### Large answers: EDNS(0) and TCP
+
+RFC 1035 limits a DNS message over UDP to 512 bytes. A server that has more sets the TC bit, and the client asks again over TCP. RFC 7766 made TCP support a required part of DNS. Over TCP each message has a 2-byte length prefix, and the lookup pays one more round trip for the handshake.
+
+**EDNS(0)** (RFC 6891) lets a client announce a larger buffer in an OPT pseudo-record. Large UDP answers then need IP fragmentation, and fragments are often lost or forged. DNS Flag Day 2020 therefore recommended 1,232 bytes: the 1,280-byte IPv6 minimum MTU minus 48 bytes of IPv6 and UDP headers. DNSSEC signatures make answers large, so this limit matters.
+
+## Cache poisoning
+
+A resolver accepts the first reply that matches its question, its server address, its source port and its 16-bit ID. An attacker who is not on the path cannot read the query, but it can guess. If a forged reply arrives before the real one, the resolver caches the forgery for its TTL.
+
+<NetAppDnsPoisonDemo />
+
+1. At 100 Mbit/s and a 40 ms RTT, 5,154 forged replies of 97 bytes fit in one race. The chance per race is 7.86%, and success takes about 12.7 races: half a second.
+2. Turn off "Show a race the attacker wins". This is the usual race: the real reply arrives first and the attacker starts again.
+3. Turn on source port randomization. The attacker must now guess 65,536 × 28,232 values. The expected time grows from half a second to about 4 hours.
+4. Turn on DNSSEC. A forged reply can match every field, but it has no valid signature, so the resolver drops it.
+
+Dan Kaminsky made this practical in 2008 (CERT VU#800113, July 8, 2008). Before him, a failed race for `www.example.com` meant waiting until the real answer expired from the cache. Kaminsky raced on random names instead, such as `r4711.example.com`, which are never cached. His forged replies carried a referral: "example.com is served by ns1.example.com, at the attacker's address". A resolver that accepts it hands the whole zone to the attacker.
+
+The fix was a random source port per query, which adds about 16 bits of randomness (RFC 5452). Linux's default ephemeral range, `net.ipv4.ip_local_port_range` = 32768 to 60999, gives 28,232 ports. Resolvers had dropped records outside the zone they asked about (the bailiwick rule) since about 1997. Kaminsky's forged referral stays inside that zone, so this rule does not stop it. As step 3 shows, random ports raise the cost; they do not make poisoning impossible.
+
+## DNSSEC in brief
+
+**DNSSEC** (RFC 4033 to 4035) signs the data, not the channel. Each zone signs its record sets; an RRSIG record carries each signature. The zone publishes its public keys in DNSKEY records. The parent zone publishes a DS record: a hash of the child's key. The chain runs from the root key, which validating resolvers hold as a trust anchor, through DS and DNSKEY records down to the answer.
+
+A validating resolver sets the AD bit when the chain checks out, and answers SERVFAIL when a signature is wrong. DNSSEC proves that data came from the zone owner. It does not hide the question, and it does not protect the last hop between the stub and the resolver.
+
+## Privacy: DNS over TLS, HTTPS and QUIC
+
+Classic DNS is plain text, so anyone on the path sees every name you look up. Three standards encrypt the hop between the stub and the resolver:
+
+| Protocol | RFC | Transport | Port |
+|---|---|---|---|
+| DNS over TLS (DoT) | 7858 | TCP + TLS | 853 |
+| DNS over HTTPS (DoH) | 8484 | HTTP/2 or HTTP/3, media type `application/dns-message` | 443 |
+| DNS over QUIC (DoQ) | 9250 | QUIC | 853 |
+
+DoH looks like any other HTTPS traffic, so a network cannot easily pick it out. It can only block the addresses of known DoH resolvers. Browsers can therefore choose their own resolver. This protects users on hostile networks. It also takes control away from enterprise networks and their filters.
+
+## The HTTPS record
+
+The **SVCB** and **HTTPS** record types (RFC 9460, 2023) tell a client how to connect before it connects. An HTTPS record can carry the protocols the server speaks (`alpn=h3,h2`), a port, address hints and keys for Encrypted Client Hello. A browser that asks for A and HTTPS records together can open a QUIC connection on its first visit. [HTTP/3](/networking/apps/http-3) shows the time this saves. The TargetName in an HTTPS record is never compressed.
+
+## Connect
+
+- [UDP](/networking/transport/udp): the transport of almost every DNS query.
+- [TCP handshake and teardown](/networking/transport/tcp-handshake-and-teardown): the extra round trip of the TCP fallback.
+- [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency): why a resolver can safely send a query again.
+- [Eventual consistency](/distributed/consistency/eventual-consistency): a cache with TTLs is an eventually consistent replica of a zone.
+- [CDNs](/networking/infrastructure/cdns) and [anycast](/networking/infrastructure/anycast): how CNAMEs and short TTLs steer users to nearby servers.
+- [TLS handshake](/networking/security/tls-handshake): the channel under DoT and DoH.
+
+<Recall cards={[
+  { q: "What does name compression replace, and how is a pointer encoded?", a: "The end of a name that already appeared in the message. A pointer is 2 bytes: the top two bits are 11, and the other 14 bits are the offset of the earlier copy." },
+  { q: "What is glue, and when does a delegation need it?", a: "Address records for a zone's name servers, held in the parent zone. It is needed when the name server's name is inside the zone it serves, such as ns1.example.com for example.com." },
+  { q: "For how long does a resolver cache an NXDOMAIN answer?", a: "For the smaller of the SOA record's TTL and the SOA MINIMUM field (RFC 2308)." },
+  { q: "What happens when an answer is larger than the client's UDP limit?", a: "The server sets the TC bit, and the client asks again over TCP with a 2-byte length prefix. EDNS(0) can raise the UDP limit; 1,232 bytes avoids fragmentation." },
+  { q: "Why did Kaminsky's attack work, and what changed?", a: "Random names are never cached, so the attacker could race at once and forge a referral for the whole zone. Resolvers added random source ports, about 16 more bits. Bailiwick checks did not help, because the forged referral stays inside the zone. DNSSEC stops forgery fully." },
+  { q: "What does a DS record do in DNSSEC?", a: "It sits in the parent zone and holds a hash of the child zone's key. This links the child's DNSKEY into the chain of trust from the root." },
+]} />

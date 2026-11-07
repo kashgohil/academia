@@ -1,0 +1,130 @@
+---
+summary: "HTTP/1.1 is text on a TCP connection: request and response heads, bodies framed by Content-Length or chunked coding, persistent connections, pipelining and its head-of-line blocking, six connections per host, and caching with max-age, ETags and conditional requests. A page-load waterfall on the reference TCP shows where the time goes."
+---
+import { NetAppWaterfallDemo, NetAppFramingDemo, NetAppCacheDemo } from "@/demos/net/NetAppHttp1Demos";
+
+**HTTP** is the request-response protocol of the web. A client sends a request: a method, a path and header fields. A server sends back a response: a status code, header fields and usually a body. HTTP/1.1 first appeared in RFC 2068 (1997) and RFC 2616 (1999). Today three RFCs from June 2022 define it. RFC 9110 gives the semantics of every HTTP version, RFC 9111 caching, and RFC 9112 the HTTP/1.1 message format.
+
+HTTP/1.1 sends **text** over one TCP connection. Each line ends with CR LF, and an empty line ends the head. This is a GET request as a browser sends it, and the head of a response:
+
+```text
+GET /app.js HTTP/1.1
+Host: www.example.com
+User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ... Chrome/130.0.0.0 Safari/537.36
+Accept: */*
+Accept-Encoding: gzip, deflate, br, zstd
+Accept-Language: en-US,en;q=0.9
+Referer: https://www.example.com/
+Cookie: session=8f2c1a9e4b7d6c3a; theme=dark
+
+HTTP/1.1 200 OK
+Date: Sat, 07 Nov 2026 12:00:00 GMT
+Server: nginx
+Content-Type: image/jpeg
+Content-Length: 80000
+Cache-Control: max-age=86400
+ETag: "5d8c72a1-80000"
+```
+
+The request is 331 bytes, and the response head is 174 bytes. A browser repeats most of these header fields on every request to the same site. HTTP/2 compresses them; HTTP/1.1 cannot.
+
+## Connections and the page-load waterfall
+
+HTTP/1.0 opened a new TCP connection for each request. HTTP/1.1 made **persistent connections** the default: the connection stays open for the next request unless a side sends `Connection: close`. A new connection is expensive. It costs one RTT for the TCP handshake, one more for TLS 1.3, and it starts in **slow start** with a small congestion window.
+
+<Predict
+  id="h1-conns"
+  question="A page has its HTML and 12 resources, 453 KB in all. At an 80 ms RTT and 10 Mbit/s, one keep-alive connection loads it in 1,802 ms. How long does it take with six keep-alive connections?"
+  options={["About 300 ms: six times faster", "About 900 ms: twice as fast", "About 1,800 ms: the link is the limit"]}
+  answer={1}
+  explain="The run gives 896 ms. Six connections overlap their round trips, but each pays its own handshakes and slow start, and the link needs 362 ms for the bytes alone. So the gain is about 2 times, not 6."
+>
+<NetAppWaterfallDemo />
+</Predict>
+
+1. With one keep-alive connection, each request waits for the previous response. Every row starts with a light bar: one round trip of waiting. Count the RTTs: 22.5.
+2. Raise the connection limit to 6. Six rows run at the same time, and the load time halves. Each new connection starts with a TCP and a TLS handshake.
+3. Select "new one per request" with 6 connections: 1,176 ms. Every request pays two handshakes and a fresh slow start.
+4. Select pipelining with 1 connection: 832 ms. All requests leave at once, and the responses come back to back.
+5. Now make style.css slow. With pipelining, every response behind it waits 300 ms: the load takes 1,132 ms. With six connections it takes 963 ms, because only one connection waits.
+6. Turn the slow response off and set the RTT to 200 ms. Round trips now dominate: one connection needs 3,842 ms, pipelining 1,716 ms and six connections 1,944 ms.
+
+The light bars are round trips, and the solid bars are bytes. On a fast link most of the page load time is waiting. This is why HTTP/1.1 performance work was about fewer round trips: fewer requests (sprites, bundles, inlined CSS), more connections, and connections that stay open.
+
+### Pipelining and head-of-line blocking
+
+With **pipelining**, a client sends several requests without waiting for the responses. RFC 9112 section 9.3.2 lets the server work on them in parallel if all use safe methods. It must still send the responses in the order of the requests. One slow response therefore blocks all responses behind it. This is **head-of-line blocking** at the HTTP layer.
+
+Pipelining failed in practice. Some servers and proxies mixed up or dropped pipelined requests. Also, when a server closes the connection, the client cannot tell which requests it processed. Firefox kept pipelining off by default and removed the code in version 54 (2017, Mozilla bug 1340655).
+
+### Six connections per host
+
+RFC 2616 told clients to open at most 2 connections to a server. RFC 7230 (2014) dropped the number and asked clients to be conservative. Browsers settled on 6 per host: Chromium's `g_max_sockets_per_group` is 6 for normal sockets and 255 for WebSockets. Sites then spread resources over several host names ("domain sharding") to get more connections.
+
+More connections have costs. Each one pays its own handshakes and slow start. Six connections also start with six initial windows of 10 segments, so they push a burst into the bottleneck queue that one connection would not. They compete with each other and with other users. HTTP/2 instead puts all requests on one connection.
+
+Two Linux settings matter for persistent connections. `net.ipv4.tcp_slow_start_after_idle` (default 1) shrinks the congestion window after the connection is idle for one RTO, so a kept-alive connection can start slowly again. Servers that keep long-lived connections often set it to 0.
+
+## Framing: where a message ends
+
+TCP delivers bytes, not messages. The receiver must find where each body ends, and RFC 9112 section 6.3 gives the rules in order:
+
+1. `Transfer-Encoding: chunked`: the body is a series of chunks. Each chunk has a hex size line, the data and CR LF. A chunk of size 0 ends the body.
+2. `Content-Length`: exactly that many bytes.
+3. Neither: a request has no body; a response runs until the server closes the connection.
+
+<NetAppFramingDemo />
+
+1. With Content-Length, the parser finds both requests. The second request starts right after byte 19 of the body.
+2. Select chunked and move the chunk size. The hex size lines change. A server uses chunked coding when it streams a body that it has not finished computing.
+3. Select close. Only the end of the connection ends the body, so a connection that breaks early looks like a short body.
+4. Select a wrong length. With 6 bytes too few, the rest of the body becomes the start of a "request" that is not valid.
+5. Select CL + TE. The proxy and the server split the same bytes into different requests.
+
+The last case is **request smuggling**. A front-end proxy that trusts Content-Length forwards one request. A back-end that follows Transfer-Encoding sees two, and the second one never passed the proxy's checks. RFC 9112 says that Transfer-Encoding overrides Content-Length, and that a message with both "ought to be handled as an error". A proxy that forwards such a message must first remove Content-Length.
+
+## Caching
+
+The fastest request is the one that a client does not send. RFC 9111 defines when a cache may reuse a stored response:
+
+- **Fresh**: the response is younger than its freshness lifetime, from `Cache-Control: max-age=N`. The cache uses it with no request at all.
+- **Stale**: older than that. The cache must **revalidate**: it sends a conditional request with `If-None-Match` (the stored ETag) or `If-Modified-Since`. If nothing changed, the server answers `304 Not Modified` with no body.
+- `no-cache` means: store it, but revalidate before every use. `no-store` means: never store it.
+- With no explicit lifetime but a `Last-Modified` field, a cache may guess one. RFC 9111 suggests 10% of the time since the last change.
+
+<Predict
+  id="h1-cache"
+  question="A site deploys a new app.js twice in two hours and serves it with max-age=3600. Of 11 visits, how many run an old app.js?"
+  options={["0: the browser checks the server on every visit", "1: only the first visit after each deploy", "5: the cached copy stays fresh for an hour after each fetch"]}
+  answer={2}
+  explain="A fresh response is used without asking the server, even when the server has a new version. With max-age=3600, 5 of the 11 visits run old code. With max-age=600 none do, but the browser makes 8 round trips instead of 2."
+>
+<NetAppCacheDemo />
+</Predict>
+
+1. At max-age=600 with an ETag, the 11 visits cost 154 KB and 8 round trips. Most revalidations end in a 304 of 439 bytes, request included.
+2. Set max-age to 3600. Only 2 round trips and 101 KB, but 5 visits run old code.
+3. Turn the ETag off at max-age=600. A stale copy cannot be revalidated, so every expiry costs a full 50 KB body: 404 KB.
+4. Select `no-store`: 11 full downloads, 555 KB. Select `no-cache`: 11 round trips, but almost no bytes.
+5. Select "none". The heuristic gives the 3-day-old file a lifetime of more than 7 hours, and 6 visits run old code.
+6. Select "versioned URL". The page names the file by a hash of its content and sends `max-age=31536000, immutable` (RFC 8246). Each deploy is a new URL, so the cache is always right: 3 downloads, no stale visits.
+
+The versioned URL is the standard answer for static assets: cache them forever and change the name when the content changes. The HTML that names them gets a short lifetime or `no-cache`, so it is checked on each visit.
+
+## Connect
+
+- [TCP handshake and teardown](/networking/transport/tcp-handshake-and-teardown) and [congestion control](/networking/transport/congestion-control-reno-and-cubic): the handshakes and the slow start in every waterfall row.
+- [Flow control](/networking/transport/flow-control): what stops a fast server from flooding a slow client.
+- [HTTP/2](/networking/apps/http-2): many requests on one connection, with binary frames and header compression.
+- [TLS handshake](/networking/security/tls-handshake): the second round trip of each new connection.
+- [CDNs](/networking/infrastructure/cdns) and [load balancers](/networking/infrastructure/load-balancers): the shared caches and proxies between browsers and servers.
+- [Queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law): why the first byte waits behind other work.
+
+<Recall cards={[
+  { q: "Why did persistent connections make HTTP/1.1 faster than HTTP/1.0?", a: "Each new connection pays a TCP handshake, a TLS handshake and a fresh slow start. A persistent connection pays them once and reuses a congestion window that has grown." },
+  { q: "What is head-of-line blocking in HTTP/1.1 pipelining?", a: "The server must send responses in request order, so a slow response delays every response pipelined behind it on that connection." },
+  { q: "In what order does an HTTP/1.1 receiver decide where a body ends?", a: "Transfer-Encoding chunked first, then Content-Length; with neither, a request has no body and a response ends when the connection closes." },
+  { q: "How does request smuggling work?", a: "Two parsers on the path disagree on where a message ends, for example a proxy that uses Content-Length and a server that uses Transfer-Encoding. The server then sees a hidden extra request." },
+  { q: "What is the difference between a fresh hit, a 304 and no-cache?", a: "A fresh hit uses the stored copy with no request. A 304 answers a conditional request (If-None-Match) when the copy is still valid. no-cache allows storing but forces revalidation before every use." },
+  { q: "Why do sites use versioned asset URLs with a one-year max-age?", a: "A cached asset is never stale, because new content gets a new URL. Browsers skip every request for unchanged assets and still see each deploy at once." },
+]} />

@@ -1,0 +1,104 @@
+---
+summary: "HTTP/3 maps HTTP onto QUIC streams: one bidirectional stream per request, control and QPACK streams beside them, frames with varint headers, and QPACK in place of HPACK because QUIC does not order streams. Clients learn about HTTP/3 from Alt-Svc or an HTTPS DNS record and race QUIC against TCP."
+---
+import { NetAppH3StreamsDemo, NetAppQpackDemo, NetAppDiscoveryDemo } from "@/demos/net/NetAppHttp3Demos";
+
+**HTTP/3** (RFC 9114, June 2022) is HTTP over [QUIC](/networking/transport/quic). The QUIC lesson covers the transport: independent streams, packet numbers that never repeat, the 1-RTT handshake, 0-RTT and connection migration. This lesson covers what HTTP has to change to run on that transport. The answer is: more than one would expect, because HTTP/2 relied on TCP's single ordered byte stream in places that are easy to miss.
+
+## Requests on QUIC streams
+
+HTTP/3 keeps the semantics of RFC 9110 and the ideas of [HTTP/2](/networking/apps/http-2): binary frames, many concurrent requests, compressed header fields. It drops everything QUIC already does:
+
+| HTTP/2 | HTTP/3 |
+|---|---|
+| a stream id in every 9-byte frame header | no stream id: the QUIC stream carries the frame |
+| WINDOW_UPDATE, per stream and connection | QUIC flow control (MAX_STREAM_DATA, MAX_DATA) |
+| RST_STREAM | QUIC's RESET_STREAM and STOP_SENDING |
+| PING, the connection preface | QUIC does these |
+| PRIORITY frames (deprecated) | RFC 9218 priorities: a header field and PRIORITY_UPDATE |
+| HPACK | QPACK (RFC 9204) |
+
+Each request uses one **client-initiated bidirectional stream**: ids 0, 4, 8 and so on. The client sends a HEADERS frame and optional DATA frames, then ends its side of the stream. The response comes back on the same stream. An HTTP/3 frame is a type, a length and a payload, and the type and length are QUIC **variable-length integers**. A varint uses its top two bits for its length: 1, 2, 4 or 8 bytes.
+
+Each side also opens **unidirectional streams**, and the first byte of each says what it is. The **control stream** (type 0x00) starts with a SETTINGS frame and lives as long as the connection. The **QPACK encoder stream** (0x02) and **decoder stream** (0x03) carry header-table updates and their acknowledgments.
+
+<NetAppH3StreamsDemo />
+
+1. Click stream 2, the control stream: 1 byte of stream type and an 8-byte SETTINGS frame with `QPACK_MAX_TABLE_CAPACITY` (0x01) and `QPACK_BLOCKED_STREAMS` (0x07).
+2. Click stream 6, the QPACK encoder stream. It carries 252 bytes: the table capacity and the inserts that the three requests share.
+3. Click stream 0. The request is a 14-byte HEADERS frame: type 0x01, length 12, and a field section that refers to table entries.
+4. Set the dynamic table to off. Each request now carries its own literals: about 240 bytes, and 739 bytes on all client streams instead of 304.
+5. Move the varint slider across 63 and 16,383. The prefix bits change from 00 to 01 to 10, and the number of bytes doubles each time.
+
+## Why HPACK cannot work over QUIC
+
+HPACK has one dynamic table per direction, and every header block changes it. A block that adds the user agent at index 62 shifts all older entries up by one. The decoder must therefore process blocks in exactly the order the encoder wrote them. On HTTP/2 that order comes free from TCP.
+
+QUIC delivers each stream on its own. If the packet with request 1 is lost, requests 2 and 3 still arrive and are handed to HTTP/3 at once. That is the whole point of QUIC streams.
+
+<Predict
+  id="h3-hpack"
+  question="Three requests go out on streams 0, 4 and 8, encoded with HPACK. The packet with stream 0 is lost and resent. What happens to streams 4 and 8, which arrive first?"
+  options={["They wait for stream 0, as in HTTP/2", "They decode with a table that lacks request 1's entries: wrong fields or an error", "They decode correctly: HPACK indexes are absolute"]}
+  answer={1}
+  explain="The blocks of streams 4 and 8 refer to dynamic-table entries that request 1 created. The decoder has an empty table, so the run gives COMPRESSION_ERROR: index 68 is not in the table. With a partly filled table the indexes would point at the wrong fields."
+>
+<NetAppQpackDemo />
+</Predict>
+
+1. With HPACK and packet 0 lost, streams 4 and 8 fail with a decoding error at 21 and 22 ms. Stream 0 decodes at 67 ms.
+2. Lose packet 1 instead. Stream 4 waits, but stream 8 arrives first and fails: its block refers to the entry that request 2 added.
+3. Select "QPACK, may block" and lose packet 0, the encoder stream. All three streams wait for the inserts and decode at 63 ms. The blocks are only 12 bytes each.
+4. Lose packet 2 instead, the encoder data for request 2. Stream 0 decodes at once; streams 4 and 8 wait.
+5. Select "QPACK, never blocks". Nothing waits, whatever you lose, but each block carries its own literals: 972 header bytes instead of 287.
+
+### How QPACK works
+
+QPACK moves every table change onto the **encoder stream**. That stream is ordered, like any QUIC stream, so the decoder applies inserts in order. A header block (a **field section**) only reads the table. It starts with a prefix of two numbers:
+
+- **Required Insert Count**: how many inserts the decoder must have before it can decode this section.
+- **Base**: a reference point. Entries below it are addressed relative to it, and entries added for this section are "post-base".
+
+A decoder that gets a section too early **blocks** that stream until the encoder stream catches up. The decoder announces in `SETTINGS_QPACK_BLOCKED_STREAMS` how many streams may block at once. The default is 0, and so is the default table capacity: a peer must opt in. The decoder acknowledges sections on the decoder stream, so the encoder learns which entries are safe to use without any risk of blocking.
+
+This is a trade between compression and head-of-line blocking, and the encoder chooses per section. It can refer to fresh entries and risk a wait, or send literals and never wait. An encoder can also start with literals and use the table once the decoder acknowledges the inserts. QPACK also has its own static table of 99 entries, built from HTTP traffic in 2018; it does not reuse HPACK's 61.
+
+## Finding HTTP/3
+
+A browser cannot just try QUIC on UDP port 443 for every site. Many sites do not run it, and some networks block or throttle UDP. It needs a hint, and there are two:
+
+- **Alt-Svc** (RFC 7838): an HTTP response header, such as `Alt-Svc: h3=":443"; ma=86400`. It says that the same service is available over HTTP/3 on port 443 for the next 86,400 s. The browser learns it on its first, TCP-based, visit.
+- The **HTTPS DNS record** (RFC 9460): `alpn=h3,h2` in the answer. A browser that asks for it beside the A record can use QUIC on its first visit. See the [DNS lesson](/networking/apps/dns).
+
+<NetAppDiscoveryDemo />
+
+1. With Alt-Svc at a 50 ms RTT, visit 1 uses HTTP/2 over TCP and TLS 1.3: the first byte arrives at 171 ms. Visit 2 uses QUIC: 121 ms, one RTT less.
+2. Select the HTTPS record. Both visits use QUIC: 121 ms. The DNS answers come back together, so the record costs no extra round trip.
+3. Block UDP and turn racing off. The browser waits for QUIC, gives up after 2,000 ms (a model input), then uses TCP: 2,171 ms.
+4. Turn racing on. TCP starts at the same time as QUIC and wins: 171 ms, the same as plain HTTP/2.
+
+Because of the last case, browsers do not wait for QUIC to fail. They race QUIC against a TCP connection. Chromium also marks HTTP/3 as broken for a server after a failure and retries it later with growing delays. Happy Eyeballs (RFC 8305) applies the same idea to IPv6 and IPv4. The cost of racing is a second handshake that the server must do and then throw away.
+
+## Measured gains
+
+The gains of HTTP/3 come from QUIC: one RTT less to set up, no head-of-line blocking between streams, better loss recovery, and migration. They are largest where networks are worst. When Chrome deployed IETF QUIC in October 2020, Google reported that Search latency fell by more than 2%. YouTube rebuffer time fell by more than 9%, and client throughput rose by more than 3% on desktop and 7% on mobile.
+
+These are averages over very many users. The median user on a good wired network sees little difference. A user on a lossy mobile link, at the tail of the distribution, sees the most. The costs are also real. QUIC runs in user space and encrypts each packet on its own, so a server spends more CPU per byte than with kernel TCP.
+
+## Connect
+
+- [QUIC](/networking/transport/quic): the streams, handshakes, loss recovery and migration under HTTP/3.
+- [HTTP/2](/networking/apps/http-2): the frames, HPACK and priorities that HTTP/3 adapts.
+- [DNS](/networking/apps/dns): the HTTPS record that announces HTTP/3.
+- [UDP](/networking/transport/udp): what middleboxes see of QUIC, and why some block it.
+- [TLS handshake](/networking/security/tls-handshake): the keys inside QUIC's first flight.
+- [Zero-copy](/networking/programming/zero-copy): one way to win back the CPU that user-space transports spend.
+
+<Recall cards={[
+  { q: "On which streams does an HTTP/3 request travel, and what else does a connection open?", a: "One client-initiated bidirectional stream per request (ids 0, 4, 8, …). Each side also opens a control stream (type 0x00, SETTINGS first) and QPACK encoder (0x02) and decoder (0x03) streams." },
+  { q: "Why can HPACK not be used over QUIC?", a: "Each HPACK block changes the shared dynamic table, so blocks must be decoded in the order they were written. QUIC delivers streams independently, so a later block can arrive first and refer to entries the decoder does not have." },
+  { q: "What do the Required Insert Count and SETTINGS_QPACK_BLOCKED_STREAMS do?", a: "The count says how many encoder-stream inserts a field section needs; the decoder blocks that stream until it has them. The setting caps how many streams may block at once (default 0)." },
+  { q: "How does a QPACK encoder avoid blocking entirely, and what does it cost?", a: "It refers only to entries the decoder has acknowledged and sends the rest as literals. Nothing waits, but header blocks are larger." },
+  { q: "Name two ways a client learns that a server speaks HTTP/3.", a: "An Alt-Svc response header, learned on an earlier TCP visit. And an HTTPS DNS record with alpn=h3, which works on the first visit." },
+  { q: "Why do browsers race QUIC against TCP?", a: "Some networks block UDP. Waiting for a QUIC timeout before falling back would cost seconds; a race costs only an extra handshake." },
+]} />

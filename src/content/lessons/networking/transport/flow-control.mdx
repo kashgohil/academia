@@ -1,0 +1,130 @@
+---
+summary: "How a TCP receiver keeps a fast sender from overrunning it: the sliding window, zero windows and persist probes, window scaling and the 64 KiB ceiling on long paths, Linux receive-buffer autotuning, silly window syndrome, and Nagle against delayed ACKs."
+---
+import { NetTcpSlowReaderDemo, NetTcpWindowScaleDemo, NetTcpSwsDemo, NetTcpNagleDemo } from "@/demos/net/NetTcpFlowDemos";
+
+TCP data waits in a **receive buffer** in the kernel until the application reads it. If the sender sends faster than the application reads, the buffer fills. **Flow control** stops the sender before that happens. It protects the receiver. [Congestion control](/networking/transport/congestion-control-reno-and-cubic) is a different mechanism: it protects the network.
+
+## The window is free buffer space
+
+Every segment carries a 16-bit **window** field. It tells the peer how many bytes, after the acknowledged byte, the receiver can still take. The sender may send up to byte ack + window, and no further. As ACKs arrive, the acknowledged edge moves right. As the application reads, the free space grows, and the right edge moves right too. This is the **sliding window**.
+
+The sender's sequence space has four parts:
+
+| Part | Bytes |
+|---|---|
+| acknowledged | before the ACK number; the sender can free them |
+| in flight | sent, not yet acknowledged |
+| usable window | not sent yet, but inside ack + window |
+| waiting | written by the application, but outside the window |
+
+The sender sends at most min(receive window, congestion window) bytes beyond the ACK. The rate of a window-limited connection is therefore window ÷ RTT.
+
+<Predict
+  id="flow-zero"
+  question="The application stops reading for 1.1 s. The receive buffer is 16 KiB. What does the sender do once the buffer is full?"
+  options={["It keeps sending, and the receiver drops the extra data", "It stops, and sends a small probe now and then until the window opens", "It closes the connection with RST"]}
+  answer={1}
+  explain="The receiver advertises a window of 0, so the sender may send no data. It still needs to learn when the window opens, so it sends zero-window probes on a persist timer. The peer must answer each probe with an ACK that carries its current window."
+>
+<NetTcpSlowReaderDemo />
+</Predict>
+
+Things to try:
+
+1. Keep the defaults. The window is zero for 772 ms. The sender probes twice: the second wait is twice the first. When the application reads again, the receiver sends a **window update**, and the sender restarts at once. All 120 KB are read after 1730 ms.
+2. Move **Look at time** to see both windows. During the pause, the receive buffer is full of unread data, and the usable window is 0.
+3. Turn on **Lose every window update**. Now only the answer to a probe can restart the sender. The third probe comes 800 ms after the second, and the transfer ends at 2330 ms instead of 1730 ms.
+4. Raise the read rate to 1000 KB/s and the pause to 0. The window never closes.
+
+The probes are not optional. RFC 9293 says that a sender MUST probe a zero window. A window update is an ACK with no data, and TCP never retransmits a pure ACK. Without probes, one lost update would leave both sides waiting for each other forever.
+
+Linux sends each probe with the sequence number snd.una − 1, an old byte. The receiver must answer an old segment with an ACK, and that ACK carries the current window. The first probe waits one RTO, and each later wait doubles.
+
+## Window scaling and the 64 KiB ceiling
+
+The window field has 16 bits, so a window cannot exceed 65,535 bytes. On a long, fast path that is far too small.
+
+<Predict
+  id="flow-wscale"
+  question="A path has 100 Mbit/s and a 100 ms round-trip time. The receive window is 64 KiB, and window scaling is off. What rate can one TCP connection reach?"
+  options={["About 100 Mbit/s: the link is the limit", "About 5 Mbit/s: one window per round trip", "About 50 Mbit/s"]}
+  answer={1}
+  explain="The sender can have at most 65,535 bytes in flight per round trip: 65,535 × 8 / 0.1 s = 5.24 Mbit/s. The path could hold 1.25 MB, the bandwidth-delay product. The sim measures 5.14 Mbit/s, slightly less because the round trip also includes the time to send each segment."
+>
+<NetTcpWindowScaleDemo />
+</Predict>
+
+Things to try:
+
+1. Keep the defaults: 5.14 Mbit/s on a 100 Mbit/s link. Lower the RTT to 10 ms: the same window now gives 10 times the rate.
+2. Choose **4 MiB, scaling**. The connection reaches 97 Mbit/s, near the link rate.
+3. Choose **Autotuning from 64 KiB**. The receive buffer starts small and grows as the application reads. It stops near twice the bandwidth-delay product: 2.32 MiB here.
+4. Look at the window scale shift: 7. The SYN offered it, because the largest buffer is 6 MiB.
+
+RFC 7323 adds the **window scale** option. Each side announces a shift count in its SYN, from 0 to 14. Afterward, the peer multiplies every window field by $2^{\text{shift}}$, so the largest window is $2^{30}$ bytes, 1 GiB. The option appears only in SYN segments, and the window in a SYN is never scaled. So the shift is fixed for the life of the connection. A receiver must choose it at connect time for the largest buffer it may ever use.
+
+Linux takes the shift from the largest possible buffer, the larger of the `tcp_rmem` maximum and `net.core.rmem_max`. In Linux 6.12 the default `tcp_rmem` is 4 KiB, 128 KiB and up to 6 MiB, depending on RAM. For 6 MiB the shift is 7. Linux 6.16 and later raise the maximum to 32 MB, and the shift becomes 10. If either side omits the option, both use no scaling, and the 64 KiB ceiling returns. A middlebox that strips the option from SYNs therefore makes every long transfer slow.
+
+## Receive-buffer autotuning
+
+A large fixed buffer for every socket wastes memory, and a small one caps the rate. Linux sizes the buffer per connection instead (`net.ipv4.tcp_moderate_rcvbuf` = 1 by default). Once per RTT, `tcp_rcv_space_adjust` measures how many bytes the application copied out in that RTT. It grows the buffer toward about twice that amount, up to the `tcp_rmem` maximum.
+
+A sender that is limited only by the window then gets a larger window each round trip. If an application sets `SO_RCVBUF` itself, autotuning is off for that socket. A hand-set value is often smaller than what autotuning would reach.
+
+## Silly window syndrome
+
+A receiver whose application reads a few bytes at a time could advertise a window of a few bytes. A sender could then fill it with a segment of a few bytes. Each such segment carries 40 bytes of IPv4 and TCP headers. RFC 813 (Clark, 1982) calls this **silly window syndrome**.
+
+<NetTcpSwsDemo />
+
+Things to try:
+
+1. Keep 50 bytes per read and SWS avoidance off. In 600 ms the sender sends 443 segments with a mean payload of 68 bytes. Headers are 37.1% of all bytes sent.
+2. Turn SWS avoidance on. The same data takes 21 segments, and the header share drops to 2.7%.
+3. Raise the read size to 1460 bytes. Even without avoidance, the segments are full.
+
+The cure has a receiver side and a sender side (RFC 9293, section 3.8.6.2). The receiver keeps the right edge of its window still until it can open it by at least min(half the buffer, one MSS). The sender sends a small segment in only three cases. It holds all the queued data, or at least half the largest window the peer ever offered. Or an override timer of 0.1 to 1 s fires. **Nagle's algorithm** (RFC 896, 1984) is the sender side for small writes: while any data is unacknowledged, small writes wait and join into one segment.
+
+## Nagle meets delayed ACK
+
+A receiver also saves segments: it delays its ACK, hoping to piggyback it on data. RFC 9293 says the delay MUST be less than 0.5 s, and that an ACK SHOULD go out for at least every second full-sized segment. Linux delays between 40 ms (`TCP_DELACK_MIN`) and 200 ms (`TCP_DELACK_MAX`). Each rule is sensible alone. Together they can stall a request for the full delayed-ACK timer.
+
+<NetTcpNagleDemo />
+
+Things to try:
+
+1. Keep the defaults: Nagle on, delayed ACK 40 ms, one round trip 10 ms. The first request takes 60 ms and the next ones 50 ms.
+2. Set the delayed-ACK timeout to 200 ms. The first request takes 220 ms, and the next ones 210 ms.
+3. Turn off delayed ACK, with Nagle still on. Each request takes 20 ms: Nagle still costs one extra round trip.
+4. Turn off Nagle (TCP_NODELAY). Each request takes 10 ms, one round trip.
+
+The sequence is: the client writes the header, and it leaves at once, because nothing is in flight. The client writes the body. Nagle holds it, because the header is not yet acknowledged. The server has half a request, so it does not reply, and it delays its ACK. Only the delayed-ACK timer breaks the wait.
+
+There are three fixes. Write each request in one call (one `write`, or `writev` with several buffers). Or set `TCP_NODELAY` for request-response traffic. Or use `TCP_CORK` to collect a response on purpose; tcp(7) says Linux sends corked data after at most 200 ms. Many runtimes choose `TCP_NODELAY` for you. Go, for example, turns Nagle off by default on every TCP connection.
+
+```c
+int one = 1;
+setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one); // send small writes at once
+
+struct iovec iov[2] = { { hdr, hdr_len }, { body, body_len } };
+writev(fd, iov, 2);                                          // or: one call, one segment
+```
+
+## Connect
+
+- [Latency, bandwidth and BDP](/networking/foundations/latency-bandwidth-and-bdp): the product that a window must cover.
+- [Reliability and retransmission](/networking/transport/reliability-and-retransmission): the ACKs that slide the window.
+- [Congestion control: Reno and CUBIC](/networking/transport/congestion-control-reno-and-cubic): the other window, set by the network.
+- [Sockets](/networking/programming/sockets) and [zero-copy](/networking/programming/zero-copy): where the buffers sit in the API.
+- [Pipes](/os/ipc/pipes): a kernel buffer that blocks a fast writer the same way.
+- [Queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law): why bytes in flight equal rate times delay.
+
+<Recall cards={[
+  { q: "What does the window field in a TCP segment mean?", a: "How many bytes after the acknowledgment number the sender of this segment can still receive: the free space in its receive buffer." },
+  { q: "Why must a sender probe a zero window, and how does Linux build the probe?", a: "A window update is a pure ACK and is never retransmitted, so a lost update would deadlock both sides. Linux sends an ACK with sequence number snd.una − 1; the receiver must answer it with an ACK that shows its current window." },
+  { q: "What rate can a 64 KiB window reach on a 100 ms round trip?", a: "About 65,535 × 8 / 0.1 s = 5.24 Mbit/s, whatever the link rate." },
+  { q: "Why must the window scale shift be chosen at connect time?", a: "The option appears only in SYN segments, so the shift is fixed for the whole connection. Linux picks it from the maximum receive buffer it could grow to." },
+  { q: "What are the receiver's and the sender's rules against silly window syndrome?", a: "The receiver opens its window only by at least min(half the buffer, one MSS). The sender sends a small segment only if it is all the data there is, or at least half the largest window offered. Nagle holds small writes while data is unacknowledged." },
+  { q: "Explain the write-write-read stall between Nagle's algorithm and delayed ACKs.", a: "The second small write waits for the ACK of the first (Nagle). The receiver waits for more data before it ACKs (delayed ACK) and does not reply to half a request. Only the delayed-ACK timer, 40 to 200 ms on Linux, breaks the wait." },
+]} />

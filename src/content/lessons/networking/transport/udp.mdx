@@ -1,0 +1,135 @@
+---
+summary: "UDP adds ports and a checksum to IP, and nothing else. The 8-byte header, the checksum over a pseudo-header, why datagrams arrive out of order or not at all, and why DNS, games and QUIC choose it anyway."
+---
+import { NetTcpUdpChecksumDemo, NetTcpUdpOrderDemo, NetTcpHolDemo } from "@/demos/net/NetTcpUdpDemos";
+
+IP moves a packet from one host to another host. It does not know which program on the host should get the packet. A **transport protocol** adds that: a number for each communication endpoint, called a **port**. The User Datagram Protocol (UDP, RFC 768, 1980) adds ports, a length and a checksum, and nothing more. There is no connection, no order, no retransmission and no flow control.
+
+Each `sendto()` call becomes one **datagram**: one UDP header, one IP packet (unless IP fragments it), and one `recvfrom()` call at the other end. Message boundaries survive, which TCP does not give you. A datagram arrives whole, or it does not arrive.
+
+## The header
+
+The UDP header is four 16-bit fields, so it is 8 bytes:
+
+| Field | Bits | Meaning |
+|---|---|---|
+| Source port | 16 | the sender's port, so that a reply can find it; 0 if no reply is wanted |
+| Destination port | 16 | selects the receiving socket |
+| Length | 16 | header plus data, in bytes; at least 8 |
+| Checksum | 16 | covers a pseudo-header, the header and the data |
+
+The IPv4 total length field allows 65,535 bytes. The IPv4 header takes 20 of them and UDP takes 8, so the largest UDP payload over IPv4 is 65,507 bytes. In practice, a datagram larger than the path MTU is split into IP fragments. The loss of one fragment loses the whole datagram, so protocols keep datagrams small.
+
+## The checksum and the pseudo-header
+
+The checksum is the **Internet checksum** of RFC 1071. The sender adds all 16-bit words with **ones' complement** addition: a carry out of bit 15 wraps around and adds 1 at bit 0. It then inverts the result. The receiver adds every word, the checksum included, and expects 0xffff.
+
+The sum covers more than the UDP datagram. It also covers a **pseudo-header**: the source and destination IP addresses, a zero byte, the protocol number (17 for UDP) and the UDP length. These words are never sent as part of UDP. Both ends build them from the IP header. If a router delivers a datagram to the wrong host, the destination address in the receiver's pseudo-header differs, and the check fails.
+
+<Predict
+  id="udp-nat"
+  question="A NAT rewrites the source IP address of a UDP datagram. It does not change any byte of the UDP header or data. Does the receiver's checksum check still pass?"
+  options={["Yes: the checksum covers only the UDP header and the data", "No: the source address is part of the sum, through the pseudo-header", "Only over IPv6"]}
+  answer={1}
+  explain="The pseudo-header puts both IP addresses into the sum. A NAT that changes an address must also update the UDP checksum (and the TCP checksum). It can do that without reading the data: RFC 1624 shows how to update a checksum when one 16-bit word changes."
+>
+<NetTcpUdpChecksumDemo />
+</Predict>
+
+Things to try:
+
+1. Move the bit slider through the header and the data. Every single flipped bit fails the check. A flip changes one word by a power of two, and the ones' complement sum cannot hide that.
+2. Turn on **A NAT rewrites the source address**. The check fails. Turn on **The NAT also fixes the checksum**: the NAT updates the checksum for the two changed address words only, and the check passes again.
+3. With the fix on, flip a data bit as well. The check still fails, because the incremental update keeps the old error in the sum.
+4. Turn on **The sender sends checksum 0**. Now nothing is checked, and a flipped bit reaches the application.
+5. Change the payload. Watch the carries (marked +1) in the running sum.
+
+Two rules handle the value 0. In IPv4, a checksum field of 0 means "the sender did not compute one". So a sender that computes 0 sends 0xffff instead, which is the same number in ones' complement. In IPv6 the checksum is mandatory (RFC 8200, section 8.1): a receiver discards a datagram with checksum 0. RFC 6935 and RFC 6936 allow a zero checksum only for tunnel protocols.
+
+The checksum is weak. The sum does not depend on the order of the words, so two swapped 16-bit words pass. Two errors that cancel out also pass. Ethernet's CRC-32 catches far more on each link, and TLS catches everything end to end. The UDP checksum is there for errors that no link CRC can see, such as errors inside routers and hosts.
+
+```c
+// RFC 1071: the Internet checksum. Add 16-bit words, fold the carries back in, invert.
+uint16_t inet_checksum(const uint8_t *p, size_t n, uint32_t sum) {
+    for (; n > 1; p += 2, n -= 2) sum += (uint32_t)p[0] << 8 | p[1];
+    if (n) sum += (uint32_t)p[0] << 8;          // an odd last byte is padded with zero
+    while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+```
+
+## No order, no retransmission
+
+UDP gives each datagram to IP and forgets it. If two datagrams take different paths, the second can arrive first. Routers spread traffic over parallel links and paths, usually per flow, but some spread it per packet. A link can also drop a datagram. The receiver's kernel then simply delivers the next one.
+
+<Predict
+  id="udp-order"
+  question="A router sends datagrams over two paths in turn. Path B is 12 ms slower, and a datagram leaves every 4 ms. In what order does the application read them?"
+  options={["In the order they were sent: UDP numbers them", "Out of order: odd and even datagrams interleave late, and lost ones are just missing", "In order, but with gaps where datagrams were lost"]}
+  answer={1}
+  explain="UDP has no sequence numbers. The kernel hands each datagram up when it arrives. A datagram on the slow path arrives after later datagrams on the fast path, and a lost one never comes."
+>
+<NetTcpUdpOrderDemo />
+</Predict>
+
+Things to try:
+
+1. With the defaults, 7 of 12 datagrams arrive in order, 4 arrive late, and 1 is lost. Press **New random losses** to see other runs.
+2. Set the extra delay of path B to 0. Every datagram arrives in order. The network did not change its rules; the paths just became equal.
+3. Set the time between datagrams to 20 ms. Now each datagram arrives before the next one leaves, so the order holds even with two paths.
+4. Set the loss to 30%. Nothing ever comes back to fill the gaps.
+
+An application that needs order or completeness must add sequence numbers itself. RTP, the protocol for voice and video, numbers its packets and plays them from a jitter buffer. QUIC numbers every packet and retransmits lost data in new packets.
+
+## When UDP wins
+
+UDP wins when its missing features would hurt. There are three common cases.
+
+**One question, one answer.** A DNS query fits in one datagram, and so does the answer. Over UDP, the answer arrives after one round trip. Over TCP, the handshake costs a round trip first. Our sim gives 40 ms for UDP and 80 ms for TCP on a path with 20 ms one-way delay.
+
+The classic limit for a DNS message over UDP is 512 bytes (RFC 1035). EDNS(0) (RFC 6891) lets a client offer more, and DNS Flag Day 2020 recommended 1232 bytes to avoid IP fragmentation. If an answer does not fit, the server sets the TC (truncated) bit, and the client asks again over TCP. Without retransmission in UDP, the stub resolver retries on a timer: in glibc the default timeout is 5 s, with 2 attempts.
+
+**Fresh state is better than complete state.** A game server sends the world state many times per second. If one update is lost, the next update replaces it. TCP would hold every later update until the lost one is retransmitted, because it delivers bytes only in order. This is **head-of-line blocking**.
+
+<NetTcpHolDemo />
+
+Things to try:
+
+1. Keep 2% loss, 30 updates per second and 30 ms delay. Over UDP every update that arrives is 30 ms old; 3 updates are lost. Over TCP the 99th percentile is 190 ms, and the client once shows a state that is 224 ms old.
+2. Set the loss to 0. Both protocols give 30 ms for every update.
+3. Raise the loss to 8%. TCP needs more retransmission timeouts, and the red columns grow.
+4. Raise the update rate. Fast retransmit needs three later segments, so more updates per second repair a TCP loss sooner. UDP does not care.
+
+**A new transport in user space.** A new TCP feature must reach every kernel and survive every middlebox that inspects TCP. UDP passes through almost all of them. QUIC (RFC 9000) runs on UDP and does its own reliability, ordering per stream, encryption and congestion control. A loss on one QUIC stream does not block the other streams.
+
+The cost of this freedom is responsibility. UDP has no congestion control, so a UDP application can flood a shared path. RFC 8085 (BCP 145) says that an application SHOULD control the rate of the UDP traffic it sends, and QUIC does.
+
+```go
+// A UDP echo server in Go. Each ReadFrom returns one whole datagram and the sender's address.
+conn, err := net.ListenPacket("udp", ":9000")
+if err != nil { log.Fatal(err) }
+buf := make([]byte, 1500)
+for {
+	n, addr, err := conn.ReadFrom(buf)
+	if err != nil { continue }
+	conn.WriteTo(buf[:n], addr) // no connection: every reply names its destination
+}
+```
+
+## Connect
+
+- [Layers and encapsulation](/networking/foundations/layers-and-encapsulation): where the UDP header sits in a packet.
+- [TCP handshake and teardown](/networking/transport/tcp-handshake-and-teardown): the connection that UDP does not have.
+- [Reliability and retransmission](/networking/transport/reliability-and-retransmission): what an application on UDP must rebuild.
+- [QUIC](/networking/transport/quic) and [HTTP/3](/networking/apps/http-3): a full transport on top of UDP.
+- [DNS](/networking/apps/dns): the classic UDP protocol.
+- [Tail latency](/performance/systems/tail-latency): why a 99th percentile of 190 ms matters.
+
+<Recall cards={[
+  { q: "Name the four fields of the UDP header and their sizes.", a: "Source port, destination port, length and checksum, 16 bits each: 8 bytes in total." },
+  { q: "What is the pseudo-header, and why is it in the UDP checksum?", a: "The source and destination IP addresses, a zero byte, the protocol number and the UDP length. It is not sent; both ends build it. It makes a datagram delivered to the wrong host, or with a wrongly rewritten address, fail the check." },
+  { q: "What does a UDP checksum of 0 mean in IPv4 and in IPv6?", a: "In IPv4 it means the sender computed no checksum, so a computed 0 is sent as 0xffff. In IPv6 the checksum is mandatory, and a receiver discards a datagram with 0 (except for tunnels under RFC 6936)." },
+  { q: "Why can a ones' complement checksum not detect two swapped 16-bit words?", a: "Addition is commutative: the sum is the same in any word order." },
+  { q: "Why does a game prefer UDP for state updates over a lossy path?", a: "TCP delivers bytes in order, so one lost segment holds back every later update until it is retransmitted (head-of-line blocking). Over UDP the next update simply replaces the lost one." },
+  { q: "What happens when a DNS answer does not fit in the UDP size the client offered?", a: "The server sets the TC (truncated) bit, and the client repeats the query over TCP." },
+]} />

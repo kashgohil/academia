@@ -81,7 +81,7 @@ export function rtoSeries(samples: number[], cfg: RtoConfig = LINUX_RTO) {
 
 /**
  * The times at which the sender transmits and gives up, when every copy is lost and the timer doubles each time.
- * `retries` is the number of retransmissions (Linux tcp_syn_retries = 6, tcp_synack_retries = 5, tcp_retries2 = 15).
+ * `retries` is the number of retransmissions (Linux tcp_syn_retries = 6 plus tcp_syn_linear_timeouts = 4 since 6.5, tcp_synack_retries = 5, tcp_retries2 = 15).
  * Returns the send times in ms and the time of giving up (one more timeout after the last retransmission).
  */
 export function backoffSchedule(first: number, retries: number, maxRto = Infinity) {

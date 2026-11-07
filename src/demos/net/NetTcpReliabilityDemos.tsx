@@ -92,7 +92,7 @@ const RT = {
   jitter: range({ label: "Jitter (±)", min: 0, max: 100, step: 1, default: 10, format: (v) => `${v} ms` }),
   spike: range({ label: "Delay spike every", min: 0, max: 60, step: 5, default: 40, format: (v) => (v ? `${v} samples` : "never") }),
   size: range({ label: "Spike size", min: 0, max: 600, step: 10, default: 250, format: (v) => `+${v} ms` }),
-  min: seg<string>("Minimum RTO", [["200", "200 ms (Linux)"], ["1000", "1 s (RFC 6298)"]], "200"),
+  min: seg<string>("Minimum RTO", [["200", "200 ms floor"], ["1000", "1 s (RFC 6298)"]], "200"),
 };
 
 export function NetTcpRtoDemo() {

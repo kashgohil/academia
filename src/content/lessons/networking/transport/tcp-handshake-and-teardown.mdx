@@ -1,0 +1,158 @@
+---
+summary: "How TCP opens and closes a connection: the three-way handshake, the eleven states, SYN retries, SYN floods and SYN cookies, simultaneous open, half-close, RST, and why TIME_WAIT lasts 2 MSL."
+---
+import { NetTcpHandshakeDemo, NetTcpSynFloodDemo, NetTcpCookieDemo, NetTcpTimeWaitDemo } from "@/demos/net/NetTcpHandshakeDemos";
+
+TCP gives an application a reliable, ordered stream of bytes in each direction. To do that, each side numbers every byte it sends. A **sequence number** names a byte, and an **acknowledgment number** says "I have every byte before this one". Before any data flows, the two sides must agree on the first sequence number in each direction. That agreement is the **handshake**. The protocol is RFC 9293 (2022), which replaced RFC 793 (1981).
+
+## The header
+
+The fixed TCP header is 20 bytes. **Options** can add up to 40 more, because the 4-bit **data offset** counts the header length in 32-bit words, and 15 × 4 = 60.
+
+| Field | Bits | Meaning |
+|---|---|---|
+| Source and destination port | 16 + 16 | with the two IP addresses, they name the connection (the **4-tuple**) |
+| Sequence number | 32 | number of the first data byte in this segment, or of the SYN |
+| Acknowledgment number | 32 | next byte the sender of this segment expects |
+| Data offset, reserved | 4 + 4 | header length in words |
+| Flags | 8 | CWR, ECE, URG, ACK, PSH, RST, SYN, FIN |
+| Window | 16 | free space in the receive buffer, see [flow control](/networking/transport/flow-control) |
+| Checksum, urgent pointer | 16 + 16 | the checksum covers a pseudo-header, as in [UDP](/networking/transport/udp) |
+
+SYN and FIN each use one sequence number, as if they were one byte of data. So the other side can acknowledge them like data. A segment with no data, no SYN and no FIN uses no sequence number.
+
+## Three segments to open
+
+The client picks an **initial sequence number** (ISN) and sends a SYN. The server picks its own ISN, and answers with SYN-ACK: its SYN, plus an ACK of the client's SYN. The client acknowledges the server's SYN. After three segments, both sides know both ISNs, and each side knows that the other heard it.
+
+The SYN also carries options that can appear only there: the **maximum segment size** (MSS), the **window scale** and **SACK permitted**. It often carries **timestamps** too, which then appear in every later segment. If a side sends no MSS option, the peer must assume 536 bytes for IPv4.
+
+The demos start both ISNs at 0 so that the numbers stay readable. Real ISNs are not 0. RFC 9293 asks for ISN = M + F(4-tuple, secret), where M is a clock that ticks about every 4 µs and F is a pseudorandom function. The clock moves ISNs forward over time, which keeps segments of an old connection out of the window of a new one. The secret makes the ISN hard to guess, so an attacker who cannot see the traffic cannot inject a segment that the receiver accepts.
+
+<Predict
+  id="tcp-synloss"
+  question="The one-way delay is 20 ms. The client's first SYN is lost. When does connect() return?"
+  options={["After 80 ms: one extra round trip", "After about 1 s: the client waits for its retransmission timeout before it sends the SYN again", "Immediately, with an error"]}
+  answer={1}
+  explain="Before the first ACK, the client has no RTT sample. RFC 6298 says to start with a timeout of 1 s. So a lost SYN costs a full second. In the demo, connect() returns at 1040 ms. A second loss adds 2 s more: 3040 ms."
+>
+<NetTcpHandshakeDemo />
+</Predict>
+
+Things to try:
+
+1. Keep the defaults and click the rows of the log. Read the flags, the window and the options of the SYN and the SYN-ACK in the header diagram.
+2. Lose 1 SYN, then 2 SYNs. The client sends again after 1 s, then after 2 s more. The timeout doubles each time.
+3. Lose 1 SYN-ACK. Both sides time out: the client sends its SYN again, and the server sends its SYN-ACK again.
+4. Lose the third segment. The server stays in SYN_RCVD until the client's first data segment arrives. That segment carries the ACK flag too, so it completes the handshake.
+5. Choose **Simultaneous open**. Both sides send SYN, both answer with SYN-ACK: four segments, and both pass through SYN_RCVD.
+6. Choose **Closed port**. No socket listens on port 81, so the server's stack answers with RST and the client gets ECONNREFUSED.
+
+Linux retries a SYN `tcp_syn_retries` = 6 times. Since Linux 6.5 it adds `tcp_syn_linear_timeouts` = 4 more tries, and the first five waits are 1 s each. So connect() fails with ETIMEDOUT after 131 s. A listener sends up to `tcp_synack_retries` = 5 SYN-ACK retransmissions. With a 1 s timeout that doubles, the last SYN-ACK leaves 31 s after the first, and the half-open entry is dropped after 63 s. Both numbers match the Linux documentation.
+
+## The eleven states
+
+RFC 9293 defines each connection as a state machine. The demo draws these states under the diagram.
+
+| State | Meaning |
+|---|---|
+| `LISTEN` | a server socket waits for SYNs |
+| `SYN_SENT` | the client sent SYN and waits for SYN-ACK |
+| `SYN_RECEIVED` | a SYN arrived and our SYN-ACK is not yet acknowledged |
+| `ESTABLISHED` | data flows both ways |
+| `FIN_WAIT_1` | we sent FIN; it is not yet acknowledged |
+| `FIN_WAIT_2` | our FIN is acknowledged; we wait for the peer's FIN |
+| `CLOSE_WAIT` | the peer sent FIN; our application has not closed yet |
+| `CLOSING` | both FINs crossed; ours is not yet acknowledged |
+| `LAST_ACK` | we closed after the peer; we wait for the ACK of our FIN |
+| `TIME_WAIT` | we closed first; we wait 2 MSL before we forget the connection |
+| `CLOSED` | no connection |
+
+Two states point at application bugs. Many sockets in `CLOSE_WAIT` mean that the application got EOF but never called close(). Many sockets in `FIN_WAIT_2` usually mean that the peer has the same bug. Linux limits an orphaned `FIN_WAIT_2` socket with `tcp_fin_timeout`, 60 s by default.
+
+## Closing: FIN, half-close and RST
+
+Each direction closes separately. A FIN says "I will send no more bytes". After its FIN, a side can still receive. This is **half-close**.
+
+In C it is `shutdown(fd, SHUT_WR)`; in Go it is `CloseWrite()` on a `*net.TCPConn`. A client can send a request, close its side to mark the end, and then read the whole answer. In the demo's **Half-close** scenario, the client is in `FIN_WAIT_2` while the answer arrives.
+
+```go
+c, _ := net.Dial("tcp", "example.com:7")
+c.Write(request)
+c.(*net.TCPConn).CloseWrite() // send FIN: "that is the whole request"
+reply, _ := io.ReadAll(c)       // still reads until the server's FIN
+```
+
+**RST** is the abrupt end. A stack sends RST for a segment that matches no connection and no listener. Examples are a segment to a closed port, or to a host that rebooted. An application can also abort.
+
+ RST is not acknowledged and not retransmitted. The peer's next read or write fails with ECONNRESET. RFC 5961 makes a stack accept an RST only if its sequence number is exactly the next one expected. An RST elsewhere in the window gets a "challenge ACK" instead, so a blind attacker cannot easily reset a connection.
+
+## SYN floods and SYN cookies
+
+A listener keeps a small entry for each SYN until the handshake completes. An attacker can send SYNs from forged source addresses. The SYN-ACKs go to addresses that never answer, and each entry stays until its retries run out. In Linux, the limit for these entries is the `listen()` backlog, capped by `net.core.somaxconn` (4096 since Linux 5.4). RFC 4987 (2007) describes the attack and the defenses.
+
+<Predict
+  id="tcp-flood"
+  question="An attacker sends 200 forged SYNs per second. The listener keeps at most 128 half-open entries, and each entry lives 63 s. What happens to a real client that connects 1.5 s after the attack starts?"
+  options={["It connects normally: real clients answer, attackers do not", "Its SYN is dropped, and so are its retries for as long as the attack lasts", "It connects, but slowly"]}
+  answer={1}
+  explain="The backlog is full after 0.64 s, and no entry leaves for 63 s. The listener cannot tell a real SYN from a forged one, so it drops them all. Of 10 connects in the first 10 s, only the one before the backlog filled succeeds."
+>
+<NetTcpSynFloodDemo />
+</Predict>
+
+Things to try:
+
+1. Keep the defaults: 1 of 10 real connects succeeds. Turn on SYN cookies: all 10 succeed in one round trip, although the backlog stays full.
+2. Turn cookies off and raise the backlog to 1024. The attack fills it in about 5 s instead of 0.64 s. A larger backlog only buys time.
+3. Set the attack rate to 0. Every connect takes one round trip.
+
+A **SYN cookie** removes the state. When the backlog is full, the server encodes what it needs into its own ISN and forgets the SYN. The demo uses the layout that D. J. Bernstein describes on his SYN cookie page.
+
+<NetTcpCookieDemo />
+
+Things to try:
+
+1. Change the client port. The 24-bit hash changes completely; the other fields do not.
+2. Set the client MSS to 1220. The table holds only 536, 1300, 1440 and 1460, so the cookie encodes 536, the largest value that is not above 1220.
+3. Move **ACK arrives after** to 92 s or more. The counter has moved two steps since the SYN, so the cookie is rejected.
+4. Turn on the attacker. A guessed value fails the hash check.
+
+Cookies have a cost. Options from the SYN, such as window scale and SACK, have no place in 32 bits, so a plain cookie connection loses them. Linux puts them into the low bits of the TCP timestamp when timestamps are on. Linux uses its own layout, with a counter that ticks every 60 s and SipHash. Its default `tcp_syncookies` = 1 sends cookies only when the queue overflows; 2 sends them always.
+
+## TIME_WAIT
+
+The side that closes first ends in `TIME_WAIT`. It stays there for 2 × **MSL**, the maximum segment lifetime. RFC 9293 sets MSL to 2 minutes, an arbitrary value. Linux uses a fixed 60 s (`TCP_TIMEWAIT_LEN`). TIME_WAIT has two jobs.
+
+<NetTcpTimeWaitDemo />
+
+Things to try:
+
+1. **The last ACK is lost**, with TIME_WAIT. The server sends its FIN again after its timeout, and the client in TIME_WAIT acknowledges it. The server closes cleanly.
+2. Turn TIME_WAIT off. The client has forgotten the connection, so its stack answers the second FIN with RST. The server application gets ECONNRESET for a connection that was closing normally.
+3. **An old segment arrives late**, without TIME_WAIT. The client reuses port 40000, and the new connection happens to use the same ISN. The old segment falls inside the new window, and the server takes 1460 bytes of the old connection as new data. No checksum can catch this.
+4. Turn TIME_WAIT on. The port is still taken, so the second connection uses 40001. The old segment matches nothing and gets RST.
+
+So the first job is to answer a retransmitted FIN. The second is to keep the 4-tuple unused until old segments have died out in the network. Two MSL covers a segment that lives one MSL plus its answer.
+
+TIME_WAIT has a real cost on busy clients. Each connection to the same server address and port holds one local port for 60 s. With Linux's default `ip_local_port_range` of 32768–60999, that is about 470 new connections per second from one client address.
+
+The fixes are connection reuse (keep-alive and pooling), more client addresses, and `tcp_tw_reuse`. That setting lets a new outgoing connection reuse a port in TIME_WAIT when TCP timestamps make it safe. Its default, 2, enables it only for loopback. The older `tcp_tw_recycle` broke clients behind NAT and was removed in Linux 4.12. RFC 1122 also lets a host accept a new SYN for a 4-tuple in TIME_WAIT. Its new ISN must be larger than the largest sequence number it used on the old connection.
+
+## Connect
+
+- [UDP](/networking/transport/udp): a transport with no connection at all.
+- [Reliability and retransmission](/networking/transport/reliability-and-retransmission): what the sequence numbers are for after the handshake.
+- [QUIC](/networking/transport/quic): a handshake that sets up transport and encryption in one round trip.
+- [TLS handshake](/networking/security/tls-handshake): the round trips that come after TCP's.
+- [Load balancers](/networking/infrastructure/load-balancers): SYN floods and connection tables at scale.
+- [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency): why a doubling timeout is the normal way to retry.
+
+<Recall cards={[
+  { q: "Why does each side of a TCP connection send a SYN, and what does the SYN-ACK acknowledge?", a: "Each side must tell the other its initial sequence number. The SYN-ACK carries the server's own SYN and acknowledges the client's SYN (ack = client ISN + 1)." },
+  { q: "Why does a lost SYN cost about one second?", a: "With no RTT sample yet, the retransmission timeout starts at 1 s (RFC 6298). It doubles on each further loss." },
+  { q: "What is half-close, and which state is the side that called it in while it still reads?", a: "Closing only the sending direction with shutdown(SHUT_WR): a FIN goes out, but data can still arrive. After the FIN is acknowledged, that side is in FIN_WAIT_2." },
+  { q: "How does a SYN cookie let a server keep no state for a SYN?", a: "It encodes a time counter, an MSS index and a keyed hash of the 4-tuple into its ISN. The client's ACK returns ISN + 1, and the server checks the hash and the age and rebuilds the connection." },
+  { q: "Give the two reasons for TIME_WAIT.", a: "First, to acknowledge a FIN that the peer sends again because our last ACK was lost. Second, to keep the 4-tuple unused until old duplicate segments have left the network." },
+  { q: "Many sockets sit in CLOSE_WAIT. Where is the bug?", a: "In the local application: the peer closed (sent FIN), and the application read EOF but never called close()." },
+]} />

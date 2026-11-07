@@ -1,0 +1,139 @@
+---
+summary: "How TCP turns a lossy network into a reliable byte stream: sliding windows, go-back-N against selective repeat, cumulative ACKs, fast retransmit on three duplicate ACKs, SACK, and the RFC 6298 retransmission timeout with its backoff."
+---
+import { NetTcpArqDemo, NetTcpRtoDemo, NetTcpLossSweepDemo } from "@/demos/net/NetTcpReliabilityDemos";
+
+The network may lose, delay, duplicate or reorder a packet. A reliable transport must still deliver every byte once and in order. Protocols that do this with acknowledgments and retransmissions are called **ARQ** (automatic repeat request) protocols. They have four parts: sequence numbers, acknowledgments, a timer, and a rule that says what to send again.
+
+## From stop-and-wait to a window
+
+The simplest ARQ sends one segment and waits for its ACK. On a path with a 40 ms round trip, that is at most one segment per 40 ms, whatever the link rate. The fix is a **window**: the sender may have up to W segments sent and not yet acknowledged. A window of W segments sends W segments per round trip. To fill a path, W must reach the [bandwidth-delay product](/networking/foundations/latency-bandwidth-and-bdp).
+
+With many segments in flight, a loss raises a new question: what does the sender resend? There are two textbook answers.
+
+- **Go-back-N.** The receiver accepts only the next segment in order and drops anything after a gap. Its ACK is **cumulative**: "I have everything before n". On a timeout the sender resends the oldest segment and everything after it.
+- **Selective repeat.** The receiver buffers segments after a gap. It acknowledges each segment on its own, and the sender keeps one timer per segment. On a timeout the sender resends only that segment.
+
+TCP mixes the two. Its ACKs are cumulative, like go-back-N. Its receiver keeps out-of-order data, like selective repeat. On top of that, TCP finds most losses without waiting for a timer.
+
+## Duplicate ACKs and fast retransmit
+
+When segment 3 is lost, segments 4, 5 and 6 still arrive. Each one makes the receiver send an ACK that still asks for 3. Such an ACK, with no data and no new information, is a **duplicate ACK**. RFC 5681 lets a sender treat three duplicate ACKs as a loss.
+
+The sender then resends segment 3 at once: **fast retransmit**. Why three and not one? The network can reorder packets, and one or two duplicates are often just reordering.
+
+<Predict
+  id="arq-gbn"
+  question="A sender has 12 segments and a window of 5. The network loses only the first copy of segment 3. How many segments does go-back-N send in total?"
+  options={["13: segment 3 is sent again, nothing else", "17: segment 3 and the segments sent after it are sent again", "24: everything is sent twice"]}
+  answer={1}
+  explain="The go-back-N receiver drops segments 4 to 7 because they come after a gap. When the timer fires, the sender resends 3, 4, 5, 6 and 7. That is 12 + 5 = 17 segments, and it finishes after 425 ms. TCP sends 13 segments and finishes after 193 ms, because three duplicate ACKs trigger a fast retransmit long before the 200 ms timeout."
+>
+<NetTcpArqDemo />
+</Predict>
+
+Things to try:
+
+1. With segment 3 lost, compare the four rows of the table. Go-back-N needs 425 ms and 17 segments; selective repeat needs 353 ms and 13 segments; both TCP variants need 193 ms and 13 segments.
+2. Choose TCP and read the ACK row. Three orange duplicates of A3 come before the retransmission. Lose one of the ACKs that segments 4 to 7 trigger, and the retransmission still happens.
+3. Lose segments 3, 5 and 7. TCP without SACK needs 286 ms; TCP with SACK needs 246 ms. Without SACK the sender learns about only one hole per round trip.
+4. Lose only segment 12, the last one. No later segment exists to cause duplicate ACKs, so both TCP variants wait for the 200 ms timer and finish after 425 ms. This is a **tail loss**.
+5. Set the window to 1. All four protocols become stop-and-wait.
+
+Without SACK, a sender in recovery uses **partial ACKs** (NewReno, RFC 6582). It records `recover`, the highest sequence number sent when the loss was found. An ACK that moves forward but stays below `recover` shows the next hole, and the sender resends that segment at once. The cost is one round trip per hole.
+
+## SACK
+
+**Selective acknowledgment** (SACK, RFC 2018) adds a TCP option to the ACK. It lists up to four blocks of data that arrived above the gap, or three when the timestamp option also takes space. Both sides must agree with the "SACK permitted" option in their SYNs.
+
+The sender keeps a **scoreboard** of which segments are SACKed. RFC 6675 marks a segment as lost when enough data above it is SACKed. That is three separate SACKed pieces, or more than two full segments of bytes. It counts bytes in flight as a value called **pipe**, so that the sender can resend every hole within one round trip.
+
+Linux has moved beyond counting duplicates. Its default loss detection is RACK-TLP (RFC 8985, 2021; `net.ipv4.tcp_recovery` = 1). RACK marks a segment lost when a segment sent later was delivered, plus a small time allowance for reordering. TLP sends a **tail loss probe** after about two round trips without an ACK. The probe makes the receiver send a SACK, so a tail loss is repaired without the full timeout.
+
+## The retransmission timeout
+
+When no ACK comes, only a timer helps. Its value is the **retransmission timeout** (RTO). Too short, and the sender resends segments that were only late. Too long, and the connection sits idle after a loss. RFC 6298 sets the RTO from two smoothed values: the RTT itself and its variation.
+
+For the first sample R, the sender sets $\text{SRTT} = R$ and $\text{RTTVAR} = R/2$. For each later sample $R'$:
+
+$$
+\text{RTTVAR} \leftarrow (1-\beta)\,\text{RTTVAR} + \beta\,\lvert \text{SRTT} - R' \rvert, \qquad \text{SRTT} \leftarrow (1-\alpha)\,\text{SRTT} + \alpha R'
+$$
+
+$$
+\text{RTO} = \text{SRTT} + \max(G,\ 4\,\text{RTTVAR})
+$$
+
+Here $\alpha = 1/8$, $\beta = 1/4$, and G is the clock granularity. Before the first sample, the RTO is 1 s. RFC 6298 says the RTO SHOULD be at least 1 s, and any maximum must be at least 60 s. Linux applies its 200 ms minimum (`TCP_RTO_MIN`) to the variance term, so its RTO is at least SRTT + 200 ms. Its ceiling is 120 s (`TCP_RTO_MAX`).
+
+<Predict
+  id="rto-spike"
+  question="RTT samples are 50 ms ± 10 ms. Then one round trip suddenly takes 300 ms. With a 200 ms minimum RTO, does the timer fire before the ACK arrives?"
+  options={["No: the RTO is far above 50 ms", "Yes: the RTO is about 200 ms, so the segment is resent although it was not lost", "Only with the 1 s floor of RFC 6298"]}
+  answer={1}
+  explain="With stable samples, SRTT + 4·RTTVAR is about 70 ms, so the floor sets the RTO to 200 ms. A 300 ms round trip is longer: the timer fires, and the retransmission is spurious. With the 1 s floor of the RFC, the same spike causes no timeout, but every real loss costs 1 s. Linux adds its 200 ms minimum to SRTT instead, so its RTO is about 250 ms, and the timer still fires."
+>
+<NetTcpRtoDemo />
+</Predict>
+
+Things to try:
+
+1. With the defaults, 2 delay spikes of +250 ms cause 2 spurious timeouts. Switch to the 1 s minimum: none.
+2. Set the spike size to 0, and the jitter to 40 ms. RTTVAR grows to about 20 ms, but the RTO stays at the 200 ms floor.
+3. Set the base RTT to 300 ms. Now SRTT + 4·RTTVAR is above the floor, and the RTO follows the samples.
+4. Look at the last number. If every copy of a segment is lost, `tcp_retries2` = 15 sets a time limit. It is 15 retransmissions with a 200 ms RTO that doubles up to 120 s: 924.6 s. Linux gives up at the first timeout after that limit, never sooner.
+
+Two more rules matter. **Karn's algorithm**: never take an RTT sample from a retransmitted segment, because the ACK might be for either copy. And after a timeout, the RTO **doubles** (exponential backoff), and it stays doubled until a new valid sample arrives. In the RFC 6298 model, a lost SYN therefore costs 1 s, then 2 s more, as the [handshake lesson](/networking/transport/tcp-handshake-and-teardown) shows.
+
+```rust
+// RFC 6298 in a few lines. Times in ms.
+struct Rto { srtt: Option<f64>, rttvar: f64, rto: f64, backoffs: u32 }
+
+impl Rto {
+    fn on_sample(&mut self, r: f64) {
+        match self.srtt {
+            None => { self.srtt = Some(r); self.rttvar = r / 2.0; }
+            Some(s) => {
+                self.rttvar = 0.75 * self.rttvar + 0.25 * (s - r).abs();
+                self.srtt = Some(0.875 * s + 0.125 * r);
+            }
+        }
+        self.backoffs = 0;
+        self.rto = (self.srtt.unwrap() + (4.0 * self.rttvar).max(1.0)).clamp(200.0, 120_000.0);
+    }
+    fn timer_value(&self) -> f64 { (self.rto * 2f64.powi(self.backoffs as i32)).min(120_000.0) }
+    fn on_timeout(&mut self) { self.backoffs += 1; }
+}
+```
+
+After an RTO, Linux marks the unacknowledged segments as lost, except recent ones that RACK still gives time. It sends them again under a new congestion window. Without SACK, that behaves like go-back-N. With SACK, segments that the receiver already reported are skipped.
+
+## The cost of random loss
+
+<NetTcpLossSweepDemo />
+
+Things to try:
+
+1. Read the curves at 0% loss. All four protocols take the same time: the window and the round trip set it.
+2. Switch to **copies sent per segment**. At 10% loss, go-back-N sends 2.01 copies of each segment. TCP with SACK sends 1.17, selective repeat 1.26, and TCP without SACK 1.44.
+3. Compare the times at 10%: go-back-N needs 2.6 s for 60 segments, and TCP with SACK 1.3 s. Selective repeat sends few extra copies but waits for a timer at every loss.
+
+The sweep shows the trade-off. Go-back-N keeps the receiver simple and wastes the link. Selective repeat saves the link and waits for timers. TCP with SACK gets both: it repairs most losses within a round trip and resends almost only what was lost. The ACKs here also cross a lossy path, and cumulative ACKs help: a later ACK covers the work of a lost one.
+
+## Connect
+
+- [UDP](/networking/transport/udp): what an application on UDP must build again.
+- [Flow control](/networking/transport/flow-control): the window that the receiver controls.
+- [Congestion control: Reno and CUBIC](/networking/transport/congestion-control-reno-and-cubic): how loss also sets the sending rate.
+- [QUIC](/networking/transport/quic): packet numbers that never repeat, which removes the ambiguity that Karn's rule works around.
+- [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency): the same backoff in distributed systems.
+- [Exactly-once semantics](/distributed/data-systems/exactly-once-semantics): reliability above one connection.
+
+<Recall cards={[
+  { q: "After one loss in a window of W segments, what does go-back-N resend, and why?", a: "The lost segment and every segment sent after it, because its receiver drops everything that arrives after a gap." },
+  { q: "What is a duplicate ACK, and why does TCP wait for three before a fast retransmit?", a: "An ACK with no data that repeats the highest cumulative ACK. One or two duplicates are often caused by reordering, so three is a safer sign of loss (RFC 5681)." },
+  { q: "Why can a tail loss not be repaired by fast retransmit, and what does Linux do about it?", a: "No later segments arrive to cause duplicate ACKs, so only the RTO would fire. A tail loss probe (TLP, RFC 8985) resends after about two RTTs and makes the receiver report the hole." },
+  { q: "Give the RFC 6298 update rules and the RTO formula.", a: "RTTVAR = 3/4 RTTVAR + 1/4 |SRTT − R'|, then SRTT = 7/8 SRTT + 1/8 R'. RTO = SRTT + max(G, 4·RTTVAR), at least 1 s by the RFC (in Linux, at least SRTT + 200 ms)." },
+  { q: "State Karn's algorithm and the reason for it.", a: "Take no RTT sample from a retransmitted segment, because its ACK could belong to either copy." },
+  { q: "What does SACK tell the sender that a cumulative ACK cannot?", a: "Which blocks above the first gap arrived. The sender can then resend every missing segment in one round trip, instead of one hole per round trip." },
+]} />

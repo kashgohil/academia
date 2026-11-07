@@ -50,7 +50,7 @@ export interface TcpConfig {
   maxRto: number;
   /** Duplicate ACKs that trigger fast retransmit. */
   dupThresh: number;
-  /** SYN retransmissions before connect fails (Linux tcp_syn_retries = 6). */
+  /** SYN retransmissions before connect fails (Linux: tcp_syn_retries = 6, plus tcp_syn_linear_timeouts = 4 since 6.5). */
   synRetries: number;
   /** SYN-ACK retransmissions before a half-open entry is dropped (Linux tcp_synack_retries = 5). */
   synAckRetries: number;

@@ -191,6 +191,8 @@ export class SafetyMonitor {
   readonly leaders = new Map<number, NodeId>();
   /** Committed entries: index → identity. */
   readonly committed = new Map<number, string>();
+  /** The lowest term in which some server saw each index committed. Leader Completeness covers only later terms. */
+  readonly commitTerm = new Map<number, number>();
   /** First entry applied at each index, by any node. */
   readonly applied = new Map<number, { key: string; node: NodeId }>();
   readonly violations: Violation[] = [];
@@ -210,6 +212,7 @@ export class SafetyMonitor {
     else this.leaders.set(n.currentTerm, n.id);
     for (const [i, key] of this.committed) {
       if (i <= n.base) continue;
+      if (n.currentTerm <= (this.commitTerm.get(i) ?? Infinity)) continue;
       const e = n.entry(i);
       if (!e || entryKey(e) !== key) this.flag("Leader Completeness", `S${n.id + 1} leads term ${n.currentTerm} without committed entry ${i}`, `lc${n.currentTerm}:${i}`);
     }
@@ -221,6 +224,7 @@ export class SafetyMonitor {
       if (!e) continue;
       const key = entryKey(e);
       const prev = this.committed.get(i);
+      this.commitTerm.set(i, Math.min(this.commitTerm.get(i) ?? Infinity, n.currentTerm));
       if (prev === undefined) this.committed.set(i, key);
       else if (prev !== key) this.flag("State Machine Safety", `two different entries committed at index ${i}, so two servers will apply different commands there`, `cc${i}`);
     }

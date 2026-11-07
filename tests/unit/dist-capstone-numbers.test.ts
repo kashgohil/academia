@@ -87,7 +87,8 @@ describe("deterministic-simulation-testing", () => {
     expect(FUZZ_DEFAULT).toMatchObject({ servers: 3, clients: 3, faultEnd: 1500, faults: { min: 2, max: 7 } });
     expect(FUZZ_DEFAULT.work + FUZZ_DEFAULT.drain).toBe(1200);
   });
-  test("1,000 seeds pass with each read path; the ReadIndex counters", () => {
+  // 3,000 full fuzz runs: about 2 s alone, but over 5 s when the whole suite shares the CPU.
+  test("1,000 seeds pass with each read path; the ReadIndex counters", { timeout: 60_000 }, () => {
     for (const mode of ["readindex", "lease", "log"] as const) {
       const c = new Campaign({ ...FUZZ_DEFAULT, readMode: mode });
       c.run(1000);

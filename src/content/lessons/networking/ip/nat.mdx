@@ -1,0 +1,116 @@
+---
+summary: "How network address and port translation lets many hosts share one IPv4 address: the translation table, mapping and filtering behaviours, timeouts, hairpinning, why NAT breaks peer-to-peer, hole punching with STUN, TURN and ICE, and carrier-grade NAT."
+---
+import { NetIpNatTableDemo, NetIpHolePunchDemo } from "@/demos/net/NetIpNatDemos";
+
+There are about 4.3 billion IPv4 addresses, and far more devices. Most homes, offices and phone networks therefore hide many hosts behind one public address. A **network address and port translator** (NAPT, RFC 3022), usually just called NAT, makes this work. It rewrites the source address and port of each outgoing packet, and it remembers the change so that it can undo it for the replies.
+
+NAT is everywhere, so its behaviour matters to every protocol designer. It decides which packets may enter a network, how long a quiet connection survives, and whether two hosts can ever talk directly.
+
+## The translation table
+
+When an inside host sends a packet to the Internet, the NAT looks for a **mapping** for the packet's source address and port. If none exists, it creates one with a free external port on its public address. It rewrites the source to that external address and port, and it updates the IP and TCP or UDP checksums, because both cover the addresses. A reply that arrives at the external port is rewritten back to the inside host.
+
+<Predict
+  id="same-port"
+  question="Hosts H1 and H2 sit behind one NAT. Both send from source port 5000 to the same server, X port 443. What does X see?"
+  options={["Two flows from 203.0.113.10 port 5000, which X cannot tell apart", "Two flows from 203.0.113.10, with two different source ports", "Two flows from 192.168.1.10 and 192.168.1.11"]}
+  answer={1}
+  explain="The public address is the same, so the NAT must make the ports differ. It keeps port 5000 for the first host if it can, and gives the second host another free port. X sees two ordinary connections from one address."
+>
+<NetIpNatTableDemo />
+</Predict>
+
+1. With the default history, H1 keeps port 5000 and H2 gets port 40000. The reply from X reaches H1, with its destination rewritten to `192.168.1.10:5000`.
+2. Press **Y → H1's port**. The NAT drops the packet: H1 never sent anything to Y. Set **Filtering** to endpoint-independent and look again: the packet now enters.
+3. With address-and-port filtering, press **X:8080 → H1's port**. It is dropped, because H1 talked to port 443 of X, not 8080. With address-dependent filtering, it enters.
+4. Set **Mapping** to "address and port" and press **H1 → Y:3478**. H1 now has two mappings with two external ports, one per remote endpoint.
+5. Press **Wait 3 minutes** with an idle timeout of 120 s, then **X replies to H1**. The mappings have expired, so the late reply finds no mapping and is dropped.
+
+## Mapping and filtering behaviour
+
+NATs differ in two independent choices. RFC 4787 names them.
+
+| Behaviour | Mapping: which flows share an external port | Filtering: who may send in through a mapping |
+|---|---|---|
+| endpoint-independent | all flows from one inside address and port | anyone |
+| address-dependent | flows to the same remote address | addresses the inside host sent to |
+| address-and-port-dependent | flows to the same remote address and port | exact endpoints the inside host sent to |
+
+The older STUN specification (RFC 3489) used other names. A **full cone** NAT has endpoint-independent mapping and filtering. A **restricted cone** filters by address, and a **port-restricted cone** by address and port. A **symmetric** NAT makes a new mapping for each remote address and port.
+
+RFC 4787 also sets requirements for UDP. A NAT must use endpoint-independent mapping, and it must support **hairpinning**: an inside host can reach another inside host through the public address. A UDP mapping must not expire in less than 2 minutes, and 5 minutes or more is recommended. For TCP, RFC 5382 asks that an idle established connection survive at least 2 hours and 4 minutes.
+
+Real defaults vary widely. Linux connection tracking, which `iptables` and `nftables` NAT build on, keeps an unanswered UDP flow for 30 seconds (`nf_conntrack_udp_timeout`). It keeps a UDP flow for 120 seconds once the flow has replies and has lasted over 2 seconds (`nf_conntrack_udp_timeout_stream`). It keeps an established TCP connection for 432,000 seconds, which is 5 days. Home routers and mobile networks are often much shorter. So a long-lived protocol must send **keepalives** more often than the shortest timeout on the path, or the peer can no longer reach it.
+
+## Why NAT breaks peer-to-peer
+
+The Internet was designed so that any host could send to any other host. NAT ends this for hosts behind it. A packet from outside can enter only through a mapping, and only an inside host can create one. Two hosts that are both behind NATs therefore cannot simply connect: each NAT drops the other's first packet.
+
+NAT also breaks protocols that put addresses in their payload, such as FTP or SIP, because the NAT rewrites the header but not the payload. Some NATs carry an **application-level gateway** that rewrites the payload too, but it works only for protocols it knows. For this reason, new protocols avoid carrying addresses in the data.
+
+## Hole punching: STUN, TURN and ICE
+
+Two hosts can still often open a direct path, with help from a server that both can reach. Each host first asks the server what its public address and port look like. This is the job of **STUN** (Session Traversal Utilities for NAT, now RFC 8489). The server tells each host the other's public endpoint. Then both hosts send packets to each other at the same time. Each outgoing packet creates a mapping and a permit in its own NAT, which lets the other host's packets in.
+
+<Predict
+  id="punch"
+  question="A sits behind a port-restricted cone NAT, and B behind a symmetric NAT. A server has told each host the other's public address and port. Can they open a direct UDP path?"
+  options={["Yes: when both send at once, both NATs open", "No: B's NAT uses a new port toward A, and A's NAT filters packets from it", "Only over TCP"]}
+  answer={1}
+  explain="A symmetric NAT makes a new mapping for each remote endpoint. So B's packets to A leave from a port that the server never saw. A's NAT lets in only the exact endpoint A sent to, so it drops them. A's packets to B's old port find no matching permit either."
+>
+<NetIpHolePunchDemo />
+</Predict>
+
+1. Keep port-restricted and symmetric. The punch packets from B leave from a port that S never saw, and NAT A drops them. The banner says "relay".
+2. Set NAT B to port-restricted. Now both mappings stay the same for every destination. The first punches die, but each one opens a permit, and the next ones get through.
+3. Set NAT A to restricted and NAT B to symmetric. This works: A's NAT filters only by address, so B's new port does not matter.
+4. Read the table. In this model, 13 of the 16 pairs get a direct path. Every failure involves a symmetric NAT.
+
+When no direct path works, the hosts use a relay.
+
+**TURN** (Traversal Using Relays around NAT, RFC 8656) gives each host an address on a relay server, which forwards every packet. It always works, but the relay carries all the traffic and adds delay. **ICE** (Interactive Connectivity Establishment, RFC 8445) ties these together. Each host gathers candidate addresses: its local address, its address as STUN sees it, and a TURN relay address. The hosts then test candidate pairs and keep the best pair that works. WebRTC uses ICE for every call.
+
+Hole punching works often, but not always. Ford, Srisuresh and Kegel tested many NATs in 2005. They found that about 82% supported UDP hole punching and about 64% supported it for TCP. TCP is harder: the two SYNs must cross in flight, and some NATs reject an unexpected incoming SYN.
+
+## Carrier-grade NAT
+
+Many ISPs, especially mobile ones, no longer give each customer a public IPv4 address. They put customers behind a **carrier-grade NAT** (CGN), with addresses from the shared range `100.64.0.0/10` (RFC 6598) on the inside. A home router may add a second NAT behind it, so traffic crosses two translations.
+
+A public address has 64,512 ports above 1023. If the CGN gives each customer a fixed block of 1,024 ports, one address serves 63 customers. Fixed blocks make logging cheap: to trace an abuse report, the carrier needs only the block that a customer held, not every mapping. But a customer whose devices open many connections can run out of ports. And when one address carries many customers, a block or a rate limit on that address hits all of them.
+
+```go
+// The core of a NAPT, outbound: find or create a mapping, then rewrite.
+func (n *NAT) Outbound(p *Packet) {
+	key := mapKey{p.SrcIP, p.SrcPort} // endpoint-independent mapping (RFC 4787 REQ-1)
+	m, ok := n.table[key]
+	if !ok {
+		m = &Mapping{ExtPort: n.allocPort(p.SrcPort), Permits: map[endpoint]bool{}}
+		n.table[key] = m
+	}
+	m.Permits[endpoint{p.DstIP, p.DstPort}] = true // for address-and-port filtering
+	m.LastUsed = n.now
+	p.SrcIP, p.SrcPort = n.publicIP, m.ExtPort
+	p.FixChecksums() // the IP header and the TCP/UDP pseudo-header both changed
+}
+```
+
+IPv6 gives every device a global address, so it needs no NAT. But IPv6 networks keep stateful firewalls with the same filtering ideas. Inbound connections still need a permit, and hole punching still has work to do.
+
+## Connect
+
+- [Subnetting and CIDR](/networking/ip/subnetting-and-cidr): private ranges and the shared range for CGN.
+- [ICMP](/networking/ip/icmp): how a NAT translates the packet quoted inside an ICMP error.
+- [UDP](/networking/transport/udp): the transport that hole punching usually uses.
+- [Load balancers](/networking/infrastructure/load-balancers): the same address rewriting, used on purpose in a data center.
+- [Namespaces](/os/isolation/namespaces): container networking, which often hides containers behind a NAT on the host.
+
+<Recall cards={[
+  { q: "What does a NAPT change in an outgoing packet, and what must it also fix?", a: "The source address and source port. It must also update the IP header checksum and the TCP or UDP checksum, because the transport checksum covers the addresses through the pseudo-header." },
+  { q: "Explain the difference between mapping behaviour and filtering behaviour.", a: "Mapping decides which outgoing flows share one external port. Filtering decides which remote senders may send packets in through that port." },
+  { q: "What does RFC 4787 require for UDP mapping timeouts, and why do apps send keepalives?", a: "A mapping must last at least 2 minutes of idle time (5 or more recommended). Real NATs are often shorter, so apps send keepalives to keep the mapping alive." },
+  { q: "Why does hole punching fail between a symmetric NAT and a port-restricted cone NAT?", a: "The symmetric NAT uses a new external port toward the peer, which the rendezvous server never saw. The port-restricted NAT lets in only the exact endpoint its host sent to, so it drops those packets." },
+  { q: "What do STUN, TURN and ICE each do?", a: "STUN tells a host its public address and port. TURN relays traffic when no direct path works. ICE gathers candidate addresses and tests pairs to pick the best path that works." },
+  { q: "How many customers share one public address if a CGN gives each a block of 1,024 ports?", a: "63: there are 64,512 ports above 1023, and 64,512 / 1,024 is 63 whole blocks." },
+]} />

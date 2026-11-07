@@ -1,0 +1,161 @@
+---
+summary: "The IPv4 and IPv6 headers field by field: the header checksum and its incremental update, TTL, fragmentation and DF, why IPv6 dropped the checksum and router fragmentation, extension headers, address text, and dual stack."
+---
+import { NetIpV4HeaderDemo, NetIpFragmentDemo, NetIpV6ChainDemo, NetIpV6AddressDemo } from "@/demos/net/NetIpHeaderDemos";
+
+The **Internet Protocol** (IP) moves a packet from one host to another across many networks. It gives no promise of delivery, order or timing. Each router reads the header, picks the next hop, changes a few fields and sends the packet on. Everything else, such as retransmission, belongs to the layers above. This lesson reads the two headers that routers handle billions of times per second: IPv4 (RFC 791, 1981) and IPv6 (RFC 8200).
+
+## The IPv4 header, field by field
+
+An IPv4 header is 20 bytes without options. The **IHL** field gives its length in 32-bit words, so the header can grow to 60 bytes. Few packets carry options today, because many routers send them to a slow path.
+
+| Field | Bits | Job |
+|---|---|---|
+| Version | 4 | 4 for IPv4 |
+| IHL | 4 | header length in 32-bit words, at least 5 |
+| DSCP and ECN | 6 + 2 | priority class (RFC 2474) and congestion marks (RFC 3168) |
+| Total Length | 16 | header plus data, at most 65,535 bytes |
+| Identification | 16 | groups the fragments of one datagram |
+| Flags | 3 | reserved, DF (do not fragment), MF (more fragments) |
+| Fragment Offset | 13 | where this fragment starts, in 8-byte units |
+| TTL | 8 | hops left; each router subtracts 1 |
+| Protocol | 8 | the next header: 1 ICMP, 6 TCP, 17 UDP |
+| Header Checksum | 16 | covers the header only |
+| Source, Destination | 32 + 32 | addresses |
+
+RFC 791 defines the **time to live** (TTL) in seconds, but every router must subtract at least one. In practice it is a hop count. When it reaches 0, the router drops the packet and sends an ICMP "time exceeded" message back. A routing loop therefore cannot keep a packet alive forever. Linux starts packets at 64, the default of `net.ipv4.ip_default_ttl`.
+
+<Predict
+  id="ttl-checksum"
+  question="A router forwards an IPv4 packet and lowers its TTL from 64 to 63. What must the router do with the header checksum?"
+  options={["Nothing: the checksum covers only the data", "Nothing: only the destination host checks it", "Change it, because the TTL is inside the header that the checksum covers"]}
+  answer={2}
+  explain="The header checksum covers every header byte, the TTL included. Every router checks it and must write a new one after it changes the TTL. Otherwise the next router finds a mismatch and drops the packet."
+>
+<NetIpV4HeaderDemo />
+</Predict>
+
+1. Move the TTL slider. The bytes on the wire change in two places: the TTL byte and the checksum.
+2. Clear **Sender computes the checksum after each edit**, then move the TTL again. The receiver now finds a mismatch and drops the header.
+3. Turn the checksum option on again and press **Forward through a router** a few times. The table shows the checksum from the cheap update and from a full recompute. They always agree.
+4. Click **Version** and type 6, or click **IHL** and type 4. A receiver rejects both before it reads anything else.
+
+## Why the checksum is cheap to update
+
+The **Internet checksum** (RFC 1071) adds the header as 16-bit words in ones' complement arithmetic, then inverts the sum. In ones' complement, a carry out of the top bit wraps around into the lowest bit. A receiver adds all words, the checksum included, and expects `0xffff`.
+
+The sum has a useful property: a change of one word changes the sum by the same amount. RFC 1624 uses this. If the word $m$ changes to $m'$, the new checksum is
+
+$$
+HC' = \lnot(\lnot HC + \lnot m + m')
+$$
+
+where $\lnot$ is the ones' complement and $+$ is the ones' complement sum. A router changes one word (TTL and Protocol share it), so it needs three additions instead of ten. In the demo, the example header has checksum `0x26d6`, and after one hop it is `0x27d6`.
+
+```c
+// RFC 1624, eqn. 3: the router's fast path after ttl--.
+static inline uint16_t csum_fold(uint32_t s) { s = (s & 0xffff) + (s >> 16); return (s & 0xffff) + (s >> 16); }
+
+void ip_decrease_ttl(struct iphdr *ip) {
+    uint16_t old = (ip->ttl << 8) | ip->protocol;
+    ip->ttl--;
+    uint16_t new_ = (ip->ttl << 8) | ip->protocol;
+    uint32_t s = (uint16_t)~ntohs(ip->check) + (uint16_t)~old + new_;
+    ip->check = htons(~csum_fold(s));
+}
+```
+
+The checksum is weak. It cannot see two words that swap places, and it covers only the header. It exists to catch a corrupt header in a router, where a bad destination address would send a packet to the wrong place.
+
+## Fragmentation and DF
+
+Each link has a **maximum transmission unit** (MTU): the largest IP packet it carries. Ethernet carries 1,500 bytes. A tunnel carries less, because it adds its own headers. RFC 791 requires every host to accept datagrams of 576 bytes, and every router to forward 68 bytes without more fragmentation.
+
+When an IPv4 datagram is larger than the next link's MTU, a router has two choices. If **DF** is clear, it splits the datagram into **fragments**. Each fragment copies the header and carries a piece of the data. The fragment offset counts 8-byte units, so every piece but the last holds a multiple of 8 bytes. If DF is set, the router drops the datagram and sends ICMP "fragmentation needed" with its MTU. The [ICMP lesson](/networking/ip/icmp) shows how TCP uses this message.
+
+<Predict
+  id="frag-loss"
+  question="A host sends 4,000 bytes of UDP data in one IPv4 datagram over a link with a 1,500-byte MTU. The link loses 1% of its packets. Of 100 such datagrams, how many fail to arrive?"
+  options={["About 1, the same as the loss rate", "About 3", "About 30"]}
+  answer={1}
+  explain="The datagram becomes 3 fragments, and the receiver needs all of them. It arrives with probability 0.99 to the power 3, which is 97.0%. So about 3 in 100 fail. Each fragment is a separate chance to lose the whole datagram."
+>
+<NetIpFragmentDemo />
+</Predict>
+
+1. Keep 4,000 bytes and MTU 1500. The fragments carry 1,480, 1,480 and 1,040 data bytes, with offset fields 0, 185 and 370.
+2. Set the MTU to 576. The datagram now needs 8 fragments, and the curve for "datagram arrives" falls much faster than the curve for one packet.
+3. Turn on **DF**. The router sends nothing on: it drops the datagram and reports its MTU.
+4. Move the data to 1,480 bytes. The datagram fits exactly, with no fragments.
+
+Fragmentation looks helpful, but it costs a lot. Kent and Mogul showed this in "Fragmentation Considered Harmful" (SIGCOMM 1987). RFC 8900, "IP Fragmentation Considered Fragile" (2020), repeats the warning with new reasons:
+
+- **Loss multiplies.** A datagram of $k$ fragments arrives with probability $(1-p)^k$. The largest UDP datagram, 65,507 bytes, becomes 45 fragments at MTU 1500. At 1% loss, only 63.6% of them arrive.
+- **The receiver holds memory.** It keeps partial datagrams until they complete or time out. Linux waits 30 seconds (`net.ipv4.ipfrag_time`) and caps the memory at 4 MiB by default (`ipfrag_high_thresh`).
+- **Middleboxes see no ports.** Only the first fragment carries the TCP or UDP header. A firewall or a load balancer that needs the ports must reassemble or drop the rest.
+- **The ID wraps.** The 16-bit Identification field has 65,536 values. At high rates, two datagrams can use the same ID within the timeout, and the receiver can mix their fragments.
+
+So modern stacks avoid fragmentation. TCP sets DF and sizes its segments to the path. An "atomic" datagram has DF set and is not a fragment. RFC 6864 says that its ID has no meaning, so a sender may set it to any value.
+
+## IPv6: a simpler header
+
+IPv6 has a fixed 40-byte header with eight fields. It keeps what every router needs, and it moves everything else out.
+
+| IPv6 field | Bits | IPv4 equivalent |
+|---|---|---|
+| Version | 4 | Version |
+| Traffic Class | 8 | DSCP and ECN |
+| Flow Label | 20 | none; a label that load balancers can hash (RFC 6437) |
+| Payload Length | 16 | Total Length minus the header |
+| Next Header | 8 | Protocol |
+| Hop Limit | 8 | TTL |
+| Source, Destination | 128 + 128 | addresses |
+
+Three things are gone, and each removal was deliberate:
+
+- **No header checksum.** The link layer has a strong CRC, and TCP and UDP have their own checksums. For this reason, RFC 8200 makes the UDP checksum mandatory over IPv6, except in a zero-checksum mode for some tunnels. Routers no longer recompute anything after they change the hop limit.
+- **No fragmentation in routers.** Only the source fragments, with a Fragment extension header of 8 bytes. A router drops a packet that is too big and sends ICMPv6 "Packet Too Big". To make this rare, every IPv6 link must carry at least 1,280 bytes.
+- **No options in the header.** Options move into **extension headers**. Each header names the type of the next one, so they form a chain that ends at the transport header.
+
+<NetIpV6ChainDemo />
+
+1. With only the Fragment header, the chain is IPv6 (Next Header 44), Fragment (Next Header 6), then TCP. The IP headers take 48 bytes.
+2. Add Hop-by-Hop Options. It goes first, because RFC 8200 requires it to follow the IPv6 header directly. Routers on the path may read it.
+3. Add a Routing header and an Authentication Header. The chain grows, and a router that wants the TCP ports must walk all of it.
+
+The chain is flexible, but it has a cost. A router or firewall must parse an unknown number of headers to find the ports, and hardware can read only so many bytes deep. Many networks therefore drop packets with extension headers. The larger fixed header also costs payload: on a 1,500-byte link, the TCP maximum segment size is 1,440 bytes over IPv6 and 1,460 over IPv4.
+
+## Writing IPv6 addresses
+
+An IPv6 address is 128 bits, written as eight groups of four hex digits. Two rules shorten it: leading zeros in a group may go, and "::" may replace one run of zero groups. One address can therefore have many spellings. RFC 5952 fixes one **canonical** form, so that logs and tools can compare text.
+
+<NetIpV6AddressDemo />
+
+1. Pick `2001:db8:0:0:1:0:0:1`. It has two runs of two zero groups. The canonical form shortens the first one: `2001:db8::1:0:0:1`.
+2. Type `1::2::3`. Two "::" make the address ambiguous, so the parser rejects it.
+3. Pick `::ffff:192.0.2.1`. This is an **IPv4-mapped** address: an IPv6 socket uses it to talk to an IPv4 peer.
+
+The first bits give the kind of address (RFC 4291). `::1` is loopback. `fe80::/10` is link-local: every interface has one, and it never crosses a router. `fc00::/7` holds unique local addresses (RFC 4193), the IPv6 version of private space. `ff00::/8` is multicast. Global unicast addresses come from `2000::/3`.
+
+## Dual stack
+
+Most hosts today run IPv4 and IPv6 side by side. DNS returns an A record (IPv4) and an AAAA record (IPv6), and the client must choose. If it always tries IPv6 first and the IPv6 path is broken, the user waits for a timeout.
+
+**Happy Eyeballs** (RFC 8305) fixes this with a race. The client asks for AAAA first. It waits up to 50 ms for the AAAA answer if the A answer comes first. It starts an IPv6 connection, and if that has not finished after a delay, it starts IPv4 in parallel. The RFC recommends 250 ms as a default for that delay. The first connection to complete wins.
+
+## Connect
+
+- [Subnetting and CIDR](/networking/ip/subnetting-and-cidr): what the address bits mean to a router.
+- [ICMP](/networking/ip/icmp): time exceeded, fragmentation needed, and path MTU discovery.
+- [Layers and encapsulation](/networking/foundations/layers-and-encapsulation): where the IP header sits in a frame.
+- [Ethernet](/networking/link/ethernet): the CRC that lets IPv6 drop its checksum.
+- [UDP](/networking/transport/udp): the pseudo-header that ties the transport checksum to the IP addresses.
+
+<Recall cards={[
+  { q: "Why must a router change the IPv4 header checksum on every packet, and how does it do it cheaply?", a: "The checksum covers the header, and the router changes the TTL. RFC 1624 updates the checksum from the old checksum and the old and new 16-bit word, with three ones' complement additions." },
+  { q: "A 4,000-byte UDP payload crosses a 1,500-byte MTU link with DF clear. Give the fragment data sizes and offset fields.", a: "1,480, 1,480 and 1,040 bytes, with offset fields 0, 185 and 370 (in 8-byte units). Only the last has MF clear." },
+  { q: "Why does fragmentation make loss worse?", a: "The receiver needs every fragment, so a datagram of k fragments arrives with probability (1 − p) to the power k. A fragment cannot be sent again on its own." },
+  { q: "Name three things IPv6 removed from the IPv4 header, and why.", a: "The header checksum: the link CRC and transport checksums cover it. Fragmentation in routers: only the source fragments, and links carry at least 1,280 bytes. Options: they moved to extension headers." },
+  { q: "What is the RFC 5952 form of 2001:0db8:0000:0000:0000:ff00:0042:8329?", a: "2001:db8::ff00:42:8329: lower case, no leading zeros, and :: for the longest run of zero groups." },
+  { q: "How does Happy Eyeballs avoid a long wait when IPv6 is broken?", a: "It starts the IPv6 connection first. After a short delay (250 ms is a recommended default), it starts IPv4 in parallel and uses whichever connects first." },
+]} />

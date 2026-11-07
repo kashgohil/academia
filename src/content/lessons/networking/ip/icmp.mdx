@@ -1,0 +1,121 @@
+---
+summary: "ICMP, the network layer's error and diagnostic messages: echo, time exceeded and traceroute (with the anomalies that load balancers cause), destination unreachable, path MTU discovery, and the black holes that ICMP filtering creates."
+---
+import { NetIpIcmpMessageDemo, NetIpTracerouteDemo, NetIpPmtuDemo } from "@/demos/net/NetIpIcmpDemos";
+
+IP has no way to report a problem inside its own header. The **Internet Control Message Protocol** (ICMP, RFC 792) fills this gap. A router that drops a packet can send an ICMP message back to the source and say why. Hosts also use ICMP to test reachability. ICMP travels inside IP, with protocol number 1. IPv6 has its own version, ICMPv6 (RFC 4443), with protocol number 58.
+
+Many administrators see ICMP as a risk and block it. This lesson shows what then breaks: traceroute loses its answers, and path MTU discovery turns into a black hole that hangs connections.
+
+## The messages
+
+Every ICMP message starts with a type (8 bits), a code (8 bits) and a checksum (16 bits) over the whole message. The rest depends on the type.
+
+| Type | Code | Meaning | Sent by |
+|---|---|---|---|
+| 8 / 0 | 0 | echo request / echo reply (ping) | any host |
+| 3 | 0, 1 | destination unreachable: no route to the network or host | a router |
+| 3 | 3 | port unreachable: no socket listens on that UDP port | the destination |
+| 3 | 4 | fragmentation needed, but DF is set | a router |
+| 11 | 0 | time exceeded: TTL reached 0 | a router |
+| 11 | 1 | time exceeded: fragment reassembly timed out | the destination |
+| 5 | 0 to 3 | redirect: use a better first hop | a router |
+
+ICMPv6 uses other numbers for the same ideas. Type 1 is destination unreachable, 2 is Packet Too Big, 3 is time exceeded, and 128 and 129 are echo. It also carries functions that IPv4 does elsewhere, such as neighbour discovery, which replaces ARP. An IPv6 network that blocks all ICMPv6 does not work.
+
+<Predict
+  id="quote"
+  question="A router drops a UDP packet because its TTL reached 0, and sends ICMP time exceeded back. How does the sender's kernel know which socket the error belongs to?"
+  options={["The ICMP message names the socket", "The error quotes the dropped packet's IP header and first 8 data bytes, which hold the UDP ports", "It cannot know, so it drops the error"]}
+  answer={1}
+  explain="RFC 792 has every error carry the original IP header plus the first 64 bits of its data. For UDP and TCP, those 8 bytes start with the source and destination ports, which identify the socket."
+>
+<NetIpIcmpMessageDemo />
+</Predict>
+
+1. Look at **Time exceeded**. After the 8-byte ICMP header comes a full copy of the dropped packet's IP header, then its UDP header with both ports.
+2. Choose **Unreachable: fragmentation needed**. The second word now carries the next-hop MTU, here 1400.
+3. Choose **Echo request**. It has no quoted packet: an identifier and a sequence number match each reply to its request.
+
+The quote also lets a NAT translate an error back to the inside host. It reads the ports in the quoted header and finds the mapping. RFC 1812 asks routers to quote as much of the original packet as fits in a 576-byte ICMP message. In the demo, an error with the minimum quote is 56 bytes on the wire. That is 20 bytes of IP header, 8 of ICMP header and 28 of quote.
+
+Hosts and routers follow a few rules so that errors do not cause more errors. They never send an ICMP error about an ICMP error, about a fragment other than the first, or about a broadcast. They also rate-limit errors. Linux limits the errors of the types in `net.ipv4.icmp_ratemask` to each destination. On average it sends one per `net.ipv4.icmp_ratelimit`, 1000 ms by default, with bursts of up to 6. The default mask 6168 covers types 3, 4, 11 and 12, so echo replies are not limited.
+
+## Traceroute
+
+Van Jacobson wrote traceroute in 1988 with a simple trick. It sends a probe with TTL 1, and the first router drops it and answers "time exceeded". It sends TTL 2 and hears from the second router, and so on. When a probe finally reaches the destination, the destination answers "port unreachable", because the probe goes to an unlikely UDP port, starting above 33434. The source of each answer names one hop, and the time to the answer gives a round-trip time.
+
+```c
+// One traceroute probe: a UDP packet with a chosen TTL.
+int ttl = hop;
+setsockopt(udp_fd, IPPROTO_IP, IP_TTL, &ttl, sizeof ttl);
+dst.sin_port = htons(33434 + seq);   // classic traceroute: a new port per probe
+sendto(udp_fd, buf, len, 0, (struct sockaddr *)&dst, sizeof dst);
+// The answer arrives on a raw ICMP socket: type 11 from a router, type 3 code 3 from the target.
+```
+
+The design has a hidden problem. Many routers spread traffic over several equal-cost paths, and they keep each flow on one path by hashing its addresses and ports. Classic traceroute changes the destination port for every probe. So each probe is a new flow, and probes of the same hop can take different paths.
+
+<Predict
+  id="ecmp"
+  question="A traceroute shows router R3 at hop 3 and again at hop 4. What is the most likely cause?"
+  options={["A routing loop through R3", "R3 answered one probe twice", "Probes took different equal-cost paths, one a hop longer than the other"]}
+  answer={2}
+  explain="A load balancer sent the hop-3 probe down a short branch, where it reached R3. It sent the hop-4 probe down a longer branch, where R3 is one hop later. The output joins two real paths into one false one."
+>
+<NetIpTracerouteDemo />
+</Predict>
+
+1. With classic probes, the output shows A1 and B1 at hop 2, and R3 at hops 3 and 4. The demo finds 4 links in the output that do not exist, and 2 false loops.
+2. Choose **Paris: same flow**. Every probe hashes to the same branch, and the output is one real path, with no false links.
+3. Keep Paris and turn on **R3 rate-limits ICMP**. At hop 3, the first probe gets an answer and the next two show a star. The packets were not lost; only the answers were not sent.
+4. Turn on **B1 sends no ICMP errors**. A silent router appears as a row of stars, but the probes still pass through it.
+
+Augustin and others measured these effects in "Avoiding traceroute anomalies with Paris traceroute" (IMC 2006). Their tool keeps the first four bytes of the transport header fixed, which hold the ports, because load balancers hash them. It changes the UDP checksum instead, to tell the probes apart.
+
+Read traceroute output with care for other reasons too. A round-trip time includes the return path, which can differ from the forward path. It also includes the time that the router's slow path takes to build the ICMP message. So a high time at one hop says little, if later hops do not show it too.
+
+## Path MTU discovery
+
+A TCP sender wants packets as large as the path allows, but it cannot see the smallest MTU on the path. **Path MTU discovery** (RFC 1191) finds it with ICMP. The sender sets DF on every packet. A router whose next link is too small drops the packet and returns "fragmentation needed". The low 16 bits of the second word carry the next-hop MTU. The sender lowers its estimate for that destination and sends smaller packets.
+
+The sender caches the estimate. Linux keeps it for 600 seconds (`net.ipv4.route.mtu_expires`) and then tries larger packets again. RFC 1191 says that a host must never lower its estimate below 68 bytes. It must also wait at least 5 minutes before it tries to raise it. IPv6 works the same way with ICMPv6 Packet Too Big (RFC 8201). There, it is the only option, because IPv6 routers never fragment.
+
+<Predict
+  id="blackhole"
+  question="A server sits behind a firewall that drops all ICMP. A client connects through a tunnel with a 1,400-byte MTU and asks for a large file. What does the client see?"
+  options={["The file arrives a little slower, because routers fragment it", "The connection opens, then hangs, then times out", "The connection is refused at once"]}
+  answer={1}
+  explain="The handshake and the request are small, so they pass. The server's 1,500-byte data packets have DF set and die at the tunnel. The ICMP message that would tell the server is dropped by its own firewall, so it retransmits the same large packets until it gives up."
+>
+<NetIpPmtuDemo />
+</Predict>
+
+1. With the defaults, R2 drops the first four 1,500-byte packets and sends four ICMP messages. S lowers its MSS to 1,360 and finishes at 182 ms.
+2. Turn on **Firewall in front of S drops all ICMP**. Every large packet dies, and S backs off after each timeout. It gives up after 25.4 s and 7 timeouts. This is a **PMTU black hole**.
+3. Keep the firewall and turn on **MTU probing**. After the first timeout, S drops to an MSS of 1,024 and the transfer completes at 402 ms.
+4. Turn the probing off and turn on **MSS clamping**. The tunnel router rewrote the MSS in the handshake to 1,360, so no large packet is ever sent, and the transfer ends at 152 ms.
+5. Turn on **DF off**. R2 now fragments each large packet into two, and C reassembles them.
+
+The black hole is common enough to have its own RFC: RFC 2923 (2000) lists it among TCP's problems with PMTUD. RFC 4890 lists ICMPv6 Packet Too Big as traffic that firewalls must not drop. Operators and stacks use three defences:
+
+- **MSS clamping.** A router at a tunnel rewrites the MSS option in TCP handshakes, so that both ends start with segments that fit. It helps only TCP.
+- **Packetization-layer PMTUD** (PLPMTUD, RFC 4821, 2007). The transport probes with larger packets and treats their loss as a size problem, with no need for ICMP. Linux controls it with `net.ipv4.tcp_mtu_probing`. The value 0 (the default) turns it off, 1 uses it after a black hole is detected, and 2 always uses it. Probing starts from `tcp_base_mss`, 1024 by default.
+- **Datagram PLPMTUD** (DPLPMTUD, RFC 8899, 2020) brings the same idea to UDP transports such as QUIC.
+
+## Connect
+
+- [IPv4 and IPv6](/networking/ip/ipv4-and-ipv6): TTL, DF and fragmentation, the fields these messages report on.
+- [Routing](/networking/ip/routing-distance-vector-and-link-state): routing loops, which show up as time-exceeded messages.
+- [NAT](/networking/ip/nat): how a NAT uses the quoted header to deliver an error.
+- [TCP reliability and retransmission](/networking/transport/reliability-and-retransmission): the timeouts that a black hole triggers.
+- [QUIC](/networking/transport/quic): a transport that probes the path MTU on its own.
+
+<Recall cards={[
+  { q: "What does an ICMP error carry besides its type and code, and why?", a: "The IP header and the first 8 data bytes of the packet that caused it. For TCP and UDP these hold the ports, so the sender (or a NAT) can find the socket or the mapping." },
+  { q: "How does traceroute find each hop, and how does it know it reached the destination?", a: "It sends probes with TTL 1, 2, 3 and so on; each router where the TTL hits 0 answers time exceeded. The destination answers port unreachable, because the probe goes to an unused UDP port." },
+  { q: "Why can classic traceroute show links that do not exist, and how does Paris traceroute fix it?", a: "Load balancers hash the flow's ports, and classic traceroute changes the port per probe, so probes take different paths. Paris traceroute keeps the ports fixed and varies the checksum instead." },
+  { q: "Name three reasons for a star in traceroute output other than packet loss.", a: "The router sends no ICMP errors, it rate-limits them, or a firewall drops the answers on the way back." },
+  { q: "Describe a PMTU black hole.", a: "Packets with DF set are too big for a link and die there, and the ICMP message that would report it is filtered. The handshake works, but large data never arrives, so the connection hangs." },
+  { q: "Give two defences against PMTU black holes.", a: "MSS clamping at the tunnel router, and packetization-layer PMTUD (RFC 4821), which probes packet sizes and needs no ICMP." },
+]} />

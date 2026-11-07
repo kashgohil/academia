@@ -1,0 +1,141 @@
+---
+summary: "BGP, the protocol that joins the Internet's networks: path vectors, the decision process, business policy and the Gao-Rexford rules, hijacks and leaks with real incidents, RPKI origin validation, and slow convergence."
+---
+import { NetIpBgpDecisionDemo, NetIpBgpPolicyDemo } from "@/demos/net/NetIpBgpDemos";
+
+The Internet is not one network. It is tens of thousands of **autonomous systems** (ASes). Each AS is a network with one operator and one routing policy, such as an ISP, a cloud provider or a university. Each AS has an AS number, 32 bits wide since RFC 4893 (2007), which RFC 6793 now replaces. Inside an AS, [OSPF or IS-IS](/networking/ip/routing-distance-vector-and-link-state) find the shortest paths. Between ASes, one protocol carries every route: the **Border Gateway Protocol**, version 4 (BGP, RFC 4271).
+
+BGP is different from interior protocols in one important way. Its goal is not the shortest path. Its goal is the path that each AS's business allows and prefers. Money decides most routes on the Internet.
+
+## Sessions and messages
+
+Two BGP routers open a TCP connection to port 179 and exchange four kinds of messages:
+
+- **OPEN** starts the session, with the AS number and a proposed **hold time**. RFC 4271 suggests 90 seconds.
+- **KEEPALIVE** proves that the peer is alive, typically every third of the hold time.
+- **UPDATE** announces routes to prefixes, with their attributes, or withdraws routes.
+- **NOTIFICATION** reports an error and closes the session.
+
+A session between two ASes is **eBGP**. Routers inside one AS also run BGP among themselves, called **iBGP**, so that every border router knows the external routes.
+
+## Path vector
+
+A BGP route carries the list of ASes it crossed, the `AS_PATH`. Each AS adds its own number to the front when it passes a route to a neighbour. A router rejects any route whose path already contains its own AS number. This one rule stops the loops that make distance-vector protocols [count to infinity](/networking/ip/routing-distance-vector-and-link-state): BGP is a **path-vector** protocol. The path also lets an AS write policy, such as "never send traffic through AS X".
+
+## The decision process
+
+A router often hears several routes to the same prefix. RFC 4271 fixes the order of comparison. The first rule that leaves exactly one route decides; later rules do not matter.
+
+| Order | Rule | Who sets it |
+|---|---|---|
+| 1 | highest `LOCAL_PREF` | this AS's own policy |
+| 2 | shortest `AS_PATH` | the path; others can lengthen it by prepending |
+| 3 | lowest `ORIGIN` (IGP, then EGP, then INCOMPLETE) | the AS that first announced it |
+| 4 | lowest `MED`, only among routes from the same neighbour AS | the neighbour |
+| 5 | eBGP over iBGP | the session type |
+| 6 | lowest interior cost to the `NEXT_HOP` | the IGP |
+| 7 | lowest BGP identifier, then lowest peer address | the final tie-breaks |
+
+Vendors add their own steps; Cisco, for example, compares a local "weight" before everything else.
+
+<Predict
+  id="localpref"
+  question="A router has a route with a 2-AS path through a peer, and a route with a 3-AS path through a transit provider. You set LOCAL_PREF 150 on the transit route and leave 100 on the other. Which route does BGP use?"
+  options={["The 2-AS path: BGP prefers short paths", "The transit route: LOCAL_PREF is compared before path length", "Neither alone: MED must break the tie"]}
+  answer={1}
+  explain="LOCAL_PREF is the first rule. A route with a higher LOCAL_PREF wins at once, whatever its path length. This is how an AS puts its own policy above the path."
+>
+<NetIpBgpDecisionDemo />
+</Predict>
+
+1. With the defaults, routes 1 and 3 tie on the first three rules. Route 3 loses on MED, because both come from AS 65001. Route 1 wins at rule 4.
+2. Move **LOCAL_PREF** for AS 65002 to 150. Route 2 wins at rule 1, and nothing else is compared.
+3. Set it back to 100 and move the prepend slider to 1. All paths now have 3 ASes. MED removes route 3, and route 1 beats route 2 only at rule 7, on the BGP identifier. At 2, route 2 has the shortest path and wins at rule 2.
+4. Set the prepend to 0 and a MED of 50 on route 1. Route 1 now loses to route 3 on MED, because both come from AS 65001, and route 3 wins at rule 4. MED can never remove route 2, because route 2 comes from another AS.
+
+Prepending is how an AS asks the world to send less traffic over one link. It adds its own number several times to the routes it announces there. It is only a request. An AS that sets `LOCAL_PREF` on the route ignores it, because rule 1 comes first.
+
+Rule 6 creates **hot-potato routing**. When two exits are otherwise equal, an AS hands the traffic to the neighbour at the exit closest to where it entered. Traffic then often takes different paths in the two directions.
+
+## Policy: customers, peers and providers
+
+Most links between ASes are one of two kinds. On a **customer-provider** link, the customer pays the provider to carry its traffic to and from the rest of the Internet. On a **peer** link, two ASes exchange traffic between their own customers without payment. Gao and Rexford (IEEE/ACM ToN, 2001) described the policy that follows from this:
+
+- **Prefer** routes from customers (they pay you) over routes from peers (free) or providers (you pay). Most ASes also prefer peers over providers, but the proof does not need it. An AS sets this with `LOCAL_PREF`.
+- **Export** routes from customers, and your own, to everybody. Export routes from peers and providers only to your customers. Nobody carries traffic between two parties that do not pay for it.
+
+The resulting paths are **valley-free**: they climb from customer to provider, cross at most one peer link, and then only descend. Assume that every AS follows these rules and no AS is its own indirect provider. Gao and Rexford proved that BGP then always converges to a stable state. Without such rules, BGP policies can oscillate forever.
+
+```go
+// The Gao-Rexford export rule, as a filter on each outgoing route.
+func mayExport(learnedFrom, to Relationship) bool {
+	switch learnedFrom {
+	case Self, Customer:
+		return true // customers' routes go to everyone: they pay for this
+	default: // Peer or Provider
+		return to == Customer // never give free transit to a peer or provider
+	}
+}
+```
+
+## Hijacks and leaks
+
+BGP believes what neighbours say. Nothing in RFC 4271 checks that an AS may announce a prefix. Two kinds of accident or attack follow:
+
+- A **hijack**: an AS announces a prefix that belongs to someone else.
+- A **route leak**: an AS passes on routes that its policy should keep, for example from one provider to another (RFC 7908).
+
+<Predict
+  id="subprefix"
+  question="AS6 announces 198.51.100.0/22. AS10, a small network far away, announces 198.51.100.0/24, a part of it. Nobody filters. How many of the 9 other networks now send traffic for 198.51.100.10 to AS10?"
+  options={["Only AS10's direct neighbours", "About half: the networks closer to AS10", "All of them"]}
+  answer={2}
+  explain="Every router does a longest-prefix match. The /24 is more specific than the /22 in every table that has it, so it wins everywhere, however long its path. Even AS6's own traffic for that address goes to AS10."
+>
+<NetIpBgpPolicyDemo />
+</Predict>
+
+1. Choose **same-prefix hijack**. Now the /22 competes with the /22, and each network compares the routes by policy and path length. 4 of 9 networks prefer the attacker's route, the ones that are closer to it.
+2. Choose **sub-prefix hijack** again, and press **all transit** to make the five transit networks drop RPKI-invalid routes. The /24 is invalid, so it never spreads, and 0 networks are captured.
+3. Press **tier-1s**. Now only AS1 and AS2 filter. AS5 still accepts the /24 from its customer AS10, so AS5, AS9 and AS11 stay captured: 3 networks.
+4. Choose **forged origin**: AS10 announces the /24 with the path "AS10 AS6", so that AS6 seems to be the origin. With maxLength /22 it is still invalid. Set maxLength to /24, and it becomes valid: 9 networks are captured even with ROV.
+5. Choose **route leak**. AS12 passes AS6's route from one provider to the other. AS4 prefers the route from its customer AS12, and 6 networks now send AS6's traffic through a small network. ROV changes nothing, because the origin is correct.
+
+Real incidents follow these patterns:
+
+- **YouTube, 24 February 2008.** At 18:47 UTC, Pakistan Telecom (AS17557) announced 208.65.153.0/24, a part of YouTube's 208.65.152.0/22, and its provider PCCW (AS3491) passed it on. YouTube announced the same /24 at 20:07 and two /25s at 20:18. PCCW withdrew the bad route at 21:01 (RIPE NCC case study).
+- **The 2019 leak through Verizon.** On 24 June 2019, a BGP optimizer at DQE Communications (AS33154) created more-specific routes. Its customer Allegheny Technologies (AS396531) leaked them to Verizon (AS701), which accepted them. Cloudflare lost about 15% of its global traffic at the worst point. Cloudflare's ROAs allowed nothing longer than a /20. Its post-mortem noted that ROV, a prefix limit or IRR filters at Verizon would have dropped the leaked routes.
+- **Facebook, 4 October 2021.** A maintenance command took down Facebook's backbone. Its DNS servers are designed to withdraw their BGP routes when they cannot reach the data centers, and they did. The rest of the Internet could no longer find Facebook for about six hours.
+
+## RPKI and route origin validation
+
+The **Resource Public Key Infrastructure** (RPKI, RFC 6480) lets the holder of a prefix sign a **Route Origin Authorization** (ROA). A ROA says, for example: "AS6 may originate 198.51.100.0/22, with prefixes up to /22". Routers download the validated ROAs and check each route's origin AS (RFC 6811):
+
+- **Valid**: a ROA covers the prefix, with this origin AS and a length within maxLength.
+- **Invalid**: ROAs cover the prefix, but none matches the origin or the length.
+- **NotFound**: no ROA covers the prefix.
+
+An AS that does **route origin validation** (ROV) drops invalid routes. The demo shows its two limits. First, ROV protects a network only if the networks on its paths deploy it too. Second, it checks only the last AS in the path, so an attacker can forge the origin. A loose maxLength makes this easy, because then the forged /24 is valid. RFC 9319 (2022) therefore recommends avoiding maxLength in most cases.
+
+BGPsec (RFC 8205) signs the whole path, but it needs every AS on the path to take part. For leaks, RFC 9234 (2022) adds BGP roles and an "Only to Customer" attribute. With it, a router can detect a route that has already gone down to a customer.
+
+## Slow convergence
+
+BGP converges slowly. A router waits a minimum time between updates for the same destination, the MinRouteAdvertisementInterval. RFC 4271 suggests 30 seconds for eBGP. After a withdrawal, routers also try every longer path they know before they give up, called **path exploration**. Labovitz and others measured this in "An Experimental Study of Delayed Internet Routing Convergence" (SIGCOMM 2000). Failover for a multihomed site took about three minutes on average, and some events took up to fifteen minutes.
+
+## Connect
+
+- [Routing](/networking/ip/routing-distance-vector-and-link-state): count to infinity, which the path vector prevents.
+- [Subnetting and CIDR](/networking/ip/subnetting-and-cidr): longest-prefix match, which makes sub-prefix hijacks so strong.
+- [Anycast](/networking/infrastructure/anycast): one prefix announced from many places, on purpose.
+- [Certificates and PKI](/networking/security/certificates-and-pki): the same idea of signed claims, for names instead of prefixes.
+- [The network model](/distributed/foundations/the-network-model-messages-delays-and-partitions): what a partition looks like from inside a distributed system.
+
+<Recall cards={[
+  { q: "How does BGP prevent routing loops without counting to infinity?", a: "Each route carries its AS path. A router rejects any route whose path already contains its own AS number." },
+  { q: "Give the first four rules of the BGP decision process in order.", a: "Highest local preference, shortest AS path, lowest origin type (IGP, EGP, INCOMPLETE), and lowest MED among routes from the same neighbour AS." },
+  { q: "State the Gao-Rexford preference and export rules.", a: "Prefer customer routes over peer and provider routes. Most ASes also rank peer routes above provider routes. Export customer routes and your own to everyone; export peer and provider routes only to customers." },
+  { q: "Why does a sub-prefix hijack capture traffic everywhere, even over a long path?", a: "Forwarding uses longest-prefix match before any BGP preference. Every router that has the more specific prefix uses it, whatever the path." },
+  { q: "What does route origin validation check, and what attack still passes it?", a: "It checks that the origin AS and prefix length match a signed ROA. An attacker that puts the real owner's AS at the end of a forged path still passes, especially with a loose maxLength." },
+  { q: "When does origin validation stop a route leak, and when does it not?", a: "It stops a leak of more-specific prefixes that are longer than the ROA allows, as in the 2019 Verizon leak. It cannot stop a leak of the real prefixes with the correct origin, because only the path and the policy are wrong." },
+]} />

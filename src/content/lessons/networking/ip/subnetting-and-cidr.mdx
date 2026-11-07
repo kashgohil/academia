@@ -1,0 +1,136 @@
+---
+summary: "How an IPv4 address splits into network and host bits: masks, CIDR prefixes of any length, special ranges, subnet planning, longest-prefix match in a trie, and route aggregation."
+---
+import { NetIpSubnetDemo, NetIpLpmDemo, NetIpAggregateDemo } from "@/demos/net/NetIpCidrDemos";
+
+A router does not store a route for each of the 4,294,967,296 IPv4 addresses. It stores routes for **prefixes**: blocks of addresses that share their first bits. The first bits name a network, and the remaining bits name a host on it. This lesson shows how the split works, how routers choose between routes that overlap, and how a few routes can stand for many networks.
+
+## From classes to CIDR
+
+Until 1993, the first bits of an address fixed the size of its network. A class A address started with bit 0 and had an 8-bit network part. Class B started with 10 and had 16 bits, and class C started with 110 and had 24 bits. So a network had 16,777,216, 65,536 or 256 addresses, and nothing in between.
+
+The classes wasted space and routing table entries. An organization with a few thousand hosts was too big for a class C. So it got a class B and used a small part of it. Or it got many class C networks, and each one was a separate route in every router. **Classless Inter-Domain Routing** (CIDR, RFC 1519 in 1993, now RFC 4632) removed the classes. A prefix can have any length, written after a slash: `192.168.1.0/24` means "the first 24 bits".
+
+<Predict
+  id="hosts"
+  question="You change a subnet from /24 to /25. What happens to the number of addresses you can give to hosts?"
+  options={["It halves, from 254 to 127", "It falls from 254 to 126", "It stays at 254: the mask only matters to routers"]}
+  answer={1}
+  explain="A /25 has 128 addresses. Two of them are reserved in every subnet: the network address (all host bits 0) and the broadcast address (all host bits 1). So 126 remain, not 127."
+>
+<NetIpSubnetDemo />
+</Predict>
+
+1. Move the prefix length from /24 to /25 and to /26. The host part shrinks by one bit each time, and the usable hosts go 254, 126, 62.
+2. Set /31. Both addresses become hosts, with no network or broadcast address. RFC 3021 allows this for point-to-point links, where nobody needs a broadcast.
+3. Pick `100.72.5.9`. It is in shared address space for carrier-grade NAT, not in private space.
+4. Pick `8.8.8.8` and set /8. Before CIDR, every address that starts with bit 0 was in a fixed /8.
+
+## The arithmetic
+
+A **mask** has 1 bits for the network part and 0 bits for the host part. A /24 mask is `255.255.255.0`. Three operations give everything else:
+
+$$
+\text{network} = a \land \text{mask}, \qquad \text{broadcast} = \text{network} \lor \lnot\,\text{mask}, \qquad \text{hosts} = 2^{32-n} - 2
+$$
+
+A host uses the same test to decide where to send a packet. If the destination is in its own subnet, it sends the packet directly, after ARP finds the hardware address. If not, it sends the packet to its default gateway. A wrong mask breaks this: the host tries to reach a remote address directly, or sends a local one to the router.
+
+```go
+// Is addr in net/len? The same test a host makes before every send.
+func inPrefix(addr, net uint32, len uint) bool {
+	if len == 0 {
+		return true // the default route matches everything
+	}
+	mask := ^uint32(0) << (32 - len)
+	return addr&mask == net&mask
+}
+```
+
+## Special ranges
+
+Some prefixes have fixed meanings, listed in the IANA special-purpose registry (RFC 6890). Routers on the Internet do not forward most of them.
+
+| Prefix | Use | Defined in |
+|---|---|---|
+| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | private networks | RFC 1918 |
+| `100.64.0.0/10` | shared space for carrier-grade NAT | RFC 6598 |
+| `127.0.0.0/8` | loopback | RFC 1122 |
+| `169.254.0.0/16` | link-local, when no DHCP server answers | RFC 3927 |
+| `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24` | documentation | RFC 5737 |
+| `198.18.0.0/15` | benchmarking | RFC 2544, RFC 6890 |
+| `224.0.0.0/4` | multicast | RFC 5771 |
+| `240.0.0.0/4` | reserved | RFC 1112 |
+
+The three private ranges hold 17,891,328 addresses, and any network may reuse them. The shared range `100.64.0.0/10` holds 4,194,304. It exists because a carrier that puts its customers behind NAT needs addresses that cannot clash with the private addresses in the customers' homes. IANA gave its last free blocks to the regional registries on 3 February 2011, so these reuse tricks matter. The [NAT lesson](/networking/ip/nat) shows the cost.
+
+## Planning subnets
+
+**Variable-length subnet masks** (VLSM) cut one block into subnets of different sizes. Allocate the largest subnet first, each at the next address that is a multiple of its size. Then a hole never forms, because every later subnet is smaller and fits the alignment.
+
+From `10.20.0.0/24`, four networks need 100, 50, 20 and 2 hosts:
+
+| Need | Subnet | Usable | Unused |
+|---|---|---|---|
+| 100 hosts | `10.20.0.0/25` | 126 | 26 |
+| 50 hosts | `10.20.0.128/26` | 62 | 12 |
+| 20 hosts | `10.20.0.192/27` | 30 | 10 |
+| 2 hosts (a link) | `10.20.0.224/30` | 2 | 0 |
+
+The rest of the block, from `10.20.0.228`, stays free for later.
+
+## Longest-prefix match
+
+Prefixes can overlap. A router may have a default route `0.0.0.0/0`, a route for `10.0.0.0/8`, and a route for `10.1.2.0/24`. A packet for `10.1.2.77` matches all three. The rule is **longest-prefix match**: the most specific route wins, because it describes the destination best.
+
+<Predict
+  id="lpm"
+  question="A router has three routes: 0.0.0.0/0 to the ISP, 10.0.0.0/8 to the core, and 10.1.2.0/24 to rack 7. Where does it send a packet for 10.1.2.77?"
+  options={["To the core: 10.0.0.0/8 comes first in the table", "To the ISP: the default route catches everything", "To rack 7: 10.1.2.0/24 is the longest match"]}
+  answer={2}
+  explain="All three routes match. The router picks the one with the most bits, /24. The order of routes in the table does not matter."
+>
+<NetIpLpmDemo />
+</Predict>
+
+1. Look up `10.1.2.77`. The walk passes the default route, `10.0.0.0/8` and `10.1.0.0/16`, and stops at the /24.
+2. Look up `10.1.9.1`. No /24 matches, so the /16 wins.
+3. Add `10.1.2.128/25 rack7b`, then look up `10.1.2.200`. The new route takes half of rack 7's traffic and no other route changes.
+4. Remove `0.0.0.0/0` and look up `8.8.8.8`. With no default route, the router drops the packet and reports "destination unreachable".
+
+The demo stores the routes in a **binary trie**: each level tests one address bit. A lookup walks down the bits of the destination and remembers the last route it passed. It examines at most 32 bits, however many routes there are. A linear scan would compare every route, and the global IPv4 table held about 1.09 million prefixes in November 2026 (CIDR Report).
+
+Real implementations compress the trie. Linux uses a level-compressed trie in `net/ipv4/fib_trie.c`, based on the LC-trie of Nilsson and Karlsson (IEEE JSAC, 1999). A node there can test several bits at once, so a lookup takes a few memory reads. Router hardware often uses a **TCAM** (ternary content-addressable memory), which compares the address with every entry in one cycle. TCAM is fast but expensive and power-hungry, so the size of the global table is a real hardware limit.
+
+## Aggregation
+
+If four routes `198.51.96.0/24` to `198.51.99.0/24` all lead to the same place, one route `198.51.96.0/22` says the same thing. This is **aggregation**, or summarization. It keeps tables small, and it hides changes. If one subnet inside the /22 goes down, the routers outside do not need to hear about it.
+
+<NetIpAggregateDemo />
+
+1. Click `10.20.6.0/24` to add it. All eight /24s are present, and they merge into one /21.
+2. Remove `10.20.3.0/24`. The summary breaks into three routes, because only two halves of the same parent can merge.
+3. Turn on **Announce one /21 even if some /24s are missing**. The table is small again, but the missing blocks now attract traffic that goes nowhere.
+
+Aggregation works best when addresses follow the topology. A provider that assigns its customers blocks from its own space announces one aggregate for all of them. A customer that brings its own block, or connects to two providers, adds another prefix to every table in the world. Most networks accept nothing longer than a /24 for IPv4 or a /48 for IPv6 (RFC 7454), which puts a floor under this growth.
+
+## IPv6 subnets
+
+IPv6 subnetting uses the same prefix arithmetic, with different habits. A LAN is almost always a /64, because interface identifiers of unicast addresses are 64 bits long (RFC 4291). A site often gets a /48, which holds 65,536 /64 subnets. RFC 6177 no longer makes /48 the default, so many ISPs give homes less. There is no broadcast address, because IPv6 uses multicast instead. The all-zero interface ID is still reserved, as the Subnet-Router anycast address (RFC 4291).
+
+## Connect
+
+- [IPv4 and IPv6](/networking/ip/ipv4-and-ipv6): the headers that carry these addresses.
+- [Routing](/networking/ip/routing-distance-vector-and-link-state): how the routes get into the table.
+- [BGP](/networking/ip/bgp): why a more specific prefix can steal traffic across the Internet.
+- [ARP](/networking/link/arp): what a host does after it decides the destination is local.
+- [NAT](/networking/ip/nat): how private addresses reach the Internet.
+
+<Recall cards={[
+  { q: "How do you get the network address, the broadcast address and the usable host count of a /n?", a: "Network: the address AND the mask. Broadcast: the network OR the inverted mask. Hosts: 2 to the power (32 − n), minus 2 (except /31 and /32)." },
+  { q: "Why can a /31 have two hosts?", a: "RFC 3021 allows /31 on point-to-point links. With only two ends, nobody needs a network or broadcast address, so both addresses are hosts." },
+  { q: "State the longest-prefix-match rule, and say why the order of routes does not matter.", a: "Of all routes that contain the destination, the router uses the one with the longest prefix. The rule depends only on prefix length, not on table order." },
+  { q: "Why does a trie lookup cost at most 32 steps for IPv4?", a: "Each level tests one bit of the address, and there are 32 bits. The cost depends on the address length, not on the number of routes." },
+  { q: "When can two prefixes merge into one, and what goes wrong if you announce a summary with a hole?", a: "Only when they are the two halves of the same parent prefix. A summary with a hole attracts traffic for the missing block, which then has nowhere to go." },
+  { q: "Why does 100.64.0.0/10 exist when private ranges already exist?", a: "A carrier that puts customers behind its own NAT needs addresses that do not clash with the RFC 1918 addresses inside the customers' homes. RFC 6598 reserved it." },
+]} />

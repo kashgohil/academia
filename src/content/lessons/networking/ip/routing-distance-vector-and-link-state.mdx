@@ -1,0 +1,118 @@
+---
+summary: "How routers inside one network build their tables: distance vector (Bellman-Ford, RIP, count to infinity, split horizon, poison reverse) and link state (flooding, Dijkstra, OSPF areas), and what users see while a network converges after a link fails."
+---
+import { NetIpDvDemo, NetIpDijkstraDemo, NetIpConvergenceDemo } from "@/demos/net/NetIpRoutingDemos";
+
+A router does two jobs. The **data plane** forwards each packet with a longest-prefix match in its forwarding table, millions of times per second. The **control plane** builds that table, and it runs a **routing protocol** to learn where the networks are. This lesson covers the two families of protocols that run inside one organization: **distance vector** and **link state**. The next lesson covers [BGP](/networking/ip/bgp), which runs between organizations.
+
+Both families solve the same problem: find a shortest path to every destination, and find a new one when a link fails. They differ in what routers tell each other. A distance-vector router tells its neighbours its own conclusions. A link-state router tells every router the raw facts about its links, and each router computes the paths itself.
+
+## Distance vector
+
+In a distance-vector protocol, each router sends its neighbours a list: "I can reach network N at cost d". A router that hears such lists keeps, for each destination, the neighbour that offers the cheapest total:
+
+$$
+D_x(y) = \min_{v \in \text{neighbours}(x)} \big( c(x,v) + D_v(y) \big)
+$$
+
+This is the Bellman-Ford equation (Ford 1956, Bellman 1958). The routers never see the whole map, only their neighbours' distances. The **Routing Information Protocol** (RIP, RFC 2453) is the classic example. Its cost is a hop count. A router sends its full table every 30 seconds, with a random offset of up to 5 seconds, so that routers do not synchronize. A route that no neighbour repeats for 180 seconds times out.
+
+Good news spreads fast: a new short path reaches the whole network in one update per hop. Bad news can spread very slowly.
+
+<Predict
+  id="count-to-infinity"
+  question="Routers form a line A–B–C, and the destination is C. The link B–C fails. A still remembers that it can reach C in 2 hops, through B. How long until A and B both know that C is unreachable?"
+  options={["One advertisement: B tells A that C is gone", "One advertisement per hop on the path", "They count up one hop at a time until they reach the protocol's infinity"]}
+  answer={2}
+  explain="B hears A say 'C is 2 hops away' and believes it, not knowing that A's path goes through B itself. B now says 3, A says 4, and so on. RIP stops this only at 16, its value for infinity."
+>
+<NetIpDvDemo />
+</Predict>
+
+1. Keep the line and **everything**, then step through. After the cut, B takes A's old route (3 via A), A follows B (4 via B), and the two count up to 16. It takes 17 advertisements, and the plot shows a staircase.
+2. Choose **split horizon** and step again. A does not tell B about a route that goes through B, so B learns nothing false. The run ends after 4 advertisements.
+3. Choose the **triangle** topology with **split horizon**. C's bad news reaches B, but A's old route reaches B first. Now the loop runs A → C → B → A, and the routers count to 16 again.
+4. Choose **poison reverse** in the triangle. It does not help either: the loop has three routers, and poison reverse only stops loops of two.
+
+## Why counting to infinity happens, and the fixes
+
+The flaw is that a distance hides its path. B cannot tell that A's "2 hops to C" depends on B itself. So after the failure, each router uses the other's old answer as evidence. The count stops only at a cost that the protocol defines as unreachable. RIP sets this **infinity** to 16, which limits a RIP network to paths of 15 hops.
+
+Three fixes are standard, and RFC 2453 describes all of them:
+
+- **Split horizon.** Never advertise a route back to the neighbour you use for it.
+- **Poison reverse.** Advertise it back, but with cost infinity. This is explicit, so the neighbour does not need to wait for a timeout.
+- **Triggered updates.** Send a change at once instead of at the next 30-second tick. RFC 2453 asks for a random wait of 1 to 5 seconds between triggered updates, so a burst of changes does not flood the network.
+
+The first two remove every loop of two routers. The demo's triangle shows that a loop of three survives them. Newer distance-vector designs carry more state to prevent this, but RIP does not.
+
+## Link state
+
+A link-state router announces facts, not conclusions. It describes its own links in a **link-state advertisement** (LSA): "I am R4, my neighbours are R2 at cost 1 and R7 at cost 10". It **floods** the LSA: every router stores it and sends it on to all its other neighbours. A sequence number tells a router whether an LSA is new, so a copy that loops back is ignored. Soon every router has the same database, a full map of the network.
+
+Each router then runs **Dijkstra's algorithm** (1959) on the map, with itself as the root. The ARPANET moved from distance vector to this design in May 1979 (McQuillan, Richer and Rosen, 1980). Open Shortest Path First (OSPF, RFC 2328 for IPv4, RFC 5340 for IPv6) and IS-IS are its descendants.
+
+<NetIpDijkstraDemo />
+
+1. Step through from A. Dijkstra settles the unsettled router with the smallest distance, then tries every link out of it. The settled set grows in order of distance.
+2. Click the link B–C until its cost is 10, then step again. C is now reached through D, E and F instead, at distance 5, and the tree changes shape.
+3. Click F to run Dijkstra from F. The tree from F is a different tree, but it uses the same map. Every router computes its own tree.
+
+Dijkstra is correct when no cost is negative. When it settles a router at distance d, every other path to it starts at a router whose distance is already at least d. With a binary heap, it runs in $O((V + E) \log V)$ time for V routers and E links. That is fast enough for thousands of routers.
+
+OSPF adds the details a real network needs:
+
+- **Reliable flooding.** Neighbours acknowledge each LSA. Each router refreshes its own LSAs every 30 minutes (LSRefreshTime), and an LSA that reaches MaxAge, one hour, is removed. Sequence numbers start at `0x80000001`.
+- **Rate limits.** A router originates the same LSA at most once per 5 seconds (MinLSInterval), and accepts a new copy at most once per second (MinLSArrival).
+- **Hellos.** Neighbours exchange hellos to check that a link is alive. RFC 2328 gives 10 seconds as a sample interval for a LAN, and the dead interval is a multiple of it, such as 4.
+- **Areas.** A large network splits into areas around a backbone, area 0. Routers inside an area flood only that area's LSAs. Area border routers send summaries between areas, so a change in one area does not make every router run SPF.
+
+The **cost** of a link is a configuration choice. Many routers derive it as a reference bandwidth divided by the link bandwidth, with a default reference of 100 Mbit/s. A 10 Mbit/s link then costs 10, but 100 Mbit/s, 1 Gbit/s and 10 Gbit/s links all cost 1. OSPF then sees no difference between a 1 Gbit/s path and a 10 Gbit/s path, so operators raise the reference.
+
+## Convergence: what users see
+
+Between a failure and the moment all tables agree again, the network is **converging**. Packets that arrive in that window can die at the failed link, go nowhere, or circle in a loop until their TTL runs out. The demo runs both protocols as real packet protocols, with data flowing from A to F at one packet per millisecond.
+
+<Predict
+  id="convergence"
+  question="Link C–F fails while A sends one packet per millisecond to F through C. The routers run link state and need 10 ms to notice the failure. About how many packets are lost?"
+  options={["None: link state reroutes at once", "About 10, roughly the detection time", "About 100"]}
+  answer={1}
+  explain="Until the ends of the link notice the failure, they keep sending into it. After that, flooding and SPF take a few more milliseconds. In the demo 11 packets die, and the detection time is most of it."
+>
+<NetIpConvergenceDemo />
+</Predict>
+
+1. With link state and 10 ms detection, 11 packets die, and the tables are stable 19 ms after the cut. Set detection to 0 and to 40. Each extra millisecond of detection costs one more packet.
+2. Choose **distance vector** with **poison reverse**. With an alternative path, it converges about as fast as link state, because triggered updates spread the news hop by hop.
+3. Cut F off completely, choose **everything**, and turn off triggered updates. The routers count to infinity at the pace of their periodic updates, and 82 packets circle until their TTL runs out.
+4. Keep F cut off and choose **poison reverse**. The loops disappear: packets now die at the first router.
+
+Convergence time is the sum of four parts: detect the failure, spread the news, compute new paths, and install them in the forwarding hardware. In practice, detection often dominates. Loss of light on a fiber is quick, but a failure behind a switch is visible only when hellos stop. Bidirectional Forwarding Detection (BFD, RFC 5880, 2010) sends small hellos at short intervals to cut this time.
+
+Link state can loop for a moment too. Routers finish SPF at different times, and for a few milliseconds one may forward along the new path while its neighbour uses the old one. Fast-reroute schemes avoid the wait altogether. With loop-free alternates (RFC 5286), a router computes a backup next hop in advance and switches to it as soon as it detects the failure.
+
+| | Distance vector (RIP) | Link state (OSPF, IS-IS) |
+|---|---|---|
+| A router tells | its neighbours its distances | every router its links |
+| Each router knows | next hop and distance | the full map of its area |
+| Computation | Bellman-Ford, spread over the routers | Dijkstra, on every router |
+| After a failure | can count to infinity | floods one LSA, runs SPF |
+| Memory and CPU | small | the map, and SPF on changes |
+
+## Connect
+
+- [BGP](/networking/ip/bgp): path vector, the fix for count to infinity between organizations.
+- [Subnetting and CIDR](/networking/ip/subnetting-and-cidr): the forwarding table these protocols fill.
+- [ICMP](/networking/ip/icmp): the "time exceeded" messages that looping packets produce.
+- [Failure detectors](/distributed/foundations/failure-detectors): the same trade-off between fast detection and false alarms.
+- [Gossip and SWIM](/distributed/data-systems/gossip-and-swim): another way to spread state through a network.
+
+<Recall cards={[
+  { q: "Write the Bellman-Ford update that a distance-vector router applies.", a: "$D_x(y) = \\min_v \\big(c(x,v) + D_v(y)\\big)$: over all neighbours v, the cost of the link to v plus the distance that v advertises." },
+  { q: "Why does count to infinity happen, and why does RIP use 16?", a: "A distance hides its path, so after a failure a router accepts a neighbour's old route that goes through itself. The routers count up until 16, RIP's infinity, which also limits RIP to 15 hops." },
+  { q: "What do split horizon and poison reverse fix, and what do they not fix?", a: "They stop loops between two neighbours. A loop of three or more routers can still count to infinity." },
+  { q: "What does a link-state router flood, and what does every router then compute?", a: "An LSA that lists its own links and costs, with a sequence number. Every router builds the same map and runs Dijkstra with itself as the root." },
+  { q: "Why does an OSPF reference bandwidth of 100 Mbit/s cause trouble on modern links?", a: "Cost is reference divided by bandwidth, with a minimum of 1. Every link of 100 Mbit/s or faster gets cost 1, so OSPF cannot prefer a 10 Gbit/s link over a 1 Gbit/s link." },
+  { q: "Name the four parts of convergence time, and the one that often dominates.", a: "Detect the failure, spread the news, compute new paths, install them. Detection often dominates; BFD shortens it." },
+]} />

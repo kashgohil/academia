@@ -27,7 +27,7 @@ export const BBR_PROBE_RTT_MS = 200;
 export const BBR_MIN_CWND = 4;
 export const BBR_FULL_BW_THRESH = 5 / 4;
 export const BBR_FULL_BW_COUNT = 3;
-/** Model input: the allowance for segmentation offload, 3 × 2 segments at low rates in tcp_bbr.c. */
+/** Model input: the allowance for segmentation offload, 3 × 2 segments, the tcp_bbr.c value at the rates of these runs (it is 3 × 1 below 1.2 Mbit/s). */
 export const BBR_QUANTA = 6;
 
 export type BbrMode = "Startup" | "Drain" | "ProbeBW" | "ProbeRTT";

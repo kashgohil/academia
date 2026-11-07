@@ -1,0 +1,165 @@
+---
+summary: "BBR measures the path instead of waiting for loss: a bottleneck bandwidth from delivery-rate samples, a propagation RTT from the minimum RTT, and a state machine that probes both. Its gains, its behaviour with shallow buffers and against CUBIC, and what BBRv3 changes."
+---
+import { NetCcOperatingPointDemo, NetCcBbrTimelineDemo, NetCcBbrVsCubicDemo, NetCcBbrLossDemo } from "@/demos/net/NetCcBbrDemos";
+
+Reno and CUBIC are **loss-based**: they grow the window until a queue overflows, and they treat the loss as the signal. The [previous lesson](/networking/transport/congestion-control-reno-and-cubic) showed two costs. A deep buffer fills, so every flow waits behind it. A random loss that has nothing to do with congestion cuts the window anyway.
+
+BBR (Bottleneck Bandwidth and Round-trip propagation time) takes a different approach. Cardwell, Cheng, Gunn, Hassas Yeganeh and Jacobson described it in ACM Queue in 2016. It arrived in Linux 4.9. BBR builds a model of the path from measurements and sends at the rate that the model gives. This lesson describes BBR version 1, the one in mainline Linux, and then what later versions change.
+
+The runs here use the same packet model as the previous lesson: 1500-byte packets, one ACK per packet, a 200 ms minimum RTO. The BBR controller follows `tcp_bbr.c`, with the constants of that file.
+
+## Two numbers describe a path
+
+For one flow, a path has two properties that matter:
+
+- **BtlBw**, the bottleneck bandwidth: the rate of the slowest link.
+- **RTprop**, the round-trip propagation time: the RTT with empty queues.
+
+Their product is the BDP. With less than one BDP in flight, the link idles part of each round trip. With more, the extra packets wait in a queue. They add delay but no throughput.
+
+<Predict
+  id="operating-point"
+  question="A sender keeps a fixed window of 1 BDP on a 10 Mbit/s path with a 40 ms RTT and a buffer of 2 BDP. It doubles the window to 2 BDP. What happens?"
+  options={["The rate doubles and the RTT stays the same", "The rate stays the same and the RTT almost doubles", "Both double"]}
+  answer={1}
+  explain="One BDP already fills the link. The second BDP of packets can only wait in the queue. The run gives 10.00 Mbit/s and a mean RTT of 80.4 ms, against 9.55 Mbit/s and 41.7 ms at one BDP."
+>
+<NetCcOperatingPointDemo />
+</Predict>
+
+1. Move the window from 0.25 to 1 × BDP. The rate climbs on the line $\text{inflight}/\text{RTprop}$, and the RTT stays at 40 ms.
+2. Move it past 1 × BDP. The rate is flat at 10 Mbit/s, and the RTT climbs on the line $\text{inflight}/\text{BtlBw}$.
+3. Move it past the red line, BDP plus buffer. The queue overflows. At 4 × BDP, 23.2% of the packets are sent again.
+4. Change the buffer. The green line does not move, but the red line does. A loss-based sender always works at the red line, so its queue grows with the buffer.
+
+The best point is at one BDP: full rate and the least delay. A loss-based controller cannot stay there, because it gets no signal until the red line. BBR tries to work at the green line.
+
+There is a catch. To see RTprop, the queue must be empty, so the flight must be at most one BDP. To see BtlBw, the link must be full, so the flight must be at least one BDP. No single measurement shows both. BBR therefore measures them at different times and keeps each in a filter.
+
+## The two filters
+
+- **BtlBw** is the maximum of the delivery-rate samples over the last 10 round trips. A **delivery-rate sample** is the data delivered between the send of a packet and its ACK, divided by that interval.
+- **RTprop** is the minimum RTT sample over the last 10 seconds.
+
+A maximum filter fits BtlBw because queues and ACK delays can only make a rate look lower. A minimum filter fits RTprop because queues can only make an RTT look longer. From the model, BBR sets two controls.
+
+$$
+\text{pacing rate} = g_{\text{pacing}} \cdot \text{BtlBw}, \qquad \text{cwnd} = g_{\text{cwnd}} \cdot \text{BtlBw} \cdot \text{RTprop}
+$$
+
+The pacing rate is the main control. The window is only a cap for when ACKs arrive late. BBR needs **pacing**: the sender spaces its packets in time instead of sending a burst per ACK. Before Linux 4.13 this needed the `fq` queueing discipline. Since 4.13, TCP falls back to pacing of its own.
+
+```ts
+// BBR's model update on each ACK (simplified from src/sims/net/cc/bbr.ts).
+onAck(a: AckInfo) {
+  if (a.rate.priorDelivered >= this.nextRoundDelivered) { // a new round trip starts
+    this.nextRoundDelivered = a.delivered;
+    this.round++;
+  }
+  this.btlBw = this.maxFilter.update(this.round, a.rate.deliveryRate); // max over 10 rounds
+  if (a.rtt <= this.rtProp || a.now - this.rtStamp > 10_000) {        // min over 10 s
+    this.rtProp = a.rtt;
+    this.rtStamp = a.now;
+  }
+  this.pacingRate = this.pacingGain * this.btlBw;
+  this.cwnd = this.cwndGain * this.btlBw * this.rtProp;
+}
+```
+
+## The state machine
+
+| State | Pacing gain | cwnd gain | Ends when |
+|---|---|---|---|
+| Startup | 2/ln 2 ≈ 2.89 | 2.89 | BtlBw grew less than 25% in 3 rounds in a row |
+| Drain | 1/2.89 ≈ 0.35 | 2.89 | the flight is down to one BDP |
+| ProbeBW | cycle 1.25, 0.75, 1, 1, 1, 1, 1, 1 | 2 | (it stays here) each phase lasts about one RTprop |
+| ProbeRTT | 1 | cwnd = 4 packets | 200 ms and one round trip have passed |
+
+Startup doubles the delivery rate each round, as slow start does. A gain of 2/ln 2 is the smallest gain that can double it each round. When three rounds bring less than 25% more, the pipe is full, and Drain removes the queue that Startup made.
+
+In ProbeBW, the 1.25 phase sends a little more to discover new bandwidth. The 0.75 phase drains the queue that the probe made. Linux starts each flow at a random phase of the cycle, but never at the 0.75 phase. ProbeRTT starts when RTprop has had no new minimum for 10 seconds. The window then drops to 4 packets, so that the queue empties and a fresh RTprop appears.
+
+<NetCcBbrTimelineDemo />
+
+1. Watch the first second. Startup (red band) ends at 0.72 s, Drain (orange band) at 0.82 s. The 10 drops of this run all fall in Startup.
+2. Look at the thin pacing line in ProbeBW. It moves up by 25% for one RTT and down by 25% for the next. The rate stays at 10 Mbit/s, and the queue stays small.
+3. Find ProbeRTT at 10.18 s and 20.52 s (purple bands). The delivery rate dips for about a quarter of a second, and RTprop is measured again.
+4. Select **RTT to 120 ms**. RTprop keeps the old 41.5 ms value until ProbeRTT at 10.18 s. Until then the window cap is too small: from 8.5 to 10 s the flow gets only 6.5 Mbit/s.
+5. Select **rate to 20 Mbit/s**. The 1.25 phases find the new bandwidth: BtlBw reaches 20 Mbit/s within 0.6 s.
+
+## BBR in a deep buffer
+
+Run one flow alone, as in the sawtooth demo of the previous lesson, with a buffer of 4 BDP. Reno and CUBIC fill it: their mean queueing delays are 108.5 ms and 92.1 ms. BBR keeps the mean at 9.8 ms with no drops at all, and its utilisation is 98.2%. This is BBR's main promise: full rate without bufferbloat.
+
+## BBR and random loss
+
+Loss is not part of BBR v1's model. A packet that is lost on a radio link or a bad cable does not change BtlBw or RTprop.
+
+<NetCcBbrLossDemo />
+
+1. At 0% both flows fill the 20 Mbit/s link.
+2. At 1% CUBIC falls to 3.9 Mbit/s, close to the 3.7 Mbit/s of the Mathis formula. BBR keeps more than 19 Mbit/s.
+3. At 10%, BBR still gets 10.2 Mbit/s and CUBIC gets 0.63 Mbit/s. At 20% BBR falls to 1.45 Mbit/s too, and 30% of what it sends are retransmissions.
+
+This is why BBR helps on long paths with random loss. It is also BBR v1's main flaw, as the next section shows. Linux's v1 also has a special mode for traffic policers, which the model leaves out.
+
+## BBR against CUBIC
+
+<Predict
+  id="vs-cubic"
+  question="One BBR flow and one CUBIC flow share a 10 Mbit/s link with a 40 ms RTT. The buffer holds 8 BDP. Which flow gets more of the link?"
+  options={["BBR: it ignores the losses that make CUBIC back off", "CUBIC: it fills the deep buffer, and BBR does not", "They share equally"]}
+  answer={1}
+  explain="BBR caps its flight at 2 × its BDP estimate. CUBIC grows until the 8 BDP buffer overflows. The queue then holds mostly CUBIC's packets, and BBR's capped window covers only a small part of the long RTT. In the run, CUBIC gets 7.56 Mbit/s and BBR gets 2.28 Mbit/s."
+>
+<NetCcBbrVsCubicDemo />
+</Predict>
+
+1. Set the buffer to 0.5 × BDP. BBR takes 9.02 Mbit/s and CUBIC 0.76 Mbit/s. CUBIC resends 14.8% of its packets. BBR overflows the small queue but does not back off, and CUBIC halves on each loss.
+2. Set 2 × BDP. The two flows are close: 5.36 and 4.59 Mbit/s.
+3. Set 8 × BDP. Now CUBIC wins, and the mean queueing delay is 173 ms. BBR's window cap of 2 BDP is the limit, not its pacing rate.
+
+Testbed experiments agree. Hock, Bless and Zitterbart (ICNP 2017) found that BBR v1 causes heavy loss in buffers below about one BDP. In deep buffers they saw BBR limited by its in-flight cap, with a larger share for CUBIC as the buffer grows. Ware and co-authors (IMC 2019) found that BBR's share does not depend on the number of competing loss-based flows. One BBR flow took about 40% of the link against up to 16 CUBIC flows in deep buffers.
+
+## BBRv2 and BBRv3
+
+Google changed BBR twice to fix these problems. The IETF draft `draft-ietf-ccwg-bbr` (version 07, November 2026) describes BBRv3. It is an Internet-Draft that aims to become an Experimental RFC. Mainline Linux still has v1 in `tcp_bbr.c`; Google publishes its v3 code separately. The main changes in the draft:
+
+| | BBR v1 (Linux) | BBRv3 (draft-07) |
+|---|---|---|
+| Loss | ignored by the model | a round with more than 2% loss sets an upper bound on the flight |
+| In-flight bounds | 2 × BDP | adds `inflight_longterm` and `inflight_shortterm`, cut by β = 0.7 |
+| Startup pacing gain | 2/ln 2 ≈ 2.89 | 4 ln 2 ≈ 2.77, cwnd gain 2 |
+| Drain pacing gain | 1/2.89 | 0.5 |
+| ProbeBW | 8 phases of one RTprop | DOWN (0.90), CRUISE (1.0), REFILL (1.0), UP (1.25) |
+| ProbeRTT | cwnd 4 packets | cwnd 0.5 × BDP, 200 ms |
+
+The draft also says that a sender that uses ECN must treat CE marks as congestion. It does not specify the response. The aim of these changes is to coexist with loss-based flows and to keep losses low in shallow buffers.
+
+## Using BBR on Linux
+
+```sh
+sysctl -w net.ipv4.tcp_congestion_control=bbr   # the default for new connections
+sysctl -w net.core.default_qdisc=fq              # pacing in the qdisc; optional since Linux 4.13
+ss -ti dst example.com                           # shows "bbr" and its bw and mrtt estimates
+```
+
+BBR is a sender-side change. A server can use BBR for its downloads while every client keeps CUBIC for its uploads.
+
+## Connect
+
+- [Congestion control: Reno and CUBIC](/networking/transport/congestion-control-reno-and-cubic): the loss-based controllers that BBR competes with.
+- [Latency, bandwidth and the BDP](/networking/foundations/latency-bandwidth-and-bdp): the two numbers of BBR's model.
+- [QUIC](/networking/transport/quic): a transport in user space, where a new controller ships with the application.
+- [Latency vs throughput](/performance/systems/latency-vs-throughput): the same trade-off inside one machine.
+- [Tail latency](/performance/systems/tail-latency): what a standing queue does to the slowest requests.
+
+<Recall cards={[
+  { q: "What are BtlBw and RTprop, and with which filter does BBR estimate each?", a: "BtlBw is the bottleneck bandwidth: the max of delivery-rate samples over 10 round trips. RTprop is the round-trip propagation time: the min RTT over 10 seconds." },
+  { q: "Why can BBR not measure BtlBw and RTprop at the same moment?", a: "RTprop is visible only with an empty queue, so at most one BDP in flight. BtlBw is visible only with a full link, so at least one BDP in flight. BBR measures them in different phases." },
+  { q: "Give BBR v1's ProbeBW pacing gains and say what each phase is for.", a: "1.25 for one RTprop to probe for more bandwidth. Then 0.75 for one RTprop to drain the queue that the probe made. Then six phases at 1. Linux never starts at the 0.75 phase." },
+  { q: "When does BBR v1 enter ProbeRTT, and what does it do there?", a: "When RTprop has had no new minimum for 10 seconds. It limits the window to 4 packets for at least 200 ms and one round trip, so the queue empties and a fresh RTprop appears." },
+  { q: "Why does BBR v1 take most of a shallow buffer but lose in a deep one against CUBIC?", a: "It ignores loss, so in a shallow buffer CUBIC halves while BBR keeps sending. In a deep buffer CUBIC fills the queue, and BBR's flight is capped at 2 × its BDP estimate, which covers little of the inflated RTT." },
+  { q: "Name three changes in BBRv3 compared with v1.", a: "It bounds the flight after rounds with more than 2% loss, with bounds that it cuts by 0.7. It uses new ProbeBW phases: DOWN 0.90, CRUISE, REFILL, UP 1.25. It lowers the Startup pacing gain to 2.77 and raises the Drain pacing gain to 0.5." },
+]} />

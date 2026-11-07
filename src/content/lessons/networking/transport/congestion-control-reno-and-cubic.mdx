@@ -1,0 +1,187 @@
+---
+summary: "Why the Internet collapsed in 1986 and how Jacobson fixed it: ACK clocking, slow start, AIMD and the Reno sawtooth. Then buffer sizing and bufferbloat, the Mathis formula, CUBIC's cubic curve, and RTT fairness."
+---
+import { NetCcCollapseDemo, NetCcSawtoothDemo, NetCcCubicCurveDemo, NetCcBufferDemo, NetCcFairnessDemo, NetCcLossDemo } from "@/demos/net/NetCcRenoDemos";
+
+[Flow control](/networking/transport/flow-control) protects the receiver. **Congestion control** protects the network. A TCP sender keeps a second limit, the **congestion window** (`cwnd`). It may have at most the smaller of `cwnd` and the receive window in flight. Nobody tells the sender the right value for `cwnd`. It must find the value from what comes back: ACKs, losses, delay and ECN marks.
+
+All runs in this lesson are packet-level runs of a model on PacketNet's dumbbell topology. The model inputs are 1500-byte packets, 40-byte ACKs, one ACK per packet, and a minimum RTO of 200 ms, which is the Linux value. The link rates, RTTs and buffers of each demo are model inputs too, and each demo states them.
+
+## Congestion collapse
+
+Nagle named the problem **congestion collapse** in RFC 896 (1984). In October 1986 it happened. Jacobson reports that the throughput from LBL to UC Berkeley, 400 yards apart, fell from 32 kbit/s to 40 bit/s. The demo below shows one way that a busy network can deliver almost nothing.
+
+<Predict
+  id="collapse"
+  question="Twelve senders share a 2 Mbit/s link. Each keeps 8 packets in flight and sends its window again when a fixed 300 ms timer expires. The link is busy 100% of the time. What fraction of the link carries new data?"
+  options={["About 100%: a busy link does useful work", "About 70%: some copies, mostly new data", "Under a third"]}
+  answer={2}
+  explain="The 96 packets in flight make an RTT of about 575 ms, longer than the 300 ms timer. Each sender sends its window again while the first copies still wait, and the copies push the queue delay past 1 s. In the model, 6.1 packets go on the wire for each new packet that arrives, and the goodput is 29% of the link."
+>
+<NetCcCollapseDemo />
+</Predict>
+
+1. Move the slider from 1 to 6 senders. Goodput grows until the link is full. Nothing times out yet, because the RTT stays shorter than the timer.
+2. Go to 8 senders. The 1986 curve falls off a cliff to 29%, and the dashed line stays at 100%. The link is busy with copies.
+3. Select **1988**. The same 12 senders now keep the goodput at 98%. Each one backs off when it loses a packet, and its timer follows the measured RTT.
+4. Look at the queueing delay of the 1988 senders: it is still near 900 ms. They avoid collapse, but they fill a deep buffer. The section on bufferbloat comes back to this.
+
+The 1986 sender here is simpler than the real one: its timer is fixed. RFC 793 set the timer to a smoothed RTT times a constant, with no term for the variance. Jacobson lists exponential backoff among the algorithms that 4BSD still lacked. In both cases, a timer that grows more slowly than the queue delay resends packets that are only late.
+
+## Jacobson's fix
+
+Jacobson added seven algorithms to 4BSD TCP ("Congestion Avoidance and Control", SIGCOMM 1988). These were RTT variance estimation, exponential retransmit backoff, slow start, a more aggressive receiver ACK policy, dynamic window sizing, Karn's clamped backoff, and fast retransmit. Two principles join them.
+
+- **Conservation of packets.** In equilibrium, a sender puts a new packet into the network only when an old one leaves it.
+- **Self-clocking.** An ACK means that a packet left the network. If the sender sends one packet per ACK, the ACKs pace the sender at the rate of the bottleneck. This is **ACK clocking**.
+
+To reach equilibrium, the sender starts with a small window and doubles it each RTT. This is **slow start**. It is slow only compared with sending a full window at once. In equilibrium, the sender uses **AIMD** (additive increase, multiplicative decrease). It adds one packet per RTT and halves the window on a loss. Chiu and Jain (1989) showed that AIMD converges to a state that is both efficient and fair.
+
+## Reno, as RFC 5681 states it
+
+Reno is Jacobson's algorithm plus **fast recovery**, named after 4.3BSD Reno. RFC 5681 is the current standard. The sender keeps `cwnd` and a threshold, `ssthresh`, in bytes. Linux keeps both in packets.
+
+| Event | Reno does |
+|---|---|
+| ACK, `cwnd` below `ssthresh` | slow start: `cwnd` grows by 1 packet per packet ACKed, so it doubles per RTT |
+| ACK, `cwnd` at or above `ssthresh` | congestion avoidance: `cwnd` grows by about 1 packet per RTT |
+| 3 duplicate ACKs | fast retransmit; `ssthresh = max(FlightSize/2, 2·SMSS)`; `cwnd` goes to about `ssthresh` |
+| retransmission timeout | `ssthresh` as above; `cwnd` = 1 packet, the loss window; slow start again |
+
+```go
+// Reno's reaction to ACKs and losses, in packets.
+func (c *Reno) OnAck(acked float64) {
+	if c.cwnd < c.ssthresh {
+		c.cwnd += acked // slow start: +1 per ACKed packet, so x2 per RTT
+	} else {
+		c.cwnd += acked / c.cwnd // avoidance: +1 per RTT
+	}
+}
+
+func (c *Reno) OnLoss(inflight float64) { // once per window of data
+	c.ssthresh = math.Max(inflight/2, 2)
+	c.cwnd = c.ssthresh
+}
+```
+
+The initial window was 1 to 4 packets for many years. RFC 6928 raised it to about 10 packets, and Linux uses 10 since version 2.6.39. NewReno (RFC 6582) repairs several losses in one window. SACK (RFC 2018 and RFC 6675) tells the sender exactly which packets arrived. Linux reduces the window with Proportional Rate Reduction (RFC 6937) since version 3.2. The model here uses SACK and declares a packet lost when 3 packets sent after it are acknowledged.
+
+## The sawtooth and the buffer
+
+With one Reno flow, the window climbs one packet per RTT until the queue overflows. Then it halves. The plot of `cwnd` is a **sawtooth**.
+
+<Predict
+  id="sawtooth"
+  question="One Reno flow uses a 10 Mbit/s link with a 40 ms RTT, so the BDP is 33 packets. The bottleneck buffer holds a quarter of that. What utilisation does the link get?"
+  options={["100%: the sender always has data to send", "About 86%", "About 50%, because the window halves"]}
+  answer={1}
+  explain="The window peaks at the BDP plus the buffer, 41 packets, and falls to half of that, 21 packets. Below 33 packets the link idles for part of each RTT. The packet run gives 86.3%; the fluid model gives 88.9%."
+>
+<NetCcSawtoothDemo />
+</Predict>
+
+1. At 1 × BDP, the window falls exactly to the BDP line after each loss. The link stays full: 99.8%.
+2. Set 0.25 × BDP. The window now falls below the BDP line, and the queue is empty for long periods. Utilisation drops to 86.3%.
+3. Set 4 × BDP. Utilisation is 99.3%, but the mean queueing delay is 108.5 ms, almost three times the base RTT.
+4. Switch to CUBIC at 0.25 × BDP. CUBIC cuts its window to 70%, not 50%, so it gets 97.3% of the link.
+
+The derivation is short. Let the BDP be $P$ packets and the buffer $B$ packets. The window peaks at $W = P + B$ and falls to $W/2$. The link stays busy only if $W/2 \ge P$, that is, if $B \ge P$. This gives the old rule of thumb: buffer = RTT × link rate. Appenzeller and his co-authors attribute it to Villamizar and Song (1994).
+
+A buffer that is much larger than this adds delay and no throughput. Gettys and Nichols described this problem, **bufferbloat**, in ACM Queue (2011). Large buffers in home routers, modems and hosts filled up under load, and every flow behind them waited. Active queue management is the fix. CoDel (RFC 8289) drops packets when the queue delay stays above a 5 ms target for a 100 ms interval. FQ-CoDel (RFC 8290) adds a queue per flow.
+
+## Many flows need less buffer
+
+<NetCcBufferDemo />
+
+1. With 1 flow and 0.25 × BDP, the sum of the windows dips far below the BDP after each loss. Utilisation is 90.8%.
+2. Select 4 flows, then 32 flows. The flows lose packets at different times, so the sum stays near the top. With 32 flows, the same buffer gives 98.5%.
+3. Set 0.1 × BDP with 1 flow. The link is busy only 50.1% of the time.
+
+Appenzeller, Keslassy and McKeown (SIGCOMM 2004) showed that $n$ desynchronised flows need only $B = \mathrm{RTT} \times C / \sqrt{n}$. Their example is a 10 Gbit/s line card: the rule of thumb asks for 250 ms × 10 Gbit/s = 2.5 Gbit of buffer. With 50,000 flows, they find that 10 Mbit is enough. The result needs flows that do not lose packets at the same moment. A drop-tail queue tends to synchronise a few flows, which is why the model spreads the RTTs from 30 to 90 ms.
+
+## The Mathis formula
+
+A Reno window that rises from $W/2$ to $W$ by one packet per RTT sends about $3W^2/8$ packets per cycle and loses one. So the loss rate is $p = 8/(3W^2)$. The mean window is $3W/4$, and the throughput is the mean window per RTT:
+
+$$
+\text{throughput} \approx \frac{\text{MSS}}{\text{RTT}} \cdot \frac{\sqrt{3/2}}{\sqrt{p}} \approx \frac{\text{MSS}}{\text{RTT}} \cdot \frac{1.22}{\sqrt{p}}
+$$
+
+Mathis, Semke, Mahdavi and Ott published this in 1997. With delayed ACKs the constant is $\sqrt{3/4} \approx 0.87$.
+
+<NetCcLossDemo />
+
+1. At a 100 ms RTT and $p$ = 0.01%, the formula gives 14.7 Mbit/s. The Reno run gets 14.0 Mbit/s.
+2. Each tenfold rise in loss divides throughput by about $\sqrt{10} \approx 3.2$. The dots follow the dashed line.
+3. Look at CUBIC at 0.01% loss: 28.3 Mbit/s, about twice Reno. At 1% loss the two are equal.
+4. Select 25 ms. The formula scales as 1/RTT, so it gives four times as much at the same loss rate.
+
+The formula shows why Reno cannot fill fast long paths. For 10 Gbit/s at 100 ms with 1500-byte packets, Reno needs fewer than one loss in 4.6 billion packets. High-speed variants such as BIC and CUBIC grow faster when the window is large.
+
+## CUBIC
+
+CUBIC (Ha, Rhee and Xu, 2008) sets the window from the time since the last loss, not from the count of ACKs. RFC 9438 (2023) is the current standard. It replaced RFC 8312. CUBIC is the default in Linux since 2.6.19, and in Windows Server 2019 and updated Windows 10.
+
+$$
+W_{\text{cubic}}(t) = C\,(t - K)^3 + W_{\max}, \qquad K = \sqrt[3]{\frac{W_{\max} - W_{\text{epoch}}}{C}}
+$$
+
+$W_{\max}$ is the window at the last loss, and $W_{\text{epoch}} = \beta W_{\max}$ is the window after the cut. RFC 9438 sets $C = 0.4$ and $\beta = 0.7$. Linux stores them as `bic_scale` = 41 and `beta` = 717/1024 in `tcp_cubic.c`.
+
+<NetCcCubicCurveDemo />
+
+1. With $W_{\max}$ = 100 packets, $K$ is 4.22 s. The curve rises fast, flattens near $W_{\max}$ (the **concave** part), then probes upward faster and faster (the **convex** part).
+2. Change the RTT from 50 ms to 200 ms. The CUBIC curve does not move. Reno's line needs 2.5 s at 50 ms and 10 s at 200 ms.
+3. Set the RTT to 10 ms. Reno's line is now above CUBIC. Here CUBIC uses its **Reno-friendly** estimate (dashed). It grows at $3(1-\beta)/(1+\beta) \approx 0.53$ packets per RTT from the smaller cut. RFC 9438 chooses this rate so that CUBIC gets about the same average window as Reno.
+
+CUBIC adds **fast convergence**. If a loss comes before the window regains the old $W_{\max}$, a new flow is probably taking a share. CUBIC then sets $W_{\max} = \text{cwnd} \cdot (1+\beta)/2$, which releases bandwidth sooner. RFC 9438 also asks for HyStart++ (RFC 9406), which leaves slow start before the queue overflows. The Linux module has HyStart on by default. The model here uses plain slow start.
+
+## RTT fairness
+
+<Predict
+  id="rtt-fair"
+  question="Two Reno flows share a 10 Mbit/s link. Flow 1 has a 20 ms RTT, flow 2 has an 80 ms RTT. How do they share the link?"
+  options={["Equally: AIMD converges to fairness", "Flow 1 gets about twice as much", "Flow 1 gets about five times as much"]}
+  answer={2}
+  explain="AIMD converges to equal windows only when the flows have the same RTT. Flow 1 grows its window four times as often and sends each window four times as often. In the run, flow 1 gets 8.21 Mbit/s and flow 2 gets 1.66 Mbit/s, a ratio of 4.95."
+>
+<NetCcFairnessDemo />
+</Predict>
+
+1. Set the RTT of flow 2 to 1 × 20 ms. Flow 2 starts 2 s late and catches up. Jain's fairness index is 0.999.
+2. Go back to 4 × 20 ms and switch to CUBIC. The ratio falls from 4.95 to 3.42. CUBIC's growth follows the clock, not the ACKs.
+3. Set 2 × 20 ms. Reno gives a ratio of 2.31, and CUBIC gives 1.75.
+4. Try 8 × 20 ms. The long flow has a window of a few packets, so many of its losses end in a timeout, with either algorithm.
+
+**Jain's index** is $(\sum x_i)^2 / (n \sum x_i^2)$. It is 1 for equal shares and $1/n$ when one flow takes everything. CUBIC is fairer than Reno across RTTs, but not fair. At short RTTs and small windows it runs in its Reno-friendly region, and it is then about as RTT-unfair as Reno.
+
+## On a Linux host
+
+```sh
+sysctl net.ipv4.tcp_congestion_control             # the default: cubic
+sysctl net.ipv4.tcp_available_congestion_control   # modules that are loaded
+sysctl net.ipv4.tcp_allowed_congestion_control     # what unprivileged sockets may pick
+ss -ti                                             # cwnd, ssthresh, rtt and more per socket
+```
+
+A program can choose the algorithm per socket with the `TCP_CONGESTION` option of `setsockopt`. The sysctl `net.ipv4.tcp_slow_start_after_idle` (default 1) shrinks the window of an idle connection. Linux halves `cwnd` for each RTO of idle time, but not below the initial window.
+
+ECN (RFC 3168) lets a router mark a packet instead of dropping it. With the default value 2 of `net.ipv4.tcp_ecn`, Linux accepts ECN when the peer asks for it, but does not ask itself. A value of 1 makes it ask too. DCTCP (RFC 8257) cuts the window in proportion to the fraction of marked packets. It is meant for data centres, where all switches mark early.
+
+## Connect
+
+- [Latency, bandwidth and the BDP](/networking/foundations/latency-bandwidth-and-bdp): the pipe that `cwnd` must fill.
+- [Reliability and retransmission](/networking/transport/reliability-and-retransmission): the RTO, SACK and fast retransmit on which Reno builds.
+- [BBR](/networking/transport/bbr): a controller that measures the path instead of waiting for loss.
+- [QUIC](/networking/transport/quic): the same algorithms, in user space, with better loss detection.
+- [Queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law): why a full queue means delay.
+- [Deterministic simulation testing](/distributed/capstone/deterministic-simulation-testing): the method behind every run in this lesson.
+
+<Recall cards={[
+  { q: "What happened in October 1986, and how can a busy link deliver almost nothing?", a: "Congestion collapse: throughput from LBL to UC Berkeley fell from 32 kbit/s to 40 bit/s. When the queue delay grows past the retransmission timer, senders resend packets that are only late, and the link carries mostly copies." },
+  { q: "State the two principles behind Jacobson's 1988 changes.", a: "Conservation of packets: in equilibrium, send a new packet only when an old one leaves. Self-clocking: ACKs mark departures, so one packet per ACK paces the sender at the bottleneck rate." },
+  { q: "What does Reno do on 3 duplicate ACKs, and on a timeout?", a: "On 3 duplicate ACKs: fast retransmit, ssthresh = max(FlightSize/2, 2 SMSS), and cwnd goes to about ssthresh. On a timeout: the same ssthresh, cwnd = 1 packet, and slow start again." },
+  { q: "Why does one Reno flow need a buffer of one BDP to keep the link full?", a: "The window peaks at BDP + B and halves to (BDP + B)/2. The link stays busy only if that is at least the BDP, so B must be at least the BDP." },
+  { q: "Give the Mathis formula and what it says about loss on a fast long path.", a: "Throughput ≈ (MSS/RTT) · 1.22/√p. To fill 10 Gbit/s at 100 ms with 1500-byte packets, Reno needs less than one loss in about 4.6 billion packets." },
+  { q: "Why is CUBIC fairer than Reno to flows with long RTTs, but not fully fair?", a: "CUBIC sets the window from the time since the last loss, so its growth does not depend on the RTT. At small windows and short RTTs it runs in its Reno-friendly region, which is as RTT-unfair as Reno." },
+]} />

@@ -1,0 +1,143 @@
+---
+summary: "QUIC moves the transport into user space on top of UDP: independent streams with no head-of-line blocking, packet numbers that never repeat, a combined 1-RTT handshake and 0-RTT with its replay risk, connection IDs that survive a change of network, and headers that middleboxes cannot read."
+---
+import { NetCcHolDemo, NetCcHandshakeDemo, NetCcLossDetectDemo, NetCcMigrationDemo, NetCcHeaderDemo } from "@/demos/net/NetCcQuicDemos";
+
+**QUIC** is a transport protocol that runs on [UDP](/networking/transport/udp). It gives what TCP and TLS give together: reliable, ordered, encrypted delivery with congestion control. It started at Google and became an IETF standard in May 2021. The standard is RFC 9000 (transport), RFC 9001 (TLS), RFC 9002 (loss detection and congestion control) and RFC 8999 (invariants). HTTP/3 (RFC 9114, 2022) runs on it.
+
+Langley and co-authors described Google's deployment at SIGCOMM 2017. They estimated that 7% of Internet traffic was QUIC. It cut Google Search latency by 8.0% on desktops and 3.6% on mobile, and YouTube rebuffers by 18.0% and 15.3%.
+
+## Why a new transport
+
+- **Head-of-line blocking.** HTTP/2 puts many requests on one TCP connection. TCP delivers one ordered byte stream, so one lost packet stops every request behind it.
+- **Handshake latency.** TCP needs one round trip, and TLS then needs at least one more, before the request can go.
+- **Ossification.** Many middleboxes read and rewrite TCP headers, and some drop packets with options they do not know. Changes to TCP are therefore slow to deploy.
+- **The kernel.** TCP lives in the operating system. A new feature reaches users only with an OS update.
+
+QUIC answers each point. It has independent **streams** in one connection. It merges the transport and TLS 1.3 handshakes. It encrypts almost all of each packet, so middleboxes have little to read and nothing to rewrite. And it runs in user space, so an application ships its own QUIC stack.
+
+## Streams and head-of-line blocking
+
+A QUIC connection carries many streams. A **stream** is an ordered byte stream of its own, with its own flow control. A stream ID is a 62-bit number. Its lowest bit says who opened the stream (0 for the client), and the next bit says if it is bidirectional (0) or unidirectional (1). HTTP/3 sends each request on its own client-opened bidirectional stream.
+
+<Predict
+  id="hol"
+  question="A server sends 24 packets that carry 4 resources, one chunk per packet, in turn. Packet 2 is lost and sent again one RTT later. Over one TCP connection, how many of the 24 chunks arrive but must wait before the application can read them?"
+  options={["5: the later chunks of the resource that lost a packet", "21: every chunk after the gap", "0: TCP reorders the data"]}
+  answer={1}
+  explain="TCP gives the application one ordered byte stream, so it can hand over nothing after the gap until the gap is filled. In the run, 21 chunks wait, 29.2 ms on average. QUIC holds back only the 5 chunks of the stream with the gap, 6.7 ms on average."
+>
+<NetCcHolDemo />
+</Predict>
+
+1. Keep packet 2 dropped. In the TCP lanes, every chunk after packet 2 waits (red line) until the retransmission arrives at 65.8 ms. In the QUIC lanes, only stream 3 waits.
+2. Compare when each resource is complete. TCP: all four at 65.8 ms. QUIC: 39.2, 40.2, 65.8 and 42.1 ms.
+3. Select 1 stream. QUIC and TCP are now the same: one stream has no other stream to protect.
+4. Drop packets 2 and 9. With TCP the two gaps block almost everything. With QUIC two streams wait, each for its own gap.
+
+Both views use the same packets and the same retransmission. Only the rule for handing data to the application differs. This rule is the whole gain. It matters most on lossy paths and for many parallel resources. QUIC has two levels of flow control: per stream (`MAX_STREAM_DATA`) and per connection (`MAX_DATA`).
+
+## Packet numbers and loss recovery
+
+A TCP retransmission carries the same sequence number as the original. When the ACK comes, the sender cannot tell which copy arrived. Karn and Partridge (1987) therefore told senders to ignore RTT samples of retransmitted segments. TCP timestamps (RFC 7323) solve the ambiguity in another way.
+
+QUIC separates the two jobs. A **packet number** names a transmission and never repeats within a **packet number space**. There are three spaces: Initial, Handshake and application data. A packet number is an integer from 0 to $2^{62}-1$.
+
+Lost data goes again in a new frame of a new packet, with a new number. An ACK therefore always names exactly one transmission, and every RTT sample is exact. ACK frames list ranges of packet numbers. They also carry an **ACK Delay** field: the time that the receiver held the ACK, which the sender takes out. QUIC also forbids reneging: an acknowledged packet stays acknowledged.
+
+<Predict
+  id="pn-threshold"
+  question="A sender sends packets 0 to 11, one every millisecond, on a path with a 40 ms RTT. Packet 3 is lost. When does the sender declare it lost?"
+  options={["When a retransmission timer of about one second fires", "When the ACK of packet 6 arrives, because three later packets are acknowledged", "When the ACK of packet 4 arrives"]}
+  answer={1}
+  explain="RFC 9002 declares a packet lost when a packet sent at least 3 later (kPacketThreshold) is acknowledged. The ACK of packet 6 arrives at 48 ms, and packet 3 is declared lost then."
+>
+<NetCcLossDetectDemo />
+</Predict>
+
+1. With packets 3 and 11 dropped, packet 3 is lost by the **packet threshold** at 48 ms. Its chunk goes again in packet 12.
+2. Packet 11 has no 3 later packets. The **time threshold** declares it lost at 89 ms. Packet 12, sent later, is acknowledged, and packet 11 is older than 9/8 of the RTT.
+3. Drop only packet 11, the last one. Nothing comes after it, so the **probe timeout** (PTO) fires at 82.7 ms and sends a probe. The ACK of the probe shows the loss at 123.7 ms.
+4. Read the last column. TCP would send "seq 3" again, and its ACK could belong to either copy.
+
+| RFC 9002 constant | Value | Use |
+|---|---|---|
+| `kPacketThreshold` | 3 | lost when a packet 3 numbers later is acknowledged |
+| `kTimeThreshold` | 9/8 | lost when a later packet is acknowledged and it was sent more than 9/8 × max(smoothed RTT, latest RTT) ago |
+| `kGranularity` | 1 ms | the smallest time threshold |
+| `kInitialRtt` | 333 ms | the RTT before the first sample |
+| PTO | smoothed RTT + max(4 × RTT variance, 1 ms) + `max_ack_delay` | when to send a probe |
+
+A PTO does not declare anything lost and does not cut the window. It only sends one or two probes to get an ACK. The default congestion controller in RFC 9002 is similar to NewReno. Its initial window is 10 maximum-size datagrams, but at most 14,720 bytes or two datagrams, whichever is larger. Many stacks also offer CUBIC or BBR, because the controller is part of the application.
+
+## Handshakes: 1-RTT and 0-RTT
+
+QUIC carries the TLS 1.3 handshake in its own CRYPTO frames. The first flight sets up the connection and the keys at the same time. A client datagram that carries an Initial packet must be at least 1200 bytes long. Until the server has validated the client's address, it may send at most 3 times the bytes it received. This **anti-amplification limit** stops an attacker from using a server to flood a forged address.
+
+<Predict
+  id="handshake"
+  question="With TCP and TLS 1.3, the first byte of a response arrives 3 RTTs after the client starts. How many RTTs does it take with QUIC and a new connection?"
+  options={["1 RTT", "2 RTTs", "3 RTTs: the handshakes are the same"]}
+  answer={1}
+  explain="QUIC merges the transport handshake into the TLS handshake. After one RTT the client has the server's Finished and sends its request; the response arrives one RTT later. At a 50 ms RTT the run gives 101 ms, against 151 ms for TCP with TLS 1.3."
+>
+<NetCcHandshakeDemo />
+</Predict>
+
+1. Compare the rows of the table. TCP with TLS 1.2 needs 4 RTTs, with TLS 1.3 it needs 3, and QUIC needs 2.
+2. Select the 6 KB certificate flight with QUIC. The server must stop at 3 × 1200 bytes and wait for one more client packet, so the response needs 3 RTTs. Short certificate chains matter for QUIC.
+3. Select **QUIC 0-RTT**. On a resumed connection, the client sends the request in its first flight. The response arrives after 1 RTT.
+4. Turn on the replay. The attacker copies the first packet and sends it to the server later. The server runs the request a second time.
+5. Turn on anti-replay protection. The server remembers the ClientHello and rejects the copy.
+
+**0-RTT data** uses keys from an earlier session. It is not forward secret, and an attacker can replay it (RFC 8446 section 8 and appendix E.5, RFC 9001 section 9.2). TLS gives no guarantee against a replay across connections. A server can limit it with single-use tickets or by recording ClientHellos, but a cluster of servers makes this hard. The safe rule is to accept only idempotent requests in early data. HTTP has a status code for this: 425 (Too Early) in RFC 8470 asks the client to retry after the handshake.
+
+## Connection IDs and migration
+
+A TCP connection is its 4-tuple: two addresses and two ports. If one changes, the connection is gone. QUIC names a connection by **connection IDs** of up to 20 bytes in version 1. Each endpoint chooses the IDs that its peer puts in packets. A phone can move from Wi-Fi to cellular, or a NAT can give the client a new port. Packets then arrive from a new address with a known connection ID.
+
+The server then checks that the new path works. It sends a PATH_CHALLENGE frame with 8 random bytes, and the client echoes them in a PATH_RESPONSE. A new path can have a very different bandwidth and RTT. So unless only the port changed, the endpoints reset the congestion controller and the RTT estimate. To stop an observer from linking the two paths, a client uses a fresh connection ID when it moves on purpose.
+
+<NetCcMigrationDemo />
+
+1. At the defaults, Wi-Fi goes down at 600 ms. TCP gets no new data for 160 ms and QUIC for 110 ms. The file is complete at 1,310 ms with TCP and 1,260 ms with QUIC.
+2. Raise the cellular RTT to 150 ms. The gap grows, because TCP pays 2.5 RTTs to reconnect, and QUIC pays 1.5.
+3. Move the drop time. The cost of the move stays the same; only the amount of data at risk changes.
+
+The model is kind to TCP. Its application learns of the change at once and asks for the rest of the file with a range request. A real application may learn of it only after a timeout.
+
+## Encrypted headers
+
+<NetCcHeaderDemo />
+
+1. Press **Next packet, same number**. The packet number on the wire changes each time, because the mask comes from a sample of the encrypted payload.
+2. Change the spin bit. It changes on the wire too: it is not protected.
+3. Read the bytes. Only the low 5 bits of the first byte and the packet number bytes differ between the two views.
+
+A QUIC short header starts with one byte of flags. In order: header form (0), fixed bit (1), **spin bit**, two reserved bits, key phase, packet number length (2 bits). The destination connection ID and a packet number of 1 to 4 bytes follow.
+
+**Header protection** (RFC 9001) takes a 16-byte sample of the encrypted payload and makes a mask from it with a separate key. The mask hides the low 5 bits of the first byte and the packet number. Everything else, including every ACK, is inside the encrypted payload. The spin bit is optional: it flips once per RTT, so an operator can measure the RTT without reading anything else.
+
+## User space
+
+QUIC runs in user space on top of UDP sockets. Examples are Google's QUICHE in Chromium, Cloudflare's quiche, quinn in Rust, and Microsoft's MsQuic. MsQuic also runs inside the Windows kernel as `msquic.sys`. Mainline Linux has no in-kernel QUIC as of late 2026.
+
+A user-space stack can ship a new congestion controller or a bug fix with the application. The cost is CPU: each packet crosses the kernel as a UDP datagram, and each packet is encrypted on its own. Stacks reduce this cost by sending batches of datagrams per system call.
+
+## Connect
+
+- [TCP handshake and teardown](/networking/transport/tcp-handshake-and-teardown): the round trip that QUIC merges with TLS.
+- [Reliability and retransmission](/networking/transport/reliability-and-retransmission): TCP's retransmission ambiguity and RTO.
+- [Congestion control: Reno and CUBIC](/networking/transport/congestion-control-reno-and-cubic) and [BBR](/networking/transport/bbr): the controllers that QUIC stacks use.
+- [HTTP/3](/networking/apps/http-3): the application protocol on QUIC streams.
+- [TLS handshake](/networking/security/tls-handshake): the keys behind 1-RTT and 0-RTT.
+- [io_uring for networking](/networking/programming/io-uring-for-networking): batching the system calls that a user-space transport makes.
+
+<Recall cards={[
+  { q: "Why does one lost packet stall every HTTP/2 request on a TCP connection, but only one request on QUIC?", a: "TCP delivers one ordered byte stream, so nothing after a gap reaches the application. QUIC orders data only inside each stream, so only the stream with the gap waits." },
+  { q: "How do QUIC packet numbers remove TCP's retransmission ambiguity?", a: "A packet number names one transmission and never repeats in its space. Lost data goes in a new packet with a new number, so every ACK names exactly one transmission and every RTT sample is exact." },
+  { q: "State RFC 9002's two loss rules and what a PTO does.", a: "A packet is lost once a packet 3 numbers later is acknowledged. It is also lost when a later packet is acknowledged and it was sent over 9/8 RTT ago. A PTO only sends probes to get an ACK; it declares nothing lost." },
+  { q: "How many RTTs to the first response byte for TCP + TLS 1.3, QUIC, and QUIC 0-RTT?", a: "3, 2 and 1. QUIC merges the transport and TLS handshakes, and 0-RTT sends the request with the first flight of a resumed connection." },
+  { q: "What is the risk of 0-RTT data, and how do servers limit it?", a: "It can be replayed and is not forward secret. Servers accept only idempotent requests in early data, use single-use tickets or record ClientHellos, and HTTP can answer 425 (Too Early)." },
+  { q: "What lets a QUIC connection survive a change of address, and what does the server do first?", a: "Connection IDs, not the 4-tuple, name the connection. The server validates the new path with PATH_CHALLENGE and PATH_RESPONSE (8 bytes) and resets congestion control and the RTT estimate unless only the port changed." },
+]} />

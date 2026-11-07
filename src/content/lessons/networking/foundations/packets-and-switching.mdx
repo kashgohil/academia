@@ -1,0 +1,143 @@
+---
+summary: "Two ways to share a link: reserve a fixed slice for each user, or cut data into packets that take turns. Statistical multiplexing, store-and-forward pipelining against cut-through, the queue inside every router, and the head-of-line blocking that limits a simple switch to 58.6%."
+---
+import { CircuitPacketDemo, PipelineDemo, RouterQueueDemo, HolDemo } from "@/demos/net/NetFoundSwitchingDemos";
+
+Every network shares links between many users. There are two basic ways to do it. **Circuit switching** reserves a fixed part of every link on the path before any data moves, as the old telephone network did. **Packet switching** reserves nothing: data travels in packets, and each packet takes its turn on each link.
+
+Paul Baran at RAND (1964) and Donald Davies at the UK's National Physical Laboratory (1965) proposed packet switching independently. Davies gave the packet its name. The Internet is a packet network, so its links are cheap to share but give no guarantees. This lesson shows what that trade means in time, in queues and in lost packets.
+
+## Reserved slices against shared packets
+
+In circuit switching, a link is cut into fixed slices, for example by time (**TDM**, time-division multiplexing) or by frequency. A user who holds a slice gets its rate, all the time, whether it sends or not. Nobody can borrow an idle slice.
+
+In packet switching, a user sends at the full link rate when it has data. When two users send at the same time, one packet waits in a queue. This is **statistical multiplexing**: the link is sized for the average sum of the traffic, not for the sum of every user's peak.
+
+<Predict
+  id="share"
+  question="Ten users share a 10 Mbit/s link. Each sends 15 kB files at random times, and together they use 30% of the link. How do file times compare between ten reserved 1 Mbit/s slices and one shared link?"
+  options={["About the same: the capacity and the load are the same", "Packets are about 2× faster, because of less waste", "Packets are about 8× faster on average"]}
+  answer={2}
+  explain="On a reserved slice, a 15 kB file always takes 120 ms, plus a wait behind the same user's earlier files. On the shared link it takes 12 ms when the link is free, and the link is free most of the time at 30% load. In this run the mean is 147 ms against 18.0 ms, 8.2× faster."
+>
+<CircuitPacketDemo />
+</Predict>
+
+1. Look at the circuit lanes. Most of them are empty most of the time, but no user can use another user's lane.
+2. Move **Offered load** to 90%. Both systems slow down, but the shared link stays faster. It never idles while a file waits.
+3. Set **Users** to 2. Each slice is now half the link, and the gap between the two systems becomes small.
+4. Press **New random run** a few times. The numbers change, but the order does not.
+
+## Why sharing wins, and what it costs
+
+Look at the numbers from the classic example. A 1 Mbit/s link serves users who need 100 kbit/s while they are active, and each is active 10% of the time. Circuits admit exactly 10 users, because each needs a reserved tenth. With packets, 35 users can share the link. More than 10 of them are active at the same time with probability only about 0.0004.
+
+The number of active users $X$ out of $n$ follows a binomial distribution. The link overflows when $X$ exceeds the number of slots $k$:
+
+$$
+P(X > k) = \sum_{j=k+1}^{n} \binom{n}{j} p^{j} (1-p)^{n-j}
+$$
+
+The cost of this gain is that nothing is guaranteed. When many users are active together, packets wait in queues, and when a queue is full, packets are lost. Circuit switching gives a fixed delay and no loss, but it wastes every slice that is idle. Bursty traffic, such as web pages and file transfers, has a high peak and a low average, so packets win for it.
+
+## Store-and-forward and pipelining
+
+A normal router is **store-and-forward**: it receives the last bit of a packet before it sends the first bit on. It needs the whole packet to check the checksum and to read the destination. So each router adds one full **serialization time**, the time to put the packet's bits on the link: $L/R$ for $L$ bits at rate $R$.
+
+If a message goes as one large packet over $h$ links, each link must wait for the whole message. If it goes as many small packets, the links work at the same time, like the stages of a pipeline. For $P$ packets of $L$ bits over $h$ equal links with propagation delay $d$:
+
+<Steps>
+<div>The first packet reaches the destination after $h$ serializations and $h$ propagation delays: $h \cdot L/R + h \cdot d$.</div>
+<div>The packets leave the source back to back, so each next packet arrives one serialization later.</div>
+<div>The last packet therefore arrives at $T = (P + h - 1)\,L/R + h\,d$.</div>
+</Steps>
+
+<Predict
+  id="pipeline"
+  question="A 15 kB message crosses 3 links of 10 Mbit/s with 0.5 ms each. Is it faster as one packet, or as 11 packets with 40 header bytes each?"
+  options={["One packet: fewer headers to send", "11 packets: about 16 ms against 38 ms", "The same: the same bytes cross the same links"]}
+  answer={1}
+  explain="One packet waits for its full 12 ms serialization at every router: 3 × (12.03 + 0.5) ms = 37.6 ms. With 11 packets the three links work in parallel, so only the first packet pays the full path. It takes 16.25 ms, although the headers add 2.8% more bytes."
+>
+<PipelineDemo />
+</Predict>
+
+1. Move **Data bytes per packet** from 15,000 down to 100. The total time first falls, then rises again as headers start to dominate.
+2. Find the dot on the curve. For this message the best size is near 540 bytes, much smaller than the 1,500 that Ethernet allows.
+3. Set **Links on the path** to 1. Now the packet size hardly matters, because there is no pipeline to fill.
+4. Turn on **Cut-through switches**. Each switch starts to send after it reads the first 14 bytes, so large packets lose most of their penalty.
+
+## The best packet size, and cut-through
+
+With $M$ bytes of data and $H$ header bytes per packet, the time is about $(M/p + h - 1)(p + H) \cdot 8/R$ for $p$ data bytes per packet. Set the derivative to zero:
+
+$$
+p^{*} = \sqrt{\frac{M H}{h - 1}}
+$$
+
+For the demo's message, $p^{*}$ is about 548 bytes, and a search over whole packets gives 536 bytes and 15.32 ms. Real networks use a fixed MTU instead, mostly 1500. But the formula shows the trade: more hops favor smaller packets, and larger headers favor larger packets.
+
+A **cut-through** switch starts to send a frame after it reads the destination MAC address, before the frame has fully arrived. It cuts the wait at each switch from a full serialization to a few header byte times, plus the lookup time. Low-latency data center switches use it. The cost is that the switch forwards a frame before it can check the FCS, so it passes on corrupt frames. It also falls back to store-and-forward when the output port is busy, or when the input and output links run at different rates.
+
+## The queue inside a router
+
+A router has three main parts. An **input port** looks up the destination in the forwarding table, by longest-prefix match. A **switching fabric** moves the packet to the output port. The **output port** sends the packet, and it has a queue for packets that arrive while the link is busy.
+
+Queueing is the part of the delay that changes with load. When packets arrive faster than the link sends them, the queue grows. When the queue is full, a simple **drop-tail** queue discards each new packet.
+
+<Predict
+  id="queue"
+  question="Packets of one size arrive at random (Poisson) at 80% of an output link's capacity. One packet takes S to send. How long does a packet wait in the queue on average?"
+  options={["0.8 S: the link is busy 80% of the time", "2 S", "4 S"]}
+  answer={1}
+  explain="For random arrivals and a fixed service time (the M/D/1 queue), the mean wait is ρS / (2(1 − ρ)) = 0.8 S / 0.4 = 2 S. If packet sizes vary as much as the arrivals (M/M/1), the wait doubles to 4 S. At 90% load, M/D/1 gives 4.5 S."
+>
+<RouterQueueDemo />
+</Predict>
+
+1. Read the lower plot. The dots are PacketNet runs; they lie on the M/D/1 curve. Above 80% load the curve turns sharply up.
+2. Set the load to 100% or more. The queue climbs to the buffer limit and stays there, and drops start.
+3. Set the load to 30% and press **Add a burst** two times. Four inputs send 10 packets each at the same time, and the queue jumps far above anything the random load did.
+4. Set **Buffer** to 10 and add bursts. The bursts now cause drops even at low average load.
+5. Compare **longest wait the buffer allows** with the buffer size. A buffer is a delay: 40 packets of 1.2 ms each can add 48 ms.
+
+## How large should a buffer be?
+
+The demo shows the M/D/1 mean wait, $W = \rho S / (2(1-\rho))$. With 1500-byte packets on 10 Mbit/s, $S$ = 1.2 ms. At 80% load the mean wait is 2.4 ms, and at 90% it is 5.4 ms. [Queueing theory](/performance/systems/queueing-theory-and-littles-law) gives the general rule: the wait grows as $1/(1-\rho)$.
+
+Random load is not the main reason for buffers, though. Bursts are. Several inputs often send to one output at the same time, as in the **incast** pattern of a data center. The output must then hold the burst or drop it. In the demo, 40 packets arrive almost at once at a 20-packet buffer: one goes on the wire, 20 wait, and 19 are dropped.
+
+The classic rule of thumb sizes a buffer as the round-trip time times the link rate, $\text{RTT} \times C$. It is usually attributed to Villamizar and Song (1994). Appenzeller, Keslassy and McKeown ("Sizing Router Buffers", SIGCOMM 2004) showed that a link with $n$ long-lived TCP flows needs only about $\text{RTT} \times C / \sqrt{n}$.
+
+Too much buffer is also a problem. A large buffer that stays full adds delay to every packet but no throughput. Gettys and Nichols called this **bufferbloat** ("Bufferbloat: Dark Buffers in the Internet", ACM Queue, 2011). On Linux each device has a queueing discipline (qdisc), and `tc qdisc show` lists it. Active queue management keeps such queues short; the [congestion control](/networking/transport/congestion-control-reno-and-cubic) lessons return to it.
+
+## Head-of-line blocking
+
+Some switches queue packets at the inputs instead of the outputs, because the fabric then needs to run only at the link rate. Each input then has one FIFO queue. If the packet at the head of a queue waits for a busy output, every packet behind it waits too. This is true even if their own outputs are idle. This is **head-of-line (HOL) blocking**.
+
+<HolDemo />
+
+1. Press **Step one slot** a few times. When two inputs want the same output, one loses. A red note marks an input that is HOL-blocked: a packet behind its head wants an output that stays idle.
+2. Press **Run 500 slots**. With 4 ports, the throughput settles near 65%, far below 100%.
+3. Increase **Ports** and run again. The throughput falls toward the dashed line at 58.6%.
+
+Karol, Hluchyj and Morgan (IEEE Transactions on Communications, 1987) computed this limit. With fixed-size packets, random outputs and FIFO inputs, the throughput of each input approaches $2 - \sqrt{2} \approx 58.6\%$ as $N$ grows. The demo measures 75% for 2 ports, 65.5% for 4 and 61.8% for 8. The fix is **virtual output queues**: each input keeps one queue per output, so a blocked packet blocks only its own output. A scheduler then matches inputs to outputs in each slot. McKeown's iSLIP (IEEE/ACM Transactions on Networking, 1999) is a well-known scheduler for this.
+
+The same pattern returns at higher layers. HTTP/1.1 requests on one connection and TCP's in-order delivery both block later data behind an earlier item. [HTTP/2](/networking/apps/http-2) and [QUIC](/networking/transport/quic) were built partly to remove it.
+
+## Connect
+
+- [Layers and encapsulation](/networking/foundations/layers-and-encapsulation): what is inside each packet that a router forwards.
+- [Latency, bandwidth and the BDP](/networking/foundations/latency-bandwidth-and-bdp): how serialization, queueing and propagation add up on a real path.
+- [Switches and VLANs](/networking/link/switches-and-vlans): how an Ethernet switch learns where to send a frame.
+- [Queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law): the math behind the wait curve.
+- [Tail latency](/performance/systems/tail-latency): why the 99th percentile of the queue matters more than the mean.
+
+<Recall cards={[
+  { q: "What does a circuit reserve, and what does packet switching gain by not reserving it?", a: "A circuit reserves a fixed slice of every link on the path, used or not. Packet switching lets a user send at the full rate when it has data and lets idle capacity serve others: statistical multiplexing." },
+  { q: "A 1 Mbit/s link serves users who need 100 kbit/s while active and are active 10% of the time. How many users do circuits admit, and how many can share with packets?", a: "Circuits admit 10. With packets, 35 users overflow the link only with probability about 0.0004." },
+  { q: "Give the time for P equal packets of L bits over h store-and-forward links of rate R and delay d.", a: "$T = (P + h - 1)L/R + hd$. Only the first packet pays every serialization; the others follow one serialization apart." },
+  { q: "What does a cut-through switch gain and what does it give up?", a: "It starts to send after it reads the destination MAC, so it adds a few byte times instead of a full serialization. It cannot drop a frame with a bad FCS before it forwards it. It falls back to store-and-forward when the output is busy or runs at a different rate than the input." },
+  { q: "Random arrivals of fixed-size packets load a link to 90%. What is the mean wait in the queue, in packet times?", a: "M/D/1: ρ / (2(1 − ρ)) = 0.9 / 0.2 = 4.5 packet times. With variable sizes (M/M/1) it is 9." },
+  { q: "Why does an input-queued switch with FIFO inputs reach only about 58.6% throughput, and what fixes it?", a: "Head-of-line blocking: a packet that waits for a busy output blocks the packets behind it, even if they want idle outputs. Virtual output queues, one per output at each input, with a matching scheduler such as iSLIP, remove it." },
+]} />

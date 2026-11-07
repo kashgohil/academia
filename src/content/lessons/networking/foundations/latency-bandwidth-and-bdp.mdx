@@ -1,0 +1,156 @@
+---
+summary: "Latency is the sum of four delays per hop: processing, queueing, serialization and propagation. Bandwidth is a rate, not a speed. Their product, the bandwidth-delay product, is how much data must be in flight to keep a path busy, and every window and buffer is sized against it."
+---
+import { PathLatencyDemo, BandwidthLatencyDemo, FillPipeDemo } from "@/demos/net/NetFoundLatencyDemos";
+
+Two numbers describe a network path. **Latency** is how long one bit takes to get from one end to the other. **Bandwidth** is how many bits per second the path can carry. People often call a link with more bandwidth "faster", but bandwidth does not move a bit any sooner. It only lets more bits move at the same time.
+
+This lesson takes latency apart, shows when bandwidth helps and when it does not, and joins the two in one number: the **bandwidth-delay product** (BDP). The BDP tells you how many bytes a sender must keep in flight to use a path fully.
+
+## Four delays on every hop
+
+A packet of $L$ bits crosses each hop in four steps. The router first examines it (processing). Then the packet waits until the link is free (queueing). Then the router puts its bits on the link (serialization). Last, the bits travel along the link (propagation). For a link of rate $R$, length $\ell$ and signal speed $v$:
+
+$$
+d_{\text{hop}} = d_{\text{proc}} + d_{\text{queue}} + \frac{L}{R} + \frac{\ell}{v}
+$$
+
+The terms behave very differently. Serialization depends on the packet size and the rate. Propagation depends only on distance. Queueing depends on the other traffic, so it is the only term that changes from moment to moment.
+
+<Predict
+  id="largest"
+  question="A 1500-byte packet goes from New York to London. It crosses a 100 Mbit/s home line, fast ISP links and 5,570 km of 100 Gbit/s long haul. Which delay is the largest?"
+  options={["Serialization on the slow home line", "Queueing behind other traffic at 50% load", "Propagation through the fiber"]}
+  answer={2}
+  explain="Light needs 27.3 ms for 5,570 km of fiber. Serialization on the 100 Mbit/s line is 0.12 ms, and the queue there adds less than 0.1 ms on average. Propagation is 99% of the total. More bandwidth would not change that."
+>
+<PathLatencyDemo />
+</Predict>
+
+1. Choose **Frankfurt → London**. Propagation falls to about 3.5 ms one way, but it is still the largest part.
+2. Set **Access link rate** to 1 Mbit/s. Now serialization on the access line is 12 ms per packet, and the queue behind other traffic grows to match.
+3. Set **Packet size** to 64 bytes. Serialization almost disappears; propagation stays the same.
+4. Move **Other traffic** to 95% with a slow access line. The 99th percentile wait is many times the mean.
+
+## Propagation: light in glass
+
+Light in a vacuum travels at exactly 299,792,458 m/s; the SI defines the metre this way. In optical fiber, light moves slower by the fiber's **group index**. A model input of 1.468 fits standard single-mode fiber (Corning gives 1.4679 at 1550 nm for SMF-28e+). That gives about 204 km per millisecond, or 4.9 µs per km.
+
+The shortest path on the Earth is the **great circle**. Fiber along it sets a lower bound on the round-trip time (RTT) that no protocol can beat:
+
+| Route | Great circle | RTT in fiber, at least | RTT in vacuum, at least |
+|---|---|---|---|
+| Frankfurt – London | 638 km | 6.2 ms | 4.2 ms |
+| New York – London | 5,570 km | 54.6 ms | 37.2 ms |
+| New York – Tokyo | 10,850 km | 106.3 ms | 72.4 ms |
+| San Francisco – Sydney | 11,950 km | 117.0 ms | 79.7 ms |
+| geostationary satellite, request and answer | 4 × 35,786 km | – | 477 ms |
+
+Real RTTs are larger, because cables follow coasts, cross oceans where landing is possible, and pass through extra routers. Some trading networks send data by microwave between towers instead, because radio in air moves at almost the speed of light in a vacuum. A geostationary orbit must be 35,786 km high to circle once per sidereal day, so a request and its answer cross that height four times.
+
+## Serialization, processing and queueing
+
+Serialization is $L/R$. For a 1500-byte packet it is 1.2 ms at 10 Mbit/s, 12 µs at 1 Gbit/s and 120 ns at 100 Gbit/s. It matters on slow links, and at each store-and-forward hop it is paid again (see [packets and switching](/networking/foundations/packets-and-switching)).
+
+Processing is the time a router or a host needs to look at a packet: lookup, checks and copies. In hardware routers it is microseconds or less, so the demo uses a few microseconds per router as a model input. In software stacks it can be much larger. An extra copy or a system call per packet costs time on every packet.
+
+Queueing is the term that hurts in practice, because it is variable. At 50% load on the access link the mean wait is small, but the tail is not. The wait also grows without limit as the load approaches 100%. Most "the network is slow" problems are queueing problems, not propagation problems.
+
+## Bandwidth is not speed
+
+A transfer of $S$ bytes needs at least $8S/R$ seconds on the wire. It also needs round trips: one for the TCP handshake, and more for TLS. TCP also cannot send at full rate at once. A new connection starts with a small **initial window** and doubles it each round trip (**slow start**). RFC 6928 (an Experimental RFC, 2013) raised the initial window to about 10 segments, and Linux uses 10 (`TCP_INIT_CWND`).
+
+<Predict
+  id="bwlat"
+  question="Download 100 kB. Link A has 1 Gbit/s and a 150 ms RTT. Link B has 50 Mbit/s and a 10 ms RTT. Which finishes first?"
+  options={["A, because it has 20× the bandwidth", "B, by more than 10×", "They finish at about the same time"]}
+  answer={1}
+  explain="The bytes need only 0.8 ms on A and 16 ms on B. But A spends 150 ms on the handshake, then sends in three rounds of 10, 20 and 39 segments, one RTT apart. A needs 525 ms and B needs 44.8 ms. For small transfers, the round trips dominate."
+>
+<BandwidthLatencyDemo />
+</Predict>
+
+1. Read the banner. On A, 10× the bandwidth saves nothing for 100 kB, but half the RTT saves half the time.
+2. Move **Transfer size** up. B wins below about 9.5 MB; above that, A's rate starts to matter.
+3. Choose **TCP + TLS 1.3**. Every transfer pays one more RTT, which hurts the far link most.
+4. Make the links equal in rate and different in RTT. The curves are parallel: latency adds a fixed cost to every transfer.
+
+The steps in the curves are the round trips of slow start. Each step doubles the window. A web page made of many small objects lives almost entirely in this region. This is why CDNs move content closer, why browsers reuse connections, and why [QUIC](/networking/transport/quic) and TLS 1.3 remove round trips from the setup.
+
+## The bandwidth-delay product
+
+While a sender waits one RTT for an acknowledgment, the link keeps carrying bits. The amount of data "in the pipe" when the path is full is
+
+$$
+\text{BDP} = R \times \text{RTT}
+$$
+
+This is [Little's law](/performance/systems/queueing-theory-and-littles-law) for a network path: the number in the system equals the throughput times the time in the system. A sender that keeps fewer bytes unacknowledged than the BDP leaves the link idle for part of every RTT.
+
+| Path (model inputs) | Rate | RTT | BDP |
+|---|---|---|---|
+| data center, same row of racks | 100 Gbit/s | 0.05 ms | 625 kB |
+| home broadband to a nearby CDN | 100 Mbit/s | 20 ms | 250 kB |
+| New York to London | 10 Gbit/s | 70 ms | 87.5 MB |
+| geostationary satellite | 100 Mbit/s | 600 ms | 7.5 MB |
+
+<Predict
+  id="window"
+  question="A path has 10 Mbit/s and a 21.4 ms RTT, so its BDP is about 18 full packets. The sender raises its window from 18 to 40 packets. What happens?"
+  options={["Throughput rises about 2.2×", "Throughput stays the same, and the RTT more than doubles", "Throughput falls, because the router drops the extra packets"]}
+  answer={1}
+  explain="Eighteen packets already keep the link busy. The other 22 can only wait in the router's queue, at 1.2 ms each, so the RTT grows from 21.4 ms to 48 ms. The throughput stays at the link rate. With an unlimited buffer nothing is dropped; the window only adds delay."
+>
+<FillPipeDemo />
+</Predict>
+
+1. Keep a window of 8. The pipe view shows one burst of 8 packets moving through a long, mostly empty pipe. The throughput is about window / RTT: 4.4 Mbit/s.
+2. Raise **Window** to 18. The packets now fill the pipe end to end, and the throughput reaches 9.73 Mbit/s of data.
+3. Raise **Window** to 40. The pipe stays full, and red blocks pile up in the router's queue. The RTT plot rises in a straight line.
+4. Change **One-way delay** to 40 ms. The BDP grows to about 68 packets, and the same window of 18 now gets only about a quarter of the link.
+
+## Windows must cover the BDP
+
+Throughput with a window $W$ is at most $\min(R, W/\text{RTT})$. TCP's receive window is a 16-bit field (RFC 7323), so without help it can say at most 65,535 bytes. Over a 100 ms RTT that is 5.24 Mbit/s, whatever the link rate. RFC 7323 uses the term **long fat network** for paths whose BDP is too large for this field.
+
+The **window scale** option fixes the field. In the SYN, each side announces a shift count of up to 14, so the window can reach $65535 \times 2^{14}$ bytes, just under 1 GiB. Linux enables it by default. Then the buffers become the limit.
+
+Linux sizes the receive buffer automatically within `net.ipv4.tcp_rmem`, three values: minimum, default and maximum. The default has been 131072 bytes since Linux 4.20. The maximum depends on RAM: up to 6 MB through Linux 6.15, and up to 32 MB since 6.16. Linux advertises only part of the buffer as window, because it keeps room for overhead. Even a full 6 MiB window over a 70 ms RTT allows at most about 719 Mbit/s. A 10 Gbit/s transatlantic link has a BDP of 87.5 MB.
+
+```sh
+# Inspect the limits that cap a TCP window on this host.
+sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.core.rmem_max
+# A program can also set its own buffer. Linux doubles the value it is given,
+# and net.core.rmem_max caps it, not tcp_rmem.
+# Setting the buffer also turns off autotuning for that socket.
+```
+
+```go
+// Size the receive buffer for a known path: rate in bit/s, RTT in seconds.
+bdp := int(rateBps * rtt.Seconds() / 8)
+// SetReadBuffer turns off autotuning, and net.core.rmem_max caps the value.
+// Use it only when rmem_max allows the BDP.
+if err := conn.(*net.TCPConn).SetReadBuffer(bdp); err != nil {
+	log.Fatal(err)
+}
+```
+
+The other side of this rule is just as important. A window or a buffer much larger than the BDP buys no throughput. It only fills a queue somewhere on the path, as in the demo, and that queue delays every other packet behind it. This is the bufferbloat of the previous lesson. [BBR](/networking/transport/bbr) is a congestion control that measures the bottleneck rate and the minimum RTT, and tries to keep about one BDP in flight.
+
+## Connect
+
+- [Packets and switching](/networking/foundations/packets-and-switching): where queueing delay comes from, and why buffers are a delay.
+- [Flow control](/networking/transport/flow-control): the receive window that this lesson sizes.
+- [Congestion control: Reno and CUBIC](/networking/transport/congestion-control-reno-and-cubic) and [BBR](/networking/transport/bbr): how TCP finds the right window without knowing the BDP.
+- [CDNs](/networking/infrastructure/cdns): the cure for propagation is a shorter path.
+- [Latency vs throughput](/performance/systems/latency-vs-throughput) and [Latency numbers](/performance/memory/latency-numbers): the same trade inside one machine.
+- [The eight fallacies](/distributed/foundations/the-eight-fallacies): "latency is zero" and "bandwidth is infinite".
+
+<Recall cards={[
+  { q: "Name the four delays a packet meets at each hop, and the one that changes from moment to moment.", a: "Processing, queueing, serialization (L/R) and propagation (distance / signal speed). Queueing changes with the other traffic." },
+  { q: "About how fast does light move in fiber, and what is the smallest fiber RTT from New York to London?", a: "About 204 km per ms, or 4.9 µs per km, with a group index near 1.47. Over the 5,570 km great circle the RTT is at least 54.6 ms." },
+  { q: "Why does 10× the bandwidth not speed up a 100 kB download over a 150 ms RTT?", a: "The transfer is spent in round trips: the handshake and the slow-start rounds that grow the window from 10 segments. The bytes need under a millisecond on the wire; the RTTs need hundreds." },
+  { q: "Define the bandwidth-delay product and say what it is for.", a: "BDP = rate × RTT: the bytes in flight when the path is full. A sender needs a window of at least one BDP to keep the link busy." },
+  { q: "What is the largest TCP window without window scaling, and what throughput does it allow over a 100 ms RTT?", a: "65,535 bytes, from the 16-bit field. That allows about 5.24 Mbit/s over 100 ms. Window scaling (RFC 7323) allows shifts up to 14, just under 1 GiB." },
+  { q: "What happens when a sender's window is much larger than the BDP?", a: "Throughput stays at the link rate, and the extra packets wait in the bottleneck queue. The RTT grows by the queue's drain time: bufferbloat." },
+]} />

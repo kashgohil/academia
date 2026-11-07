@@ -1,0 +1,161 @@
+---
+summary: "How a request becomes bits on a wire: each layer adds its own header in front of the bytes it gets, and the receiver removes them in the opposite order. Real headers byte by byte, where each layer's code runs, which checks catch which errors, and what the MTU does to a large packet."
+---
+import { EncapsulationDemo, CorruptionDemo, MtuDemo } from "@/demos/net/NetFoundLayersDemos";
+
+A program that sends an HTTP request does not know about cables, MAC addresses or routers. A switch that forwards a frame does not know about HTTP. **Layering** makes this possible. Each layer gives a service to the layer above it and uses the service of the layer below it.
+
+On the sending side, each layer takes the bytes from the layer above as an opaque **payload** and puts its own **header** in front. This is **encapsulation**. On the receiving side, each layer reads and removes its own header and passes the rest up. A layer reads only its own header, so you can change one layer without changing the others.
+
+## The stack, and where its code runs
+
+The Internet uses four layers. RFC 1122 names them link, internet, transport and application. The OSI reference model (ISO/IEC 7498-1, the same text as ITU-T X.200) has seven layers. It splits the bottom into physical and data link, and it puts session and presentation layers between transport and application. The Internet has no separate code for session and presentation, so the four-layer model describes real stacks better.
+
+| Layer (RFC 1122) | OSI | Unit | Example header | Where the code runs on Linux |
+|---|---|---|---|---|
+| application | 5–7 | message | HTTP request line and headers | user space: the program and its libraries, such as a TLS library |
+| transport | 4 | segment | TCP, 20 bytes without options | kernel: `tcp_transmit_skb` in `net/ipv4/tcp_output.c` |
+| internet | 3 | packet | IPv4, 20 bytes without options | kernel: `ip_queue_xmit` in `net/ipv4/ip_output.c` |
+| link | 2 | frame | Ethernet, 14 bytes + 4-byte FCS | kernel neighbour layer, `dev_queue_xmit`, the driver, the NIC |
+| physical | 1 | bits | preamble, line code | the NIC's PHY |
+
+The border between user space and the kernel is the socket. A `write()` copies bytes into the socket's send buffer and returns. From there, the kernel decides when to send them and how to cut them into segments. The NIC reads the finished frame from memory by DMA (direct memory access) and adds the frame check sequence in hardware.
+
+<Predict
+  id="wire-bytes"
+  question="A 60-byte HTTP GET leaves a Linux host as one TCP segment in one Ethernet frame. How many byte times does it use on the wire?"
+  options={["60: the headers are small enough to ignore", "100: TCP and IP add 20 bytes each", "138: Ethernet, its FCS, the preamble and the gap add 38 more"]}
+  answer={2}
+  explain="TCP adds 20 bytes and IPv4 adds 20, so the packet is 100 bytes. Ethernet adds a 14-byte header and a 4-byte FCS, so the frame is 118 bytes. The PHY also sends an 8-byte preamble first and then stays silent for 12 byte times. Only 43.5% of the wire time carries the request."
+>
+<EncapsulationDemo />
+</Predict>
+
+1. Move **Layers added** from 0 to 4, one step at a time. Each step puts a new colored block in front of the old bytes. The old bytes do not change.
+2. At step 3, click the TTL byte: it is `40` (64 in decimal), just before the protocol byte `06`. The diagram below shows the IPv4 header as RFC 791 draws it.
+3. Click **Destination MAC** in the Ethernet header. It holds the router's MAC, not the server's. The IP header holds the server's address.
+4. Turn on the **TCP timestamps option**. The TCP header grows from 20 to 32 bytes, and **Data Offset** changes from 5 to 8.
+5. Choose the short path **/**. The frame is still more than half headers.
+
+## What each header is for
+
+Each header serves a different **scope**. The Ethernet header gets the frame across one link. Its destination is the MAC address of the next device, so every router writes a new Ethernet header. The IPv4 header gets the packet across the whole path. Its addresses stay the same from end to end, but every router lowers the **TTL** (time to live) by one and fixes the header checksum.
+
+The TCP header is end to end, so a plain router does not change it. NAT devices and MSS clamping are exceptions. Its **ports** select the socket on each host. Its **sequence number** gives the position of the first data byte in the stream, and its **acknowledgment number** says which byte the sender expects next. The **window** says how many bytes the receiver can accept now.
+
+Each header also names what is inside it. The EtherType 0x0800 says "IPv4", the IP protocol number 6 says "TCP", and the TCP port 80 says "HTTP". A receiver uses these fields to choose the next parser. It peels headers by fixed offsets and length fields:
+
+```go
+// Peel an Ethernet + IPv4 + TCP frame. Every multi-byte field is big-endian (network byte order).
+func peel(f []byte) (payload []byte, err error) {
+	if binary.BigEndian.Uint16(f[12:14]) != 0x0800 {
+		return nil, errors.New("not IPv4")
+	}
+	ip := f[14:]
+	ihl := int(ip[0]&0x0f) * 4 // header length in 32-bit words
+	total := int(binary.BigEndian.Uint16(ip[2:4]))
+	if ip[0]>>4 != 4 || ihl < 20 || total > len(ip) || ip[9] != 6 {
+		return nil, errors.New("bad or non-TCP packet")
+	}
+	tcp := ip[ihl:total]
+	dataOff := int(tcp[12]>>4) * 4
+	return tcp[dataOff:], nil
+}
+```
+
+Real stacks do not always build every byte in the kernel. With **checksum offload**, the kernel leaves the TCP checksum for the NIC to fill. With **TSO** (TCP segmentation offload), the kernel hands the NIC one large buffer, and the NIC cuts it into frames and writes their headers. **GRO** (generic receive offload) does the opposite on receive: it merges a run of segments into one large buffer. The Linux documents `checksum-offloads.rst` and `segmentation-offloads.rst` describe them, and `ethtool -k eth0` shows which ones a NIC uses.
+
+Offloads explain a common surprise. A `tcpdump` capture on the sender can show TCP checksums that look wrong. The capture sees the buffer before the NIC fills in the checksum.
+
+## Which check catches which error
+
+Three checks protect the frame in the demo below. The **FCS** (frame check sequence) is a CRC-32 over the whole frame. It is strong, but each link computes a new one, so it protects only one link. The **IPv4 header checksum** covers the IP header only (RFC 791). The **TCP checksum** covers a pseudo-header with both IP addresses, the TCP header and the data (RFC 9293), from one end to the other.
+
+Both IP and TCP use the **Internet checksum** of RFC 1071: the ones' complement of the ones' complement sum of 16-bit words. It is cheap, and a router can update it after a TTL change without a full sum (RFC 1624). But the sum does not depend on the order of the words. If two 16-bit words change places, the checksum stays the same.
+
+<Predict
+  id="router-memory"
+  question="A bit flips in the HTTP text inside a router's memory, after the router checked the incoming frame and before it sent the frame on. What catches the error?"
+  options={["The Ethernet FCS on the next link", "The TCP checksum at the server", "Nothing: the server's program gets the wrong byte"]}
+  answer={1}
+  explain="The router computes a new FCS over the bytes in its memory, so the FCS on the next link is correct for the wrong bytes. The IPv4 checksum covers only the IP header. The TCP checksum covers the data from end to end, so the server's kernel finds the error and drops the segment."
+>
+<CorruptionDemo />
+</Predict>
+
+1. Keep **in the router's memory** and press **flip a bit in the HTTP text**. Every link check passes, and the TCP checksum fails.
+2. Press **flip a bit of the TTL**. The IPv4 header checksum fails. The router updated the checksum with RFC 1624, and that update keeps the error visible.
+3. Click a byte in the Ethernet header. The router writes a new header anyway, so the change disappears.
+4. Press **swap two 16-bit words**. Every check passes, and the server's program gets wrong bytes.
+5. Switch to **on the wire** and repeat. Now the FCS catches every change, and the server's NIC drops the frame.
+
+## The end-to-end argument
+
+Saltzer, Reed and Clark stated the principle in "End-to-end arguments in system design" (ACM Transactions on Computer Systems, 1984). A function such as an integrity check can be correct only at the end points. Checks in the network can make errors rarer, but they cannot replace the check at the ends.
+
+Measurements support this. Stone and Partridge studied real traffic in "When the CRC and TCP checksum disagree" (SIGCOMM 2000). Between 1 packet in 1,100 and 1 packet in 32,000 failed the TCP checksum. Link CRCs should catch all but about 1 error in 4 billion. The authors could trace about half of the errors to a cause. The causes included end-host hardware, end-host software and router memory, where no link check looks.
+
+The 16-bit TCP checksum is weak against such errors, as the swap shows. Data that must be correct needs a stronger check above TCP. TLS gives one: every record carries a cryptographic authentication tag, so a changed byte makes the record fail.
+
+## The MTU, and what happens when a packet does not fit
+
+Each link has a **maximum transmission unit** (MTU): the largest packet that one frame can carry. Ethernet carries at most 1500 bytes of payload (RFC 894). A full TCP segment over IPv4 then holds 1500 − 20 − 20 = 1460 data bytes. This value is the **maximum segment size** (MSS).
+
+A tunnel puts headers inside that 1500. PPPoE, used by many DSL lines, adds 8 bytes, so the inner MTU is 1492 (RFC 2516). VXLAN, used in data center overlays, adds an outer IPv4 header, UDP, the VXLAN header and the inner Ethernet header (RFC 7348). That is 50 bytes, so the inner MTU is 1450.
+
+When an IPv4 packet is too large for the next link, a router can **fragment** it (RFC 791). Every fragment gets a copy of the IP header with the same Identification. **Fragment Offset** gives the position of its data in units of 8 bytes. The **MF** (more fragments) flag is 1 on every fragment except the last. Only the destination puts the fragments back together.
+
+<Predict
+  id="fragments"
+  question="A host sends 4,000 bytes of UDP data over IPv4 with DF off. Its own link has an MTU of 1500, and a VXLAN link later on the path has an MTU of 1450. How many IP packets cross the VXLAN link?"
+  options={["3: the sender already cut it to fit", "4: the router cuts only the first fragment again", "5: the router cuts two of the sender's fragments again"]}
+  answer={2}
+  explain="The sender cuts the 4,008-byte payload into 1,480 + 1,480 + 1,048 bytes for its 1500-byte link. Each 1,500-byte fragment is too large for 1450, so the router cuts it into 1,424 + 56 bytes. The 1,068-byte fragment fits. That makes 5 packets, two of them tiny."
+>
+<MtuDemo />
+</Predict>
+
+1. Read the table. The offsets 178, 185, 363 and 370 are in units of 8 bytes: 1,424, 1,480, 2,904 and 2,960 bytes.
+2. Turn on **DF**. The router drops the packet and returns ICMP "fragmentation needed", with the next-hop MTU in the message.
+3. Choose **IPv6**. IPv6 routers never fragment, so the router returns ICMPv6 Packet Too Big.
+4. Choose **plain Ethernet** and set the payload to 1,400 bytes. One packet fits, and the payload share is 95.5%.
+5. Move **UDP payload** slowly past 1,472. The payload share drops in a step, because a second fragment brings its own headers.
+
+## Why everyone avoids fragmentation
+
+Fragmentation looks harmless, but it has three costs. The loss of any fragment loses the whole datagram, so loss rates multiply with the number of fragments. The receiver must keep partial datagrams in memory until the last fragment arrives or a timer expires. And fragments after the first carry no TCP or UDP header, so firewalls and load balancers that read ports cannot classify them.
+
+TCP therefore avoids fragmentation. Each side announces its MSS in the SYN, and Linux sets DF on TCP packets by default (`net.ipv4.ip_no_pmtu_disc` is 0). This is **path MTU discovery** (RFC 1191 for IPv4). A router that cannot forward a packet with DF set drops it and sends back ICMP type 3, code 4. The sender then sends smaller segments.
+
+Path MTU discovery fails when a firewall drops those ICMP messages. Small packets get through, but full-size ones vanish: the connection opens and then hangs. This is a **PMTU black hole**. Two fixes are common. Routers on PPPoE lines rewrite the MSS option in SYNs down to 1452 (**MSS clamping**). Packetization-layer path MTU discovery (RFC 4821, and RFC 8899 for datagram protocols) probes with larger packets and does not need ICMP.
+
+IPv6 goes further. Only the source may fragment, with an 8-byte Fragment extension header, and every link must carry at least 1280 bytes (RFC 8200). A router returns ICMPv6 Packet Too Big (type 2, RFC 4443) for a packet that is too large.
+
+## What the headers cost
+
+| Payload per frame | Frame | Byte times on the wire | Payload share |
+|---|---|---|---|
+| 1 byte of TCP data | 64 (5 bytes of padding) | 84 | 1.2% |
+| 60-byte HTTP GET | 118 | 138 | 43.5% |
+| 1448 bytes (MSS with timestamps) | 1518 | 1538 | 94.1% |
+| 1460 bytes (full MSS) | 1518 | 1538 | 94.9% |
+
+The 20 byte times of preamble and gap matter most for small frames. A 10 Gbit/s link can carry at most 14.88 million minimum-size frames per second, but only about 813,000 full-size frames. A router or a software packet processor must therefore handle about 67 ns per packet at line rate with small packets. Packet rate, not bit rate, is often the real limit.
+
+## Connect
+
+- [Packets and switching](/networking/foundations/packets-and-switching): what routers do with these frames, and where they wait.
+- [Ethernet](/networking/link/ethernet) and [ARP](/networking/link/arp): the link header in detail, and how the next hop's MAC is found.
+- [IPv4 and IPv6](/networking/ip/ipv4-and-ipv6) and [ICMP](/networking/ip/icmp): every IP field, and the errors that path MTU discovery uses.
+- [Zero-copy](/networking/programming/zero-copy): offloads and the cost of copying the bytes this lesson builds.
+- [System calls](/os/processes/system-calls) and [DMA and the IOMMU](/os/io/dma-and-the-iommu): the border to the kernel, and how the NIC reads the frame.
+- [The network model](/distributed/foundations/the-network-model-messages-delays-and-partitions): why applications still need their own checks and sequence numbers.
+
+<Recall cards={[
+  { q: "Name the four layers of RFC 1122 and the usual name for the unit of data at each.", a: "Application (message), transport (segment), internet (packet), link (frame). OSI adds physical below and session and presentation above transport." },
+  { q: "Which header does a router rewrite on every hop, and which fields of the IPv4 header does it change?", a: "It writes a new Ethernet header, with its own MAC as source and the next hop's MAC as destination, and a new FCS. In IPv4 it lowers the TTL and updates the header checksum." },
+  { q: "A byte changes in a router's memory after the router checked the frame. Why does the Ethernet FCS not catch it, and what does?", a: "The router computes a new FCS over the changed bytes for the next link. Only an end-to-end check catches it: the TCP checksum, or a stronger check such as a TLS authentication tag." },
+  { q: "Which error does the Internet checksum miss by design?", a: "A reordering of 16-bit words. The ones' complement sum is commutative, so swapped words give the same checksum." },
+  { q: "What is the MSS of TCP over IPv4 on Ethernet, and over PPPoE?", a: "1460 bytes: 1500 − 20 (IP) − 20 (TCP). Over PPPoE the MTU is 1492, so the MSS is 1452." },
+  { q: "How does path MTU discovery for IPv4 work, and how does it fail?", a: "The sender sets DF. A router that cannot forward the packet drops it and returns ICMP type 3, code 4 with the next-hop MTU. If a firewall drops that ICMP message, large packets vanish and the connection hangs: a PMTU black hole." },
+]} />

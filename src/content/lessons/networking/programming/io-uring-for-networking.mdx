@@ -1,0 +1,132 @@
+---
+summary: "io_uring on sockets: completion instead of readiness, what that does to buffer memory, multishot accept and recv, provided buffer rings and ENOBUFS, registered files and direct descriptors, zero-copy send, and system calls and CPU per request with labelled cost inputs."
+---
+import { NetProgBufRingDemo, NetProgRequestCostDemo } from "@/demos/net/NetProgUringDemos";
+
+[The io_uring lesson](/os/io/io-uring) of the OS track built the rings: the SQ, the CQ, SQPOLL, links and the security history. This lesson uses them for sockets. The network changes three things. Most connections are idle most of the time. Data arrives when the peer decides, not when you ask. A server runs the same two operations, receive and send, millions of times.
+
+## Completion, not readiness
+
+With `epoll`, the kernel says "this socket has data", and then you call `recv` with a buffer. With io_uring, you submit a `recv` with a buffer first, and the kernel posts a CQE when the data is in it. The first is the **readiness model**, and the second is the **completion model**.
+
+The completion model needs the buffer before the data exists. A server with 10,000 connections and a 16 KiB buffer in each pending `recv` holds 156 MiB, although almost all connections are idle. The `epoll` server reads into one buffer per thread, only when data is there. So io_uring for sockets needs a way to choose the buffer late. That is the job of **provided buffers**.
+
+A `recv` on a socket with no data cannot finish at once. Since Linux 5.7 (`IORING_FEAT_FAST_POLL`), io_uring then arms an internal poll on the socket, and runs the `recv` again when the socket is ready. Before that, such a request went to a worker thread. So inside the kernel, io_uring on sockets is still readiness. The completion model is the interface that your program sees.
+
+| Feature | Linux |
+|---|---|
+| `IORING_OP_SENDMSG`, `RECVMSG` | 5.3 |
+| `IORING_OP_ACCEPT`, `CONNECT` | 5.5 |
+| `IORING_OP_SEND`, `RECV` | 5.6 |
+| Provided buffers (`IORING_OP_PROVIDE_BUFFERS`), fast poll | 5.7 |
+| Direct descriptors: accept into the registered file table | 5.15 |
+| Multishot accept, provided buffer rings, `COOP_TASKRUN` | 5.19 |
+| Multishot recv, `SEND_ZC`, `SINGLE_ISSUER` | 6.0 |
+| `DEFER_TASKRUN` | 6.1 |
+| Receive and send bundles | 6.10 |
+| Incremental buffer use (`IOU_PBUF_RING_INC`) | 6.12 |
+| Zero-copy receive (`IORING_OP_RECV_ZC`) | 6.15 |
+
+Each line is the first kernel with the feature. A library must probe the kernel and fall back, because many systems in production run older kernels.
+
+## Provided buffers and multishot
+
+A **provided buffer ring** is a ring of buffer ids in memory that the program shares with the kernel. The program fills it with buffers and registers it as a **buffer group**. A `recv` with `IOSQE_BUFFER_SELECT` names a group, not a buffer. When data arrives, the kernel takes the next buffer from the ring. The CQE has `IORING_CQE_F_BUFFER` set, and the upper 16 bits of `cqe->flags` hold the buffer id.
+
+A **multishot** request posts many CQEs from one SQE. Multishot accept posts one CQE per new connection. Multishot `recv` posts one CQE per piece of data, each in a new provided buffer. `IORING_CQE_F_MORE` in a CQE says that the request is still armed.
+
+<Predict
+  id="uring-enobufs"
+  question="A ring holds 8 buffers. 16 connections each send 2 messages at once, and the program needs 5 µs per message. What happens to data that finds no free buffer?"
+  options={["The kernel drops it, and TCP sends it again later", "The multishot recv ends with -ENOBUFS; the data waits in the socket until the program arms a new recv", "The kernel waits for a buffer, and the recv stays armed"]}
+  answer={1}
+  explain="The request ends: its last CQE has res = -ENOBUFS and no F_MORE. No data is lost, because it stays in the socket receive buffer. The program must give buffers back and submit a new multishot recv. In the demo, that happens 18 times for 32 messages."
+>
+<NetProgBufRingDemo />
+</Predict>
+
+Things to try:
+
+1. Keep the defaults. All 8 buffers are taken after about 12 µs. Then CQEs with -ENOBUFS follow, and the program re-arms 18 receives as it returns buffers.
+2. Raise the ring to 32 buffers. No -ENOBUFS, and at most 27 buffers are in use. Size the ring for the burst, not for the number of connections.
+3. Set the program time to 1 µs. The program now returns buffers as fast as data arrives, and no receive ends.
+4. Read the memory table: 156 MiB with a buffer per connection, 4 MiB with a shared ring of 256.
+
+A sketch with liburing:
+
+```c
+struct io_uring_buf_ring *br = io_uring_setup_buf_ring(&ring, 256, BGID, 0, &err);
+for (int i = 0; i < 256; i++)
+    io_uring_buf_ring_add(br, bufs[i], 16384, i, io_uring_buf_ring_mask(256), i);
+io_uring_buf_ring_advance(br, 256);                  /* publish 256 buffers */
+
+static void arm_recv(struct io_uring *r, int fd) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(r);
+    io_uring_prep_recv_multishot(sqe, fd, NULL, 0, 0);
+    sqe->flags |= IOSQE_BUFFER_SELECT;
+    sqe->buf_group = BGID;
+    io_uring_sqe_set_data64(sqe, fd);
+}
+
+/* in the CQE loop */
+if (cqe->res > 0) {
+    int bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+    handle(fd, bufs[bid], cqe->res);
+    io_uring_buf_ring_add(br, bufs[bid], 16384, bid, io_uring_buf_ring_mask(256), 0);
+    io_uring_buf_ring_advance(br, 1);                /* give it back */
+}
+if (!(cqe->flags & IORING_CQE_F_MORE))
+    arm_recv(&ring, fd);                             /* ended: -ENOBUFS, EOF or an error */
+```
+
+Two smaller features help here. **Registered files** put sockets in a table, and an SQE names the index. That saves a reference count on each operation. A **direct descriptor** goes further: accept can put the new socket straight into the table, with no normal file descriptor at all. Multishot accept with `IORING_FILE_INDEX_ALLOC` lets the kernel pick the slot.
+
+## System calls and CPU per request
+
+An echo or proxy server does one receive and one send per request. With `epoll`, that is `epoll_wait` (shared by a batch), `recv` and `send`: 2 system calls per request plus a part of one. With io_uring, one `io_uring_enter` submits the sends and waits for the next batch of CQEs.
+
+<Predict
+  id="uring-cost"
+  question="At 16 requests per loop, io_uring with multishot recv and registered files makes 33 times fewer system calls than epoll. How many more requests per second does one core handle?"
+  options={["About 33 times more", "About 3 times more", "About 25% more"]}
+  answer={2}
+  explain="In the model, epoll costs 2,123 ns per request and the best io_uring design costs 1,693 ns: 591,000 requests per second against 471,000. The 1,600 ns of kernel work for the recv and the send stays the same in every design."
+>
+<NetProgRequestCostDemo />
+</Predict>
+
+Things to try:
+
+1. Set the batch to 1. `epoll` makes 3 system calls per request, and io_uring makes 1. The gap is largest here.
+2. Look at the green part of the second bar. A single-shot `recv` that waits for data arms an internal poll each time. Multishot arms it once.
+3. Turn off the CPU mitigations. A system call costs 60 ns instead of 200 ns, and `epoll` comes closer.
+4. Compare SQPOLL with registered files. SQPOLL removes the last system call but costs more per request here, because the kernel thread runs on another core. It also keeps that core busy.
+
+The lesson from [the OS track](/os/io/io-uring) holds: system calls are only part of the cost. For sockets, the larger gains are structural. Multishot removes an SQE and a poll arm per request. Buffer rings cut memory, which keeps the working set in cache. `DEFER_TASKRUN` (Linux 6.1, with `SINGLE_ISSUER`) runs completion work only when the program waits for CQEs. So the kernel does not interrupt the program at random times.
+
+## Sends and zero-copy sends
+
+A TCP socket is one byte stream. Two sends in flight on the same socket must reach it in the right order. Keep one send per socket in flight, and queue the rest in your program. If you must submit two at once, link them with `IOSQE_IO_LINK`, which runs them one after the other.
+
+`IORING_OP_SEND_ZC` (Linux 6.0) sends without a copy. It usually posts two CQEs with the same `user_data`. The first has the result and `IORING_CQE_F_MORE`. The second has `IORING_CQE_F_NOTIF` and means that the kernel no longer needs your buffer. It does not mean that the peer got the data. [The zero-copy lesson](/networking/programming/zero-copy) shows when this pays.
+
+## When to choose it
+
+Choose io_uring when a few cores must carry many requests, and when you control the kernel version. Thread-per-core runtimes such as Glommio are built on it, and Tokio offers the separate `tokio-uring` crate. Go's netpoller uses `epoll`. Many sandboxes block io_uring for the security reasons in [the OS lesson](/os/io/io-uring), and Linux 6.6 added `kernel.io_uring_disabled`. So keep an `epoll` path, and measure the two with your own traffic.
+
+## Connect
+
+- [io_uring](/os/io/io-uring): the rings, SQPOLL, links and the security history.
+- [select, poll and epoll](/networking/programming/select-poll-and-epoll): the readiness model that this replaces.
+- [Zero copy](/networking/programming/zero-copy): `SEND_ZC` and `MSG_ZEROCOPY` against a copy.
+- [I/O performance](/performance/systems/i-o-performance): system calls and batching in general.
+- [Latency vs throughput](/performance/systems/latency-vs-throughput): what batching costs in delay.
+
+<Recall cards={[
+  { q: "Why does the completion model need provided buffers for sockets?", a: "A recv must have its buffer when you submit it. With thousands of idle connections, a buffer per pending recv wastes memory. A provided ring lets the kernel pick a buffer only when data arrives." },
+  { q: "How does a CQE from a provided-buffer recv tell you which buffer holds the data?", a: "IORING_CQE_F_BUFFER is set, and the buffer id is in the upper 16 bits of cqe->flags (cqe->flags >> IORING_CQE_BUFFER_SHIFT)." },
+  { q: "A multishot recv posts a CQE without IORING_CQE_F_MORE. What do you do?", a: "Arm a new recv. The request ended: on -ENOBUFS (the ring ran dry, and the data is still in the socket), on EOF or on an error." },
+  { q: "Why does io_uring with 33 times fewer system calls give only about 25% more requests per core in the model?", a: "The kernel work of the recv and the send (1,600 ns) is the same in every design. System calls were about a fifth of the cost." },
+  { q: "What does the second CQE of a SEND_ZC mean?", a: "IORING_CQE_F_NOTIF: the kernel no longer needs the buffer, so you may reuse it. It says nothing about delivery to the peer." },
+  { q: "How does io_uring wait for data on a socket inside the kernel?", a: "With fast poll (Linux 5.7). A recv that cannot finish arms an internal poll and runs again when the socket is ready. No worker thread blocks." },
+]} />

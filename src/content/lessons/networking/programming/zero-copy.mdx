@@ -1,0 +1,133 @@
+---
+summary: "Count the copies and the system calls of read and write, mmap, sendfile, splice, user-space TLS, kTLS with and without NIC offload, MSG_ZEROCOPY and io_uring SEND_ZC. When zero copy pays, what it locks, NIC offloads (checksum, TSO, GSO, GRO, BIG TCP) and kernel bypass."
+---
+import { NetProgCopyPathDemo, NetProgZcThresholdDemo, NetProgRxCoresDemo } from "@/demos/net/NetProgZeroCopyDemos";
+
+At 100 Gbit/s, a server moves 12.5 GB of payload each second. A CPU core copies data that is not in its cache at about 8 GB/s in this lesson's model. So each copy of the payload costs more than one whole core. **Zero copy** means that the CPU does not touch the payload at all. The device moves it by DMA, and the CPU moves only descriptors and page references.
+
+[DMA and the IOMMU](/os/io/dma-and-the-iommu) showed how a device reads memory, and [pipes](/os/ipc/pipes) showed how `splice` moves pages by reference. This lesson counts what each way of sending costs on a real server.
+
+<Predict
+  id="zc-readwrite"
+  question="A server sends a 1 MiB file that is already in the page cache, with read() and write() in a loop. How many times does the CPU copy each byte?"
+  options={["0: the NIC does all the work with DMA", "2: into the program's buffer, then into the socket buffer", "4: each system call copies twice"]}
+  answer={1}
+  explain="read() copies from the page cache into your buffer, and write() copies it back into a kernel socket buffer. Then the NIC reads the socket buffer by DMA. Textbooks often say 4 copies: they also count the disk DMA and the NIC DMA. In the model, the two CPU copies cost 3.2 cores at 100 Gbit/s."
+>
+<NetProgCopyPathDemo />
+</Predict>
+
+Things to try:
+
+1. At 1 MiB, compare **read + write** (268.5 µs per request) with **sendfile, gather + checksum offload** (5.3 µs). The 32 system calls are not the main cost. The two copies are.
+2. Choose **sendfile, NIC without gather**. One system call, but still one CPU copy: 131.3 µs. Zero copy needs help from the NIC.
+3. Choose **read + TLS library + write**: 3 CPU passes and 6.33 cores at 100 Gbit/s. Then **kTLS + sendfile (software)**: one pass, 3.19 cores. Then **NIC encrypts**: 0.06 cores.
+4. Move the size down to 4 KiB. Now the system calls and the per-request costs matter more, and the gaps get smaller.
+5. Choose a **Memory** path. Data that the program made in its own buffer needs `MSG_ZEROCOPY` or `SEND_ZC` to avoid the copy.
+
+## sendfile and splice
+
+`sendfile(out_fd, in_fd, offset, count)` (Linux 2.2) sends file data to a socket with no user buffer. The input must be a file that supports `mmap`-like operations, so it cannot be a socket. The output can be any file since Linux 2.6.33. One call can send the whole file, so the call count drops from 2 per 64 KiB chunk to 1.
+
+Whether the CPU still copies depends on the NIC. A NIC with **scatter-gather** DMA can read a packet from several pages. With **checksum offload**, it also computes the TCP checksum. With both, the socket buffer holds only references to page cache pages, and the CPU copies no payload bytes. Without them, the kernel must copy the data into one buffer and sum it. Most fast static file servers still use the path that Dragan Stancevic described in Linux Journal in 2003.
+
+The NIC reads the pages after `sendfile` returns. If the program changes the file before that, the peer can get the new bytes. Servers that rewrite files in place must write a new file and rename it.
+
+`splice()` (Linux 2.6.17) moves page references between a pipe and another file. One end must be a pipe. Since Linux 2.6.25, a proxy can move data socket to pipe to socket with no copy into user space. That takes two calls per pipe-full. HAProxy can do this with `option splice-auto`, which is off by default. [The pipes lesson](/os/ipc/pipes) shows the pipe slots that carry the references, and the Dirty Pipe bug that they caused.
+
+## TLS in the kernel
+
+HTTPS breaks `sendfile`, because the bytes on the wire must be encrypted. The usual way reads the file, encrypts it in a TLS library and writes the result: two copies and one encryption pass.
+
+**kTLS** moves the record layer into the kernel. A TLS library does the handshake in user space and gives the keys to the socket with `setsockopt(SOL_TLS, TLS_TX, ...)`. Linux added transmit in 4.13 and receive in 4.17.
+
+With kTLS, `sendfile` works on a TLS socket.
+
+The kernel builds TLS records of up to $2^{14}$ bytes. In software, the kernel encrypts from the page cache into new buffers, so one CPU pass remains. That pass is the copy. With **TLS offload** (`TLS_HW`), the NIC encrypts each record as it sends it, and no CPU touches the payload. Netflix serves video with `sendfile` and kTLS on FreeBSD, which has its own kTLS. Drew Gallatin's talk "Serving Netflix Video at 400Gb/s on FreeBSD" (EuroBSDCon 2021) describes the design.
+
+## Zero-copy send with `MSG_ZEROCOPY`
+
+Some data is not in a file: a database answer, a message from a queue, a block of a proxy. For data in a user buffer, Linux 4.14 added `MSG_ZEROCOPY` for TCP, and 5.0 added it for UDP. The kernel pins the pages of your buffer and lets the NIC read them. It does not copy.
+
+The catch is time. After `send` returns, the NIC has not read your buffer yet. You must not change the buffer until the kernel says that it is done. The kernel posts **notifications** on the socket's error queue. Each one names a range of sends, from `ee_info` to `ee_data`, inclusive.
+
+```c
+int one = 1;
+setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &one, sizeof one);   /* once per socket */
+send(fd, buf, len, MSG_ZEROCOPY);                              /* send number k */
+
+/* later, without blocking: which sends are done? */
+struct msghdr msg = { .msg_control = ctrl, .msg_controllen = sizeof ctrl };
+if (recvmsg(fd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT) >= 0) {
+    struct sock_extended_err *e = (void *)CMSG_DATA(CMSG_FIRSTHDR(&msg));
+    /* e->ee_origin == SO_EE_ORIGIN_ZEROCOPY: sends e->ee_info..e->ee_data are free.
+       e->ee_code & SO_EE_CODE_ZEROCOPY_COPIED: the kernel copied after all. */
+}
+```
+
+<Predict
+  id="zc-threshold"
+  question="MSG_ZEROCOPY removes the copy into the kernel. For which send sizes does it use less CPU than a plain send()?"
+  options={["For every size: no copy is always cheaper", "Only above about 10 KB", "Only above about 1 MB"]}
+  answer={1}
+  explain="Zero copy is not free. Each send pins pages, sets up a notification, and later the program reads the error queue. Below a few pages, a copy costs less. The kernel documentation says MSG_ZEROCOPY is generally only effective at writes over around 10 KB. The model's crossover is 9.75 KiB."
+>
+<NetProgZcThresholdDemo />
+</Predict>
+
+Things to try:
+
+1. At the defaults, the crossover is 9.75 KiB. At 64 KiB, zero copy takes 2,210 ns against 8,392 ns for the copy.
+2. Raise the copy speed to 20 GB/s, as for data that is still in the cache. The crossover moves up, because a cheap copy is harder to beat.
+3. Set sends per notification read to 1. Each send now pays a full `recvmsg`, and the crossover moves up again.
+4. Move the RTT. At 10 Gbit/s and 50 ms, 59.6 MiB of your buffers are locked at any time.
+
+The last point is particular to TCP. The kernel may have to send the data again after a loss, so it keeps your pages until the peer acknowledges them. Locked memory is about the send rate times the RTT. The pinned pages count against your locked-memory limit. When the socket exceeds its option memory or you exceed the limit, `send` fails with `ENOBUFS`.
+
+Two more rules come from the kernel documentation. A packet that loops back to a local socket gets a deferred copy, so a test between two local processes shows no gain. A NIC without scatter-gather also forces a copy. In both cases, `SO_EE_CODE_ZEROCOPY_COPIED` tells you, and you can stop using the flag on that socket. The `SEND_ZC` operation of io_uring does the same pinning, but its notification is a second CQE, with no extra system call. Receive also has zero-copy forms: `TCP_ZEROCOPY_RECEIVE` (Linux 4.18) maps received pages into your memory, and io_uring added zero-copy receive in 6.15.
+
+## Offloads: fewer, larger packets
+
+The copy is not the only cost per byte. Each packet also passes through the driver, IP and TCP. A 1500-byte MTU at 100 Gbit/s is 8.13 million frames per second, which leaves one core 123 ns per frame. So NICs and the kernel cut the number of times that the stack runs.
+
+- **Checksum offload**: the NIC computes and checks the TCP and UDP checksums.
+- **TSO** (TCP segmentation offload): the stack hands the NIC one large segment, and the NIC cuts it into MSS-sized packets with correct headers.
+- **GSO** (generic segmentation offload): the same in software, as late as possible, for devices without TSO.
+- **GRO** (generic receive offload): the receiver merges consecutive packets of one flow into one large packet before IP and TCP see it.
+
+The usual limit for these large packets was 64 KiB. **BIG TCP** raised it for IPv6 in Linux 5.19 and for IPv4 in 6.3. `ethtool -k eth0` shows which offloads a NIC has turned on.
+
+<NetProgRxCoresDemo />
+
+Things to try:
+
+1. At 100 Gbit/s with bulk traffic, the plain kernel needs 11.6 cores in the model. Checksum offload saves about one core, and GRO brings it to 2.5.
+2. With GRO on, the largest part is the copy to the program. That is the copy that zero-copy receive removes.
+3. Choose **64-byte frames**: 148.81 million frames per second, 6.7 ns each. GRO has nothing to merge, and the kernel needs 163.9 cores. Kernel bypass needs 8.9.
+
+## Kernel bypass
+
+**Kernel bypass** moves the packet path into the program. **DPDK** drivers poll the NIC's descriptor rings from user space, with no interrupts, in memory from huge pages. Usually the NIC is unbound from its kernel driver and bound to `vfio-pci`, but some drivers, such as mlx5, share the NIC with the kernel.
+
+`AF_XDP` (Linux 4.18) is the kernel's own form. A socket shares a memory area (the UMEM) and four rings (fill, completion, RX and TX) with the driver. It runs zero-copy when the driver supports it, and copy mode otherwise. **XDP** (Linux 4.8) runs a small eBPF program on each packet in the driver, before the stack.
+
+The price is high. You lose the kernel TCP stack, so you bring your own or handle only simple protocols. You lose the kernel tools: `tcpdump`, `ss`, the firewall. Polling cores spin at 100% even with no traffic. So bypass fits packet machines with small packets at very high rates: load balancers, firewalls, DDoS filters, telecom gateways. A web server that sends large responses gets most of the gain from `sendfile`, kTLS and offloads, and it keeps the kernel.
+
+## Connect
+
+- [DMA and the IOMMU](/os/io/dma-and-the-iommu): how the NIC reads the pages, and what mapping costs.
+- [Pipes](/os/ipc/pipes): `splice` and `vmsplice`, and the Dirty Pipe bug.
+- [io_uring for networking](/networking/programming/io-uring-for-networking): `SEND_ZC` and provided buffers.
+- [Interrupts](/os/io/interrupts): NAPI and coalescing, the other half of the per-packet cost.
+- [Latency, bandwidth and the BDP](/networking/foundations/latency-bandwidth-and-bdp): why locked zero-copy memory grows with the RTT.
+- [TLS handshake](/networking/security/tls-handshake): the part of TLS that stays in user space with kTLS.
+- [Load balancers](/networking/infrastructure/load-balancers): where kernel bypass and XDP are common.
+
+<Recall cards={[
+  { q: "What two NIC features make sendfile copy no payload bytes with the CPU?", a: "Scatter-gather DMA lets the NIC read a packet from page cache pages. Checksum offload means the CPU does not read the bytes to sum them." },
+  { q: "Why is kTLS with software encryption not zero copy?", a: "The kernel encrypts from the page cache into new buffers. That encryption pass touches every byte, so it is the copy. Only NIC offload (TLS_HW) removes it." },
+  { q: "Why does MSG_ZEROCOPY lose for small sends?", a: "It replaces a per-byte copy with per-page pinning, notification setup and reading the error queue. Below about 10 KB those fixed costs are larger than the copy." },
+  { q: "With TCP, how long does the kernel hold a MSG_ZEROCOPY buffer, and how much memory is that?", a: "Until the peer acknowledges the data, because the kernel may have to send it again. About the send rate times the RTT." },
+  { q: "What do TSO and GRO save?", a: "Passes through the stack. TSO lets the stack send one large segment that the NIC cuts up. GRO merges received packets of a flow before IP and TCP process them." },
+  { q: "Why does kernel bypass win most for small packets?", a: "Small packets give GRO nothing to merge, so the kernel pays its full per-packet cost each time. A polling bypass path costs far less per packet, at the price of spinning cores and no kernel TCP." },
+]} />

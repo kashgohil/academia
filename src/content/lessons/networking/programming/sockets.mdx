@@ -1,0 +1,156 @@
+---
+summary: "The Berkeley socket API on TCP: each call and the TCP state it causes, the SYN queue and the accept queue behind listen(), short reads and writes, shutdown and close, RST on close, SIGPIPE, SO_REUSEADDR and SO_REUSEPORT, ephemeral ports and socket buffers."
+---
+import { NetProgLifecycleDemo, NetProgAcceptQueueDemo, NetProgStreamDemo } from "@/demos/net/NetProgSocketDemos";
+
+A **socket** is a file descriptor for one end of a network conversation. The kernel runs the protocol, and your program calls a small set of functions. This interface first shipped in 4.2BSD in August 1983, so people call it the **Berkeley socket API**. POSIX standardized it, and Linux, macOS and Windows all copy it.
+
+The calls look like file calls, but they do not act like file calls. A call returns when the kernel has done its part, and that is often not what you expect. This lesson puts each call next to the TCP segments that it causes. The segments come from the reference TCP of [the handshake lesson](/networking/transport/tcp-handshake-and-teardown).
+
+<Predict
+  id="sockets-late-accept"
+  question="A server calls listen() but does not call accept() for 150 ms. A client calls connect() and then write(). What does the client see?"
+  options={["connect() blocks until the server calls accept()", "connect() returns after one round trip, and the write succeeds", "connect() fails with ECONNREFUSED"]}
+  answer={1}
+  explain="The kernel finishes the handshake on its own. accept() only takes a finished connection from a queue. So connect() returns after 40 ms, the write copies the request into the send buffer, and the server kernel acknowledges it. The program sees the request when it calls accept() at 150 ms."
+>
+<NetProgLifecycleDemo />
+</Predict>
+
+Things to try:
+
+1. Read the call log of **Request and reply**. `connect()` returns at 40.1 ms, one round trip after the SYN. The server closed first, so the server socket ends in `TIME_WAIT`.
+2. Choose **accept() is late**. The connection waits in the accept queue from 60.1 ms. The request waits in the receive buffer of a socket that no program holds yet.
+3. Choose **Write after the peer closed**. The client reads EOF, but it writes again. That write succeeds, because it only copies bytes. The answer is an RST, and the next write fails with `EPIPE`.
+4. Choose **close() with unread data**. The server reads 1000 of 3000 request bytes and calls `close()`. The client gets 7,300 of 20,000 response bytes, then `ECONNRESET`.
+5. Turn on **Lingering close**. Now the client gets all 20,000 bytes.
+
+## The calls and the states
+
+| Call | What the kernel does | TCP state after it |
+|---|---|---|
+| `socket()` | makes a socket with no address | `CLOSED` |
+| `bind()` | gives it a local address and port | `CLOSED` |
+| `listen(fd, backlog)` | makes it a listener with two queues | `LISTEN` |
+| `connect()` | picks a local port if needed, sends SYN, waits for SYN-ACK | `SYN_SENT`, then `ESTABLISHED` |
+| `accept()` | takes one finished connection from the accept queue | the new socket is already `ESTABLISHED` |
+| `write()` | copies bytes into the send buffer | no change |
+| `read()` | copies bytes out of the receive buffer; 0 means the peer sent FIN | no change |
+| `shutdown(SHUT_WR)` | sends FIN after the queued data | `FIN_WAIT_1` or `LAST_ACK` |
+| `close()` | drops this descriptor; on the last reference, closes both directions | as `shutdown`, or RST |
+
+Two rows surprise most people. First, `accept()` does no network work. The three-way handshake ends in the kernel, and `accept()` only dequeues the result. Second, a successful `write()` does not mean that the peer has the bytes. It means that the kernel has them.
+
+## Two queues behind listen()
+
+A listening socket has two queues. The **SYN queue** holds half-open requests in `SYN_RECEIVED`. The **accept queue** holds connections that finished the handshake and wait for `accept()`. In Linux the `backlog` argument limits both, and the kernel caps it at `net.core.somaxconn`. That default is 4096 since Linux 5.4, and it was 128 before.
+
+The two queues fail in different ways. Linux checks the SYN queue first: when it is full, the default `tcp_syncookies = 1` answers with a SYN cookie instead of a stored request. Then Linux checks the accept queue. When that queue is full, the SYN is dropped, even if a cookie was possible. The counters `ListenOverflows` and `ListenDrops` in `nstat` go up.
+
+The final ACK of a handshake meets the same check. With the default `tcp_abort_on_overflow = 0`, Linux ignores that ACK and keeps the request. The client is now in `ESTABLISHED`, but the server is not. The client's request is dropped too, until the queue has room and the client sends again.
+
+<Predict
+  id="sockets-burst"
+  question="24 clients connect within 24 ms. The listen() backlog is 8, and one server thread spends 20 ms on each connection. When does the last client get its answer?"
+  options={["After about 0.5 s: 24 × 20 ms of work", "After about 1.1 s: dropped SYNs and ignored ACKs wait for timeouts", "Never: 16 clients get ECONNREFUSED"]}
+  answer={1}
+  explain="The work takes 480 ms. But the queue overflows twice. Ignored ACKs cost the client a 200 ms retransmission of its request. Dropped SYNs cost a full second, because a SYN has no RTT sample yet. The last answer arrives at 1,120 ms. No client gets an error: overflow looks like latency."
+>
+<NetProgAcceptQueueDemo />
+</Predict>
+
+Things to try:
+
+1. Keep the defaults. The red bars are clients that think they are connected, while the server ignored their ACK. The last four rows waited for a SYN retransmission after 1 s.
+2. Read the `ss -lnt` line. For a listener, `Recv-Q` is the current accept queue and `Send-Q` is the backlog. Here `Recv-Q` reached 9 with a backlog of 8. Linux tests `sk_ack_backlog > sk_max_ack_backlog`, so one extra connection fits.
+3. Raise the backlog to 32. Nothing overflows, and the last answer arrives at 500 ms.
+4. Set the work to 5 ms. Fewer clients overflow, but some still wait 200 ms, and two wait a whole second.
+
+The lesson: a small backlog does not refuse load. It turns load into retransmission delays of 200 ms and 1 s, which look like random tail latency. A larger backlog only absorbs a burst. If the program accepts more slowly than clients arrive for a long time, any queue fills.
+
+## Bytes, not messages
+
+TCP gives you a byte stream. It keeps the order of the bytes. It does not keep the boundaries of your writes. One `write()` can arrive as two reads, and two writes can arrive as one read.
+
+<NetProgStreamDemo />
+
+Things to try:
+
+1. With the defaults, five messages of 1000 bytes leave as segments of 1000, 1460, 1040 and 1460 bytes and one of 40. Three of the five reads cut a message in two.
+2. Read the write table. The send buffer holds 2,500 unacknowledged bytes here. So `write()` returns 500 when you ask for 1000, and then -1 with `EAGAIN`.
+3. Set the reader to read every 20 ms. It now gets larger chunks, but they still do not line up with the messages.
+4. Turn off Nagle. The segment sizes change, and the boundaries are still lost.
+
+A **short write** returns fewer bytes than you asked for. A blocking socket usually hides this: the call sleeps until all bytes fit in the send buffer. A signal can still interrupt it after part of the data. A non-blocking socket returns a short count or `EAGAIN`. So every sender needs a loop, and every receiver needs **framing**: a way to find where a message ends. A length prefix is the simplest framing.
+
+```go
+// Write: 4-byte length, then the payload. Read: exactly that many bytes.
+func writeMsg(w io.Writer, p []byte) error {
+	var h [4]byte
+	binary.BigEndian.PutUint32(h[:], uint32(len(p)))
+	if _, err := w.Write(append(h[:], p...)); err != nil { // net.Conn.Write loops until done or error
+		return err
+	}
+	return nil
+}
+
+func readMsg(r io.Reader) ([]byte, error) {
+	var h [4]byte
+	if _, err := io.ReadFull(r, h[:]); err != nil {
+		return nil, err
+	}
+	p := make([]byte, binary.BigEndian.Uint32(h[:]))
+	_, err := io.ReadFull(r, p) // loops over short reads
+	return p, err
+}
+```
+
+In Rust the same two loops are `write_all` and `read_exact`. In C you write them yourself. Check each return value for `-1` with `EINTR` or `EAGAIN`, and for 0, which means EOF on a read.
+
+## Closing: shutdown, close and RST
+
+`close()` releases a descriptor. A socket that `fork()` or `dup()` shared stays open until the last descriptor closes. `shutdown()` acts on the connection itself, whatever the count of descriptors. `shutdown(SHUT_WR)` sends FIN and keeps the read side open. This is the half-close of [the handshake lesson](/networking/transport/tcp-handshake-and-teardown).
+
+`close()` with unread data in the receive buffer does not send FIN. RFC 1122 (section 4.2.2.13) says that the host SHOULD send RST, to show that data was lost. Linux does this in `tcp_close()`, and it counts the event as `TCPAbortOnClose`. The RST also throws away the data that your program wrote but the kernel has not sent yet.
+
+The receiver of an RST can still read the bytes that already arrived. Then one read fails with `ECONNRESET`, and later reads return 0. A response that was still in the server's send buffer is gone. HTTP servers avoid this with a **lingering close**: `shutdown(SHUT_WR)`, read and discard until EOF or a timeout, then `close()`. `SO_LINGER` with a time of 0 sends RST on purpose. Use it only when you want an abort.
+
+**SIGPIPE.** After the peer resets a connection, writes fail with `EPIPE`. On Linux, the first write reports `ECONNRESET` instead, unless the socket was in `CLOSE_WAIT`. With `EPIPE` the kernel also sends `SIGPIPE`, which ends the process unless you pass `MSG_NOSIGNAL` to `send()` or ignore the signal. Rust sets `SIGPIPE` to `SIG_IGN` before `main`, so you get an `io::Error` instead. Go catches the signal: a broken connection gives an `EPIPE` error, and only fds 1 and 2 end the program.
+
+## Ports and addresses
+
+A TCP connection is named by its 4-tuple: local address and port, remote address and port. When a client calls `connect()` with no `bind()`, the kernel picks a local port from `net.ipv4.ip_local_port_range`. The default range is 32768 to 60999: 28,232 ports.
+
+As [the handshake lesson](/networking/transport/tcp-handshake-and-teardown) showed, the side that closes first holds the 4-tuple in `TIME_WAIT` for 60 s. So one client address can open about 470 new connections per second to one server address and port. Two server ports, or two client addresses, double that, because only the whole 4-tuple must be unique. A `bind()` to port 0 before `connect()` takes a port for every destination at once. `IP_BIND_ADDRESS_NO_PORT` (Linux 4.2) delays the choice to `connect()`, so that ports can be shared again.
+
+| Option | What it allows | Typical use |
+|---|---|---|
+| `SO_REUSEADDR` | `bind()` to a port that has connections in `TIME_WAIT`; it fails only when an active listener has the address | restart a server at once |
+| `SO_REUSEPORT` (Linux 3.9) | many sockets bind the same address and port; for TCP, each has its own accept queue, and the kernel spreads new connections over them | one listener per thread or process |
+
+`SO_REUSEPORT` needs the option on every socket before `bind()`, and the same effective user ID for all of them. It is the main tool against a contended accept queue, and it has its own trade-off. [The epoll lesson](/networking/programming/select-poll-and-epoll) measures it. When one of the listeners closes, the connections in its queue are reset by default. Since Linux 5.14, the sysctl `net.ipv4.tcp_migrate_req` can move them to another listener.
+
+## Socket buffers
+
+Each socket has a send buffer and a receive buffer. `setsockopt` with `SO_SNDBUF` or `SO_RCVBUF` sets them, and the kernel doubles the value that you give, for its bookkeeping. Setting a size also turns off autotuning for that socket.
+
+Linux autotunes within `net.ipv4.tcp_rmem` and `tcp_wmem`. The maximums depend on RAM and reach 32 MB and 4 MB. Before Linux 6.16, the receive maximum was 6 MB. A receive buffer smaller than the bandwidth-delay product limits the throughput, as [flow control](/networking/transport/flow-control) showed. So leave the sizes alone unless you measured a reason.
+
+## Connect
+
+- [TCP handshake and teardown](/networking/transport/tcp-handshake-and-teardown): the states, SYN cookies and `TIME_WAIT` behind these calls.
+- [Flow control](/networking/transport/flow-control): what the receive buffer advertises.
+- [select, poll and epoll](/networking/programming/select-poll-and-epoll): many sockets in one thread, and `SO_REUSEPORT` at work.
+- [Unix domain sockets](/os/ipc/unix-domain-sockets): the same API with no network.
+- [Blocking, non-blocking and async I/O](/os/io/blocking-non-blocking-and-async-i-o): what `O_NONBLOCK` and `EAGAIN` mean.
+- [Signals](/os/ipc/signals): why `SIGPIPE` ends a process by default.
+- [Tail latency](/performance/systems/tail-latency): how a few slow connects become a slow page.
+
+<Recall cards={[
+  { q: "What does accept() do on the network?", a: "Nothing. The kernel finishes the handshake on its own and puts the connection in the accept queue. accept() only takes it out." },
+  { q: "The accept queue of a Linux listener is full. What happens to a new SYN and to a final handshake ACK?", a: "The SYN is dropped, so the client retries after 1 s. The ACK is ignored (tcp_abort_on_overflow = 0), so the client thinks it is connected while the server does not." },
+  { q: "For a listening socket, what do Recv-Q and Send-Q in ss -lnt show?", a: "Recv-Q is the number of connections in the accept queue. Send-Q is the backlog." },
+  { q: "Why does every TCP receiver need framing?", a: "TCP keeps the order of bytes but not the boundaries of writes. A read can return part of a message or parts of two messages." },
+  { q: "What does close() do when unread data is in the receive buffer, and what can the peer lose?", a: "It sends RST instead of FIN. Data that the closer wrote but did not send yet is discarded, so the peer can get a cut response and then ECONNRESET." },
+  { q: "Why can one client address open only about 470 new connections per second to one server port?", a: "Each closed connection holds its 4-tuple in TIME_WAIT for 60 s, and the default ephemeral range has 28,232 ports." },
+]} />

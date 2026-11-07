@@ -1,0 +1,145 @@
+---
+summary: "Event loops for network servers: inside epoll (interest tree, ready list, wakeup callbacks), the thundering herd on a listening socket, EPOLLEXCLUSIVE and SO_REUSEPORT, edge-triggered accept loops, EPOLLONESHOT and EPOLLOUT, a reactor in C with timers, and kqueue."
+---
+import { NetProgHerdDemo, NetProgEtAcceptDemo } from "@/demos/net/NetProgEpollDemos";
+
+[Blocking, non-blocking and async I/O](/os/io/blocking-non-blocking-and-async-i-o) covered the basics. It showed why `select` and `poll` cost $O(N)$ per call while `epoll` costs $O(\text{ready})$, and why an edge-triggered read must continue until `EAGAIN`. It also showed how a fast peer can starve a drain loop. This lesson starts there and goes to the problems of real network servers. These servers have listening sockets, many threads, timeouts and slow peers.
+
+## Inside epoll
+
+`epoll_create1()` makes an **epoll instance**, a kernel object with three parts. The **interest list** is a red-black tree of `epitem` entries, one per registered file, so `epoll_ctl` costs $O(\log N)$. The **ready list** (`rdllist`) holds the items that have an event. The **wait queue** holds the threads that sleep in `epoll_wait`.
+
+`epoll_ctl(EPOLL_CTL_ADD)` hooks a callback, `ep_poll_callback`, into the wait queue of the socket. When a segment arrives, the softirq of [the interrupts lesson](/os/io/interrupts) queues it and wakes the socket's wait queue. The callback puts the item on the ready list and wakes one thread in `epoll_wait`. No part of this scans the other sockets. That is why `epoll` stays cheap with 100,000 idle connections.
+
+Each item in the interest list names an open file description together with the descriptor number. The `epoll(7)` man page says that a file leaves the interest list only after all descriptors that refer to it are closed. So if you `dup()` a socket or `fork()`, and then close one copy, events keep coming for a number that you think is closed. Call `EPOLL_CTL_DEL` before `close()`.
+
+## Who wakes up
+
+A server with many threads must decide how they share one listening socket. A common design gives each worker its own epoll instance, and adds the same listening socket to each. Every epoll instance then puts its own callback on the socket's wait queue.
+
+<Predict
+  id="epoll-herd"
+  question="8 workers each wait in epoll_wait, and each epoll set holds the same listening socket. All 8 are idle. One connection arrives. How many workers wake up?"
+  options={["1: the kernel picks one", "8: all of them, and 7 get EAGAIN from accept()", "2: one per CPU socket"]}
+  answer={1}
+  explain="Each epoll instance has its own callback on the socket's wait queue, and a normal callback wakes its sleeper. So every idle worker wakes and calls accept(). One wins; the others get EAGAIN and sleep again. In the demo, an average of 6.00 workers wake per connection at 2,000 connections per second."
+>
+<NetProgHerdDemo />
+</Predict>
+
+Things to try:
+
+1. With **epoll**, read the table: 6.00 threads woken and 5.00 failed `accept()` calls per connection. At the model inputs, that wastes about 9,500 ns of CPU per connection.
+2. Choose **EPOLLEXCLUSIVE**. One thread wakes per connection. Now lower the rate to 300 per second: workers w0 to w3 serve almost nothing, and one worker serves 28%.
+3. Choose **Blocking accept()**. Each worker gets 12% to 13%, because the waiter that slept longest wins.
+4. Choose **`SO_REUSEPORT`** at 2,000 per second. The balance is perfect, but 25% of the connections wait in a busy worker's queue while another worker is idle. The p99 wait rises from 0 to 4.38 ms.
+5. Raise the rate to 6,000 per second. Every design now queues, and `SO_REUSEPORT` has a p99 wait of 13.67 ms against 2.05 ms for a shared queue.
+
+This waste is the **thundering herd**: many sleepers wake for one event, as in [condition variables](/os/sync/condition-variables). It grows with the number of workers. With 16 workers in the demo, 14 wake for each connection.
+
+`EPOLLEXCLUSIVE` (Linux 4.5) puts the callback on the socket's wait queue as an exclusive entry. The wakeup stops after the first epoll instance that has a sleeping thread. The man page promises only that "one or more" instances get the event. The reason is that each busy instance on the way also gets the item on its ready list, so it can see the event later.
+
+Which worker wins matters too. Cloudflare measured this in 2017 ("Why does one NGINX worker take all the load?"). Blocking `accept()` was close to FIFO, a round robin. An `epoll` design was close to LIFO: the worker that went idle last got the next connection. LIFO keeps a few workers warm, which is good for caches but bad for balance. The model uses those two rules.
+
+`SO_REUSEPORT` gives each worker its own listening socket and its own accept queue. The kernel picks the queue with a hash of the 4-tuple. Only one worker ever wakes, and the counts come out even. But the hash does not know which worker is busy. A connection can wait behind a slow request while a neighbor sleeps, so the tail latency gets worse. nginx offers both. Its `reuseport` listen parameter arrived in 1.9.1, and its `accept_mutex` is off by default since 1.11.3, because `EPOLLEXCLUSIVE` and `reuseport` do the job.
+
+| Design | Wakeups per connection | Balance | Weak point |
+|---|---|---|---|
+| Blocking `accept()` in each thread | 1 | round robin | a thread cannot wait for other sockets at the same time |
+| Shared socket in each epoll set | every idle worker | uneven | herd: wasted wakeups and `EAGAIN` |
+| Same, with `EPOLLEXCLUSIVE` | 1, sometimes more | LIFO: concentrated | idle workers stay idle |
+| `SO_REUSEPORT` | at most 1 | even counts | waits behind a busy worker |
+
+## Edge-triggered accept loops
+
+A listening socket is readable when its accept queue is not empty. In edge-triggered mode, `epoll_wait` reports it only after a new wakeup. Here the rule from the OS lesson, "read until `EAGAIN`", becomes "accept until `EAGAIN`". The failure looks different, because new connections keep arriving.
+
+<Predict
+  id="epoll-et-accept"
+  question="A listening socket is in edge-triggered mode. Four clients connect at almost the same time. The loop calls accept() once per event. A fifth client connects 300 ms later. How many connections does the loop never accept?"
+  options={["None: the fifth connection makes a new edge, and the loop catches up", "Two: each new edge releases only one connection", "Three: only the first event counts"]}
+  answer={1}
+  explain="Connections 3 and 4 arrive while the item is already on the ready list, so they add no event. The loop accepts 1 and 2, then sleeps with two connections queued. The fifth connection makes one edge, and the loop accepts connection 3. Connections 4 and 5 stay in the queue."
+>
+<NetProgEtAcceptDemo />
+</Predict>
+
+Things to try:
+
+1. Keep the defaults. Read the log: "the item is already on the ready list" for connections 3 and 4. The loop sleeps with 2 in the queue.
+2. Set the burst to 8. Now 6 connections never leave the queue. Their clients see an open connection that the server never reads.
+3. Choose **accept() until EAGAIN**. Every connection is accepted, and the last `accept()` in each round fails with `EAGAIN`. That failure is the sign that the queue is empty.
+4. Choose **Level** with **accept() once per event**. It also works: level mode reports the socket again while the queue is not empty.
+
+The callback adds the item to the ready list only if it is not there already. So connections that arrive between two `epoll_wait` calls merge into one event. In edge mode `epoll_wait` does not put the item back. The safe loop:
+
+```c
+for (;;) {
+    int c = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (c < 0) {
+        if (errno == EAGAIN) break;          /* the queue is empty: safe to wait */
+        if (errno == EINTR || errno == ECONNABORTED) continue;
+        if (errno == EMFILE || errno == ENFILE) { shed_load(lfd); break; }
+        break;
+    }
+    add_conn(ep, c);                          /* EPOLLIN | EPOLLRDHUP | EPOLLET */
+}
+```
+
+`accept4()` (Linux 2.6.28) sets `O_NONBLOCK` and `FD_CLOEXEC` in the same call. Watch `EMFILE`. At the descriptor limit, `accept` fails and the connection stays in the queue. A level-triggered loop then spins at 100% CPU. A common fix keeps one spare descriptor open. On `EMFILE`, close it, accept and close the connection, and open the spare again.
+
+## Threads, EPOLLONESHOT and EPOLLOUT
+
+Several threads can share one epoll instance. With edge triggering, new data can make a second event while a first thread still reads the socket. A second thread then reads the same connection, and the two threads process parts of one request in the wrong order. `EPOLLONESHOT` (Linux 2.6.2) turns the item off after one event. The thread that handles it calls `EPOLL_CTL_MOD` to turn it on again when it is done.
+
+Write readiness needs care too. A connected socket is almost always writable. If you register `EPOLLOUT` in level mode all the time, every `epoll_wait` returns at once, and the loop spins. Write first. Ask for `EPOLLOUT` only when a write was short or returned `EAGAIN`, because the send buffer was full. Remove it when your output queue is empty.
+
+This is backpressure: a slow reader fills your send buffer, and the loop stops reading new requests from that client. `EPOLLRDHUP` (Linux 2.6.17) reports that the peer sent FIN, so a half-closed connection does not need an extra `read`.
+
+## A reactor with timers
+
+An event loop with handlers for each event is a **reactor**. Every network server also needs timers: idle timeouts, request deadlines, retries. The loop computes how long it may sleep from its nearest deadline.
+
+```c
+for (;;) {
+    int timeout = timers_next_ms(&heap, now_ms());   /* -1 when no timer is set */
+    int n = epoll_wait(ep, evs, 256, timeout);
+    for (int i = 0; i < n; i++) {
+        struct conn *c = evs[i].data.ptr;
+        if (c == LISTENER)                    { accept_all(ep); continue; }
+        if (evs[i].events & (EPOLLHUP | EPOLLERR)) { conn_close(c); continue; }
+        if (evs[i].events & EPOLLIN)  conn_read(c);   /* to EAGAIN, then parse frames */
+        if (evs[i].events & EPOLLOUT) conn_flush(c);  /* drop EPOLLOUT when the queue is empty */
+        timers_reset(&heap, c, now_ms() + IDLE_MS);
+    }
+    timers_expire(&heap, now_ms(), conn_close);       /* idle connections */
+}
+```
+
+The timer structure must handle a reset on every request. A binary **min-heap** does it in $O(\log N)$. Go's runtime keeps a 4-ary heap of timers for each P. A **timing wheel** is an array of slots, one per tick, so insert and delete cost $O(1)$. Varghese and Lauck described hierarchical wheels at SOSP in 1987.
+
+Tokio uses a wheel of 6 levels with 64 slots each and 1 ms precision. A simpler trick suits idle timeouts: do not move the timer on each request. Store the last activity time, and check it when the old timer fires.
+
+Linux can also deliver timers as descriptors. `timerfd_create()` (Linux 2.6.25) makes a file that becomes readable when the timer expires, so it goes into the same epoll set. Most loops use the `epoll_wait` timeout instead, which saves a descriptor and a system call.
+
+## kqueue
+
+On macOS and the BSDs, `kqueue` does this job. Jonathan Lemon presented it at the USENIX FREENIX track in 2001, and it first appeared in FreeBSD 4.1. One call, `kevent()`, both changes the interest list and waits, so a loop can apply 100 changes and collect events with one system call. `EV_CLEAR` gives edge behavior and `EV_ONESHOT` gives one-shot behavior. Rust's `mio` and Go's netpoller hide the difference between the two interfaces.
+
+## Connect
+
+- [Blocking, non-blocking and async I/O](/os/io/blocking-non-blocking-and-async-i-o): the costs of select, poll and epoll, and the drain and starvation rules.
+- [Sockets](/networking/programming/sockets): the accept queue and `SO_REUSEPORT`.
+- [io_uring for networking](/networking/programming/io-uring-for-networking): a completion model instead of readiness.
+- [Condition variables](/os/sync/condition-variables): the same thundering herd with threads.
+- [Interrupts](/os/io/interrupts): the softirq that wakes the socket.
+- [Load balancers](/networking/infrastructure/load-balancers): the same balance problem across machines.
+
+<Recall cards={[
+  { q: "Name the three parts of an epoll instance.", a: "A red-black tree of registered items (the interest list), a ready list, and a wait queue of threads in epoll_wait." },
+  { q: "Why can a closed fd still produce epoll events?", a: "epoll registers the open file description. It stays registered while any other descriptor (from dup or fork) still refers to it." },
+  { q: "What does EPOLLEXCLUSIVE change, and why does the man page say one or more?", a: "The wakeup stops at the first epoll instance with a sleeping thread. Busy instances passed on the way also get the item on their ready lists, so they can report it later." },
+  { q: "SO_REUSEPORT balances connection counts evenly. What does it make worse?", a: "Tail latency. The 4-tuple hash ignores load, so a connection can wait behind a busy worker while another worker is idle." },
+  { q: "Why can an edge-triggered loop that accepts once per event leave connections in the queue forever?", a: "Connections that arrive while the item is on the ready list make no new event. Each later edge releases only one connection, so the backlog never drains." },
+  { q: "When should a loop register EPOLLOUT?", a: "Only after a short write or EAGAIN, while its output queue is not empty. A connected socket is almost always writable, so permanent EPOLLOUT makes the loop spin." },
+]} />

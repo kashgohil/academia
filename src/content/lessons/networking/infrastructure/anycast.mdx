@@ -1,0 +1,126 @@
+---
+summary: "One prefix announced from many sites: catchments that follow BGP policy instead of geography, prepending, NO_EXPORT and local nodes, the DNS root servers, DDoS spread over sites, what a route change does to a TCP connection, and anycast against DNS-based steering."
+---
+import { NetInfraAnycastCatchmentDemo, NetInfraAnycastDdosDemo, NetInfraAnycastTcpDemo, NetInfraAnycastBreakDemo } from "@/demos/net/NetInfraAnycastDemos";
+
+A **unicast** address belongs to one host. An **anycast** address belongs to many hosts in many places, and the network delivers each packet to one of them. On the Internet, anycast needs no new protocol. An operator announces the same prefix with [BGP](/networking/ip/bgp) from several **sites**. Every router picks its best route as usual, so each network sends its packets to one site. The set of networks that reach a site is the site's **catchment**.
+
+RFC 4786 (BCP 126, 2006) describes how to operate anycast services, and RFC 7094 (IAB, 2014) describes its architecture. Anycast carries some of the most used services on the Internet:
+
+- The **DNS root**. There are 13 root server names, a.root-servers.net to m.root-servers.net, run by 12 independent organisations. Behind them, root-servers.org counted 2,048 operational instances in November 2026.
+- **Public resolvers**. Google Public DNS answers on 8.8.8.8 from the nearest location that announces it, and Cloudflare serves 1.1.1.1 from its anycast network.
+- **CDNs**. Cloudflare announces the same IP ranges from each of its data centers ([CDNs](/networking/infrastructure/cdns)).
+
+## The catchment follows BGP, not geography
+
+"Nearest" in anycast means best by BGP. The decision process compares local preference first, then AS path length, then tie-breakers. None of these rules measures distance or delay.
+
+<Predict
+  id="catchment"
+  question="The operator has a site in Sydney, bought from a global carrier based in the US. That carrier also sells transit to the New York site. Where do users of the Sydney ISP, whose transit provider buys from the same carrier, send their packets?"
+  options={["To the Sydney site: it is 0 km away", "To the New York site", "To the Singapore site: it is the nearest in Asia"]}
+  answer={1}
+  explain="The carrier has two customer routes of equal length, one to each site, and breaks the tie by neighbour number. It picks New York and passes only that route to its customers. Packets from Sydney travel 15,988 km, about 157 ms more round trip on straight fiber."
+>
+<NetInfraAnycastCatchmentDemo />
+</Predict>
+
+1. With the defaults, 11.4% of the users reach a site that is not the nearest. Click the Sydney ISP to see its path, and note that the Sydney site gets no users at all.
+2. Turn on **the Sydney site also peers with the Sydney ISP**. A peer route beats a provider route on local preference, so Sydney's users now stay in Sydney. Only Johannesburg is left far away: 5.1% of users.
+3. Turn the peering off, keep **NYC** selected, and move **prepend** to 1. The carrier now prefers the shorter path to Sydney, and San Francisco's users go to Sydney: 11,947 km instead of 4,129 km.
+4. Set prepend back to 0 and turn off **announce** for NYC. New York and San Francisco both go to Sydney, not to London, because the carrier's customer route wins.
+5. Reset, choose **SGP**, and turn on **NO_EXPORT**. Its transit provider stops passing the route on, so Tokyo and Mumbai move to sites far away. Now 46.2% of users are off their nearest site.
+
+The model treats each network as one router, so its last tie-break is the lowest neighbour number. A real carrier has routers in many cities and breaks such ties per router, by the nearest exit (hot-potato routing). But local preference and path length come first, and they ignore distance in both cases.
+
+Measurements show the same effect at scale. Li and others studied a year of D-root traffic ("Internet Anycast: Performance, Problems, & Potential", SIGCOMM 2018). Only about a third of queries went to the geographically closest site.
+
+Over a third travelled more than 1,000 km further than needed. Calder and others studied Bing's anycast CDN (IMC 2015). Anycast sent about 20% of clients to a front-end that was not the best one. It was at least 25 ms slower than the best unicast choice for 20% of requests.
+
+An operator steers catchments with a few tools:
+
+- **Prepending** makes a site's path longer, so some networks pick another site. The demo shows that it moves whole customer cones, often far away.
+- **Peering** at local exchanges gives nearby networks a route that they prefer by policy.
+- **Communities** ask neighbours to limit a route. A route with `NO_EXPORT` (RFC 1997) is not passed outside the neighbour's AS. RFC 4786 calls such a site a **local** node; a **global** node is visible to the whole routing system.
+
+## Spreading an attack
+
+A distributed denial-of-service attack comes from many sources. With anycast, each source's packets go to the site of its own catchment, so the attack splits over the sites like the users do.
+
+<Predict
+  id="ddos"
+  question="A 300 Gbit/s attack hits a service whose sites each handle 100 Gbit/s. With one unicast site, about a quarter of real users get through. With five anycast sites, how many get through?"
+  options={["Still about a quarter: the total attack is the same", "About 86%", "All of them: 500 Gbit/s is more than 300"]}
+  answer={1}
+  explain="The attack splits by catchment. Four sites stay under capacity, and only the Singapore site is overloaded, where many bots sit. 85.6% of real users get through. It is not 100%, because the split follows the bots, not the capacity."
+>
+<NetInfraAnycastDdosDemo />
+</Predict>
+
+1. Press **only NYC (unicast)**. One site gets the whole attack, and 26.4% of users get through. Press **all**: 85.6%.
+2. Singapore is overloaded, because the Mumbai and Tokyo bots reach it. Turn **SGP** off. Its catchment moves to London and New York, and now both are overloaded: 68.7% of users get through.
+3. Turn SGP on and raise the attack to 600 Gbit/s. Every site except idle Sydney now drops traffic, and 60.7% of users get through.
+
+The 2015 attacks on the DNS root show both choices in practice. Moura and others studied the events of 30 November and 1 December 2015 ("Anycast vs. DDoS", IMC 2016). Some letters saw up to 5 million queries per second.
+
+Some sites stayed up and absorbed the attack as degraded absorbers, which cut off part of their own users. Other sites withdrew their routes, so that their traffic, good and bad, moved to other sites. Withdrawing protects a site but can overload its neighbours, as step 2 shows.
+
+## TCP and route changes
+
+Anycast routes each packet by itself. If a route changes in the middle of a TCP connection, the next packets reach another site. That site has no socket for the connection, so it answers with RST.
+
+<Predict
+  id="tcp"
+  question="A client downloads 100 KB from an anycast address. At 100 ms, its ISP's route moves from site A to site B. Both sites run the same server. What happens?"
+  options={["Nothing: both sites serve the same content", "The download pauses, then site B continues it", "Site B resets the connection, and the download fails"]}
+  answer={2}
+  explain="Site B has no state for the connection: no sequence numbers, no socket. It answers the client's next ACK with RST, and the client's connection dies with 45,260 of 100,000 bytes."
+>
+<NetInfraAnycastTcpDemo />
+</Predict>
+
+1. With the defaults, the client's ACKs go to site B after 100 ms. Site B answers with RST, and the connection dies at 213 ms. Site A goes on to send 77 segments into a connection that no longer exists.
+2. Choose **2 KB**. The answer arrives at 60 ms, before the change. The RST later only closes an idle connection.
+3. Turn on **the route moves back**. Site B sends 5 RSTs, but each one carries a sequence number behind data that the client already has. The client drops them as outside its window, and the download completes.
+4. Move the change to 20 ms with 2 KB. The request itself goes to site B, and nothing arrives.
+
+So anycast TCP breaks only when a route changes during a connection. RFC 7094 says that TCP over anycast fails "probabilistically, but possibly catastrophically". RFC 4786 asks that the routing choice stay stable for much longer than a transaction. If route changes for a client come at random, with a mean time $m$ between them, a connection of length $d$ sees one with probability
+
+$$
+P = 1 - e^{-d/m}
+$$
+
+<NetInfraAnycastBreakDemo />
+
+Wei and Heidemann measured this from more than 9,000 vantage points against 11 anycast services ("Does Anycast Hang up on You?", TMA 2017). About 98% saw few or no changes. About 1% were **anycast unstable**: on average, they reached a different site at least every 10 minutes. Most of them stayed unstable for more than a week. For such a client, a 10 s page load fails 1.65% of the time, and a 1-hour WebSocket almost surely. A 100 ms DNS query over TCP fails with a chance of 0.017%.
+
+This is why anycast fits short exchanges. UDP DNS has one packet each way, and RFC 7094 calls UDP the "lingua franca" of anycast. For long transfers, operators keep routing stable, keep connections short, and make clients reconnect. Another design uses anycast only to find a site, and then moves the client to that site's unicast address.
+
+## Anycast or DNS-based steering
+
+| | Anycast | DNS-based steering |
+|---|---|---|
+| Granularity | per network path, as BGP decides | per resolver, or per client subnet with EDNS Client Subnet |
+| Control | indirect: prepends, communities, peering | direct: the authoritative server picks any site |
+| Load awareness | none: BGP does not see load or latency | the mapping can use load and measured latency |
+| Failover | when BGP withdraws the route, in seconds to minutes | when cached answers expire: the DNS TTL |
+| DDoS | the attack splits over sites automatically | the attacker can aim at one site's unicast address |
+
+The two combine well: anycast for DNS itself and for the first contact, and DNS answers or redirects for bulk traffic.
+
+## Connect
+
+- [BGP](/networking/ip/bgp): the decision process, Gao-Rexford policy, and hijacks, which are anycast by accident.
+- [Load balancers](/networking/infrastructure/load-balancers): ECMP and connection state, the same problem one level down.
+- [CDNs](/networking/infrastructure/cdns): edges that users reach by anycast or by DNS.
+- [TCP handshake and teardown](/networking/transport/tcp-handshake-and-teardown): RST, and why a segment for an unknown connection gets one.
+- [UDP](/networking/transport/udp): the protocol that suits anycast best.
+
+<Recall cards={[
+  { q: "What decides which anycast site a network reaches?", a: "BGP: local preference from business policy, then AS path length, then tie-breakers. None of these measures distance or latency, so the catchment can be far from the nearest site." },
+  { q: "Name three ways an operator can shape anycast catchments.", a: "Prepend the AS path at a site, and peer with nearby networks at local exchanges. Limit a route with a community such as NO_EXPORT, which makes a site local." },
+  { q: "How does anycast help against a DDoS attack, and what does withdrawing an overloaded site do?", a: "Each bot's traffic goes to its own catchment's site, so the attack splits over many sites. Withdrawing a site moves its whole catchment, good and bad traffic, to other sites, which can overload them." },
+  { q: "Why does a route change break an anycast TCP connection?", a: "The next packets reach another site, which has no socket or sequence state for the connection. It answers with RST, and the client's connection dies." },
+  { q: "What is the chance that a connection of length d sees a route change, if changes come at random with mean spacing m?", a: "$1 - e^{-d/m}$. With m = 10 minutes, a 10 s page load fails 1.65% of the time, and a 1-hour connection almost always." },
+  { q: "Give two advantages of DNS-based steering over anycast, and one of anycast.", a: "DNS steering can choose any site directly and can use load and latency. Anycast needs no mapping system and spreads an attack over all sites automatically." },
+]} />

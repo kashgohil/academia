@@ -1,0 +1,150 @@
+---
+summary: "How one address fronts many servers: L4 and L7 balancers, NAT, direct server return and tunnels on real packets, ECMP and Maglev hashing when balancers and backends change, policies and tail latency, health checks, outlier detection, retries and draining."
+---
+import { NetInfraLbModesDemo, NetInfraLbChangeDemo, NetInfraLbPolicyDemo, NetInfraLbHealthDemo } from "@/demos/net/NetInfraLbDemos";
+
+A service with many servers gives its clients one address. This address is the **virtual IP** (VIP): no single host owns it. A **load balancer** receives the traffic for the VIP and sends each connection or request to one **backend** server.
+
+The balancer must do three things. It must keep all packets of one connection on one backend. It must spread the work so that no backend is overloaded. It must stop using a backend that has failed.
+
+Balancers come in two kinds:
+
+| | L4 balancer | L7 balancer |
+|---|---|---|
+| Reads | IP and TCP or UDP headers | the HTTP request (after it ends TLS) |
+| Unit of choice | a connection (a 5-tuple) | a request |
+| TCP connections | the client's connection goes through to the backend | two: client to balancer, balancer to backend |
+| Can do | forward packets at line rate, keep the client's IP | route by path or header, retry, add headers, cache |
+| Examples | Linux IPVS, Google's Maglev, Facebook's Katran | Envoy, NGINX |
+
+## How a packet reaches the backend
+
+An L4 balancer can forward a packet in three ways. Linux IPVS has all three: `VS/NAT`, `VS/TUN` (IP tunnelling) and `VS/DR` (direct routing). The demo runs them with a real TCP download, and adds a full proxy for comparison.
+
+<Predict
+  id="dsr"
+  question="A client downloads 1 MB through a balancer in direct-server-return mode. What share of the bytes on the client's link passes through the balancer?"
+  options={["All of it: the balancer is on the path", "About half: the requests and the ACKs", "About 1%: only the client's packets"]}
+  answer={2}
+  explain="In DSR the backend answers the client directly. The balancer sees only the client's request and ACKs, which are small: 1.36% of the bytes in this run."
+>
+<NetInfraLbModesDemo />
+</Predict>
+
+1. Start with **NAT** at 20 KB. The balancer sends 100% of the client's bytes, because the replies also come back through it. Read the address table: the balancer rewrites the destination on the way in and the source on the way out.
+2. Choose **DSR**. The response arrows now go from the backend straight to the router. The balancer sends 3.33% of the bytes. Move the size to 200 KB: the share falls to 1.53%.
+3. Choose **IP-in-IP**. The path is the same as DSR, but each forwarded packet carries 20 more bytes, so the share is 4.27% at 20 KB.
+4. Choose **full proxy**. The balancer ends the client's connection and opens its own to the backend. Turn off the pool: the first byte comes 2 ms later, one round trip on the data-center links.
+
+Web responses are much larger than requests. With **direct server return** (DSR), a balancer with a 10 Gbit/s link can front backends that send far more than 10 Gbit/s. DSR works because the balancer only rewrites the destination MAC address. So the balancer and the backends must share one Ethernet segment. Each backend holds the VIP on a loopback interface and does not answer ARP for it. So the router still sends the VIP's traffic to the balancer.
+
+A **tunnel** removes the shared-segment rule. The balancer wraps the packet in a new IP header to the backend: IP-in-IP (RFC 2003, protocol 4), GRE or GUE. The cost is the outer header, 20 bytes for IPv4 without options.
+
+A full-size 1500-byte packet no longer fits a 1500-byte path, so operators raise the MTU inside the data center or lower the MSS. With 1500 bytes, the largest TCP payload falls from 1460 to 1440 bytes. Maglev uses GRE and DSR (Eisenbud et al., NSDI 2016). Katran uses IP-in-IP and works only in DSR mode.
+
+DSR has a price: the balancer never sees a response. It cannot measure response times or read status codes, and it cannot be an L7 balancer. Many sites therefore use two tiers: an L4 tier with DSR in front of a tier of L7 proxies.
+
+## Many balancers: ECMP and connection state
+
+One balancer is a single point of failure, so a service runs several. Each balancer announces the VIP to the routers with BGP, and the routers spread packets over them with **equal-cost multipath** (ECMP). A router picks the next hop from a hash of header fields, so all packets of a connection take the same path. On Linux, `net.ipv4.fib_multipath_hash_policy` sets which fields go into the hash: 0 (the default) uses only the addresses, and 1 uses the 5-tuple.
+
+Each balancer then picks a backend. It can remember its choice in a **connection tracking** table, or compute the choice again from the packet with a hash. A hash such as Maglev's lookup table ([Rendezvous and jump hashing](/distributed/partitioning/rendezvous-and-jump-hashing)) gives the same answer on every balancer, with no shared state.
+
+<Predict
+  id="modulo"
+  question="Ten backends sit behind balancers that pick hash(5-tuple) mod N, with no connection tracking. You add an eleventh backend. What share of the open connections breaks?"
+  options={["About 9%: the new backend's share", "About 50%", "About 91%"]}
+  answer={2}
+  explain="With mod 11 instead of mod 10, a hash keeps its backend only when both answers agree, which happens for about 1 in 11 hashes. The other connections land on a backend with no socket for them, which answers with RST: 91.0% in the demo."
+>
+<NetInfraLbChangeDemo />
+</Predict>
+
+1. With **add backend**, compare the rows. Hash mod N breaks 91.0%. The Maglev table breaks 8.8%, close to the new backend's fair share. With connection tracking, nothing breaks.
+2. Choose **add balancer**. With hash-threshold ECMP, 47.5% of the connections move to another balancer. Hashing balancers do not care. A balancer that picked at random has no record of a moved connection, and 42.8% break.
+3. Choose **add both**. Now the moved connections meet a changed table: 4.1% break even with Maglev and tracking. Switch ECMP to **resilient**: only 19.9% move, and 1.7% break.
+4. Choose **backend crashes**. The connections on the dead backend are lost in every row. Maglev without tracking breaks only 0.3% of the others, because its table moves few other slots.
+5. Choose **drain backend**. Only connection tracking lets the old connections finish on the draining backend.
+
+Hash-threshold ECMP (RFC 2992) cuts the hash space into one range per next hop. Adding or removing a next hop moves between 1/4 and 1/2 of the flows; modulo-N would move $(N-1)/N$. Linux 5.13 added **resilient** next-hop groups. They keep a table of buckets and move only the buckets of the next hop that left or the share that a new one takes.
+
+The Maglev paper explains why it uses both tools.
+
+Each Maglev machine keeps a local connection table, not shared even between its own threads. The table covers backend changes. Consistent hashing covers balancer changes, because a moved connection finds the same backend on its new balancer. When both change at once, the paper says that connections will break. Katran makes the same choice, with a fixed-size LRU connection table and a modified Maglev hash. A SYN flood can fill such a table; the hash then still works.
+
+## Choosing a backend: policies and the tail
+
+For new connections or requests, the balancer needs a **policy**. Round robin takes the backends in turn. **Least connections** picks the backend with the fewest open requests. The **power of two choices** (P2C) samples two backends at random and takes the less loaded one. When all backends have equal weights, Envoy's `LEAST_REQUEST` does exactly this by default (`choice_count` 2).
+
+NGINX offers it as `random two least_conn`. Envoy's default policy is round robin, NGINX's default is weighted round robin, and the IPVS default scheduler is weighted least-connection.
+
+<Predict
+  id="stale"
+  question="Ten servers at 80% load. The balancer sees load counts that are 50 ms old. Which policy gives the lower 99th percentile: least connections, or two random choices?"
+  options={["Least connections: it always picks the best server", "Two random choices", "They are the same"]}
+  answer={1}
+  explain="With old counts, least connections sends every request to the server that looked emptiest 50 ms ago, so that server's queue explodes. Two random choices spread the requests over many servers. In the demo, p99 is 369 ms against 118 ms."
+>
+<NetInfraLbPolicyDemo />
+</Predict>
+
+1. At 80% with exact counts, read the p99 column: random 321 ms, round robin 128 ms, least connections 58.6 ms, two choices 79.0 ms.
+2. Turn on **server 0 is 3 times slower**. Random and round robin still give it a tenth of the work. Its queue grows without limit, and their p99 goes past a minute. Least connections and two choices send it only 4.1%.
+3. Turn the slow server off and choose **50 ms old**. Least connections gets worse than round robin. Choose **200 ms old**: its p99 reaches 1,497 ms, and two choices stay near 202 ms.
+
+With random choice, each server is an M/M/1 queue at load $\lambda$, and the mean time in the system is $1/(1-\lambda)$ service times. Mitzenmacher ("The Power of Two Choices in Randomized Load Balancing", IEEE TPDS, 2001) solved the many-server limit with $d$ random choices. The fraction of queues that hold at least $i$ requests is
+
+$$
+s_i = \lambda^{(d^i - 1)/(d - 1)}
+$$
+
+For one choice, this is $\lambda^i$: it falls geometrically. For two choices, the exponent doubles at each step, so long queues become very rare. At 90% load, a server has 3 or more requests with probability 0.729 under random choice and 0.478 under two choices. The mean time falls from 10 to 2.61 service times. A third choice helps much less than the second.
+
+Least connections with exact counts is the best of the four. Exact counts are rare in practice. Many balancers each see only their own requests, or they see reports that are some milliseconds old. P2C keeps most of the gain and is robust to both problems.
+
+## Health, failure and retries
+
+A balancer finds a failed backend in two ways. **Active health checks** send a probe at a fixed interval and remove the backend after a number of failed probes in a row. **Passive outlier detection** watches real traffic and ejects a backend after errors. Real defaults differ a lot:
+
+| Product | Setting | Default |
+|---|---|---|
+| AWS Application Load Balancer | health check interval, unhealthy threshold | 30 s, 2 |
+| Envoy outlier detection | `consecutive_5xx`, `base_ejection_time`, `max_ejection_percent` | 5, 30 s, 10% |
+| NGINX upstream | `max_fails`, `fail_timeout` | 1, 10 s |
+
+<Predict
+  id="health"
+  question="A balancer gets 1,000 requests per second for 10 backends. One backend starts to return errors. Health checks run every 5 s and need 3 failures. About how many requests fail?"
+  options={["About 15: one per failed check", "About 1,200", "About 12,000"]}
+  answer={1}
+  explain="The backend gets 100 requests per second until the third failed check, about 12 s after the failure. That is 1,199 failed requests in the demo."
+>
+<NetInfraLbHealthDemo />
+</Predict>
+
+1. With the defaults, 1,199 requests fail before the checks remove the backend at 16.9 s.
+2. Choose **every 30 s, 2 failures**, the AWS defaults. The worst case is 60 s, and here 3,623 requests fail.
+3. Turn on **outlier detection**. Five errors in a row eject the backend after 5 failed requests.
+4. Choose **hangs**. Each failure is now known only after a 1 s timeout, so 106 requests fail before the ejection.
+5. Set **retries** to 1. The client sees no errors. In the hang case, each saved request arrives 1 s late, because it waited for the timeout first.
+
+Retries hide failures, but they multiply load. If each of $L$ layers retries $r$ times, one user request can become $(r+1)^L$ attempts at the bottom: 64 for three layers with three retries. A **retry budget** caps retries at a share of the active requests. A configured Envoy budget defaults to 20%, so three layers add at most $1.2^3 = 1.73$ times the load. Retry only idempotent requests: NGINX does not pass a POST to the next server once it has been sent. [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency) shows the retry storm itself, and [Tail latency](/performance/systems/tail-latency) shows hedged requests.
+
+To remove a backend on purpose, **drain** it: stop new connections and let the open ones finish. AWS waits 300 s by default (the deregistration delay). If connection lifetimes are exponential with a mean of 1 hour, 92% of them are still open after 300 s. Connections that are still open after that can break, so long-lived protocols such as WebSockets need clients that reconnect.
+
+## Connect
+
+- [Consistent hashing](/distributed/partitioning/consistent-hashing) and [Rendezvous and jump hashing](/distributed/partitioning/rendezvous-and-jump-hashing): the Maglev table and why it moves few keys.
+- [BGP](/networking/ip/bgp): how balancers announce a VIP to the routers.
+- [NAT](/networking/ip/nat): the same address rewriting, for a different purpose.
+- [Queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law): the M/M/1 queue behind the policy plot.
+- [CDNs](/networking/infrastructure/cdns) and [Anycast](/networking/infrastructure/anycast): balancing across the world instead of inside one data center.
+
+<Recall cards={[
+  { q: "Why does a DSR balancer carry only a small share of a download's bytes, and what does it give up?", a: "The backend owns the VIP and answers the client directly, so the balancer sees only requests and ACKs. It never sees responses, so it cannot read status codes or act as an L7 balancer." },
+  { q: "What does an IP-in-IP tunnel add to DSR, and what does it cost?", a: "The backend can sit behind routers instead of on the balancer's Ethernet segment. Each packet carries a 20-byte outer header, so full-size packets need a larger MTU or a smaller MSS." },
+  { q: "Why does Maglev use both connection tracking and consistent hashing?", a: "Tracking keeps connections on their backend when backends change. Consistent hashing lets another balancer pick the same backend when ECMP moves a connection. Connections break only when both change at once." },
+  { q: "What share of connections breaks when hash mod N goes from 10 to 11 backends, and why?", a: "About 10/11, or 91%: a hash keeps its backend only when mod 10 and mod 11 agree, which happens for about 1 hash in 11." },
+  { q: "Why do two random choices beat least connections when load information is old?", a: "Least connections sends every request to the server that looked emptiest, so that one server gets a herd. Two random choices spread the requests over many servers and still avoid the longest queues." },
+  { q: "How many attempts can one request cause when 3 layers each retry 3 times, and what limits it?", a: "$(3+1)^3 = 64$ attempts. A retry budget of 20% of active requests, the default of a configured Envoy budget, limits three layers to about 1.73 times the load." },
+]} />

@@ -1,0 +1,148 @@
+---
+summary: "Content delivery networks: TLS at the edge and the round trips it saves, the edge–shield–origin hierarchy, hit ratio under Zipf with LRU, LFU and Che's approximation, cache keys and Vary, max-age, stale-while-revalidate and stale-if-error, request collapsing, purge, and how a request finds an edge."
+---
+import { NetInfraCdnLatencyDemo, NetInfraCdnHitDemo, NetInfraCdnTierDemo, NetInfraCdnFreshDemo } from "@/demos/net/NetInfraCdnDemos";
+
+A **content delivery network** (CDN) is a set of caching servers in many places, close to users. Each place is a **point of presence** (PoP), and its servers are **edge servers**. A user's request goes to a nearby edge. The edge answers from its cache if it can. Otherwise it fetches the object from the customer's own server, the **origin**, and keeps a copy.
+
+A CDN gives three things. It cuts latency, because most round trips stay short. It cuts the load on the origin, because many users share one copy. It absorbs traffic peaks and attacks with capacity that the origin does not have.
+
+## Where the time goes
+
+Light in fiber needs at least 157 ms for a round trip between Sydney and New York ([Latency, bandwidth and the BDP](/networking/foundations/latency-bandwidth-and-bdp)). A new HTTPS connection costs several round trips before the first byte. TCP needs one ([TCP handshake](/networking/transport/tcp-handshake-and-teardown)). TLS 1.3 needs one more (RFC 8446), and a full TLS 1.2 handshake needs two. Then the request itself needs one.
+
+<Predict
+  id="ttfb"
+  question="A user in Sydney opens a new HTTPS connection for a page on a server in New York. With TLS 1.3 and no CDN, the first byte arrives after about 500 ms. With an edge 10 ms away that has the page, when does it arrive?"
+  options={["About 450 ms: the edge saves one round trip", "About 190 ms: one trip to New York is still needed", "About 30 ms"]}
+  answer={2}
+  explain="The edge ends TCP and TLS itself and has the page, so all three round trips are 10 ms long. The long path to New York is not used at all: 30 ms."
+>
+<NetInfraCdnLatencyDemo />
+</Predict>
+
+1. Look at the **edge hit**: three short round trips, 30 ms. Choose **no CDN**: the same three round trips now cross the whole path, 500 ms.
+2. Choose **miss, warm**. The edge already has an open connection to the origin and sends the request on it. The miss costs one long round trip: 187 ms.
+3. Choose **miss, cold**. The edge must first do its own TCP and TLS handshakes with the origin. The first byte arrives at 500 ms, as without a CDN.
+4. Choose **TLS 1.2**. No CDN now costs 666 ms, and a hit costs 40 ms. Each extra handshake round trip is cheap at the edge and expensive across the ocean.
+
+In round trips, with $r_e$ to the edge and $r_o$ from the edge to the origin, the first byte with TLS 1.3 arrives after
+
+| Path | Time to first byte |
+|---|---|
+| no CDN | $3(r_e + r_o)$ |
+| edge hit | $3 r_e$ |
+| miss on a warm origin connection | $3 r_e + r_o$ |
+| miss on a new origin connection | $3 r_e + 3 r_o$ |
+
+So the edge helps even for content that it cannot cache, as long as it keeps warm connections to the origin. This is why CDNs end TLS at the edge and pool their origin connections.
+
+## The hierarchy: edge, shield, origin
+
+A large CDN has hundreds of PoPs. If each edge fetches its misses from the origin, the origin sees one miss per object per edge. A **shield** (a tier-two or regional cache) sits between the edges and the origin. Edges send their misses to the shield, and only the shield's misses reach the origin. AWS CloudFront has regional edge caches between its PoPs and the origin. An optional Origin Shield layer sits between those regional caches and the origin.
+
+<Predict
+  id="shield"
+  question="Without a shield, a CDN grows from 1 edge to 64 edges for the same users. What happens to the request rate at the origin?"
+  options={["It stays the same: the users did not change", "It goes up, about threefold", "It goes down: more cache in total"]}
+  answer={1}
+  explain="Each edge now sees only 1/64 of the requests. Its copies expire before many requests use them, and every edge must fetch every object on its own. In the demo, the origin rate goes from 220 to 672 requests per second."
+>
+<NetInfraCdnTierDemo />
+</Predict>
+
+1. Read the red line: 220 origin requests per second with 1 edge, 672 with 64 edges. Read the green line: 113 with a shield, for any number of edges.
+2. Read the table for 64 edges. The edges hit only about 30% of the time, and the shield answers most of their misses.
+3. Raise **max-age** to 300 s. Every line drops, because each fetched copy now serves more requests.
+4. Make the shield small. It loses its advantage, because then the shield misses as often as the edges.
+
+Huang and others measured Facebook's photo stack in 2013 ("An Analysis of Facebook Photo Caching", SOSP). Browser caches served 65.5% of requests, the edge caches 20.0%, the origin cache 4.6%, and the backend storage 9.9%. The edge hit ratio was 58.0% and the origin cache's was 31.8%. A lower tier sees the requests that the tier above it missed, which are the harder ones.
+
+## Hit ratio and cache size
+
+Requests for web objects follow a **Zipf-like** law: the object of rank $r$ gets a share proportional to $r^{-\theta}$. Breslau and others ("Web Caching and Zipf-like Distributions", INFOCOM 1999) found $\theta$ between 0.64 and 0.83 in proxy traces. They also found that the hit ratio grows like the logarithm, or a small power, of the cache size. Each doubling of the cache adds less than the one before.
+
+<Predict
+  id="lru"
+  question="10,000 objects with Zipf popularity (θ = 0.8). An LRU cache holds 1,000 of them, 10% of the catalog. What hit ratio does it reach?"
+  options={["About 10%", "About 44%", "About 90%"]}
+  answer={1}
+  explain="Popular objects get most requests, so a cache of the 10% most popular objects would answer 57% of requests. LRU does not keep exactly those objects, and it reaches 43.5% in the simulation and 43.7% by Che's formula."
+>
+<NetInfraCdnHitDemo />
+</Predict>
+
+1. Read the dots at 1,000 objects: LRU 43.5%, FIFO 39.3%, LFU 56.0%. LFU comes close to the ideal of 57.1%, because the popularity in this model never changes.
+2. Move the cache size to 2,000. LRU reaches 56.6%: twice the cache adds 13 points.
+3. Choose **2 variants per URL**. The same cache now hits 33.2%. With 50 variants, it hits 5.3%.
+4. Move **θ** to 1.0, then to 0.6. A steeper law makes caching much easier.
+
+**Che's approximation** (Che, Tung and Wang, IEEE JSAC, 2002) predicts LRU with one number, the **characteristic time** $T$. An object stays in the cache if it was requested within the last $T$ requests. With request probabilities $p_i$ and a cache of $C$ objects:
+
+$$
+\sum_i \left(1 - e^{-p_i T}\right) = C, \qquad \text{hit ratio} = \sum_i p_i \left(1 - e^{-p_i T}\right)
+$$
+
+The dashed gray line is this formula, and the LRU dots lie on it. LFU beats LRU here, but real popularity changes, and pure LFU keeps yesterday's objects. Real caches use mixes. Facebook's study found that S4LRU, an LRU with four segments, raised the edge hit ratio by 8.5% over FIFO. That cut the requests sent downstream by 20.8%.
+
+### Cache keys and Vary
+
+The **cache key** decides which requests share a copy. RFC 9111 builds it from, at a minimum, the request method and the target URI.
+
+The `Vary` response header adds request headers to the match. A cache must not reuse a stored response without revalidation unless every header that `Vary` names matches (RFC 9111, section 4.1). `Vary: *` never matches. `Vary: Accept-Encoding` makes a few variants, which is fine. `Vary: User-Agent` can make thousands, and the demo shows what that does to the hit ratio. So it pays to **normalize** keys: sort or drop query parameters, and map a header to a few classes before the lookup.
+
+## Freshness and the thundering herd
+
+A response stays **fresh** for its `max-age`. A shared cache uses `s-maxage` instead, if present (RFC 9111). The `Age` header carries a copy's age from one cache to the next. So an edge's copy from a shield expires when the shield's copy does. After expiry, the cache must check the copy with the origin (a conditional request) or fetch it again.
+
+At the moment a hot object expires, every request waits for the origin. If each waiting request sends its own fetch, the origin gets a **thundering herd**: about the request rate times the fetch time. At 200 requests per second and a 180 ms fetch, that is 36 fetches.
+
+<Predict
+  id="herd"
+  question="An object gets 200 requests per second at one edge and expires every 10 s. A fetch takes 180 ms. Without request collapsing, what is the largest burst of fetches that the origin sees within one second?"
+  options={["1", "About 40", "About 200"]}
+  answer={1}
+  explain="Every request that arrives during the 180 ms fetch sends its own fetch: about 200 × 0.18 = 36 on average. The largest burst in the run is 42."
+>
+<NetInfraCdnFreshDemo />
+</Predict>
+
+1. Read the top strip: a burst of fetches at each expiry, 42 at the most. Turn on **collapse**: one fetch per expiry, 6 in the whole minute.
+2. Turn on **the origin fails**. Each fetch now gets a fast 503, and 2,962 users see an error, because the cache does not keep errors. Turn collapsing off: 2,845 errors, and a fetch for almost every request.
+3. Set **stale-if-error** to 60 s. The same requests get the old copy instead of the error: no user sees an error.
+4. Set **stale-while-revalidate** to 30 s. Users never wait for the origin: the p99 latency falls to 10 ms, one trip to the edge.
+
+RFC 5861 defines both extensions. With `stale-while-revalidate`, a cache may serve a stale response for that many seconds while it revalidates in the background. With `stale-if-error`, it may serve a stale response when the origin answers 500, 502, 503 or 504.
+
+**Request collapsing** (or coalescing) is the rule that only one fetch per object runs at a time. Varnish does it automatically. NGINX has it as `proxy_cache_lock`, which is off by default and covers only objects that are not yet in the cache. For an expired copy, `proxy_cache_use_stale updating` lets one request refresh it while the others get the stale copy. CloudFront calls it request collapsing.
+
+**Purging** removes content before it expires. A CDN can purge by URL, or by a tag that the origin attached to many objects: Fastly's `Surrogate-Key` header and Cloudflare's `Cache-Tag` header. A soft purge only marks the content stale, so `stale-while-revalidate` and `stale-if-error` still protect the origin. Fastly's blog states that a purge reaches all its PoPs in about 150 ms.
+
+## How a request finds an edge
+
+There are two ways to send a user to a nearby edge:
+
+| | DNS-based mapping | Anycast |
+|---|---|---|
+| How | the CDN's DNS server returns the address of a chosen edge | every PoP announces the same prefix with BGP |
+| Who chooses | the CDN, per DNS query | BGP, per network path |
+| Sees | the resolver's address, or the client's subnet with EDNS Client Subnet (RFC 7871) | nothing about load or latency |
+| Reacts | within the DNS TTL | within BGP convergence |
+
+Akamai's mapping system works through DNS, with very short TTLs (Nygren, Sitaraman and Sun, 2010). Cloudflare announces the same IP ranges from each of its data centers. The [Anycast](/networking/infrastructure/anycast) lesson shows how BGP decides where those packets go.
+
+## Connect
+
+- [Load balancers](/networking/infrastructure/load-balancers): what happens inside a PoP after a request arrives.
+- [Buffer pools](/databases/storage/buffer-pools) and [Page replacement](/os/memory/page-replacement): LRU, Clock and scan resistance for pages instead of objects.
+- [TLS handshake](/networking/security/tls-handshake): the round trips that the edge saves.
+- [Hot keys](/distributed/partitioning/hot-keys): the same Zipf skew, against shards instead of caches.
+
+<Recall cards={[
+  { q: "With TLS 1.3, what is the time to the first byte for an edge hit, and for a miss over a warm origin connection?", a: "An edge hit costs 3 round trips to the edge: TCP, TLS and the request. A warm miss adds one round trip from the edge to the origin." },
+  { q: "Why does origin load grow when a CDN adds edges without a shield?", a: "Each edge sees a smaller share of the requests. Its copies expire before many requests use them, and every edge fetches every object on its own." },
+  { q: "State Che's approximation for an LRU cache.", a: "Find the characteristic time T with $\\sum_i (1 - e^{-p_i T}) = C$. Object i is cached with probability $1 - e^{-p_i T}$, and the hit ratio is $\\sum_i p_i (1 - e^{-p_i T})$." },
+  { q: "What does Vary do to the cache key, and why is Vary: User-Agent harmful?", a: "It adds the named request headers to the match. User-Agent has thousands of values, so each URL splits into many copies, each far less popular, and the hit ratio falls." },
+  { q: "What is a thundering herd, how large is it, and what stops it?", a: "When a hot object expires, every request during the fetch sends its own fetch: about the request rate times the fetch time. Request collapsing sends one fetch and makes the others wait for it." },
+  { q: "What do stale-while-revalidate and stale-if-error allow?", a: "SWR lets a cache serve a stale copy while it revalidates in the background, so no user waits. SIE lets it serve a stale copy when the origin answers 500, 502, 503 or 504." },
+]} />

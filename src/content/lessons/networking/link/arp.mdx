@@ -1,0 +1,126 @@
+---
+summary: "How a host finds the MAC address behind an IP address: the ARP request and reply, the Linux neighbour cache and its states (REACHABLE, STALE, DELAY, PROBE), gratuitous ARP, ARP spoofing and its defences, and IPv6 Neighbor Discovery."
+---
+import { ArpExchangeDemo, NeighCacheDemo, ArpSpoofDemo, SolicitedNodeDemo } from "@/demos/net/NetLinkArpDemos";
+
+A host wants to send an IP packet to 10.0.0.3, which is on its own subnet. The IP layer knows the destination address. The Ethernet layer needs a destination MAC address, and nothing in the IP address gives it. The two address spaces are independent. A NIC keeps its MAC when the host moves to another subnet, and an IP address can move to another NIC.
+
+The **Address Resolution Protocol** (ARP) fills this gap for IPv4. David Plummer defined it in RFC 826 (1982). It is a small protocol with no security, and it still runs on every IPv4 LAN.
+
+## Request and reply
+
+An ARP message rides directly in an Ethernet frame with EtherType `0x0806`. For Ethernet and IPv4 it has 28 bytes.
+
+| Field | Bits | Value for Ethernet and IPv4 |
+|---|---|---|
+| Hardware type | 16 | 1 (Ethernet) |
+| Protocol type | 16 | `0x0800` (IPv4) |
+| Hardware address length | 8 | 6 |
+| Protocol address length | 8 | 4 |
+| Operation | 16 | 1 = request, 2 = reply |
+| Sender MAC, sender IP | 48, 32 | the asker |
+| Target MAC, target IP | 48, 32 | the address to resolve; the MAC is zero in a request |
+
+The payload is shorter than 46 bytes, so the NIC pads it, and an ARP frame has the minimum 64 bytes. The asker sends the **request** to the broadcast MAC: "who has 10.0.0.3? Tell 10.0.0.1". Every host on the LAN receives it. Only the owner of 10.0.0.3 sends a **reply**, and it sends it by unicast to the asker.
+
+RFC 826 also tells the target to learn from the request. Before it replies, the target adds the sender's IP and MAC to its own table. The asker will almost certainly send a packet that needs an answer, so the answer then needs no ARP of its own.
+
+<Predict
+  id="request"
+  question="Host A pings host C for the first time on a switched LAN of four hosts. How many hosts receive A's ARP request?"
+  options={["One: the switch sends it only to C", "Three: every other host", "None: the switch answers for C"]}
+  answer={1}
+  explain="The request goes to the broadcast MAC, and a switch floods every broadcast to all ports except the one it came from. B, C and D all receive it and pass it to their CPUs. Only C answers."
+>
+<ArpExchangeDemo />
+</Predict>
+
+1. Look at the first step. The request reaches B, C and D. C's reply goes back to A only. Then the ping and the pong need no ARP: C learned A from the request.
+2. Click **Send** again with A and C. No ARP frames at all: both caches hold the entry.
+3. Click **C gets a new NIC**, then send A to C again. A still has the old MAC. The switch floods the frame, and every NIC drops it. A does not know.
+4. Click **C sends a gratuitous ARP**, then send again. A updated its entry from the broadcast, and the ping works.
+5. Click **Flush A's cache** and send. A must ask again.
+
+## The neighbour cache
+
+A host keeps the answers in its **ARP cache**. Linux keeps one neighbour table for ARP and another for IPv6, built on the same code, and `ip neigh` shows both. Each entry has a state. The machine comes from IPv6's Neighbor Discovery (RFC 4861), and Linux uses it for ARP too.
+
+| State | Meaning | Leaves the state when |
+|---|---|---|
+| INCOMPLETE | a request is out; packets wait in a queue | a reply arrives (REACHABLE), or 3 requests got no answer (FAILED) |
+| REACHABLE | recently confirmed | the reachable time passes with no new confirmation (STALE) |
+| STALE | the MAC is probably right, but not confirmed | a packet is sent: the host uses the MAC and moves to DELAY |
+| DELAY | waiting for an upper layer to confirm | 5 s pass: REACHABLE if confirmed, otherwise PROBE |
+| PROBE | sending unicast requests, one per second | a reply (REACHABLE), or 3 probes got no answer (FAILED) |
+
+The timers are sysctls in `net.ipv4.neigh.default`: `base_reachable_time_ms` (30000), `delay_first_probe_time` (5 s), `retrans_time_ms` (1000) and `ucast_solicit` (3). Linux draws the real reachable time at random, from half to one and a half times the base. With the default base, an entry stays REACHABLE for 15 to 45 s.
+
+The DELAY state is the clever part. A STALE entry is still used at once, so the first packet does not wait. The host then gives the upper layer 5 s to prove that the neighbour is alive. TCP gives this proof for free: an ACK for new data shows that the path works. Linux passes it down as a confirmation: TCP calls `sk_dst_confirm`, and a UDP application can pass the `MSG_CONFIRM` flag. With confirmations, a busy neighbour never needs a probe.
+
+<NeighCacheDemo />
+
+1. With the defaults, the entry stays REACHABLE for 44.1 s. It goes STALE, the next packet moves it to DELAY, and after 5 s one unicast probe confirms it again.
+2. Turn on **TCP confirms**. The entry stays REACHABLE for the whole run, and A sends only one ARP request.
+3. Now turn on **B's cable is cut**. A keeps the entry REACHABLE and sends into a dead link until 142 s. The entry fails at 152 s, 52 s after the cut.
+4. Set one packet every 60 s with no confirmations. The entry is STALE when each packet leaves, so every packet starts a probe.
+
+Step 3 shows the cost of the cache. The bound is the longest reachable time, plus DELAY, plus the probes: 45 + 5 + 3 = 53 s with the defaults. During that time, the host sends every packet to a MAC that nobody owns. A protocol that needs faster failover cannot wait for ARP. It must announce the change.
+
+A cache is also a table with limits. Linux does not remove entries while the table holds fewer than `gc_thresh1` (128), and it allows at most `gc_thresh3` (1024) entries that are not permanent. A large flat subnet, such as a big container network, can overflow it, and new neighbours then fail to resolve.
+
+## Gratuitous ARP
+
+A **gratuitous ARP** is an ARP message that nobody asked for. RFC 5227 (2008) defines two related messages. An **ARP probe** has sender IP 0.0.0.0: a host asks "does anyone use this address?" before it takes it. An **ARP announcement** has the host's own IP as both sender and target: "this IP is now at this MAC". The announcement is the classic gratuitous ARP.
+
+The announcement makes failover fast. When a standby host takes over a virtual IP, for example with keepalived, it broadcasts an announcement with its own MAC. Every host that has an entry for that IP replaces the MAC at once. Standard VRRP keeps one virtual MAC for the IP, so its announcement mainly teaches the switches the new port of that MAC. RFC 826 already requires this: a receiver that has the sender's IP in its table updates the MAC, whoever the message was for.
+
+Linux follows that rule. The sysctl `arp_accept` only controls whether a gratuitous ARP may create a new entry; existing entries are updated in every case. The default value, 0, creates none.
+
+## ARP spoofing
+
+Nothing in ARP proves who sent a message. Any host on the LAN can send a reply that says "10.0.0.1 is at my MAC". The victim must accept changes, because a new NIC or a failover is legitimate.
+
+<ArpSpoofDemo />
+
+1. With the defaults, the attack starts at 2 s. After one forged reply, 23 of the 32 packets go through the attacker. The victim sees no outage.
+2. Turn off **forwards the traffic**. The attacker now drops the packets: a denial of service.
+3. Turn on the static entry. The forged replies change nothing.
+4. Turn off the static entry and turn on **dynamic ARP inspection**. The switch drops every forged reply.
+
+This is a **man-in-the-middle** position: the attacker can read, change or drop every packet. Tools that automate it have existed for decades.
+
+The defences work at different layers:
+
+- **Static entries** (`ip neigh replace 10.0.0.1 lladdr MAC dev eth0 nud permanent`) cannot be poisoned. Someone must update them by hand, so they suit only a few critical hosts.
+- **Dynamic ARP inspection** in a managed switch checks each ARP message on an untrusted port. It compares it with the bindings of **DHCP snooping**: the IP that the DHCP server gave to each MAC. A forged message does not match, and the switch drops it.
+- **Encryption above the link** keeps the man in the middle blind. With TLS, the attacker can still drop traffic, but it cannot read or change it without a valid certificate.
+
+## IPv6: Neighbor Discovery
+
+IPv6 has no ARP. **Neighbor Discovery** (NDP, RFC 4861) does the same job with ICMPv6 messages. They are Router Solicitation (133), Router Advertisement (134), Neighbor Solicitation (135), Neighbor Advertisement (136) and Redirect (137). A Neighbor Solicitation (NS) is the request, and a Neighbor Advertisement (NA) is the reply.
+
+NDP does not broadcast. An NS goes to the **solicited-node multicast address** of the target: `ff02::1:ff00:0/104` plus the low 24 bits of the target (RFC 4291). Each host joins the group for each of its addresses. Its NIC filters multicast MACs in hardware, so the NS interrupts only hosts whose addresses end in the same 24 bits.
+
+<SolicitedNodeDemo />
+
+1. Read the steps for each address. The last 24 bits become part of the group, and the last 32 bits of the group become the MAC.
+2. Set 500 hosts. An ARP request interrupts 499 of them. The NS for the same target interrupts none but the target.
+
+NDP adds two small protections. Every NDP message must have hop limit 255, and a receiver drops any other value. A router decrements the hop limit, so this proves that the sender is on the same link. It does not stop an attacker on the link, however. **SEND** (RFC 3971) signs NDP messages but is rarely deployed. **RA Guard** (RFC 6105) lets a switch drop Router Advertisements from ports where no router should be.
+
+## Connect
+
+- [Ethernet](/networking/link/ethernet): the frame that carries ARP, and the broadcast address.
+- [Switches and VLANs](/networking/link/switches-and-vlans): why a broadcast reaches every port, and how a VLAN limits it.
+- [IPv4 and IPv6](/networking/ip/ipv4-and-ipv6) and [subnetting](/networking/ip/subnetting-and-cidr): when the next hop is the destination and when it is the router.
+- [TLS handshake](/networking/security/tls-handshake): the defence that still works when the LAN is hostile.
+- [Failure detectors](/distributed/foundations/failure-detectors): the neighbour cache is a failure detector with a timeout.
+
+<Recall cards={[
+  { q: "Who receives an ARP request, and who receives the reply?", a: "The request goes to the broadcast MAC, so every host on the LAN receives it. The reply goes by unicast to the asker only." },
+  { q: "Why does the target of an ARP request add the sender to its own cache?", a: "The asker will almost certainly send a packet that needs an answer. If the target learns the asker's MAC from the request, the answer needs no ARP exchange of its own." },
+  { q: "Name the Linux neighbour states that an entry for a live, busy neighbour without TCP confirmations passes through after the first reply.", a: "REACHABLE, then STALE when the reachable time ends, then DELAY when a packet leaves. After 5 s it goes to PROBE, and the answer to the unicast probe makes it REACHABLE." },
+  { q: "What is the purpose of the DELAY state?", a: "The host keeps using a STALE entry at once. Meanwhile it gives an upper layer such as TCP 5 s to confirm that the neighbour is alive, which avoids the probe." },
+  { q: "Why can a host not simply refuse ARP replies that change a MAC?", a: "Changes are legitimate: a new NIC, or a standby router that takes over a virtual IP with a gratuitous ARP. ARP has no way to tell these from an attack." },
+  { q: "Where does an IPv6 Neighbor Solicitation go, and why is that better than a broadcast?", a: "To the solicited-node multicast group ff02::1:ff00:0/104 plus the target's low 24 bits. NICs filter multicast in hardware, so only hosts with the same low 24 bits are interrupted." },
+]} />

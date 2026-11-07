@@ -1,0 +1,143 @@
+---
+summary: "Why Wi-Fi delivers far less than its PHY rate: one shared half-duplex medium, CSMA/CA with random backoff and an ACK for every frame, the hidden terminal and RTS/CTS, aggregation, rate adaptation, and the slow station that drags everyone down until airtime fairness fixes it."
+---
+import { AirtimeDemo, ContentionDemo, HiddenTerminalDemo, AnomalyDemo, RateDemo } from "@/demos/net/NetLinkWifiDemos";
+
+Wi-Fi (IEEE 802.11) carries Ethernet frames over radio. To the IP layer it looks like Ethernet: 48-bit MAC addresses, the same EtherTypes, a bridge in the access point. Under that surface it works very differently, and the differences explain why a laptop with an "867 Mb/s" link gets much less.
+
+## A shared medium where you cannot hear a collision
+
+All stations on one channel share one medium, as on the first Ethernet cable. But a radio cannot listen while it sends. Its own signal at the antenna is many orders of magnitude stronger than a distant station's signal. So a Wi-Fi station cannot detect a collision while it happens, and CSMA/CD does not work.
+
+802.11 uses **CSMA/CA** (collision avoidance) instead, in the **distributed coordination function** (DCF):
+
+1. A station with a frame listens. The medium must stay idle for a **DIFS** (DCF inter-frame space) before the station may count.
+2. It picks a random **backoff** from 0 to CW slots, where CW is the contention window, and counts down one slot for each idle slot. While the medium is busy, the count freezes.
+3. At zero it sends the whole frame. It cannot know yet if the frame collided.
+4. The receiver checks the FCS and, after a **SIFS** (short inter-frame space), sends an **ACK**. SIFS is shorter than DIFS, so no other station can start in that gap.
+5. No ACK means failure. The station doubles its window (CW becomes 2CW + 1, up to a maximum) and tries again. After a success it resets CW.
+
+| 802.11a OFDM parameter (5 GHz, 20 MHz) | Value |
+|---|---|
+| slot time | 9 µs |
+| SIFS | 16 µs |
+| DIFS = SIFS + 2 slots | 34 µs |
+| CWmin, CWmax | 15, 1023 slots |
+| preamble and SIGNAL field | 20 µs |
+| OFDM symbol | 4 µs |
+| ACK frame, sent at a basic rate | 14 bytes |
+
+Unlike Ethernet, Wi-Fi acknowledges every unicast frame at the link layer. Radio loses frames often, and a retry after microseconds is much better than a TCP timeout after hundreds of milliseconds. The station gives up after a retry limit: `dot11ShortRetryLimit`, 7 attempts by default.
+
+<Predict
+  id="airtime"
+  question="One laptop, alone on the channel, sends 1500-byte packets over 802.11a at 54 Mb/s. No collisions and no losses. About what throughput does it get?"
+  options={["About 54 Mb/s", "About 45 Mb/s", "About 30 Mb/s"]}
+  answer={2}
+  explain="Each frame carries fixed costs: DIFS, an average backoff of 7.5 slots, a 20 µs preamble, SIFS and an ACK. At 54 Mb/s the 1500 bytes take only about 222 µs, but the whole exchange takes 397.5 µs. That gives about 30 Mb/s."
+>
+<AirtimeDemo />
+</Predict>
+
+1. At 54 Mb/s with 1500-byte packets, the data takes 252 µs of the 397.5 µs exchange. One station gets 30.2 Mb/s, 56% of the PHY rate.
+2. Select **802.11ac, 867 Mb/s**. One frame now gets only 59.6 Mb/s, 6.9% of the PHY rate. The payload bits take 13.8 µs; the fixed costs stay.
+3. Raise **Frames per A-MPDU** to 64. One preamble and one Block Ack now cover 64 packets: 694.7 Mb/s.
+4. Select **802.11n, 150 Mb/s**. The aggregate stops at 42 frames, because an 802.11n A-MPDU holds at most 65,535 bytes.
+5. Turn on RTS/CTS at 54 Mb/s. Two more control frames and two more SIFS cut throughput to 24.7 Mb/s.
+
+## Why faster PHYs need aggregation
+
+The fixed cost of a frame exchange is measured in time, not in bytes. DIFS, the backoff, the preambles, SIFS and the ACK take about the same time at every rate. When the PHY gets ten times faster, only the payload part shrinks. So per-frame efficiency collapses at high rates.
+
+802.11n added **A-MPDU aggregation**. The sender packs many frames (MPDUs), each with its own header and FCS, into one transmission with one preamble. The receiver answers with one **Block Ack**, a bitmap that says which frames arrived. A lost frame is resent alone, not the whole burst. Linux allows up to 64 frames per A-MPDU for 802.11n and 256 for 802.11ax.
+
+Aggregation needs a queue. A station can build a large burst only if many packets wait for the same receiver. This links Wi-Fi throughput to queueing: a driver must hold enough packets to aggregate, but not so many that latency grows (bufferbloat).
+
+## Contention
+
+With more stations, two of them sometimes pick the same backoff slot. They both send, both frames are lost, and the medium is wasted for a full frame time. Bianchi modelled this in "Performance Analysis of the IEEE 802.11 Distributed Coordination Function" (IEEE JSAC, 2000). The simulation below runs the same protocol event by event.
+
+<ContentionDemo />
+
+1. With 1 station there are no collisions: 30.3 Mb/s, the single-station figure.
+2. Move to 50 stations. Total throughput falls to 21.9 Mb/s, and 62% of the attempts fail.
+3. Set CWmin to 7 with many stations: collisions rise. Set 63 with few stations: idle slots waste time.
+4. Turn on RTS/CTS. A collision now wastes only a short RTS, but every frame pays for the handshake.
+
+The exponential backoff makes DCF stable: when many stations collide, their windows grow until collisions are rare. The total throughput degrades slowly, but each station's share falls as 1/N, and its delay grows.
+
+## The hidden terminal
+
+Carrier sense assumes that every station hears every other. On radio this is false. A and C can both reach the access point but be too far apart, or behind a wall, to hear each other. Tobagi and Kleinrock described this **hidden terminal** problem in 1975.
+
+For A, the medium looks idle while C sends, so A counts down and sends too. The two frames overlap at the AP, and both are lost. Neither sender can tell why.
+
+<Predict
+  id="hidden"
+  question="A and C are hidden from each other, and both send full frames at 12 Mb/s to the AP. What does turning on RTS/CTS do to their total throughput?"
+  options={["It lowers it: two more control frames per data frame", "It roughly triples it", "Nothing: RTS/CTS cannot help stations that cannot hear each other"]}
+  answer={1}
+  explain="Without RTS/CTS, most data frames collide at the AP. With it, the AP's CTS reaches both stations, and the hidden one stays quiet for the announced time. Collisions now hit only short RTS frames. In the simulation, throughput goes from 3.11 to 9.11 Mb/s."
+>
+<HiddenTerminalDemo />
+</Predict>
+
+1. With the defaults, A and C are 46 m apart and hidden. They get 3.11 Mb/s together, against 9.65 Mb/s when they hear each other. Three quarters of the attempts fail.
+2. Turn on RTS/CTS: 9.11 Mb/s. The strip shows RTS collisions, short and cheap.
+3. Move them within 30 m of each other. Carrier sense works again.
+4. Select 54 Mb/s. Frames are shorter, so the hidden stations overlap less often, and RTS/CTS gains less.
+
+**RTS/CTS** comes from Karn's MACA (1990) and MACAW (SIGCOMM 1994). Before a data frame, the sender sends a short **RTS** (request to send, 20 bytes). The receiver answers with a **CTS** (clear to send, 14 bytes). Both carry a **Duration** field: how long the rest of the exchange will take. Every station that hears either frame sets its **NAV** (network allocation vector) and stays quiet for that time. This is **virtual carrier sense**: the hidden station never hears A, but it hears the AP's CTS.
+
+RTS/CTS costs airtime on every frame. Drivers therefore use it only for frames above a size threshold, `dot11RTSThreshold`. Its classic default of 2347 bytes turns it off for normal frames. It also protects new PHYs from old ones on a shared channel. On Linux, `iw phy phy0 set rts 500` sets the threshold.
+
+## Rate adaptation
+
+A Wi-Fi link has many rates. A faster rate packs more bits into each symbol, so it needs a cleaner signal. As the **SNR** (signal-to-noise ratio) falls with distance or walls, the fast rates lose more and more frames. A lost frame still costs its full airtime.
+
+<RateDemo />
+
+1. At 45 m, the best rate is 24 Mb/s, with 17.3 Mb/s of goodput. 36 Mb/s loses three quarters of its frames and delivers only 5.7 Mb/s.
+2. Walk close to the AP. 54 Mb/s wins.
+3. Walk far away. Only 6 Mb/s still works.
+
+The sender cannot see the SNR at the receiver directly, so it must learn from ACKs. The default rate control of mac80211, **Minstrel HT**, keeps a success rate and a throughput estimate for each rate. Drivers with their own rate control, such as iwlwifi, do not use it. It spends a small fraction of its transmissions on sampling other rates, and it sends with the best measured one. A retry chain falls back to slower rates within one frame's retries.
+
+## The performance anomaly and airtime fairness
+
+DCF is fair in one sense: each station gets the same chance to send a frame. Frames at a slow rate take much longer. Heusse and colleagues measured the result ("Performance Anomaly of 802.11b", INFOCOM 2003). One host at 1 Mb/s cut the throughput of the hosts at 11 Mb/s to below 1 Mb/s.
+
+<AnomalyDemo />
+
+1. Three stations at 54 Mb/s get 10.06 Mb/s each. Set station 3 to 6 Mb/s. It takes 74% of the airtime, and every station falls to 3.96 Mb/s.
+2. Select **equal airtime**. Each station gets a third of the time. The fast stations keep 10.06 Mb/s; the slow one gets what its own rate allows.
+3. Compare the totals: 11.87 Mb/s with equal frames, 21.91 Mb/s with equal airtime.
+
+An access point controls the downlink, so it can schedule by time instead of by frame. Høiland-Jørgensen and colleagues did this in Linux ("Ending the Anomaly", USENIX ATC 2017). Airtime fairness arrived in the ath9k driver in Linux 4.11 and as a general mac80211 scheduler in 5.1. **AQL** (airtime queue limits, 5.5) also limits how much airtime the driver may queue, which keeps latency low.
+
+## Why the PHY rate is not the throughput
+
+The number that a laptop shows is the PHY rate of the last frame. The throughput that an application sees is lower for many reasons, and they multiply:
+
+- Each exchange pays fixed costs in time: DIFS, backoff, preambles, SIFS and the ACK.
+- Contention wastes slots and causes collisions; hidden terminals cause more.
+- Retries and rate adaptation spend airtime on frames that fail.
+- The medium is half duplex: TCP ACKs travel in the other direction on the same air.
+- Slow stations on the same channel take airtime from fast ones.
+
+## Connect
+
+- [Ethernet](/networking/link/ethernet): CSMA/CD on a cable, where a sender can hear a collision.
+- [Switches and VLANs](/networking/link/switches-and-vlans): the access point is a bridge between radio and Ethernet.
+- [Congestion control: Reno and CUBIC](/networking/transport/congestion-control-reno-and-cubic) and [BBR](/networking/transport/bbr): TCP on a link whose loss is often not congestion.
+- [Queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law): why aggregation queues and latency trade off.
+- [Failure detectors](/distributed/foundations/failure-detectors): a missing ACK cannot tell a collision from a fade, as a timeout cannot tell a slow node from a dead one.
+
+<Recall cards={[
+  { q: "Why can Wi-Fi not use collision detection, and what does it do instead?", a: "A radio cannot hear a weak distant signal while it sends its own strong one. 802.11 avoids collisions with random backoff after a DIFS, and learns of failure from a missing ACK." },
+  { q: "Why does SIFS have to be shorter than DIFS?", a: "The ACK (and CTS) follow after a SIFS. Other stations must wait a full DIFS of idle medium before counting down, so they cannot take the gap before the ACK." },
+  { q: "Why does a single 1500-byte frame use only about 7% of an 867 Mb/s PHY rate, and what fixes it?", a: "The fixed costs (DIFS, backoff, preamble, SIFS, ACK) take about 190 µs at any rate, while the payload takes about 14 µs. A-MPDU aggregation shares those costs over up to 64 frames with one Block Ack." },
+  { q: "What is a hidden terminal, and how does RTS/CTS help?", a: "Two stations reach the AP but cannot hear each other, so carrier sense fails and their frames collide at the AP. With RTS/CTS, the AP's CTS carries a duration that sets every station's NAV, so the hidden one stays quiet." },
+  { q: "Why does one slow station lower the throughput of all stations under DCF?", a: "DCF gives each station the same number of frame opportunities. A slow station's frames take much more airtime, so everyone waits for it, and all stations end up with about the slow one's throughput." },
+  { q: "How does a sender choose a Wi-Fi rate when it cannot see the receiver's SNR?", a: "It measures delivery from ACKs. Minstrel HT keeps a success rate per rate and samples other rates on a small fraction of frames. It sends with the rate that has the best measured throughput." },
+]} />

@@ -1,0 +1,135 @@
+---
+summary: "How an Ethernet switch learns where each MAC address lives, why a loop turns one broadcast into a storm, how the spanning tree protocol elects a root and blocks ports (and why it takes 30 to 50 seconds), and how 802.1Q VLANs split one switch into many."
+---
+import { LearningSwitchDemo, StormDemo, StpDemo, VlanDemo } from "@/demos/net/NetLinkSwitchDemos";
+
+Early Ethernet put every station on one cable, so every frame reached every station. A **hub** kept that model with twisted pair: it repeats each bit to every port. All ports share one collision domain and one link's worth of bandwidth.
+
+A **switch** (the standard calls it a **bridge**) reads each frame and sends it only where it needs to go. Each port is its own link, and each link is full duplex. Two pairs of hosts can talk at full rate at the same time. A switch needs no configuration to do this: it learns.
+
+## Learning, flooding, ageing
+
+A switch keeps a **MAC table** (also called the forwarding database, or CAM table after the memory that holds it). Each entry maps a MAC address, in a VLAN, to a port. The switch fills it from the **source** address of every frame. A frame from MAC X arrived on port 3, so X lives behind port 3.
+
+For each frame, the switch looks up the **destination** address:
+
+1. A known unicast address on another port: send the frame on that port only.
+2. A known address on the same port the frame came from: drop it (filter). The receiver already has it.
+3. An unknown unicast address, a broadcast, or a multicast: **flood** it to every port except the incoming one.
+
+Entries expire if their address sends nothing for the **ageing time**. IEEE 802.1D recommends 300 s, and the Linux bridge uses the same default (`ageing_time`). Ageing lets a host move to another port. A host that only receives, never sends, ages out, and every frame to it is flooded again.
+
+<Predict
+  id="learn"
+  question="A switch was just switched on, and its MAC table is empty. A sends a frame to B. Then B sends a frame to A. Which hosts receive the second frame?"
+  options={["B's frame is flooded to A, C and D", "Only A: the switch learned A's port from the first frame", "Nobody: the switch must learn B's port first"]}
+  answer={1}
+  explain="The switch learns from source addresses. A's first frame taught it that A is behind port A. The second frame's destination is A, which is now known, so it goes to port A only. The first frame was the one that was flooded."
+>
+<LearningSwitchDemo />
+</Predict>
+
+1. Look at step 1: an empty table, so the frame to B is flooded. C and D receive it, and their NICs drop it.
+2. Send B to A, then A to B. Both are forwarded on one port only.
+3. Send C to all. A broadcast is always flooded, even when the table knows everybody.
+4. Click **Wait 2 min**, then send A to B. Set the ageing time to 60 s and repeat: the table is empty again, and the next frame floods.
+
+The table has a fixed size. An attacker can send frames from thousands of made-up source addresses until it is full. The switch then cannot learn real hosts, so it floods their traffic to every port, including the attacker's. **Port security**, a limit on addresses per port, stops this attack.
+
+A switch also chooses when to start sending. A **store-and-forward** switch receives the whole frame and checks the FCS first. At 10 Gb/s, a 1518-byte frame takes 1.21 µs to arrive. A **cut-through** switch starts after the first bytes of the header, so it saves that time. It cannot drop a corrupt frame, because the FCS comes last. It forwards it and marks it as bad.
+
+## Loops
+
+Redundant links are good for availability: if one cable fails, another path exists. But two paths between switches make a loop, and Ethernet has no defence against a loop. A frame has no TTL field, so nothing stops a frame that goes around forever.
+
+<Predict
+  id="storm"
+  question="Three switches are cabled in a triangle with 1 Gb/s links, with no spanning tree. H1 sends one broadcast. How many copies does H2 receive in the next half millisecond?"
+  options={["One", "Two: one from each direction", "About 200"]}
+  answer={2}
+  explain="Each switch floods the broadcast to all other ports, so one copy goes clockwise and one goes counter-clockwise around the triangle, forever. Each time a copy passes S2, H2 gets another one. In the simulation, H2 gets 198 copies in 0.5 ms."
+>
+<StormDemo />
+</Predict>
+
+1. Select **line (no loop)**. The broadcast reaches each host once.
+2. Select **triangle**. Two copies circle forever. H2 receives 198 copies in 0.5 ms, and the switches see H1's address jump between ports 594 times.
+3. Select **4 switches, full mesh**. Each copy now makes two new copies at every switch. The busiest link is 99% busy, and 13,602 frames are dropped at full queues.
+4. Turn on **Run spanning tree** with each topology. STP blocks just enough link ends to cut every loop.
+
+This is a **broadcast storm**. The links fill up, and the CPUs of every host take an interrupt for every broadcast. The MAC tables **flap**. H1's address arrives on a different port each time, so the switches keep moving it and send real traffic the wrong way. The network stops until someone pulls a cable.
+
+## The spanning tree protocol
+
+The fix is to keep the redundant links but use only a tree of them. Radia Perlman designed the **spanning tree protocol** (STP) at DEC: "An Algorithm for Distributed Computation of a Spanning Tree in an Extended LAN" (SIGCOMM 1985). IEEE standardized it in 802.1D. The switches compute the tree together by exchanging **BPDUs** (bridge protocol data units), sent to the group address `01:80:C2:00:00:00`.
+
+The algorithm has three steps:
+
+1. **Elect a root.** Each bridge has an 8-byte **bridge ID**: a priority (default 32768) and its MAC address. The lowest ID wins. Each bridge first claims to be the root, and it gives up when it hears a better claim.
+2. **Pick a root port.** Each other bridge finds its cheapest path to the root and uses that port. The cost of a path is the sum of port costs: 802.1D-1998 gives 4 for 1 Gb/s and 19 for 100 Mb/s. Ties go to the lower bridge ID of the sender, then to the lower port ID.
+3. **Pick a designated port per link.** On each link, the bridge with the cheapest path to the root forwards for that link. Every port that is neither a root port nor a designated port **blocks**: it drops data frames, but it still listens to BPDUs.
+
+The root sends a BPDU every **hello time** (2 s). Each bridge passes the information on, with a higher message age. If the information on a port is not refreshed, it expires at the **max age** (20 s). A port that becomes active does not forward at once. It spends one **forward delay** (15 s) in the listening state and another in the learning state. Meanwhile every bridge can hear about the new tree.
+
+<StpDemo />
+
+1. With all priorities at 32768, S1 wins because it has the lowest MAC. S2–S3 and S3–S4 each have a blocked end (B), so the tree has no loop.
+2. Look at the start of the ping band. Nothing is forwarded for 30 s: every port spends 15 s listening and 15 s learning.
+3. The default cuts S1–S2 at 40 s. The pings stop for 47 s. S3 and S4 ignore S2's worse BPDUs, wait until their stored information reaches max age, and only then start listening.
+4. Cut S2–S4 instead. S4 sees the failure itself and uses its blocked port at once, but the port still needs 30 s. Cut S2–S3: nothing happens, because that link was blocked.
+5. Give S4 priority 4096 and look at how the whole tree changes.
+6. Turn on **rapid mode**. The outage drops to the 0.5 s between two pings.
+
+These waits are the classic numbers of 802.1D. A direct failure costs 30 s, and an indirect one up to 20 + 15 + 15 = 50 s. The same 30 s also apply when a host plugs in. Switch vendors therefore let ports to hosts skip the wait (Cisco calls it **PortFast**; RSTP calls them **edge ports**).
+
+**RSTP** (802.1w, 2001, now part of 802.1D-2004) keeps the same tree but changes how ports reach forwarding. A bridge and its neighbour agree on each point-to-point link with a proposal and an agreement handshake, instead of a timer. A blocked port that is a precomputed **alternate** to the root port can take over at once. Convergence then takes about as long as a few BPDU exchanges.
+
+On Linux, a bridge has STP off by default (`ip link set br0 type bridge stp_state 1` turns it on). The kernel implements only classic 802.1D STP, with default timers of 2, 20 and 15 s. RSTP and MSTP need a user-space daemon such as `mstpd`.
+
+Even RSTP blocks links that cost money, and every flood still reaches every switch. Many data centers therefore keep each layer 2 domain small and route between racks with IP, which uses every link at once.
+
+## VLANs
+
+A **VLAN** (virtual LAN) splits one physical switch into several logical ones. A frame in VLAN 10 never reaches a port in VLAN 20, broadcasts included. Hosts in different VLANs talk only through a router, as if they were on different switches.
+
+To carry several VLANs on one link between switches, 802.1Q inserts a 4-byte **tag** after the source MAC:
+
+| Field | Bits | Meaning |
+|---|---|---|
+| TPID | 16 | `0x8100`: a tag follows (it sits where the EtherType would be) |
+| PCP | 3 | priority 0 to 7, for quality of service (802.1p) |
+| DEI | 1 | drop eligible: drop this frame first under congestion |
+| VID | 12 | the VLAN ID; 0 means "no VLAN", and 4095 is reserved, so 4094 VLANs remain |
+
+Each switch port has a mode. An **access port** belongs to one VLAN. It sends and receives untagged frames, so the host does not know about VLANs. A **trunk port** carries many VLANs, each frame with its tag, except for one **native VLAN** whose frames cross untagged.
+
+<VlanDemo />
+
+1. Send a broadcast from A. Only C hears it: the same VLAN on the other switch. On the trunk the frame carries tag 10 and grows from 64 to 68 bytes.
+2. Send from B. Only D hears it, with tag 20.
+3. Select **trunk: 10 only** and send from B. The trunk does not carry VLAN 20, so D hears nothing.
+4. Select **access port, VLAN 10**. VLAN 10 still works, untagged, but VLAN 20 is cut off.
+5. Go back to the full trunk and turn on the **native VLAN mismatch**. A's frame crosses untagged, and S2 puts it in its native VLAN 20: D hears a host from another VLAN.
+
+The native VLAN is a known weakness. In **VLAN hopping by double tagging**, an attacker on the native VLAN sends a frame with two tags. The first switch removes the outer tag, because it is the native VLAN, and forwards the frame on the trunk with the inner tag. The next switch delivers it into the victim VLAN. Good practice is to use an unused VLAN as the native VLAN, or to tag it too.
+
+Twelve bits allow only 4094 VLANs, which is too few for a provider or a cloud. **Q-in-Q** (802.1ad) stacks a provider tag (TPID `0x88A8`) on top of the customer's tag. **VXLAN** (RFC 7348) carries Ethernet frames inside UDP packets, with a 24-bit segment ID: about 16 million segments over a routed network.
+
+On Linux, `ip link add link eth0 name eth0.10 type vlan id 10` makes a tagged sub-interface. A bridge with `vlan_filtering` on acts as a VLAN-aware switch, and `bridge vlan add` sets the VLANs of each port.
+
+## Connect
+
+- [Ethernet](/networking/link/ethernet): the addresses a switch learns, and the tag inside the frame.
+- [ARP](/networking/link/arp): the broadcasts that every switch floods.
+- [Routing with distance vectors and link state](/networking/ip/routing-distance-vector-and-link-state): routers solve the loop problem with TTLs and shortest paths instead of a tree.
+- [Gossip and SWIM](/distributed/data-systems/gossip-and-swim): another protocol where nodes agree on a structure by exchanging small messages.
+- [Namespaces](/os/isolation/namespaces) and [containers](/os/isolation/containers): where Linux bridges and veth pairs build switched networks inside one host.
+
+<Recall cards={[
+  { q: "What does a learning switch learn from, and what does it do with a frame for an unknown destination?", a: "It learns from the source MAC of each frame: that MAC lives behind the incoming port. A frame for an unknown unicast address, a broadcast or a multicast is flooded to all other ports." },
+  { q: "Why does one broadcast in a loop of switches never die?", a: "Each switch floods it to all other ports, and an Ethernet frame has no TTL. The copies go around the loop forever, and in a mesh they multiply." },
+  { q: "How does STP pick the root bridge, a root port and a designated port?", a: "Root: the lowest bridge ID (priority, then MAC). Root port: each other bridge's cheapest path to the root. Designated port: on each link, the bridge with the cheapest path forwards. All other ports block." },
+  { q: "Why does classic STP take 30 s to forward on a new port, and up to 50 s after an indirect failure?", a: "A port spends one forward delay (15 s) listening and one learning before it forwards. After an indirect failure, a bridge first waits for its stored information to expire at max age (20 s)." },
+  { q: "What is in an 802.1Q tag, and how many VLANs does it allow?", a: "TPID 0x8100 (16 bits), PCP priority (3), DEI (1) and a 12-bit VLAN ID. IDs 0 and 4095 are reserved, so 4094 VLANs remain." },
+  { q: "What goes wrong when the two ends of a trunk use different native VLANs?", a: "Frames of the native VLAN cross untagged. Each end puts them into its own native VLAN, so traffic leaks from one VLAN into another." },
+]} />

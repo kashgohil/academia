@@ -1,0 +1,139 @@
+---
+summary: "The Ethernet frame byte by byte: MAC addresses and their two special bits, the EtherType, padding to 64 bytes, a real CRC-32 FCS that drops a frame for one flipped bit, why CSMA/CD set the minimum size, and what each frame costs on the wire."
+---
+import { FrameLabDemo, CollisionWindowDemo, WireCostDemo } from "@/demos/net/NetLinkEthernetDemos";
+
+The **link layer** moves a frame from one network interface to another interface on the same link. It does not know about routes or connections. Its job is narrow. It puts bits on a medium, marks where a frame starts and ends, says who it is for, and catches damage.
+
+Ethernet does this job on almost every wired network. Metcalfe and Boggs described it in "Ethernet: Distributed Packet Switching for Local Computer Networks" (CACM, 1976). Their experimental network ran at about 3 Mb/s on one shared coaxial cable. DEC, Intel and Xerox published "Ethernet II" in 1982, and IEEE approved 802.3 in 1983. The frame format from that time is still the frame format today.
+
+## The frame
+
+A frame on the wire has these fields. The sizes are fixed by IEEE 802.3.
+
+| Field | Bytes | What it does |
+|---|---|---|
+| Preamble | 7 | `0x55` repeated: alternating bits let the receiver lock its clock |
+| SFD (start frame delimiter) | 1 | `0xD5`: the frame starts after this byte |
+| Destination MAC | 6 | the receiver; all ones is broadcast |
+| Source MAC | 6 | the sender; switches learn from it |
+| EtherType | 2 | what the payload is: `0x0800` IPv4, `0x0806` ARP, `0x86DD` IPv6 |
+| Payload | 46 to 1500 | the packet of the layer above, padded to 46 |
+| FCS (frame check sequence) | 4 | a CRC-32 of everything from the destination MAC to the payload |
+
+After the frame, the sender must stay quiet for the **inter-frame gap**, 96 bit times (12 bytes). A frame counted from the destination MAC to the FCS has 64 to 1518 bytes. An optional 802.1Q VLAN tag adds 4 bytes after the source MAC, so a tagged frame can have 1522 bytes.
+
+The two bytes after the addresses have two meanings. A value of 1536 (`0x0600`) or more is an EtherType. A value of 1500 or less is a length, the original 802.3 format, and an LLC header then says what the payload is. Values between the two ranges are not defined.
+
+<Predict
+  id="fcs"
+  question="One bit of the payload flips on the cable. The receiving NIC computes the CRC and finds a mismatch. What does Ethernet do?"
+  options={["It corrects the bit, as ECC memory does", "It drops the frame and counts an error; nobody tells the sender", "It sends a negative acknowledgement, and the sender transmits again"]}
+  answer={1}
+  explain="A CRC detects errors but cannot correct them, and Ethernet has no acknowledgements. The NIC drops the frame and increments a counter. A higher layer, usually TCP, notices the loss and sends the data again."
+>
+<FrameLabDemo />
+</Predict>
+
+1. Move the payload length to 0. The NIC adds 46 bytes of padding, so the frame still has 64 bytes. Move it to 46: the padding goes to 0.
+2. Click any byte in the hex dump. One bit changes, and the receiver's CRC no longer matches the FCS. Click it again to repair it.
+3. Click **Swap two 16-bit words**. The CRC catches it, but the Internet checksum of the same bytes does not change.
+4. Select **broadcast**, then **IPv4 multicast**. Look at the last bit of the first byte: it is 1 for every group address.
+5. Turn on the VLAN tag. The header grows to 18 bytes, and the padding shrinks by 4.
+
+## MAC addresses
+
+A **MAC address** is 48 bits, written as six bytes in hex. Two bits of the first byte have special meanings.
+
+- The least significant bit is the **I/G bit** (individual or group). A 1 marks a group address: multicast or broadcast. Ethernet sends each byte least significant bit first, so this is the first address bit on the wire. A receiver knows at once if the frame is for a group.
+- The next bit is the **U/L bit** (universal or local). A 1 marks a **locally administered** address, which software chose. A 0 marks a universal address that the maker assigned.
+
+In a universal address from a large block (MA-L), the first 24 bits are the maker's **OUI** (Organizationally Unique Identifier). The IEEE Registration Authority sells these blocks. The maker numbers its NICs with the other 24 bits. Hypervisors and container runtimes make up addresses, so they should set the U/L bit.
+
+Multicast IP groups map to group MACs. For IPv4, RFC 1112 puts the low 23 bits of the group after `01:00:5e`. A group address has 28 variable bits, so 32 groups share each MAC, and the IP layer must filter the rest. For IPv6, RFC 2464 puts the low 32 bits after `33:33`.
+
+## The FCS catches damage
+
+The FCS is a **cyclic redundancy check** (CRC). The sender treats the frame as a long binary polynomial, divides it by a fixed generator of degree 32 (`0x04C11DB7`), and sends the remainder. The receiver runs the same division. Hardware does it as the bits arrive, with a shift register and a few XOR gates.
+
+A CRC with a generator of degree 32 detects every burst of errors of 32 bits or less. Koopman measured the Ethernet polynomial (DSN 2002). For frames up to the Ethernet MTU, it detects every error of 3 bits or less: its Hamming distance is 4. A random error that is not a burst slips through with a probability of about one in $2^{32}$.
+
+The receiver does not compare two numbers. It runs the CRC over the whole frame, FCS included, and compares the result with one constant, `0x2144DF1C` in the usual software form. The demo shows this value for each frame.
+
+```rust
+// Ethernet appends the FCS least significant byte first, so a good frame
+// always gives the same CRC over all of its bytes.
+fn fcs_ok(frame_with_fcs: &[u8]) -> bool {
+    crc32fast::hash(frame_with_fcs) == 0x2144_DF1C
+}
+```
+
+Compare this with the 16-bit **Internet checksum** (RFC 1071) that IPv4, TCP and UDP use. It is a sum, and a sum does not see order. In 10,000 random frames, the simulation applied each kind of error once per frame:
+
+| Error | CRC-32 missed | Internet checksum missed |
+|---|---|---|
+| one bit | 0 | 0 |
+| two bits | 0 | 289 |
+| burst of 32 bits or less | 0 | 0 |
+| two 16-bit words swapped | 0 | 10,000 |
+
+A bad frame is dropped, not repaired. Linux counts it in `rx_crc_errors` (in `struct rtnl_link_stats64`), and `ip -s -s link` shows it in the crc column. A switch that works in **store-and-forward** mode checks the FCS before it forwards, so it drops bad frames too. A **cut-through** switch starts to send before the FCS arrives, so it can only forward a bad frame and mark it.
+
+## Why at least 64 bytes
+
+The 64-byte minimum comes from the shared cable of early Ethernet. Every station listened before it sent (**carrier sense**). Two stations could still start at almost the same time, before the signal of the other arrived. The method was **CSMA/CD** (carrier sense multiple access with collision detection). A station listens while it sends. A collision makes it stop, send a jam signal, and try again after a random wait.
+
+Detection works only while the sender is still sending. In the worst case, A starts, and B, at the far end, starts just before A's signal reaches it. The collision then needs a full round trip to come back to A. If A finished its frame before that, A believes the frame went out fine, and nobody sends it again.
+
+<Predict
+  id="slot"
+  question="At 10 Mb/s, a 64-byte minimum frame allows a collision domain of about 2.5 km. Keep the 64-byte minimum and CSMA/CD, but run at 1 Gb/s. About how long can the cable be?"
+  options={["Still about 2.5 km: the speed of light does not change", "About 10 times shorter", "About 100 times shorter"]}
+  answer={2}
+  explain="At 1 Gb/s a frame of 512 bits lasts 100 times less time than at 10 Mb/s. The signal crosses the cable at the same speed. So the round trip must be 100 times shorter: about 25 m. Gigabit half duplex therefore made the slot 8 times longer."
+>
+<CollisionWindowDemo />
+</Predict>
+
+1. At 10 Mb/s, set the cable to 2500 m. The 512-bit frame is longer than the 217-bit round trip of the cable alone.
+2. Select **1 Gb/s** with a 64-byte frame. The collision reaches A long after A finished: the dot turns red. The longest cable for this frame is now 59 m.
+3. At 1 Gb/s, raise the frame size to 512 bytes. A detects the collision again.
+4. Shorten the cable at 1 Gb/s until a 64-byte frame works.
+
+The standard sets the **slot time** to 512 bit times at 10 and 100 Mb/s. That is the round trip of the largest allowed network: 2500 m for 10BASE5 with four repeaters. The simulation counts only the cable, so it gets about half of that. The real budget also counts repeaters, transceivers and the jam signal.
+
+At 1 Gb/s, the same rule gives a network that is too small to use. Half-duplex gigabit Ethernet therefore made the slot 4096 bit times (512 bytes). A short frame is followed by **carrier extension**, symbols that only fill time. 10 Gb/s Ethernet (802.3ae) dropped half duplex and CSMA/CD completely.
+
+Almost every link today is full duplex, so frames never collide. 100BASE-TX and fiber links use one pair or one fiber for each direction. 1000BASE-T sends both ways on all four pairs at once and cancels its own echo. The 64-byte minimum stays, because every NIC and switch expects it.
+
+## What a frame costs on the wire
+
+Each frame carries a fixed cost: 8 bytes of preamble and SFD, 14 bytes of header, 4 bytes of FCS, and a 12-byte gap. That is 38 bytes, whatever the payload. A short payload is also padded to 46 bytes.
+
+<WireCostDemo />
+
+1. At 1500 bytes, 97.5% of the wire carries payload. Set 64 bytes and watch the share fall.
+2. Set 46 bytes at 10 Gb/s. The NIC must handle 14.88 million frames per second: one frame every 67.2 ns.
+3. Set 9000 bytes, a common jumbo frame. The share rises only to 99.6%, but the frame rate falls by a factor of almost six.
+4. Turn on the VLAN tag at 1500 bytes. Each frame now costs 4 more bytes.
+
+The time per frame is the real limit for small packets. At 67.2 ns per frame, a CPU core at 3 GHz (a model input) has about 200 cycles for each packet. The Linux stack needs more than that, which is why fast packet paths such as XDP and DPDK exist.
+
+**Jumbo frames** raise the MTU above 1500, often to 9000 bytes. They cut the per-packet work of the hosts by almost six. The wire overhead falls only from 2.5% to 0.4%. They are not part of IEEE 802.3, so every NIC, switch and router on the path must agree on the size. A switch or NIC with a smaller MTU drops the large frames, often with no message. On Linux, `ip link set dev eth0 mtu 9000` changes the MTU.
+
+## Connect
+
+- [Layers and encapsulation](/networking/foundations/layers-and-encapsulation): where the frame sits in the stack.
+- [ARP](/networking/link/arp): how a host finds the destination MAC for an IP address.
+- [Switches and VLANs](/networking/link/switches-and-vlans): what a switch does with the source and destination MACs.
+- [Reliability and retransmission](/networking/transport/reliability-and-retransmission): who recovers a frame that the FCS dropped.
+- [Zero-copy](/networking/programming/zero-copy) and [latency vs throughput](/performance/systems/latency-vs-throughput): why the packet rate, not the bit rate, limits a host.
+
+<Recall cards={[
+  { q: "List the fields of an Ethernet frame with their sizes, from the first bit on the wire.", a: "Preamble 7, SFD 1, destination MAC 6, source MAC 6, EtherType 2, payload 46 to 1500, FCS 4. Then a 12-byte gap. An 802.1Q tag adds 4 bytes after the source MAC." },
+  { q: "What do the two lowest bits of a MAC address's first byte mean?", a: "Bit 0 is I/G: 1 means a group (multicast or broadcast) address. Bit 1 is U/L: 1 means a locally administered address that software chose." },
+  { q: "What does a NIC do with a frame whose FCS does not match, and who recovers it?", a: "It drops the frame and increments an error counter (rx_crc_errors on Linux). Ethernet sends no feedback; a higher layer such as TCP detects the loss and retransmits." },
+  { q: "Why must a CSMA/CD frame be at least as long as the network's round trip?", a: "A sender detects a collision only while it is still sending. If the frame ends before the collision comes back, the sender thinks it succeeded and never retries." },
+  { q: "Why does a minimum-size frame cost 84 bytes of wire time, and what rate does that give at 10 Gb/s?", a: "64 bytes of frame plus 8 of preamble and SFD plus a 12-byte gap. At 10 Gb/s that is 14.88 million frames per second, one every 67.2 ns." },
+  { q: "Which error does the Internet checksum miss that CRC-32 catches, and why?", a: "Two 16-bit words that swap places. A sum does not depend on order, but a CRC is a polynomial remainder that depends on the position of every bit." },
+]} />

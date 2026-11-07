@@ -1,0 +1,113 @@
+---
+summary: "The layers of a store such as etcd or CockroachDB: client API, routing, ranges, one Raft group per range, the state machine, three read paths, and transactions across ranges. Then the design choices (one group or many, ReadIndex or leases, fixed or split ranges) and what each one costs."
+---
+import { ArchitectureDemo, DesignExplorerDemo } from "@/demos/dist/CapstoneArchDemos";
+
+The earlier modules built the parts one at a time: [Raft](/distributed/consensus/raft-log-replication), [linearizability](/distributed/consistency/linearizability), [sharding](/distributed/partitioning/sharding), [clocks](/distributed/time/hybrid-logical-clocks) and [leases](/distributed/coordination/leases-and-fencing-tokens). A **replicated store** joins them into one service that keeps keys and values safe on several machines. etcd, CockroachDB, TiKV and DynamoDB are replicated stores. This lesson shows the layers and the choices. The next lesson builds a working store, the third lesson tries to break it, and the last one compares three real designs.
+
+The [databases capstone](/databases/engine/architecture-of-an-embedded-engine) did the same for one machine. A replicated store has an engine of that kind inside each replica. The new problems are above the engine: which machine holds a key, who may change it, and how a read knows that it is current.
+
+## The layers
+
+| Layer | Job | In this track |
+|---|---|---|
+| Client API | `put`, `get`, `delete`, compare-and-set, transactions; retries with a session id | [timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency) |
+| Routing | find the range that holds a key, and its leader | [sharding](/distributed/partitioning/sharding), [consistent hashing](/distributed/partitioning/consistent-hashing) |
+| Transactions | change keys in several ranges atomically | [two-phase commit](/distributed/transactions/two-phase-commit), [Percolator](/distributed/transactions/percolator-and-snapshot-isolation) |
+| Leader or leaseholder | order the writes of one range, answer its reads | [leases and fencing tokens](/distributed/coordination/leases-and-fencing-tokens) |
+| Replicated log | one Raft group per range: commit on a majority | [Raft log replication](/distributed/consensus/raft-log-replication) |
+| State machine | apply committed commands to a map, an LSM tree or a B+ tree | [the embedded engine](/databases/engine/architecture-of-an-embedded-engine) |
+
+A **range** is a contiguous slice of the key space, such as all keys from `h` up to `p`. Each range has its own replicas and its own Raft group. One machine holds replicas of many ranges, and it leads some of them. This design is called **multi-Raft**. A store with one Raft group for all keys, such as etcd, is the special case with one range.
+
+<Predict
+  id="arch-lease"
+  question="A get arrives at the gateway. The range location is cached, and the range leader holds a valid lease. How many messages does the Raft layer send for this read?"
+  options={["Four: a heartbeat round to two followers", "Two: one AppendEntries and one reply", "None"]}
+  answer={2}
+  explain="Under a valid lease the leader knows that no other leader can exist, so it answers from its own state machine. The read still costs the hops from the client to the gateway and from the gateway to the leader. ReadIndex would add the heartbeat round of four messages."
+>
+<ArchitectureDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **put** on `cat` and step through. The request costs 8 messages and 55.7 ms. Two go between the app and the gateway, 2 between the gateway and the leader, and 4 form the Raft round.
+2. Select **get** with **ReadIndex**. It also costs 8 messages, because the leader confirms its term with a heartbeat round. Select **lease**: the Raft layer stays dark, and the read costs 4 messages and 40.9 ms.
+3. Turn off **Range location cached**. The gateway first reads the meta range, which adds 6 messages and 33.3 ms. A real gateway caches locations, so this cost appears only after a split or a move.
+4. Select **txn**. Two ranges and a transaction record replicate in parallel: 24 messages in 62.6 ms. The intents are resolved after the answer, with 12 more messages.
+
+## The life of a write
+
+A `put(k, v)` passes the layers in this order:
+
+1. **Client API.** The client tags the command with its session: a client id and a sequence number. A retry carries the same tag.
+2. **Routing.** The gateway maps `k` to a range with its range cache. On a miss, it reads the location from the meta ranges.
+3. **Leader.** The gateway sends the command to the range leader. A follower would answer with a hint that names the leader.
+4. **Raft.** The leader appends the entry, sends `AppendEntries` to the followers, and waits for a majority to store it. The entry is then committed.
+5. **State machine.** Each replica applies the entry in log order. The session table drops a command whose tag it has already applied.
+
+The leader answers after it applies the entry. In the sim, one-way delays are 5 to 15 ms (a model input). A write by one client in a loop took 37.7 ms on average there. A real deployment adds an fsync on the leader and on the followers, which the next lesson discusses.
+
+## Three ways to read
+
+A read must not return a value that an acknowledged write has already replaced. A leader that a partition has replaced does not know that it is old. So a linearizable read needs some proof that the leader is still current. The Raft dissertation (Ongaro 2014, section 6.4) describes the options.
+
+| Read path | Proof of leadership | Cost per read (sim, 3 servers) | Depends on |
+|---|---|---|---|
+| through the log | the read is an entry; it commits only under a current leader | 6 messages, 37.7 ms | nothing extra; also a disk write on a majority |
+| ReadIndex | a heartbeat round that a majority acknowledges | 6 messages, 38.7 ms | nothing extra |
+| leader lease | no other leader can exist before the lease ends | 2 messages, 20.3 ms | a bound on clock drift |
+
+ReadIndex and the log read cost the same here, because the sim models no disk. In a real store the log read also pays for an fsync on a majority. The lease read pays no round at all, but it trusts clocks. The [lease lesson](/distributed/coordination/leases-and-fencing-tokens) shows how a slow clock breaks a lease.
+
+etcd uses ReadIndex. Its Raft library has a lease-based option, `ReadOnlyLeaseBased`, but the etcd server does not set it, so the default `ReadOnlySafe` mode applies. A CockroachDB range has a **leaseholder**, the only replica that serves strongly consistent reads and proposes writes. Since version 25.2, the default is a "leader lease", which the Raft leader holds, except briefly during a lease transfer. DynamoDB uses Multi-Paxos per partition, and its paper says that the leader "extends its leadership using a lease mechanism".
+
+## Ranges, splits and routing
+
+One Raft group has one leader, and every write goes through it. The data must also fit on every replica. Splitting the key space into ranges removes both limits. Each range is small, so it can move to another machine in seconds. Leaders spread over all machines, so writes use all of them.
+
+CockroachDB splits a range when it grows past `range_max_bytes`, 512 MiB by default, and merges small ranges below `range_min_bytes`, 128 MiB. TiKV calls its ranges Regions; the default `region-split-size` is 256 MiB since version 8.4.0, and was 96 MiB before. CockroachDB also splits a range that gets too much load.
+
+The router needs a map from keys to ranges. CockroachDB keeps it in a two-level index: the range `meta1` addresses `meta2`, and `meta2` addresses the data ranges. Each node caches the `meta2` entries that it has used. A stale cache entry costs time, not safety: the request fails at the old place, and the gateway looks the range up again.
+
+Many groups cost many heartbeats. With 8,000 ranges of three replicas and a 50 ms heartbeat, one heartbeat per group would send 640,000 messages per second. The CockroachDB paper (SIGMOD 2020) names two fixes. It coalesces heartbeats into one per pair of nodes, and it pauses (quiesces) groups that have no recent writes. With 9 nodes, coalescing alone brings the count to 1,440.
+
+## Transactions on top
+
+A write to two ranges touches two Raft groups, and neither log can order both. So a multi-range transaction needs a protocol above Raft. CockroachDB writes **intents**, provisional values that point to a **transaction record**. With **parallel commits**, the intents and a `STAGING` record replicate at the same time. The paper says that parallel commits and write pipelining together let many transactions commit "with the latency of just one round of replication". The intents become normal values later, in the background.
+
+A single-key write needs none of this. The demo shows the difference: one range costs one Raft round, and two ranges cost two rounds in parallel plus the cleanup.
+
+## Choices and their consequences
+
+<DesignExplorerDemo />
+
+1. Start with one group and ReadIndex: this is etcd. Writes are bound by one leader, 20,000 per second in the model, and every key stalls during an election.
+2. Select **one per range**. The write ceiling grows to 60,000 per second, and one crash stalls only 11% of the keys. The cost is 8,000 Raft groups and the need for transactions across them.
+3. Select **leader lease**. The read latency falls from 38.7 ms to 20.3 ms. The explorer names CockroachDB and DynamoDB, which both use a leader with a lease and split ranges as they grow.
+4. Select **5** replicas. The store survives two failures, but the write ceiling falls to 36,000 per second, because each write does five units of work.
+
+| Choice | Option A | Option B | Systems |
+|---|---|---|---|
+| Raft groups | one: simple, total order of all writes, bound by one leader and one disk | one per range: scales out, needs routing and cross-range transactions | etcd vs CockroachDB, TiKV |
+| Reads | ReadIndex: one round to a majority per read, no clock assumption | lease: no round, needs bounded clock drift | etcd vs CockroachDB, DynamoDB |
+| Ranges | fixed: simple, but a hot or large range cannot be split | split at a size or a load: small units to move and balance | CockroachDB splits at 512 MiB |
+| Replicas | 3: survives one failure | 5: survives two, costs more per write | CockroachDB defaults to 3 |
+
+## Connect
+
+- [A Raft key-value store, end to end](/distributed/capstone/a-raft-key-value-store-end-to-end): the store of this lesson as working code.
+- [Rebalancing](/distributed/partitioning/rebalancing) and [hot keys](/distributed/partitioning/hot-keys): what splits and moves are for.
+- [Spanner and TrueTime](/distributed/transactions/spanner-and-truetime): Paxos groups with leader leases, and transactions across them.
+- [ZooKeeper and etcd](/distributed/coordination/zookeeper-and-etcd): a single-group store used for coordination.
+- [Architecture of an embedded engine](/databases/engine/architecture-of-an-embedded-engine): the engine inside each replica.
+
+<Recall cards={[
+  { q: "Name the layers that a write passes in a range-partitioned replicated store.", a: "The client API with a session tag, then routing from key to range to leader. Then the range leader, the Raft log that commits on a majority, and the state machine on each replica." },
+  { q: "What does a ReadIndex read cost, and what does it prove?", a: "One heartbeat round that a majority acknowledges. It proves that the leader was still the leader after the read began, so no newer write can be missing." },
+  { q: "Why does a lease read depend on clocks?", a: "The leader answers alone while it believes the lease is valid. If its clock runs slower than the assumed bound, a new leader can exist and commit writes before the old lease really ended." },
+  { q: "What two problems does splitting the key space into ranges solve, and what new problem does it bring?", a: "It removes the single-leader write bottleneck and the limit that all data fits on one replica. Writes that touch several ranges then need a transaction protocol above Raft." },
+  { q: "How does CockroachDB keep the heartbeat cost of many Raft groups low?", a: "It coalesces heartbeats into one per pair of nodes, and it quiesces groups with no recent writes." },
+  { q: "What does parallel commits replicate at the same time?", a: "The transaction's intents and a STAGING transaction record. With write pipelining, a transaction can then commit after one round of replication." },
+]} />

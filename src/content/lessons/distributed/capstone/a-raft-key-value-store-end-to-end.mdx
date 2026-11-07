@@ -1,0 +1,148 @@
+---
+summary: "A working replicated key-value store, built from the Raft sim of this track: a state machine with put, get, delete and compare-and-set, client sessions for exactly-once writes, linearizable reads by ReadIndex and by a leader lease, snapshots and membership changes. Then faults by hand, and the linearizability checker on the history."
+---
+import { KvPlaygroundDemo, FaultPanelDemo } from "@/demos/dist/CapstoneKvDemos";
+
+The [last lesson](/distributed/capstone/architecture-of-a-replicated-store) drew the layers of a replicated store. This lesson builds one range of that store as code. It uses the Raft sim from the [consensus module](/distributed/consensus/raft-log-replication) without a change, and adds what a store needs on top. The code is in `src/sims/dist/capstone/store.ts`, and the demos run it.
+
+## The parts
+
+| Part | Job | Where |
+|---|---|---|
+| `StoreMachine` | apply `put`, `del`, `cas` (and `get` for log reads) to a map; count a revision | the state machine |
+| session table | remember the last `(client, seq)` and its result per client | inside Raft's apply loop, saved in snapshots |
+| `KvClient` | one operation at a time, a timeout, retries, leader hints | a client on its own network node |
+| read paths | log read, ReadIndex, lease read | `KvStore`, on top of the Raft API |
+| `RaftCluster` | elections, the log, snapshots, membership | the committed Raft sim |
+
+A value of 0 means "absent". So `del` writes 0, and `cas(k, 0, v)` creates `k` only if it does not exist.
+
+<Predict
+  id="kv-session"
+  question="A client sends cas(x, 0 → 1). The leader applies it, but the reply is lost. The client sends the same request again. With sessions, what does the client get back?"
+  options={["ok: the leader finds (client, seq) in its session table and returns the saved result", "failed: x is already 1, so the second cas does not match", "nothing: the leader ignores the duplicate"]}
+  answer={0}
+  explain="The session table maps each client to its last sequence number and result. The retry has the same sequence number, so the leader answers with the saved result and does not apply the command again. Without sessions, the retry applies a second time and fails, although the first attempt succeeded."
+>
+<KvPlaygroundDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Send as C1** for `put x=5`, then **Run**. Watch the entry appear in S2's log, turn solid on a majority, and reach `x=5` on every server. The operation list shows the server that answered.
+2. Select **get** and send it. With **ReadIndex**, the answer comes from the leader after a heartbeat round. Select the **lease** read path and send again: the leader shows how long its lease lasts, and the read needs no round.
+3. Click **crash** on the leader, and send a write. The client times out, tries the next server, and follows its hint to the new leader. Then click **recover**: the old leader rejoins as a follower and catches up.
+4. Click **add** on S4: it joins as a learner and copies the log, but it does not vote. Click **promote**: it becomes the fourth voter. A second change at once is refused until the first one commits.
+5. Click **snapshot** on a follower. Its log turns grey up to the snapshot index. The snapshot holds the map, the revision and the session table.
+
+## The state machine and sessions
+
+The state machine must be deterministic: every replica applies the same commands in the same order and reaches the same state. A Go sketch of the apply step:
+
+```go
+type Cmd struct {
+	Op       string // "put", "del", "cas", "get"
+	Key      string
+	Value    int64
+	Expect   int64
+	ClientID uint64 // the session
+	Seq      uint64
+}
+
+type Result struct {
+	OK    bool
+	Value int64
+	Rev   int64
+}
+
+func (s *Store) Apply(c Cmd) Result {
+	if last, ok := s.sessions[c.ClientID]; ok && c.Seq <= last.Seq {
+		return last.Result // a retry: never apply twice
+	}
+	cur := s.data[c.Key]
+	var r Result
+	switch {
+	case c.Op == "get":
+		r = Result{true, cur, s.rev}
+	case c.Op == "cas" && cur != c.Expect:
+		r = Result{false, cur, s.rev}
+	default:
+		next := c.Value
+		if c.Op == "del" {
+			next = 0
+		}
+		s.data[c.Key] = next
+		s.rev++
+		r = Result{true, next, s.rev}
+	}
+	s.sessions[c.ClientID] = Session{c.Seq, r}
+	return r
+}
+```
+
+The Raft dissertation describes this in section 6.3, "Implementing linearizable semantics". Without it, a retry is a new command. A `put` that runs twice can still break linearizability, and a `cas` that runs twice reports failure for a change that took place. The session table is part of the state, so it must also be part of every snapshot. In the sim, `Snapshot.sessions` carries it, and `InstallSnapshot` restores it.
+
+## Linearizable reads, on top of the Raft API
+
+The Raft sim has no read path. Reading a follower's map can return an old value, as the [linearizability lesson](/distributed/consistency/linearizability) showed. The store adds two correct paths, without changes to `raft.ts`. It wraps the network handlers of the cluster, so that it can add its own messages and still pass every Raft message on.
+
+**ReadIndex** follows section 6.4 of the dissertation. A Rust sketch:
+
+```rust
+fn read(&mut self, key: &str, reply: Reply) {
+    if !self.is_leader() { return reply.redirect(self.leader_hint()); }
+    // 1. A new leader first commits an entry of its own term (the no-op).
+    //    Until then, its commit index may be behind the true one.
+    if self.term_at(self.commit_index) != self.current_term {
+        return self.pending.push(Waiting::ForNoop(key.into(), reply));
+    }
+    // 2. Note the read index, and ask every voter to confirm the term.
+    let ctx = self.next_ctx();
+    self.pending.push(Waiting::ForQuorum { ctx, read_index: self.commit_index, key: key.into(), reply });
+    for v in self.voters() { self.send(v, Msg::RiPing { term: self.current_term, ctx }); }
+}
+// 3. When acks with this term arrive from a majority, and
+// 4. last_applied >= read_index: answer from the state machine.
+```
+
+The proof is in the acks. A follower answers with its current term. If a majority still has this leader's term after the read began, no other leader can have committed anything before the read. In the sim, a read by one client cost 6 messages and 38.7 ms on average. The one-way delays are 5 to 15 ms, a model input.
+
+A **lease read** skips the round. The leader stamps each `AppendEntries` with its own clock, and the follower echoes the stamp in its reply.
+
+When a majority has echoed stamps that are no older than `s`, the leader holds a lease until `s + electionTimeout.min × (1 − ε)` on its own clock. Here ε is the assumed bound on clock drift, a model input of 5%. The followers keep their side of the promise with a rule from section 4.2.3 of the dissertation. A follower that heard from a leader within the minimum election timeout does not vote for another candidate. The etcd raft library turns this rule on with `CheckQuorum`. Lease reads cost 2 messages and 20.3 ms in the sim.
+
+A lease has one more trap. A server that restarts forgets when it last heard from the leader, so it could vote at once and break the promise. In lease mode, the store makes a restarted server ignore `RequestVote` for one minimum election timeout.
+
+A scripted run (`leaseRestart` in `scenarios.ts`) shows why. One follower cannot reach the leader and campaigns in vain, because the other follower refuses. Then that other follower restarts, and the leader is cut off. Without the rule, the restarted follower votes at once, the new leader commits `x=1`, and the old leader serves `x=0` under its lease. With the rule, the vote is ignored and the history stays linearizable. The random fuzzer of the next lesson did not find this in 1,000 seeds, because it needs four events in a narrow order.
+
+## Snapshots and membership
+
+Both come from the Raft sim. A server snapshots on its own schedule, and a follower that is far behind gets `InstallSnapshot` in chunks. Membership changes add or remove one voter at a time, and a new server first joins as a learner, as in the [membership lesson](/distributed/consensus/raft-membership-changes-and-snapshots). The store only adds the parts that change with them: the read path sends its pings to the voters of the current configuration.
+
+## Faults, by hand
+
+<FaultPanelDemo />
+
+1. Click **Run**. Three clients loop on `x` and `y`. Click **Check linearizability**: the exact checker from the consistency module reads the whole history and finds an order.
+2. **crash the leader** while it runs. Operations stall for about one election, the clients retry, and some writes show two tries. Check again: still linearizable.
+3. **cut off the leader**. The old leader keeps accepting writes, but it cannot commit them, so it never answers them. Their clients time out and retry at the new leader. When the network heals, the new leader overwrites the old entries. Check: the history is still linearizable, because no client heard "ok" from the old leader.
+4. Turn on **lose 30% of messages**. Retries grow, and the session counter shows duplicates that the leader answered from its table.
+5. Select **any server (bug)**, run for a while, and check. The checker usually reports a red read: a follower answered with a value that a later write had already replaced.
+
+The store also exposed a bug in a checker. The Raft sim's safety monitor flags Leader Completeness when a leader lacks a committed entry. A paused candidate can win an election in an old term after the cluster has moved on. Raft's property covers only leaders of later terms, so this is a false alarm. The store filters it, and the next lesson shows how the fuzzer found it.
+
+## Connect
+
+- [Raft log replication](/distributed/consensus/raft-log-replication): the commit rule that the store relies on.
+- [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency): why retries need sessions.
+- [Checking histories like Jepsen](/distributed/consistency/checking-histories-like-jepsen): the checker behind the button.
+- [Deterministic simulation testing](/distributed/capstone/deterministic-simulation-testing): the same store under thousands of random faults.
+- [A tiny key-value store, end to end](/databases/engine/a-tiny-key-value-store-end-to-end): the single-machine engine that each replica could use.
+
+<Recall cards={[
+  { q: "What does the session table store, and why must snapshots include it?", a: "For each client, the last applied sequence number and its result. It is part of the replicated state: a server that restores a snapshot without it would apply a retried command a second time." },
+  { q: "Why does a cas that is applied twice break linearizability even when its value is the same?", a: "The second application fails, so the client hears 'failed' for a change that took effect. No order of the history explains a failed cas whose new value later appears." },
+  { q: "List the four steps of a ReadIndex read.", a: "First, commit an entry of the current term. Then note the commit index as the read index. Then confirm the term with a heartbeat round to a majority. Last, wait until the state machine has applied the read index, and answer." },
+  { q: "How long is a lease, and on which clock is it measured?", a: "From the oldest stamp that a majority has echoed, for the minimum election timeout times (1 − drift bound). It is measured on the leader's own clock." },
+  { q: "Why must a restarted server wait before it votes when the store uses lease reads?", a: "It forgot when it last heard from the leader, so it cannot know which lease it promised to respect. Voting at once could elect a new leader while the old lease is still valid." },
+]} />

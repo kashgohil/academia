@@ -1,0 +1,119 @@
+---
+summary: "Testing a distributed system inside a deterministic simulation, as FoundationDB, TigerBeetle and Antithesis do: one seed fixes every delay, loss and timer, so any failure replays exactly. Random fault schedules, swarm testing, targeted faults, invariant checks, shrinking to a minimal schedule, and how this differs from Jepsen."
+---
+import { SimFuzzerDemo, BreakItDemo } from "@/demos/dist/CapstoneDstDemos";
+
+A distributed bug often needs a rare order of events. Examples are a crash between two messages, a late vote, or a lost reply after a write applied. A test on real machines meets such an order by luck, and it cannot meet it again on demand. **Deterministic simulation testing** (DST) removes the luck.
+
+The whole system runs in one process, on a simulated network with simulated clocks and disks. One random seed decides every delay, loss and timer. So a run is a pure function of its seed, and a failing seed replays the same failure every time.
+
+This lesson tests the store of the [previous lesson](/distributed/capstone/a-raft-key-value-store-end-to-end) in this way. Every module of this track already runs on such a network, `src/sims/dist/net.ts`. The tester adds random faults, two checkers, and a shrinker.
+
+## Who does this
+
+**FoundationDB** made the method known. Will Wilson presented it at Strange Loop 2014 in the talk "Testing Distributed Systems w/ Deterministic Simulation". FoundationDB is written in Flow, an extension of C++ with actors and async/await. The SIGMOD 2021 paper says that the simulator models the "network, disk, time, and pseudo random number generator", "all within a single physical process". A macro, `BUGGIFY`, makes the code itself take rare paths in simulation, such as a slow reply or an early timeout. The FoundationDB docs estimate that the team has run "roughly one trillion CPU-hours of simulation".
+
+**TigerBeetle**, a financial database built on Viewstamped Replication, has the VOPR: "The Viewstamped Operation Replicator". It stubs out the clock, the network and the disk. A run is deterministic for a seed and a Git commit, and it injects lost and reordered packets, partitions, and corrupt disk reads and writes. Its docs say that the whole cluster runs real code under faults "at 1000x speed", on 1,024 cores, around the clock.
+
+**Antithesis** applies the idea to software that was not written for it. Its founders include Will Wilson and Dave Scherer, the chief architect of FoundationDB. Instead of a simulated network inside the program, it runs the program in a hypervisor that "emulates a deterministic computer". The company came out of stealth in February 2024, after more than five years.
+
+## The tester
+
+A run has five parts, all fixed by the seed:
+
+1. **The cluster:** 3 servers and 3 clients on the deterministic network, with one-way delays of 5 to 15 ms (a model input).
+2. **The workload:** each client loops `get` (40%), `put` (30%), `cas` (20%) and `del` (10%) on two keys. Write values are unique, so each read names the write that it saw.
+3. **The fault schedule:** 2 to 7 faults in the first 1,500 ms. Then everything heals, and the clients run on for 1,200 ms more.
+4. **The checkers:** the exact [linearizability checker](/distributed/consistency/checking-histories-like-jepsen) reads the whole history. The Raft safety monitor checks Election Safety, Leader Completeness, Log Matching and State Machine Safety.
+5. **A fingerprint:** a hash of every send, delivery, loss, timer and operation. Equal fingerprints mean equal runs.
+
+The faults come in two kinds.
+
+**Timed faults** start at a random time. They crash or restart a server, crash or cut off the leader, split the cluster, lose messages, slow the network, or pause a server.
+
+**Targeted faults** wait for a moment in the protocol, as `BUGGIFY` does. One restarts the next server that grants a vote. One cuts off the next new leader after its first append. One crashes the next leader that commits.
+
+A narrow window, such as the time between two vote requests, is easy for a targeted fault and rare for a timed one.
+
+Each seed also draws a **swarm**: a random subset of the fault kinds and a random load. Swarm testing (Groce et al., ISSTA 2012) found that tests which leave some features out reach states that the full mix blocks. A schedule with only cuts and no crashes, for example, lets a stale log grow long.
+
+<Predict
+  id="dst-follower"
+  question="The bug: reads go to a random server, which answers from its own map. The fuzzer finds a failing seed and shrinks its fault schedule. How many faults does the minimal schedule keep?"
+  options={["At least one cut, so that a follower falls behind", "None: a follower lags behind the leader in a healthy cluster too", "Two: a cut and a crash of the leader"]}
+  answer={1}
+  explain="A follower applies an entry only after the leader's next message tells it about the commit. In that gap, a read on the follower returns the old value, although the write has returned to its client. The shrinker removes every fault, and the run still fails."
+>
+<BreakItDemo />
+</Predict>
+
+1. Hunt for **read from any server**. Seed 1 fails at once, and all 5 of its faults shrink away. In the replay, a client's write returns, and a later read on a lagging follower returns the old value.
+2. Select **no session dedup**. Seed 5 fails, and its 6 faults shrink to 1: crash the next leader that commits. The leader replicates a `cas` and dies before it answers. The new leader commits and applies the entry, but it does not know that a client waits. The client retries, the retry applies a second time, and the client hears "failed". Click **same seed, bug fixed** to see the session table answer the retry instead.
+3. Select **votedFor not on disk**. Seed 5 fails with two leaders in term 2. The minimal schedule keeps a restart of a server right after it voted. That server forgets its vote and votes again in the same term.
+4. Select **commit older terms**. This bug needs the Figure 8 order from the [log replication lesson](/distributed/consensus/raft-log-replication). An old-term entry sits on a minority, and a newer conflicting entry sits elsewhere. Then a leader commits the old entry by counting replicas. Its hunt uses only three targeted faults, and seed 590 is the first to fail.
+
+## Why determinism matters
+
+A failure in a real cluster leaves a log and a guess. A failure in the simulator leaves a seed. Replaying the seed gives the same fingerprint. So a developer can add print statements, set breakpoints, or step through the run, and the bug stays put. A fix is checked by running the same seed again.
+
+Determinism has a price: every source of randomness must come from the seed. In this track, protocols call `net.random()`, never `Math.random`. Time is the network's time, not the wall clock. Iteration over a hash map must have a fixed order. FoundationDB pays this price for the whole database: all I/O goes through interfaces that the simulator can replace.
+
+## Shrinking
+
+A failing schedule from the fuzzer has many faults, and most of them do not matter. The shrinker keeps the seed and tries smaller schedules:
+
+1. Remove one fault. If the run still fails in the same way (the same checker), keep the smaller schedule.
+2. When no single fault can go, halve the length of each fault, and keep each change that still fails.
+3. Stop when nothing changes. The result is **1-minimal**: removing any one remaining fault makes the failure go away.
+
+The seed stays the same, but the run does not stay "the same run". Removing a fault changes which messages are sent, and so which random delays they draw. So a smaller schedule can fail for another reason, or pass by chance. The shrinker accepts any failure of the same kind, as test-case reducers usually do. In the tests, every shrunk schedule of every bug still fails, and the same seed with the same schedule passes when the bug is fixed.
+
+## Coverage
+
+A fuzzer that passes means little unless it reached the hard states. The second demo counts what the runs did, not only what they injected.
+
+<SimFuzzerDemo />
+
+1. Click **Run** with **ReadIndex**. Seeds pass one after another. Watch the fault bars fill and the counters of elections, truncated logs, retries and duplicate writes grow.
+2. Click **Pause**, then **Replay last seed**. The replay has the same fingerprint as the first run.
+3. Select **lease**. Reads now come from the lease, and the ReadIndex counter almost stops. The fuzzer still finds no failure.
+4. Turn off **swarm testing**. Every seed now uses every fault kind at full load.
+
+In the tests, 1,000 seeds pass with each of the three read paths. With ReadIndex, they check 39,700 operations and reach 2,173 elections, 237 log truncations and 290 duplicate writes that the sessions stopped.
+
+The counters also show what a fuzzer cannot reach. With the default mix, the Figure 8 bug did not fail in 1,000 seeds; it needed its own mix. The lease bug of the previous lesson, a vote right after a restart, did not fail in 1,000 seeds either; it needed a scripted run. A pass is evidence about the states that the runs visited, and only about those.
+
+## A checker can be wrong too
+
+An early version of this tester flagged the correct store. Seed 103 with one fault, a pause of S3 at 180 ms for 262 ms, broke Leader Completeness, said the Raft safety monitor. The replay showed what happened. S3 had collected its votes for term 1, and then it paused. Meanwhile the other servers moved on to term 2 and committed entry 1. When S3 resumed, it processed its old vote replies and became leader of term 1.
+
+That is legal Raft. Leader Completeness covers leaders of later terms, and term 1 is earlier. S3 can do no harm: every message it sends carries term 1, and every server rejects it. The monitor checked every leader against every committed entry, so it raised a false alarm. The fix went into the Raft module: the monitor now checks only leaders of terms later than the commit. Without a deterministic replay, this would have been a mystery.
+
+## How this differs from Jepsen
+
+| | Jepsen | Deterministic simulation |
+|---|---|---|
+| What runs | the real binaries, on real machines or containers | the system's code in one process, on simulated I/O |
+| Faults | real partitions, kills, pauses and clock changes from outside | simulated, at any point, including inside the protocol |
+| Reproduce a failure | often not: timing is real | always: the seed and the schedule |
+| Speed | real time | faster than real time; many seeds in parallel |
+| Finds bugs in | the system as deployed, including the OS, the network stack and the configuration | the logic; the simulator's model of the world can be wrong |
+| Needs | nothing from the system but a client | all I/O behind interfaces, or a deterministic hypervisor |
+
+The two methods share their checkers: a history of invocations and completions, and a linearizability or isolation check. Jepsen tests what users run. DST tests the logic far more often and makes every failure easy to debug. Teams such as FoundationDB's use simulation as the main test, and add tests on real hardware.
+
+## Connect
+
+- [Checking histories like Jepsen](/distributed/consistency/checking-histories-like-jepsen): the checker that reads every history here.
+- [Crash testing the engine](/databases/engine/crash-testing-the-engine): the same method for a single-machine engine, with power cuts instead of partitions.
+- [The network model](/distributed/foundations/the-network-model-messages-delays-and-partitions): the deterministic network that every module uses.
+- [Raft leader election](/distributed/consensus/raft-leader-election): why votedFor must be on disk.
+
+<Recall cards={[
+  { q: "What makes a simulation run deterministic, and what does that buy?", a: "Every delay, loss, timer and random choice comes from one seed, and time is simulated. The same seed and schedule give the same run, so any failure replays exactly for debugging and for checking a fix." },
+  { q: "What is a targeted fault, and why does the tester need it?", a: "A fault that waits for a protocol moment, such as restarting the next server that grants a vote. Narrow windows like the one between two vote requests are rare for faults at random times." },
+  { q: "Describe the shrinking loop and its result.", a: "Keep the seed. Remove one fault at a time, and keep each removal after which the run still fails the same checker. Then halve fault lengths. Stop when nothing changes: removing any remaining fault makes the failure go away." },
+  { q: "Why can a smaller schedule fail for a different reason than the original?", a: "Removing a fault changes which messages are sent, so the seed's random delays fall on other messages. The run diverges from the original." },
+  { q: "Name two things Jepsen can find that a deterministic simulation can miss.", a: "Bugs in the real environment: the OS, the network stack, the configuration, the deployed binary. And behaviour that the simulator's model of the network, disk or clocks gets wrong." },
+  { q: "Why was the Leader Completeness report on the paused server a false alarm?", a: "The paused server became leader of an older term than the one in which the entry was committed. The property covers only later terms, and every server rejects the stale leader's messages." },
+]} />

@@ -1,0 +1,105 @@
+---
+summary: "Three real replicated stores side by side: etcd (one Raft group, linearizable reads by ReadIndex, watches, leases), CockroachDB (ranges with their own Raft groups, leaseholders, hybrid logical clocks, serializable transactions) and DynamoDB (partitions with a Multi-Paxos leader that holds a lease, conditional writes, global tables). What each guarantees, how a write and a read flow, how each fails, and when to choose it."
+---
+import { FlowCompareDemo, WorkloadFitDemo } from "@/demos/dist/CapstoneCompareDemos";
+
+The first lesson of this module listed the design choices of a replicated store. This lesson looks at three systems that made those choices differently. **etcd** keeps all keys in one Raft group. **CockroachDB** splits the keys into ranges, each with its own Raft group, and runs SQL transactions on top. **DynamoDB** splits a table into partitions, each with a Paxos group, and AWS operates it for you.
+
+## Three designs
+
+| | etcd | CockroachDB | DynamoDB |
+|---|---|---|---|
+| Unit of replication | the whole key space: one Raft group | a range of keys: one Raft group each | a partition: one Multi-Paxos group each |
+| Replicas | the members, usually 3 or 5 | 3 per range by default | replicas in different Availability Zones |
+| Who serves strong reads | any member, after it gets a read index from the leader | the leaseholder, under its lease | the leader, under its lease |
+| Weaker reads | serializable reads on any member | follower reads (`AS OF SYSTEM TIME`) on the nearest replica | eventually consistent reads on any replica |
+| Multi-key atomicity | `Txn`: If/Then/Else over any keys | SQL transactions, SERIALIZABLE by default | `TransactWriteItems`, up to 100 items |
+| Storage engine | bbolt, a B+ tree | Pebble, an LSM tree | a B-tree and a write-ahead log per replica |
+| Size | 2 GiB quota by default, 8 GiB suggested maximum | grows with nodes | grows with partitions |
+
+### etcd
+
+etcd stores every key in one Raft group, with a 64-bit **revision** that grows on each change. Writes go through the Raft log. Reads are linearizable by default: the server runs a ReadIndex round before it answers. A client can ask for a **serializable** read instead (`etcdctl get --consistency=s`), which any member answers from its local state and which can be stale.
+
+Two features make etcd a coordination service. A **watch** streams every change to a key or a key range, from a given revision on. A **lease** has a time-to-live that the client must renew with `LeaseKeepAlive`; when it expires, etcd deletes every key that is attached to it. A `Txn` compares keys and then runs one of two lists of operations, atomically. The source calls these "mini-transactions".
+
+The limits follow from one group. Every write passes one leader, and every member holds all the data. The default storage quota is 2 GiB, and the docs suggest 8 GiB as a maximum. A request may be at most 1.5 MiB. The defaults for `--heartbeat-interval` and `--election-timeout` are 100 ms and 1000 ms.
+
+### CockroachDB
+
+CockroachDB splits its key space into ranges of up to 512 MiB, three replicas each. Each range is a Raft group. One replica holds the range **lease**: the leaseholder is the only replica that serves strongly consistent reads and proposes writes. Since version 25.2, the default lease type is the leader lease, which the Raft leader holds, except briefly during a lease transfer.
+
+On top of the ranges, CockroachDB runs SQL transactions at SERIALIZABLE isolation. A transaction writes **intents** and a **transaction record**. With parallel commits and write pipelining, it commits after one round of replication in many cases. Timestamps come from [hybrid logical clocks](/distributed/time/hybrid-logical-clocks), and correctness needs a bound on clock offset, 500 ms by default (`--max-offset`). A read that finds a value in its uncertainty interval, from its timestamp up to that bound above it, must move its timestamp up. A node shuts itself down if its clock is off by 80% of the maximum offset from at least half of the other nodes.
+
+### DynamoDB
+
+The DynamoDB paper (Elhemali et al., USENIX ATC 2022) describes the internals. A table is split into partitions. Each partition has replicas in different Availability Zones that form a replication group, and the group uses Multi-Paxos for leader election and consensus. "Only the leader replica can serve write and strongly consistent read requests." Any replica can serve an eventually consistent read.
+
+A write goes to the leader, which writes a log record and sends it to its peers. The paper says that the write "is acknowledged to the application once a quorum of peers persists the log record", two of three replicas. The leader keeps its role with a lease. The paper says that a new leader does not serve writes or consistent reads until the lease of the previous leader expires. Request routers find the partition with a metadata service.
+
+The API reflects this design. A write can carry a `ConditionExpression`, a compare-and-set on one item. An item is at most 400 KB. Each partition delivers at most 3,000 read units and 1,000 write units per second, so one hot key cannot go faster than one partition. **Global tables** copy a table to several Regions. By default they replicate asynchronously and resolve conflicts with "last writer wins"; a multi-Region strong consistency mode has been generally available since June 2025.
+
+## One write, one read
+
+<Predict
+  id="flow-read"
+  question="A strongly consistent read of one key. Which design sends the fewest messages, if the client reaches a follower in etcd and a gateway that does not hold the lease in CockroachDB?"
+  options={["etcd, because one Raft group is simplest", "CockroachDB and DynamoDB tie: a lease lets the leader answer alone", "All three tie: every strong read needs a round to a majority"]}
+  answer={1}
+  explain="Both lease designs send 4 messages: client to router or gateway, on to the leader, and back. The etcd read sends 8. The follower asks the leader for the read index, and the leader confirms its term with a heartbeat round."
+>
+<FlowCompareDemo />
+</Predict>
+
+1. Read the default: one write. All three designs need 6 hops on the critical path and 4.0 ms. The shape is the same: a front end, a leader, and a majority that persists the entry. The etcd flow has one more message, because the follower that took the request must learn the commit before it answers.
+2. Select **one read**. CockroachDB and DynamoDB answer in 4 messages and 2.0 ms. etcd needs 8 messages and 3.0 ms, because ReadIndex adds a heartbeat round.
+3. Turn on **the client reaches the leader**. The etcd read falls to 6 messages and 2.0 ms. A CockroachDB gateway that holds the lease answers in 2 messages and 1.0 ms.
+4. Turn on **stale reads allowed**. An etcd serializable read is answered by the member alone, 2 messages. A DynamoDB eventually consistent read goes to any replica and costs half a read unit.
+5. Drag **Time** back to watch the order of events. The blue arrows decide when the client hears back. The dashed arrows to the slower follower happen anyway, but nobody waits for them.
+
+The model inputs are a hop of 0.5 ms between machines and an fsync of 1 ms. Real hops between Availability Zones can be longer, and real clients add their own distance. The counts of messages and hops do not depend on these inputs.
+
+## How each one fails
+
+| Failure | etcd | CockroachDB | DynamoDB |
+|---|---|---|---|
+| The leader crashes | every key waits for a new election, about one election timeout | only the ranges that it led wait | only the partitions that it led wait; the new leader waits for the old lease |
+| A minority is cut off | the majority side continues | per range: the side with a majority of that range's replicas continues | the side with the quorum continues |
+| A clock runs fast or slow | no effect on safety (ReadIndex) | uncertainty restarts; a node beyond the bound shuts down | the lease bound must hold |
+| A key gets hot | one leader for everything | one leaseholder for that range; the range can split by load | one partition: 1,000 write units per second |
+
+The difference is the blast radius. When an etcd leader fails, the whole store pauses. When a CockroachDB node fails, the ranges that it led pause, and the rest continue. That is why etcd suits small, critical metadata, and the other two suit large data.
+
+## Which one to choose
+
+<WorkloadFitDemo />
+
+1. **Configuration and locks** (1 GiB, linearizable, transactions over 3 keys). All three fit. etcd adds watches and leases, which coordination needs, so it is the usual choice.
+2. **Shopping carts** (800 GiB, 40,000 writes per second, stale reads fine). The etcd column fails twice. The size is far above 8 GiB, and the writes exceed one leader. CockroachDB fits with 1.5× write headroom in the model; DynamoDB grows with partitions.
+3. **Bank ledger** (300 GiB, transactions over 4 keys). etcd fails on size. CockroachDB gives SQL and serializable transactions; DynamoDB fits with transactions of up to 100 items.
+4. **One hot counter** (5,000 writes per second to one key). DynamoDB fails, because one key lives in one partition, which takes 1,000 write units per second. The other two fit: one Raft leader takes 20,000 in the model.
+
+The model inputs are labelled in the demo: one leader commits 20,000 writes per second, and CockroachDB runs 9 nodes. The limits of etcd and DynamoDB are the published ones.
+
+| Choose | When |
+|---|---|
+| etcd | small, critical state: configuration, leader election, locks, service discovery; you need watches and leases; the data fits in a few GiB |
+| CockroachDB | relational data that outgrows one machine; multi-row transactions; you want SQL and can run a cluster, or buy it as a service |
+| DynamoDB | key-value or document access at very large scale; single-item operations; you want AWS to run it; hot keys are spread out |
+
+## Connect
+
+- [Architecture of a replicated store](/distributed/capstone/architecture-of-a-replicated-store): the choices behind these three designs.
+- [ZooKeeper and etcd](/distributed/coordination/zookeeper-and-etcd): watches, leases and locks in use.
+- [Spanner and TrueTime](/distributed/transactions/spanner-and-truetime): the design that CockroachDB adapted to clocks without atomic clocks.
+- [Hot keys](/distributed/partitioning/hot-keys): what to do when one key outgrows one partition.
+- [SQLite, LMDB and RocksDB compared](/databases/engine/sqlite-lmdb-and-rocksdb-compared): the same kind of comparison for the engines inside each replica.
+
+<Recall cards={[
+  { q: "How does etcd serve a linearizable read, and what weaker read does it offer?", a: "The member that receives the read asks the leader for a read index. The leader confirms its term with a heartbeat round to a majority. The member waits until it has applied that index, and answers. A serializable read is answered by any member from its local state and can be stale." },
+  { q: "What is a CockroachDB leaseholder, and which replica holds the lease by default since version 25.2?", a: "The only replica of a range that serves strongly consistent reads and proposes writes. With leader leases, the default since 25.2, it is the Raft leader, except briefly during a lease transfer." },
+  { q: "When does DynamoDB acknowledge a write, according to its 2022 paper?", a: "When a quorum of the partition's replication group, two of three replicas, has persisted the leader's log record in its write-ahead log." },
+  { q: "Why can one hot key limit DynamoDB but not the size of a table?", a: "A table grows by adding partitions, but one key lives in one partition, which delivers at most 1,000 write units per second." },
+  { q: "What happens when a CockroachDB node's clock drifts too far?", a: "It shuts itself down if its clock is out of sync with at least half of the other nodes by 80% of the maximum offset. The default maximum offset is 500 ms." },
+  { q: "What is the blast radius of a leader crash in etcd, and in a multi-Raft store?", a: "In etcd, every key waits for the election. In a multi-Raft store, only the ranges that the crashed node led wait." },
+]} />

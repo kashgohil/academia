@@ -1,0 +1,157 @@
+---
+summary: "What the compiler makes of async fn: an enum of suspension points that holds the live locals, a poll that resumes it, the size rule and nested futures, why self-references need Pin, JavaScript generators with a driver, Kotlin and C# continuations, and stackless against stackful coroutines."
+---
+import { ConcAsyncStateMachineDemo, ConcAsyncPinDemo, ConcAsyncMemoryDemo } from "@/demos/conc/ConcAsyncDesugarDemos";
+
+An `async` function looks like normal code that blocks at each `await`. It does not block. The compiler cuts the function into pieces at each `await` and turns it into a **state machine**. This object remembers where it stopped and which local variables it still needs. Each time the executor polls the object, it runs from the last stop to the next one.
+
+This is a **coroutine**: a function that can suspend and resume. It is **stackless**, because the suspended function keeps no call stack. All it keeps is the object. This lesson shows the generated state machine in Rust, its size, and why it needs `Pin`. Then it compares JavaScript, C#, Kotlin and Go, which make other choices.
+
+<Predict
+  id="size"
+  question="handle() puts a 1 KiB array buf on its stack. buf is used only before the second await. How large is the future that handle() returns?"
+  options={["About 100 bytes: buf is dead after the first await, so the future does not keep it", "A little more than 1 KiB: the state at the first await must hold buf", "About 3 KiB: each of the three awaits keeps its own copy of buf"]}
+  answer={1}
+  explain="The future is an enum with one variant per await. Each variant holds what is live across that await, and borrowed locals that are still in scope. At the first await, buf is live, so that variant is about 1 KiB. The enum is as large as its largest variant."
+>
+<ConcAsyncStateMachineDemo />
+</Predict>
+
+1. Click **Next** four times. Each poll runs from the current state to the next await, returns Pending, and stores a new variant. The fourth poll returns Ready.
+2. Look at the bytes column. Suspend0 holds `buf` and is 1,072 bytes. Suspend1 also holds `buf`, because `buf` was borrowed and is still in scope. So the future is 1,096 bytes.
+3. Turn on **Put buf on the heap**. Now Suspend0 holds a 24-byte `Vec` header, and the future shrinks to 96 bytes. The kilobyte is still used, but on the heap.
+4. Turn on **Read data already there**. The read is ready at the first poll, so one poll runs through two awaits. Now only 3 polls finish the function. An `await` on a ready future does not suspend.
+
+## The generated enum
+
+Here is the function and, below it, roughly what rustc generates. The variant names are the ones rustc uses for coroutine layouts: `Unresumed`, `Suspend0` and so on, `Returned` and `Panicked`.
+
+```rust
+async fn handle(sock: &mut TcpStream, db: &Db) -> io::Result<()> {
+    let mut buf = [0u8; 1024];
+    let n = sock.read(&mut buf).await?;
+    let key = parse_key(&buf[..n]);
+    let row = db.get(key).await?;
+    sock.write_all(&row).await?;
+    Ok(())
+}
+```
+
+```rust
+enum Handle<'a> {
+    Unresumed { sock: &'a mut TcpStream, db: &'a Db },
+    Suspend0  { sock: &'a mut TcpStream, db: &'a Db, buf: [u8; 1024], read: Read<'a> },
+    Suspend1  { sock: &'a mut TcpStream, db: &'a Db, buf: [u8; 1024], get: Get<'a> },
+    Suspend2  { sock: &'a mut TcpStream, row: Vec<u8>, write: WriteAll<'a> },
+    Returned,
+    Panicked,
+}
+
+fn poll(self: Pin<&mut Handle<'_>>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    loop {
+        match &mut *self {
+            Unresumed { .. } => { /* buf = [0; 1024]; read = sock.read(&mut buf); */ /* → Suspend0 */ }
+            Suspend0 { read, .. } => match Pin::new(read).poll(cx) {
+                Poll::Pending => return Poll::Pending,       // keep the state, return
+                Poll::Ready(n) => { /* key = parse_key(..); get = db.get(key); → Suspend1 */ }
+            },
+            Suspend1 { get, .. } => { /* same pattern → Suspend2 */ }
+            Suspend2 { write, .. } => { /* same pattern → Returned, return Ready(Ok(())) */ }
+            Returned => panic!("`async fn` resumed after completion"),
+            Panicked => panic!("`async fn` resumed after panicking"),
+        }
+    }
+}
+```
+
+Three rules come from this shape:
+
+- **Calling an async fn runs nothing.** It only builds `Unresumed` with the arguments. The body runs at the first poll ([futures and promises](/concurrency/async/futures-and-promises)).
+- **A suspension stores the values that can still be used.** The compiler does a liveness analysis at each await. `n` and `key` die before the second await, so `Suspend1` does not hold them. But a value that was borrowed, or that has a destructor, stays stored until its scope ends. `buf` was borrowed by the read, so `Suspend1` still holds it. To free it early, put `buf` in an inner block that ends before the await.
+- **The sub-future is stored inline.** `Suspend0` holds the `Read` future itself, not a pointer to it. So a future contains the futures it awaits, and their sizes add up along a chain of awaits.
+
+The demo uses a simple layout model: a 1-byte tag and the fields in order with their alignment. Real rustc can also overlap fields that are never live at the same time. It also sometimes keeps a value longer than needed, and rustc issue 69826 tracks this. To see the real numbers, nightly rustc prints them with `-Zprint-type-sizes`.
+
+## Size matters
+
+The size of a future is fixed at compile time, so a task can be one allocation of an exact size. That is the strength of the design.
+
+The weakness is that a large local in any await chain makes every caller large. A future is often built on the stack and then moved into a task. So a deep chain of large futures can overflow the stack before the task starts. Clippy has a `large_futures` lint (in the pedantic group, since 1.70) for this case. The fixes are the ones from the demo:
+
+- put large buffers on the heap (`Vec`, `Box<[u8]>`), or
+- box a large sub-future with `Box::pin(fut).await`, so that the caller holds only a pointer.
+
+## Why Pin
+
+Look at `Suspend0` again. `read` holds `&mut buf`, and `buf` is in the same enum. The future points into itself: it is **self-referential**. Rust normally lets you move any value with a `memcpy`. If the future moved after the first poll, `buf` would move, but the pointer in `read` would keep the old address.
+
+<ConcAsyncPinDemo />
+
+1. Click **move it**, then **poll** twice. A move before the first poll is safe, because no field points into the future yet.
+2. Click **Reset**. Click **poll**, **move it**, **poll**. The pointer still holds 0x1018, but `buf` is now at 0x2018. The second poll writes into memory that the future left: use after free.
+3. Turn on **Pin it first** and repeat step 2. Moving the `Pin<Box<_>>` copies only the box pointer. The future stays in place, so its pointer stays valid.
+
+`Pin<P>` wraps a pointer and promises that the value behind it will not move again until it is dropped. `poll` takes `self: Pin<&mut Self>`, so a future can rely on its own address from the first poll on. Types that never point into themselves implement the auto trait `Unpin`, and for them `Pin` changes nothing. A future from an `async fn` is not `Unpin`. You pin it on the heap with `Box::pin`, or on the stack with the `pin!` macro. Executors pin each task once, when they allocate it.
+
+## JavaScript: a generator and a driver
+
+JavaScript engines implement `async` functions natively, but the classic down-level form shows the idea well. A generator function is already a suspendable function: `yield` stops it, and `next(v)` resumes it with a value. An `async` function is a generator that yields promises, plus a driver that resumes it when each promise settles.
+
+```ts
+function run<T>(gen: Generator<unknown, T, unknown>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const step = (resume: () => IteratorResult<unknown, T>) => {
+      let r: IteratorResult<unknown, T>;
+      try { r = resume(); } catch (e) { return reject(e); }
+      if (r.done) return resolve(r.value);
+      Promise.resolve(r.value).then((v) => step(() => gen.next(v)), (e) => step(() => gen.throw(e)));
+    };
+    step(() => gen.next(undefined));
+  });
+}
+```
+
+TypeScript emits a helper called `__awaiter` that does this. ES5 has no generators, so for ES5 targets it also emits `__generator`. That helper is a state machine with a `label` field and a `switch`, close to the Rust enum. Facebook's regenerator does the same for Babel. Note one difference from Rust: the driver is push based. The promise calls `step` when it settles, and no executor polls.
+
+## C# and Kotlin: continuations
+
+C# turns an `async` method into a type that implements `IAsyncStateMachine`. Its `MoveNext` method holds a `switch` on a state field, and the locals become fields. In release builds the type is a struct, so a method that completes without suspending allocates nothing. It is boxed to the heap only at the first real suspension.
+
+Kotlin uses **continuation-passing style** (CPS). The compiler gives each `suspend` function an extra parameter of type `Continuation<T>`, and it changes the return type to `Any?`. A function that suspends returns the marker `COROUTINE_SUSPENDED`. Later, the event calls `resumeWith` on the continuation, which reenters the function with its saved state. The state machine is the same idea, and the "waker" is the continuation itself.
+
+## Stackless and stackful
+
+All of these are stackless. Go takes the other road: a goroutine is a **stackful** coroutine. Each goroutine has its own small stack, and the runtime can suspend it at any depth of calls. Its stack starts at 2 KiB (since Go 1.4) and grows by copying to a stack twice the size. Since Go 1.19, the runtime picks the starting size from the average stack use of past goroutines.
+
+<ConcAsyncMemoryDemo />
+
+1. Keep 100,000 tasks. As futures of 256 bytes, they need 30.5 MiB. As OS threads, they need 2.86 GiB of real memory, and 781 GiB of reserved address space.
+2. Set the deepest stack to 2 KiB. A goroutine now needs 2,448 bytes, about 8 times a future. Raise it to 4 KiB: the stack doubles, and so does its cost.
+3. Raise the future size to 16 KiB. Now the futures are larger than the goroutines. A stackless task is only small when its live state is small.
+
+The numbers are a model with labelled inputs. For a thread, the main cost is not the stack reservation (8 MiB by default on Linux with glibc), which is only address space. It is the kernel stack and the kernel structures for each thread, plus the pages that the thread touched ([threads](/os/processes/threads)).
+
+| | Stackless (Rust, JS, C#, Kotlin) | Stackful (Go, Java virtual threads) |
+|---|---|---|
+| Suspend where | only at `await` in an `async` function | anywhere, at any call depth |
+| Memory per task | exactly the largest state | a stack that grows, 2 KiB or more |
+| Calls to blocking code | block the whole thread | network waits park the goroutine; other blocking calls hold one OS thread, and the runtime moves the other goroutines to another thread |
+| Cost | the "function color": async spreads up the call graph | stack growth checks, stack copies |
+
+The "color" problem is the price of stackless code. An `async` function can only be awaited from another `async` function, so async spreads up the call graph. Bob Nystrom named this in his 2015 post "What Color is Your Function?". Stackful coroutines have no color, because any function can suspend. They pay for that with a stack per task.
+
+## Connect
+
+- [Event loops](/concurrency/async/event-loops): who resumes the state machine in JavaScript.
+- [Rust async runtimes](/concurrency/async/rust-async-runtimes): how Tokio allocates, pins and polls each task.
+- [Context switching](/os/processes/context-switching): what a switch between OS threads costs, against a return from `poll`.
+- [Happens-before](/concurrency/atomics/happens-before): why a waker that crosses threads needs synchronization.
+
+<Recall cards={[
+  { q: "What does the compiler store in each variant of an async fn's state machine?", a: "The locals that are live across that await, plus borrowed locals that are still in scope, plus the sub-future it waits on, stored inline." },
+  { q: "How large is the future of an async fn?", a: "As large as its largest variant, plus a tag. A large local that is live across any await makes the whole future large." },
+  { q: "Why does a future need to be pinned before it is polled?", a: "After the first poll it can hold a pointer into itself, such as a read future that borrows a local buffer. Moving it would leave that pointer dangling." },
+  { q: "Name two ways to shrink a large Rust future.", a: "Put large buffers on the heap (Vec or Box), or box a large sub-future with Box::pin so that the caller stores only a pointer. Ending a value's scope before an await also helps." },
+  { q: "How does Kotlin compile a suspend function?", a: "In continuation-passing style: it gets an extra Continuation parameter, returns Any?, and returns COROUTINE_SUSPENDED when it suspends." },
+  { q: "What is the main cost of stackful coroutines, and of stackless ones?", a: "Stackful: a stack per task, at least 2 KiB in Go, which must grow by copying. Stackless: async spreads up the call graph, and code can suspend only at await." },
+]} />

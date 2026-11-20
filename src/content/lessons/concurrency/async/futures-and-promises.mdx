@@ -1,0 +1,139 @@
+---
+summary: "A value that is not there yet: the history (Friedman and Wise, Baker and Hewitt, Liskov and Shrira), push-based JavaScript promises against pull-based Rust futures with poll and Waker, combinators, errors, and cancellation by AbortSignal or by drop."
+---
+import { ConcAsyncPollGame, ConcAsyncCombinatorDemo } from "@/demos/conc/ConcAsyncFutureDemos";
+
+A **future** is an object that stands for a value that is not available yet. The value can come from a network reply, a timer or another thread. Code can hold the future, pass it on and combine it with other futures, and get the value later. Many languages also call it a **promise**. In some libraries the two words name the read side (future) and the write side (promise) of one value.
+
+The idea is old. Daniel Friedman and David Wise used the word "promise" in 1976, for a value that a parallel program computes when it needs it. Henry Baker and Carl Hewitt used "future" in 1977, for an expression that starts to run in parallel at once. Barbara Liskov and Liuba Shrira described promises for the Argus language in 1988 (PLDI). Promises build on "call-streams", which send a remote call and continue at once, and use the result later.
+
+Today two designs dominate. A **push** future calls your code when the value arrives: JavaScript's `Promise`, Java's `CompletableFuture`, C#'s `Task`. A **pull** future does nothing until something asks it for the value: Rust's `Future`. The difference decides who drives the work, when it starts, and how you cancel it.
+
+<Predict
+  id="lazy"
+  question="Task B is a Rust future that starts with sleep(10 ms).await. The executor has not polled B yet. 10 ms pass. Then the executor polls B for the first time. What does the poll return?"
+  options={["Ready: 10 ms have passed, so the sleep is over", "Pending: the 10 ms timer starts at the first poll", "The poll panics, because B was not polled in time"]}
+  answer={1}
+  explain="A Rust future is lazy. Creating it only builds a value. The sleep future arms its timer the first time it is polled, so the clock starts at that poll, and the poll returns Pending."
+>
+<ConcAsyncPollGame />
+</Predict>
+
+1. Click **poll(A)** and **poll(B)**. Both return Pending. Look at the reactor panel: socket a now holds the waker of A, and the timer holds the waker of B.
+2. Click **data on a**. The reactor calls the waker, and A enters the ready queue. Poll A: it returns Ready.
+3. Click **+10 ms**, poll B, click **data on b**, and poll B again. Both tasks are done in 5 polls, and none is wasted.
+4. Click **Reset**. Click **+10 ms** first, and then poll B. B arms its timer only now, at 10 ms, so the deadline is 20 ms.
+5. Click **Reset** and turn on the buggy future. Poll A, then click **data on a**. A does not enter the ready queue, because no waker was stored. A hangs. You can still finish it with a poll that nobody asked for, but a real executor does not do that.
+
+## Push: JavaScript promises
+
+A JavaScript promise has three states: pending, fulfilled and rejected. It settles once and never changes after that. `then` stores a callback. When the promise settles, the runtime queues each stored callback as a microtask ([event loops](/concurrency/async/event-loops)). A `then` on a promise that has already settled also runs later, never at once.
+
+```ts
+const p = fetch("/user/7");          // the request goes out now
+const q = p.then((r) => r.json());   // q settles when that callback returns
+q.then(show, report);                // a rejection anywhere above reaches report
+```
+
+Promises are **eager**. `fetch` starts the request when you call it, and the executor function that you pass to `new Promise` runs at once. An `async` function also runs synchronously up to its first `await`. Nobody needs to wait on a promise for its work to happen. Several consumers can call `then` on one promise, and each gets the same value.
+
+Errors travel the same path as values. A thrown exception in a callback rejects the promise that `then` returned. The rejection skips the fulfillment callbacks until it reaches a rejection handler. A rejection that no handler ever takes is reported by the host as an "unhandled rejection".
+
+## Pull: Rust futures
+
+A Rust future is a value with one method. The executor calls it, and it answers with `Ready(value)` or `Pending`.
+
+```rust
+pub trait Future {
+    type Output;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output>;
+}
+pub enum Poll<T> { Ready(T), Pending }
+```
+
+The `Context` carries a **Waker**. The contract is simple and strict: a future that returns `Pending` must first arrange for `wake` to be called when it can make progress. Usually it clones the waker and stores it where the event will happen: in the reactor's entry for a socket, or in the timer wheel. When the event comes, the reactor calls `wake()`, and the executor puts the task back in its ready queue. The executor never polls blindly, so a thousand idle tasks cost nothing.
+
+```rust
+struct Flag { shared: Arc<Mutex<State>> }
+struct State { done: bool, waker: Option<Waker> }
+
+impl Future for Flag {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let mut s = self.shared.lock().unwrap();
+        if s.done { return Poll::Ready(()); }
+        s.waker = Some(cx.waker().clone());   // store it BEFORE returning Pending
+        Poll::Pending
+    }
+}
+// The other side: set done = true, then take the waker and call wake().
+```
+
+If you forget the waker line, the bug is the one from step 5: the task hangs with no error. `Waker` has `wake(self)`, `wake_by_ref(&self)`, and `will_wake`, which tells whether a stored waker would wake the same task, so a future can skip the clone.
+
+Rust futures are **lazy**. The `Future` trait carries the attribute `#[must_use = "futures do nothing unless you .await or poll them"]`. A future that nobody polls never sends its request. A future also has one owner, which polls it, so one value has one consumer. The `Future` trait became stable in Rust 1.36 (2019), and `async`/`await` in Rust 1.39 the same year.
+
+| | JavaScript `Promise` | Rust `Future` |
+|---|---|---|
+| Starts | when created (eager) | at the first poll (lazy) |
+| Driven by | the code that resolves it | an executor that polls it |
+| Waiting code runs | as a microtask callback | when the executor polls the task again |
+| Consumers | many `then` calls | one owner; share with `Shared` from the futures crate |
+| Cost per await | one promise object and one microtask | a state change inside one task (no allocation) |
+| Cancel | not built in; `AbortSignal` by convention | drop the future |
+
+## Combinators
+
+A **combinator** builds one future from several. The common four exist in both worlds.
+
+<ConcAsyncCombinatorDemo />
+
+1. Keep **all** and **JS: keep running**. Replica 3 fails at 50 ms, so `Promise.all` rejects at 50 ms. Replicas 2 and 4 still run for 100 ms more, and their results are thrown away.
+2. Select **Rust: dropped**. `try_join_all` drops the two pending futures at 50 ms. The work after the result falls to 0 ms.
+3. Select **race**. The first result settles it, at 30 ms. Make replica 1 fail: race now rejects, but **any** still waits for the first success.
+4. Select **allSettled**. It waits for every child and reports each outcome, so it never wastes work and never fails fast.
+5. Move the latency of replica 3 above 120 ms with **all**. Now no child fails before the others finish, and all is as slow as its slowest child.
+
+| Wait for | JavaScript | Rust (futures crate) | Settles when |
+|---|---|---|---|
+| all, fail fast | `Promise.all` | `try_join_all`, `try_join!` | all succeed, or the first error |
+| all, never fail | `Promise.allSettled` (ES2020) | `join_all`, `join!` | every child is done |
+| the first result | `Promise.race` | `select`, `select_all`, `select!` | the first child settles |
+| the first success | `Promise.any` (ES2021) | `select_ok` | the first success, or all errors (`AggregateError` in JS) |
+
+The timing rules are simple. All waits for the maximum of the child times, and race waits for the minimum. That is why a fan-out to many replicas has a long [tail latency](/performance/systems/tail-latency), and why "hedged" requests race two replicas to cut it.
+
+## Cancellation
+
+A JavaScript promise cannot be cancelled. The losers of `Promise.race` run to their end. The convention is an `AbortController`: you pass its `signal` to the work, and the work checks it or listens for its "abort" event. `fetch` takes a `signal` option, and `AbortSignal.timeout(ms)` and `AbortSignal.any([...])` build signals for deadlines and for several causes.
+
+```ts
+const ctl = new AbortController();
+const replies = replicas.map((u) => fetch(u, { signal: ctl.signal }));
+const first = await Promise.any(replies);
+ctl.abort();                         // the losers stop; their promises reject with an AbortError
+```
+
+In Rust, **dropping a future cancels it**. The future is suspended at an await, so dropping it runs the destructors of its live values and nothing else. This makes cancellation free and immediate, but it creates a new question: **cancel safety**. The Tokio docs define it this way: dropping a pending future and creating it again must be a no-op.
+
+- `mpsc::Receiver::recv`, `AsyncReadExt::read` and `TcpListener::accept` are cancel safe. A dropped call loses nothing.
+- `read_exact`, `read_to_end` and `write_all` are not. They can drop bytes that they already moved.
+- `Mutex::lock` and `Semaphore::acquire` are not, for another reason: a dropped call loses its place in a fair queue.
+
+This matters most in `tokio::select!`, which drops every branch that did not win, on every loop iteration. Push and pull also differ in who can cancel. In JavaScript, the creator of the work must pass a signal down. In Rust, the owner of the future cancels it by dropping it, and the work needs no extra code. The price is that every await is a point where your function can stop for good.
+
+## Connect
+
+- [async/await desugared](/concurrency/async/async-await-desugared): how `await` turns into calls to `poll` and `then`.
+- [Rust async runtimes](/concurrency/async/rust-async-runtimes): the executor and reactor that drive `poll` and `wake`.
+- [Structured concurrency](/concurrency/async/structured-concurrency): cancellation that follows the shape of the program.
+- [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency): what to do with a request that is too slow.
+
+<Recall cards={[
+  { q: "Who first used the words promise and future for this idea, and when?", a: "Friedman and Wise used promise in 1976. Baker and Hewitt used future in 1977. Liskov and Shrira added promises with call-streams to Argus in 1988." },
+  { q: "What must a Rust future do before it returns Pending?", a: "Arrange for the task's waker to be called when it can make progress: usually clone cx.waker() and store it with the resource it waits for." },
+  { q: "What happens to the losers of Promise.race, and to the losers of select in Rust?", a: "In JavaScript they keep running, and their results are ignored. In Rust, tokio::select! drops them, which cancels them at their current await. The select functions of the futures crate return them, and they stop when you drop them." },
+  { q: "Why does a Rust future that nobody polls send no request?", a: "Futures are lazy: creating one only builds a value. The body runs only when an executor polls it." },
+  { q: "What does cancel safe mean for a Tokio future?", a: "Dropping it while it is pending and creating it again is a no-op, so no data is lost. Examples: recv and accept are cancel safe. read_exact and write_all are not." },
+  { q: "When does Promise.all settle, and when does Promise.any settle?", a: "all: when every promise fulfills, or at the first rejection. any: at the first fulfillment, or with an AggregateError when all reject." },
+]} />

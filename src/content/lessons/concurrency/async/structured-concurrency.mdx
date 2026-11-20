@@ -1,0 +1,119 @@
+---
+summary: "Every task has an owner that waits for it: Smith's argument against the go statement, nurseries, TaskGroup, coroutineScope and StructuredTaskScope, errgroup with context and Tokio's JoinSet, cooperative cancellation at checkpoints, error propagation, supervisors, and the leaks that unowned tasks cause."
+---
+import { ConcAsyncTreeDemo, ConcAsyncLeakDemo } from "@/demos/conc/ConcAsyncStructuredDemos";
+
+A `go` statement, a detached `tokio::spawn` or a promise that nobody awaits starts a task with no owner. The task can outlive the function that started it. If it fails, nobody may see the error. If the request that started it is cancelled, the task keeps running. **Structured concurrency** removes these problems with one rule. A task runs inside a scope, and the scope does not end until all of its tasks have ended.
+
+Martin Sústrik proposed this model in 2016 for his C library libdill. Nathaniel J. Smith made the argument famous in April 2018 with "Notes on structured concurrency, or: Go statement considered harmful".
+
+Smith compared `go` with `goto`. Both start control flow whose end the caller cannot see. Both break the rule that the effects of a function are over when it returns.
+
+His Python library Trio calls the scope a **nursery**. A task cannot start a child unless it first opens a nursery for the child to live in.
+
+<Predict
+  id="orphans"
+  question="A handler starts user, orders and ads as detached tasks, and orders starts orders db and orders cache. The cache task fails at 25 ms, and the handler returns that error. What happens to user, orders db and ads?"
+  options={["They stop when the handler returns", "They keep running to their end, and nobody uses their results", "The runtime cancels them, because their parent has ended"]}
+  answer={1}
+  explain="A detached task has no owner. Nothing tells it that the handler has returned, so it runs to its end. Here, three tasks run on until 120 ms: 175 ms of work after the client already has its answer."
+>
+<ConcAsyncTreeDemo />
+</Predict>
+
+1. Keep **spawn and forget** and **orders cache fails at 25 ms**. The handler returns at 25 ms. Move the time slider past 25 ms: three tasks are orphans, and the last one stops at 120 ms.
+2. Select **scope cancels siblings**. The failure cancels user, orders db and ads at 25 ms. The handler returns at 25 ms, and no task outlives it.
+3. Set **Busy work between checkpoints** to 15 ms. A cancelled task stops only at its next checkpoint, so the handler now returns at 30 ms. The scope waits until every child has stopped.
+4. Select **supervisor**. The failure stays local: the other tasks finish, and the handler returns a partial result at 120 ms.
+5. Select **ads fails at 60 ms** with spawn and forget. The handler returns at 60 ms, and orders db runs on to 90 ms.
+
+## The rule and its effects
+
+Inside a scope, you start children, and at the end of the scope you wait for all of them. Three things follow:
+
+- **No orphans.** When a function returns, all the tasks that it started have ended. You can reason about a function from its code alone, as with sequential code.
+- **Errors go up.** A child's error has a place to go: the scope. The scope cancels the other children, waits for them, and raises the error to its caller.
+- **Cancellation goes down.** Cancelling a scope cancels its children, and their children, along the tree.
+
+```python
+# Trio, and asyncio.TaskGroup since Python 3.11
+async with asyncio.TaskGroup() as tg:
+    user = tg.create_task(fetch_user(uid))
+    orders = tg.create_task(fetch_orders(uid))
+# here both tasks are done; if one failed, the other was cancelled,
+# and the errors are raised together as an ExceptionGroup
+```
+
+## The same idea in other languages
+
+| Language | Scope | On the first error |
+|---|---|---|
+| Python | Trio nursery, `asyncio.TaskGroup` (3.11) | cancel the others, raise an `ExceptionGroup` |
+| Kotlin | `coroutineScope { launch { } }` | the scope fails and cancels all other children |
+| Kotlin | `supervisorScope` | other children are not affected |
+| Swift | `withThrowingTaskGroup` (Swift 5.5, SE-0304) | an error thrown out of the group body cancels the remaining tasks |
+| Java | `StructuredTaskScope` (preview) | depends on the `Joiner` you choose |
+| Go | `errgroup.WithContext` | the context is cancelled; `Wait` returns the first error |
+| Rust | Tokio `JoinSet`; `std::thread::scope` for threads | your code decides; dropping the set aborts its tasks |
+
+Java has taken several rounds to get the API right. `StructuredTaskScope` was an incubator API in JDK 19 (JEP 428) and JDK 20 (JEP 437). It was then a preview in JDK 21 to 27 (JEPs 453, 462, 480, 499, 505, 525 and 533). JEP 505 replaced the constructors with `StructuredTaskScope.open()` and a `Joiner` that sets the policy. JEP 543 makes the API final in JDK 28. It is integrated, and JDK 28 is due in March 2027.
+
+Go shows what happens when the language does not enforce the rule. `errgroup.WithContext` returns a group and a context. The context is cancelled the first time a function passed to `Go` returns an error, or when `Wait` returns. `Wait` returns the first error. `SetLimit` caps how many goroutines run at once. But a goroutine that never looks at `ctx.Done()` keeps running, and nothing stops a programmer from starting a bare goroutine.
+
+```go
+g, ctx := errgroup.WithContext(ctx)
+for _, url := range replicas {
+    g.Go(func() error { return fetch(ctx, url) })   // fetch must watch ctx
+}
+err := g.Wait()   // all goroutines have returned here
+```
+
+Tokio has no scoped async tasks that borrow from the caller. A future can be leaked with `mem::forget`, so a scope cannot force its children to end in time. `JoinSet` gives most of the structure without borrowing. When a `JoinSet` is dropped, it aborts all its tasks. `join_next` returns results as tasks finish, and `abort_all` and `shutdown` cancel the rest. For OS threads, `std::thread::scope` (Rust 1.63) is fully structured: threads can borrow from the stack, because the scope joins them before it returns.
+
+## Cancellation is cooperative
+
+No runtime can stop a task at an arbitrary instruction and keep the program safe. A cancelled task stops at its next **checkpoint**: a point where it asks "was I cancelled?".
+
+- In Trio, every await on a Trio primitive is a checkpoint, and cancellation raises `Cancelled` there.
+- In Kotlin, suspension points check for cancellation. A CPU loop must call `ensureActive()` or `yield()`.
+- In Go, the code must check `ctx.Done()` or `ctx.Err()`. Blocking calls that take no context cannot be cancelled.
+- In Rust, the owner drops the future at its current await ([futures and promises](/concurrency/async/futures-and-promises)). Synchronous code between awaits always runs to the next await.
+
+So a scope cancels as fast as its slowest child reaches a checkpoint. Step 3 of the demo shows this: 15 ms between checkpoints makes the handler return 5 ms later. A child that blocks in a call with no checkpoint holds the whole scope open. Cleanup code also needs care. It often must await, for example to send a "goodbye" message, and an await in a cancelled task is cancelled at once. Trio solves this with a shielded cancel scope, and Kotlin with `withContext(NonCancellable)`.
+
+## Errors, and when not to cancel
+
+Fail-fast is right when the result needs every part, as in the handler above. Sometimes it is wrong: a dashboard can show five widgets when the sixth fails. A **supervisor** scope keeps the failure local. It still waits for all children, so it still has no orphans. Erlang built its error handling on this idea: a supervisor process restarts failed children by a policy ([the actor model](/concurrency/message-passing/actor-model)).
+
+Two children can fail at nearly the same time. Python groups such errors into an `ExceptionGroup` (PEP 654), and `except*` handles each kind. Go's errgroup keeps only the first error. Java lets the `Joiner` decide.
+
+## What unowned tasks cost
+
+Leaks are the most common cost of unowned tasks. A request with a timeout gives up after 50 ms, but the backend calls that it started keep running. Under load, they add up.
+
+<ConcAsyncLeakDemo />
+
+1. Keep the defaults: 1 request per ms, 3 backend calls each, and a median latency of 20 ms with a long tail. Without structure, 132 calls are in flight on average. With cancellation at the timeout, 74 are.
+2. 23.7% of the calls are slower than the 50 ms timeout. Each of them runs on after the client has left, and the load on the backend is higher.
+3. Raise the timeout to 400 ms. Few calls are cut off now, and the two curves almost meet.
+4. Lower the backend p99 toward 40 ms. The tail gets short, and cancellation saves little. Structure matters most when the tail is long.
+
+The numbers follow [Little's law](/performance/systems/queueing-theory-and-littles-law): the calls in flight equal the arrival rate times the mean time in flight. Cancellation at the timeout $T$ changes the mean time from $E[L]$ to $E[\min(L, T)]$. With a long tail, that is a large cut. Without cancellation, the extra load also makes the backend slower, and more requests time out. This feedback loop can turn a slow backend into an outage ([timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency)).
+
+Some work must outlive a request, such as a write-behind cache flush. Structured concurrency does not forbid it. It asks you to give that work an owner that lives longer. That owner can be a nursery or a `JoinSet` of the server, which the server waits for at shutdown. Every task still has someone who waits for it and sees its errors.
+
+## Connect
+
+- [Rust async runtimes](/concurrency/async/rust-async-runtimes): what `spawn` and `JoinHandle` do, and why a dropped handle detaches.
+- [Go channels and select](/concurrency/message-passing/go-channels-and-select): how a goroutine watches `ctx.Done()`.
+- [Backpressure](/concurrency/message-passing/backpressure): the other way to keep in-flight work bounded.
+- [Tail latency](/performance/systems/tail-latency): why fan-out makes the slowest child decide the result.
+
+<Recall cards={[
+  { q: "State the rule of structured concurrency.", a: "A task runs inside a scope, and the scope does not end until all of its tasks have ended. So no task outlives the code that started it." },
+  { q: "Who argued that the go statement is harmful, and why?", a: "Nathaniel J. Smith, in 2018. Like goto, it starts control flow whose end the caller cannot see, so a function's effects can continue after it returns." },
+  { q: "A scope's child fails. What does a structured scope do next?", a: "It cancels the other children, waits until they have stopped, and then raises the error to its caller." },
+  { q: "Why can a cancelled task keep running for a while?", a: "Cancellation is cooperative. The task stops only at its next checkpoint: an await, or an explicit check such as ctx.Done() or ensureActive()." },
+  { q: "What does errgroup.WithContext cancel, and when?", a: "The derived context: the first time a function passed to Go returns an error, or when Wait returns. Goroutines must watch that context to stop." },
+  { q: "How does cancellation at a timeout change the number of calls in flight?", a: "By Little's law it is the rate times the mean lifetime. Cancellation changes the lifetime from L to the minimum of L and the timeout, which cuts the long tail." },
+]} />

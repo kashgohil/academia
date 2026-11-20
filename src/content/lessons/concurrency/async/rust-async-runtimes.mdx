@@ -1,0 +1,123 @@
+---
+summary: "Inside Tokio: executor, reactor and blocking pool; per-worker local queues, the LIFO slot, the inject queue and work stealing; why spawn needs Send and 'static; the cooperative budget; blocking in async code and spawn_blocking; current_thread and thread-per-core runtimes on io_uring."
+---
+import { ConcAsyncStealDemo, ConcAsyncHogDemo } from "@/demos/conc/ConcAsyncRuntimeDemos";
+
+Rust's standard library defines `Future`, `Waker` and `async`/`await`, but it has no code that runs futures. A **runtime** library provides that code. It has three parts:
+
+- The **executor** owns the tasks. A **task** is a future that was given to `spawn`, plus a header with its state. The executor polls tasks that are ready.
+- The **reactor** (Tokio calls it the I/O driver) waits for I/O and timers. It uses the `mio` crate, which uses `epoll` on Linux, `kqueue` on macOS and the BSDs, and IOCP on Windows. When an event comes, the reactor calls the waker of the task that waits for it.
+- The **blocking pool** runs code that would block a thread, such as file I/O or a long computation.
+
+Tokio is the runtime that most Rust services use. This lesson describes Tokio 1.54 (October 2026) and points to the source where the numbers come from. Then it compares runtimes that make other choices.
+
+<Predict
+  id="spawn"
+  question="A task on worker 0 spawns 64 child tasks of 50 µs each. Workers 1 to 3 are idle. Where do the 64 children go first?"
+  options={["To the global queue, so that all 4 workers take them at once", "Into worker 0's LIFO slot and local queue; the idle workers must steal them", "Each spawn picks a random worker"]}
+  answer={1}
+  explain="A task spawned from a worker thread is scheduled on that worker: into its LIFO slot, which pushes the previous occupant to its local queue. Other workers get the children only by stealing. Without stealing, worker 0 runs all 64."
+>
+<ConcAsyncStealDemo />
+</Predict>
+
+1. Keep 4 workers and **one task spawns 64**. All tasks are done at 824 µs, and each worker made 16 or 17 polls. The idle workers woke up and stole 12 times.
+2. Turn off **Work stealing**. Worker 0 makes all 65 polls, and the run takes 3,224 µs: as long as on 1 worker (3,219 µs).
+3. Turn stealing on and select local queue capacity **16**. The local queue overflows 6 times, and each time half of it moves to the global queue.
+4. Select **ping-pong under load** and set 1 worker. Two tasks wake each other while 8 background tasks keep the queue full. With the LIFO slot, the median round trip is 2 µs. Turn the slot off: each wake waits behind the queue, and the round trip is 802 µs.
+5. With the LIFO slot on, the mean round trip is still 202 µs. After 3 LIFO polls in a row, the woken task goes to the back of the queue, so every second round trip is slow.
+
+## How a worker finds its next task
+
+Tokio's multi-thread scheduler starts one worker thread per CPU core by default (`available_parallelism`, or the `TOKIO_WORKER_THREADS` variable). Each worker has its own queues, so most scheduling needs no shared lock.
+
+- A **local queue**: a fixed ring of 256 tasks (`LOCAL_QUEUE_CAPACITY` in `queue.rs`). Only its owner pushes. Other workers can steal from it with atomic operations.
+- A **LIFO slot**: one task, which runs next. A task that is spawned or woken on a worker goes into the slot, and the task that was there moves to the local queue.
+- The **inject queue**: one global queue behind a mutex. Tasks from outside the runtime, such as a `spawn` on a non-worker thread, go here.
+
+```rust
+fn next_task(&mut self) -> Option<Task> {
+    if self.tick % self.global_queue_interval == 0 {
+        if let Some(t) = self.inject.pop() { return Some(t); }   // fairness for the global queue
+    }
+    self.lifo_slot.take()                                         // at most 3 in a row
+        .or_else(|| self.local.pop())
+        .or_else(|| self.inject.pop_batch_into(&mut self.local))   // take a fair share
+        .or_else(|| self.steal_from_others())                      // take half of a victim
+}                                                                  // None: park, maybe as the I/O driver
+```
+
+When a local queue is full, `push_overflow` moves half of it (128 tasks) and the new task to the inject queue. A worker that has nothing to do steals half of another worker's local queue (`steal_into`). When it finds no work, it **parks**. One parked worker at a time also runs the I/O driver: it sleeps in `epoll_wait`, and it wakes tasks when events come.
+
+Tokio added the LIFO slot in its 2019 scheduler rewrite. The blog post "Making the Tokio scheduler 10x faster" calls it a "next task" slot. Go and Kotlin schedulers use the same idea. Its purpose is message passing. When task A sends a message to task B, B runs next on the same core, while the message is still in the cache.
+
+The slot has two limits. At most 3 tasks run from it in a row (`MAX_LIFO_POLLS_PER_TICK`), so two tasks that wake each other cannot starve the queue. And other workers cannot steal the task in the slot. Tokio 1.51 made the slot stealable, but 1.51.2 and 1.52.2 reverted this because of its cost.
+
+The `global_queue_interval` decides how often a worker looks at the inject queue first. The current-thread scheduler uses 31. The multi-thread scheduler tunes the interval itself, from a moving average of poll times. It aims to check about every 200 µs, within 2 to 127 ticks. The older fixed default was 61. A separate `event_interval`, 61 by default, decides how often a worker checks for I/O and timers while it has tasks.
+
+## Why spawn needs Send and 'static
+
+```rust
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+```
+
+**Send** is needed because a task can move between threads. A stealing worker can poll it next, on another core. So everything that lives across an `await` must be `Send`. An `Rc` or a `std::sync::MutexGuard` that is held over an await makes the whole future not `Send`, and the compiler rejects the spawn.
+
+**'static** is needed because a task can outlive the code that spawned it. Dropping a `JoinHandle` does not stop the task: it detaches it. So the task may not borrow from the caller's stack. You move owned data in, or share it with `Arc`. For futures that are not `Send`, `spawn_local` runs them on the current thread inside a `LocalSet`.
+
+## Cooperative scheduling
+
+Tokio cannot preempt a task. A task gives up its worker only when it returns `Pending`. A task that never returns `Pending` keeps the thread, and every other task on that worker waits. The [event-loop](/concurrency/async/event-loops) rule holds here too: do not block the loop.
+
+<ConcAsyncHogDemo />
+
+1. Keep **ready channel, no budget**. The busy task reads 5,000 messages that are all ready, so each `recv` returns Ready at once. The heartbeat task, due every 1 ms, runs up to 9.5 ms late.
+2. Select **with a budget**. After 128 operations, the next `recv` returns Pending once, and the task goes to the back of the queue. The worst lateness falls to 246 µs: 128 messages of 2 µs.
+3. Move the budget slider. The worst lateness grows with the budget: 30 µs at 16, 246 µs at 128 and 1.72 ms at 1024. A small budget costs more task switches.
+4. Select **blocking call**. The task calls blocking code for 10 ms, and no budget can help: the heartbeat is again 9.5 ms late.
+5. Select **spawn_blocking**. The blocking call runs on a thread of the blocking pool, and the heartbeat is on time.
+
+The **cooperative budget** came in Tokio 0.2.14 (April 2020). Each task gets 128 operations per poll. Every Tokio resource (a channel, a socket, a timer) spends one unit when it returns Ready. When the budget is empty, the resource returns Pending and wakes the task at once, so the task yields at the next await. You can spend budget in your own loops with `tokio::task::coop::consume_budget`, or opt out with `unconstrained`. A channel from a library that does not use Tokio's budget gives the "no budget" case of the demo.
+
+No budget helps against **blocking**. `std::thread::sleep`, a synchronous file read, a long hash or parse, or a `std::sync::Mutex` that waits for long all hold the worker thread. Move such work out:
+
+- `spawn_blocking(f)` runs `f` on the blocking pool. The pool grows on demand up to 512 threads (`max_blocking_threads`), and an idle thread exits after 10 s.
+- `block_in_place(f)` turns the current worker into a blocking thread and hands its queues to a new worker. It works only on the multi-thread runtime, and it panics on a current-thread runtime.
+- For long CPU work, a separate pool such as rayon is often better, because the blocking pool is sized for waiting, not for computing.
+
+The demo's numbers come from the shared runtime with 1 core and no preemption, which is what a current-thread runtime is. A task switch costs 100 ns there, a model input.
+
+## Other designs
+
+**current_thread.** `Builder::new_current_thread()`, or `#[tokio::main(flavor = "current_thread")]`, runs all tasks on the thread that calls `block_on`. There is no stealing, and most wakes come from the same thread. So each task costs less. The program must still be careful with blocking calls. `#[tokio::main]` without a flavor uses the multi-thread scheduler.
+
+**Thread-per-core.** Glommio (from Datadog) and Monoio (from ByteDance) run one single-threaded executor per core, with no work stealing. Tasks never move, so they need not be `Send`, and data can stay in `Rc` and `RefCell`. Both are built on [io_uring](/os/io/io-uring), a completion interface: Monoio also has a fallback driver on `epoll` and `kqueue`.
+
+The cost is balance. If one core gets more connections, nothing moves the extra work to an idle core. These runtimes suit sharded systems, such as databases and proxies, where each core owns a part of the data. The `tokio-uring` crate brings io_uring to Tokio's model.
+
+| | Tokio multi-thread | Tokio current_thread | Thread-per-core (Glommio, Monoio) |
+|---|---|---|---|
+| Threads | one per core, plus the blocking pool | one | one per core |
+| Balance | work stealing | none needed | none: shard the work |
+| Task bounds | `Send + 'static` | `Send + 'static` with `tokio::spawn`; only `'static` with `spawn_local` in a `LocalSet` or a local runtime | `'static`, no `Send` |
+| I/O | readiness through mio | readiness through mio | completion through io_uring |
+| Good for | general services | tests, small tools, embedded in other loops | sharded, I/O-heavy servers |
+
+## Connect
+
+- [Futures and promises](/concurrency/async/futures-and-promises): the poll and wake contract that the scheduler builds on.
+- [Work stealing](/concurrency/patterns/work-stealing): the deque algorithm in general, and how fork-join pools use it.
+- [Multiprocessor scheduling](/os/scheduling/multiprocessor-scheduling): the kernel faces the same choice between global and per-core queues.
+- [io_uring for networking](/networking/programming/io-uring-for-networking): the completion interface that thread-per-core runtimes use.
+
+<Recall cards={[
+  { q: "Where does a task that a Tokio worker spawns go first?", a: "Into that worker's LIFO slot. The task that was in the slot moves to the back of the worker's local queue." },
+  { q: "What happens when a Tokio local queue (256 tasks) is full?", a: "push_overflow moves half of it, 128 tasks, plus the new task to the global inject queue." },
+  { q: "Why is there a LIFO slot, and what limits it?", a: "It runs a woken task next, which helps message passing and cache locality. At most 3 LIFO polls run in a row, and other workers cannot steal from the slot." },
+  { q: "Why does tokio::spawn require Send and 'static?", a: "Send: a stolen task can be polled on another thread. 'static: the task can outlive its spawner, because dropping the JoinHandle only detaches it." },
+  { q: "What does Tokio's cooperative budget do, and how large is it?", a: "Each task gets 128 operations per poll. When it runs out, Tokio resources return Pending, so the task yields even if its data is ready." },
+  { q: "Name two ways to run blocking code from async Tokio code.", a: "spawn_blocking, which uses the blocking pool (up to 512 threads by default), and block_in_place, which works only on the multi-thread runtime." },
+]} />

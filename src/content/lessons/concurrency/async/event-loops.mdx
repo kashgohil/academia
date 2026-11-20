@@ -1,0 +1,118 @@
+---
+summary: "One thread, many callbacks: the reactor pattern, a loop iteration (timers, poll, run), the JavaScript task and microtask queues, Node's nextTick and libuv phases, what one slow callback does to tail latency, and reactor against proactor."
+---
+import { ConcAsyncLoopStepper, ConcAsyncBlockingDemo } from "@/demos/conc/ConcAsyncLoopDemos";
+
+An **event loop** is one thread that runs many small pieces of work, one at a time. Each piece is a **callback**: a function that the program registered for an event, such as "this socket has data" or "this timer is due". The loop waits for events, then runs their callbacks. A callback always runs to its end. The loop never interrupts it, so callbacks need no locks between them.
+
+Douglas Schmidt described this design as the **Reactor** pattern in 1995. The kernel side of it, `epoll` and `kqueue`, is in [select, poll and epoll](/networking/programming/select-poll-and-epoll) and [blocking, non-blocking and async I/O](/os/io/blocking-non-blocking-and-async-i-o). This lesson looks at the loop from the language side. It covers the order in which the loop runs callbacks, and what happens when one callback is slow.
+
+<Predict
+  id="order"
+  question="A browser runs this script. The timer has a delay of 0 ms. In what order do the letters print?"
+  options={["A F B C E D: the 0 ms timer is due first", "A F C E D B", "A C D E F B"]}
+  answer={1}
+  explain="The script runs to its end first, so A and F print. Then the loop runs every microtask (C, E, and D, which C queued) before it takes the next task. The timer callback is a task, so B prints last."
+>
+<ConcAsyncLoopStepper />
+</Predict>
+
+1. Keep **Promises and a 0 ms timer**. Click **Next** once to run the script. Now pick the next callback yourself. Try the timer first, and read why the loop refuses.
+2. Step to the end. The second `.then` (D) enters the queue only when the first one (C) returns. So E runs before D.
+3. Select **Microtasks that queue microtasks**. The timer is due at 0 ms, but it waits until the sixth microtask has run.
+4. Select **Node: nextTick, promises, timers**. The nextTick queue runs before the promise job. Then "tick 2", which the promise queued, runs before the timer.
+5. Select **Node: setImmediate in an I/O callback**. The loop is in the poll phase, so the check phase (setImmediate) comes before the next timers phase.
+
+## One iteration
+
+Every event loop does the same three things in a cycle. It runs the timers that are due. It asks the kernel for ready I/O, and it sleeps in that call for at most the time until the next timer. Then it runs the callbacks of the events that came back.
+
+```ts
+for (;;) {
+  runDueTimers(heap, now());                     // timers: a min-heap by due time
+  const timeout = heap.size ? heap.peek().due - now() : -1;
+  for (const ev of epollWait(timeout)) ev.callback();
+  // after each callback: drain the microtask queue
+}
+```
+
+The timers live in a min-heap, so the next due time costs $O(1)$ to read and $O(\log n)$ to change. When the heap is empty and no I/O is pending, the loop has no reason to live, and the program exits. That is why a Node.js script with only a 1 s timer ends after 1 s.
+
+## Tasks and microtasks
+
+JavaScript has two kinds of queued work. A **task** is a timer callback, an I/O event, a message or a user event. A **microtask** is a promise reaction, or a function passed to `queueMicrotask`. ECMAScript queues promise reactions as jobs through `HostEnqueuePromiseJob`, and the HTML standard decides when they run.
+
+The HTML processing model takes one task from a task queue and runs it. Then it does a **microtask checkpoint**: it runs microtasks until the microtask queue is empty. Microtasks that microtasks queue also run in the same checkpoint. A browser updates the rendering in a separate task, which it queues when a rendering opportunity comes, typically once per display frame.
+
+Two results follow from this model:
+
+- **A promise callback never runs during the code that resolved it.** Promises/A+ rule 2.2.4 requires that the stack contains only platform code. So `.then` callbacks are always asynchronous, even on a promise that is already resolved.
+- **Microtasks can starve tasks.** A microtask that always queues another one blocks timers, I/O and rendering forever. So `await Promise.resolve()` does not give the loop a chance to do I/O. To yield to I/O, you must queue a task, for example with `setTimeout(fn, 0)` or `setImmediate`.
+
+Timers are not exact. The HTML standard clamps the delay to at least 4 ms when timers nest more than 5 levels deep. Node.js changes any delay below 1 ms to 1 ms. A timer only says "not before": if a callback is running when the timer becomes due, the timer waits.
+
+## Node.js and libuv
+
+Node.js runs its loop on **libuv**, a C library. libuv divides an iteration into **phases**, and each phase has its own queue.
+
+| Phase | What runs |
+|---|---|
+| pending | some I/O callbacks that were deferred from the last iteration |
+| idle, prepare | internal hooks |
+| poll | wait for I/O (with the timeout from the timer heap), then run I/O callbacks |
+| check | `setImmediate` callbacks |
+| close | close callbacks, such as `socket.on("close")` |
+| timers | `setTimeout` and `setInterval` callbacks that are due |
+
+Node adds two queues of its own. The **nextTick queue** (`process.nextTick`) runs before the promise microtask queue, and Node drains both after each callback. Since Node 11, this also happens between two timer callbacks and between two `setImmediate` callbacks. Node now calls `process.nextTick` a legacy API and recommends `queueMicrotask`. In an ES module, the order of the two queues is different, because the module itself runs in a promise job.
+
+The phase order explains a well-known puzzle. In an I/O callback, `setImmediate` always runs before `setTimeout(fn, 0)`, because check comes right after poll. In the main script, the order is not fixed. It depends on whether 1 ms has passed when the loop starts. Since libuv 1.45 (Node.js 20), timers run at the end of each iteration, after close, as the table shows. The libuv library also runs them once before the first iteration.
+
+Some work has no non-blocking kernel interface on most systems: file system calls and `getaddrinfo`. The libuv library sends this work to a **thread pool**, which has 4 threads by default. You can change the size with `UV_THREADPOOL_SIZE`, up to 1024. A program that reads many files at once can fill the pool, and then DNS lookups wait behind file reads.
+
+## One slow callback
+
+The loop runs one callback at a time, so every callback adds to the wait of all events behind it. A 20 ms callback holds up every request that arrives during those 20 ms. The loop is like a single-server queue, and [tail latency](/performance/systems/tail-latency) is where it shows.
+
+<ConcAsyncBlockingDemo />
+
+1. Keep **inline**. A normal request needs 100 µs of CPU, and its median latency is 105 µs. Each slow request makes a wall of dots: the requests that arrived during it. The p99 is 19.93 ms.
+2. Select **in 1 ms slices**. The slow job runs 1 ms at a time and goes to the back of the queue after each slice. The p99 falls to 2.29 ms. The slow request itself now takes 21.7 ms on average, not 20.11 ms.
+3. Select **worker pool**. The loop sends the slow job to another thread and stays free. The p99 is 0.2 ms, close to a run with no slow requests.
+4. With 20 ms, the p50 does not change: a median hides the problem. Now move **Slow callback** to 30 ms with **inline**. The loop is busy about 85% of the time, the queue rarely empties, and even the p50 jumps to 8.14 ms.
+
+The 5 µs in the median is the wake-up of the loop thread, a model input of the shared runtime. The slow part of the request is CPU work, so slices and threads are the only fixes. Slicing keeps one thread but makes the slow job slower, because it shares the loop. A pool adds threads, and the result must come back to the loop as a new event. Node offers `worker_threads` for this, and browsers offer Web Workers.
+
+The same rule holds in every single-threaded runtime: never block the loop. A synchronous file read, a large `JSON.parse`, a regular expression with catastrophic backtracking, or a CPU loop all stop every other connection. To find them, measure the **event-loop lag**: the delay between when a timer is due and when it runs. Node gives this as `perf_hooks.monitorEventLoopDelay()`.
+
+## Reactor and proactor
+
+A reactor waits for **readiness**. The kernel says "this socket can be read", and the callback calls `read` itself. `epoll` and `kqueue` work this way.
+
+A **proactor** waits for **completion**. The program starts the operation with a buffer, and the kernel says "the read is done, here are the bytes". Pyarali, Harrison, Schmidt and Jordan described this pattern in 1997. Windows IOCP and [io_uring](/os/io/io-uring) are completion interfaces. The libuv library is a reactor on Unix systems and uses IOCP on Windows, and it hides the difference behind one API.
+
+The difference matters for buffers. A reactor needs a buffer only when data is ready. A proactor must give the kernel a buffer for every read in flight, which is why io_uring added provided buffer rings ([io_uring for networking](/networking/programming/io-uring-for-networking)).
+
+| Runtime | The loop |
+|---|---|
+| Browser | one event loop per group of same-origin windows (an agent), plus one per worker |
+| Node.js | one libuv loop on the main thread, plus the thread pool |
+| Python asyncio | one loop per thread, started by `asyncio.run` |
+| Tokio (Rust) | an I/O driver that the worker threads poll; see [Rust async runtimes](/concurrency/async/rust-async-runtimes) |
+| Go | no loop in user code: the netpoller wakes goroutines |
+
+## Connect
+
+- [Futures and promises](/concurrency/async/futures-and-promises): the values that the loop resolves.
+- [async/await desugared](/concurrency/async/async-await-desugared): how a function that waits becomes a series of callbacks.
+- [Context switching](/os/processes/context-switching): what a thread per connection costs instead.
+- [Queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law): why a busy single server has long waits.
+
+<Recall cards={[
+  { q: "After a task runs, what does the HTML event loop do before it takes the next task?", a: "A microtask checkpoint: it runs microtasks until the microtask queue is empty, including microtasks that those microtasks queue." },
+  { q: "Why does setTimeout(fn, 0) run after a promise callback that was queued later?", a: "The timer callback is a task, and the promise callback is a microtask. All microtasks run before the loop takes the next task." },
+  { q: "In Node, which runs first inside an I/O callback, setImmediate or setTimeout(fn, 0), and why?", a: "setImmediate. The I/O callback runs in the poll phase, and the check phase comes next. The timer waits for the next timers phase." },
+  { q: "How does the loop decide how long to sleep in epoll_wait?", a: "It uses the time until the next timer is due, read from the top of the timer min-heap. With no timers, it can sleep until I/O arrives." },
+  { q: "A 20 ms callback runs on a loop that serves 100 µs requests. Which latency percentiles change?", a: "The tail: every request that arrives during the 20 ms waits for it, so the p99 goes to about 20 ms. The median stays near 100 µs." },
+  { q: "What is the difference between a reactor and a proactor?", a: "A reactor is told that a handle is ready and does the I/O itself (epoll, kqueue). A proactor starts the I/O and is told when it is complete (IOCP, io_uring)." },
+]} />

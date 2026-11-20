@@ -1,0 +1,208 @@
+---
+summary: "Specify a concurrent design as a state machine in TLA+: variables, Init, Next and primed variables, behaviors and stuttering, invariants and fairness. Then let TLC search every state: the DieHard jugs, and a deadlock in a Java-style blocking queue."
+---
+import { ConcVerJugsDemo, ConcVerTlcGraphDemo, ConcVerBlockingQueueDemo } from "@/demos/conc/ConcVerTlaDemos";
+
+The model checkers of the [previous lesson](/concurrency/verification/model-checking) explore real code. That is precise, but a bug in the *design* is often found too late, after the code exists. **TLA+** lets you check a design first. You describe the system as a state machine in plain mathematics, and a model checker explores every state.
+
+Leslie Lamport defined the logic in "The Temporal Logic of Actions" (ACM TOPLAS, 1994). His book "Specifying Systems" (Addison-Wesley, 2002) is free on his web site. **TLC**, the model checker, is by Yuan Yu, Panagiotis Manolios and Lamport (CHARME 1999).
+
+## A spec is Init and Next
+
+A TLA+ spec has three parts. The **variables** hold the state. **Init** is a formula that says which states are initial. **Next** is a formula that relates a state to the following state. In Next, a plain name such as `big` is the value now, and a **primed** name such as `big'` is the value after the step.
+
+This is the DieHard spec from the tlaplus Examples repository. In the film, the heroes must measure exactly 4 gallons with a 3-gallon jug, a 5-gallon jug and a faucet.
+
+```text
+------------------------------ MODULE DieHard ------------------------------
+EXTENDS Naturals
+VARIABLES big, small
+
+TypeOK == /\ small \in 0..3
+          /\ big   \in 0..5
+
+Init == /\ big = 0
+        /\ small = 0
+
+FillSmallJug  == /\ small' = 3
+                 /\ big' = big
+FillBigJug    == /\ big' = 5
+                 /\ small' = small
+EmptySmallJug == /\ small' = 0
+                 /\ big' = big
+EmptyBigJug   == /\ big' = 0
+                 /\ small' = small
+
+Min(m,n) == IF m < n THEN m ELSE n
+
+SmallToBig == /\ big'   = Min(big + small, 5)
+              /\ small' = small - (big' - big)
+BigToSmall == /\ small' = Min(big + small, 3)
+              /\ big'   = big - (small' - small)
+
+Next ==  \/ FillSmallJug  \/ FillBigJug
+         \/ EmptySmallJug \/ EmptyBigJug
+         \/ SmallToBig    \/ BigToSmall
+
+Spec == Init /\ [][Next]_<<big, small>>
+
+NotSolved == big # 4
+=============================================================================
+```
+
+Each action, such as `FillSmallJug`, is a formula that is true or false of a *pair* of states. Read `/\` as "and" and `\/` as "or". An action must say what happens to every variable. That is why `FillSmallJug` states `big' = big`: without it, `big` could take any value.
+
+<Predict
+  id="jugs"
+  question="Start with both jugs empty. What is the smallest number of steps that leaves exactly 4 gallons in the big jug?"
+  options={["4", "6", "8"]}
+  answer={1}
+  explain="As (small, big): fill big (0,5), pour (3,2), empty small (0,2), pour (2,0), fill big (2,5), and pour again (3,4). That is 6 steps. The next demo shows that no shorter path exists."
+>
+<ConcVerJugsDemo />
+</Predict>
+
+1. Click **FillBigJug**, then **BigToSmall**. Read the evaluated formulas: `small' = Min(big + small, 3) = 3`, and `big'` follows from it.
+2. Keep going until the big jug holds 4. The invariant `NotSolved` fails, and your behavior is the counterexample.
+3. Click **Stutter**. The state does not change, and the step is still allowed.
+4. Click **Back** and try other orders. Count the steps of your best solution.
+
+## Behaviors and stuttering
+
+A **behavior** is an infinite sequence of states. `Spec` is a temporal formula that is true of a behavior or false of it. `Init /\ [][Next]_vars` means: the first state satisfies Init, and every step satisfies `[Next]_vars`. The box `[]` means "always". `[Next]_vars` is `Next \/ UNCHANGED vars`, so a **stuttering** step, which changes none of the variables, is always allowed.
+
+Stuttering has a purpose. A spec of a clock with only an hour variable must allow the steps where only the minutes change. With stuttering, a finer spec can **implement** a coarser one: its extra steps are stutters of the coarse variables. The price is that `Spec` alone allows a system to stop and stutter forever. The section on fairness below deals with that.
+
+An **invariant** is a formula over one state that must hold in every reachable state. `TypeOK` says that each variable has the expected type. `NotSolved` is a trick: we claim that the puzzle cannot be solved, and the counterexample is the solution.
+
+## How TLC searches
+
+TLC computes every initial state and then applies Next to each state that it has found. It keeps a set of the states that it has seen. By default it searches **breadth-first**. So when it finds a state that breaks an invariant, it prints "a minimal-length behavior" that reaches it. With more than one worker thread, TLC can rarely print a trace that is not the shortest.
+
+TLC also checks for **deadlock** by default: a reachable state from which Next allows no step. You turn that check off with `-deadlock`, or with `CHECK_DEADLOCK FALSE` in the configuration file.
+
+```text
+\* DieHard.cfg
+SPECIFICATION Spec
+INVARIANT TypeOK
+INVARIANT NotSolved
+```
+
+<Predict
+  id="gcd"
+  question="Change the jugs to 4 gallons and 6 gallons. Can TLC find a behavior that leaves exactly 3 gallons in the big jug?"
+  options={["Yes, but it takes longer", "No: every reachable amount is even", "Only if the goal is in the small jug"]}
+  answer={1}
+  explain="Every action keeps both amounts as multiples of 2, which is the greatest common divisor of 4 and 6. TLC visits all 10 reachable states and finds no violation of NotSolved. A model checker can prove this for a finite model, because it saw every state."
+>
+<ConcVerTlcGraphDemo />
+</Predict>
+
+1. With the default jugs, the full state graph has 16 distinct states. A search of all of it generates 97 states, with repeats. The red line is the 6-step counterexample. Because the search is breadth-first, no shorter one exists.
+2. Drag **BFS level shown** from 0 upward. Each level is one more step from the initial state. The goal row first appears at level 6.
+3. Set the jugs to 4 and 6 and the goal to 3. TLC visits 10 states and reports no error.
+4. Look where the dots are. Every reachable state has a jug that is empty or full, because every action ends that way.
+5. Turn on **Bug**. Now `SmallToBig` ignores the capacity of the big jug. TLC reports `TypeOK` after 3 steps, in the state (0,8).
+
+The demo's checker is a small copy of what TLC does. It keeps a hash table of states and a queue, and it stops at the first error. On DieHard, it stops after 14 distinct states, at the first state with big = 4.
+
+## A spec of a concurrent program
+
+A design with threads is a state machine too. The steps of different threads interleave, and Next is a disjunction with one action for each thread. This spec models a Java bounded buffer with one monitor, `wait` and `notify`. It follows Markus Kuppe's BlockingQueue tutorial, "Weeks of debugging can save you hours of TLA+", which studies legacy Java code of this form. Only the length of the buffer matters for deadlock, so the spec keeps no data.
+
+```text
+---------------------------- MODULE BlockingQueue ----------------------------
+EXTENDS Naturals
+CONSTANTS Producers, Consumers, BufCapacity
+VARIABLES len, waitSet
+vars == <<len, waitSet>>
+
+RunningThreads == (Producers \cup Consumers) \ waitSet
+
+Notify == IF waitSet # {}
+          THEN \E t \in waitSet : waitSet' = waitSet \ {t}   \* any waiting thread
+          ELSE UNCHANGED waitSet
+
+Wait(t) == /\ waitSet' = waitSet \cup {t}
+           /\ UNCHANGED len
+
+Put(t) == IF len < BufCapacity THEN /\ len' = len + 1
+                                    /\ Notify
+                               ELSE Wait(t)
+
+Get(t) == IF len > 0 THEN /\ len' = len - 1
+                          /\ Notify
+                     ELSE Wait(t)
+
+Init == len = 0 /\ waitSet = {}
+Next == \/ \E p \in Producers \cap RunningThreads : Put(p)
+        \/ \E c \in Consumers \cap RunningThreads : Get(c)
+Spec == Init /\ [][Next]_vars
+=============================================================================
+```
+
+In Java, `notify()` wakes one waiting thread, and the program cannot choose which one. The spec says this with `\E t \in waitSet`. TLC then explores every choice, including the bad ones.
+
+<Predict
+  id="bq"
+  question="One producer, two consumers, a buffer of one slot, and notify(). Can every thread end up waiting?"
+  options={[
+    "No: each Put wakes a consumer, and each Get wakes the producer",
+    "Yes: a consumer can wake the other consumer instead of the producer",
+    "Only if the buffer has more than one slot",
+  ]}
+  answer={1}
+  explain="After a Get, both the producer and the other consumer may be waiting. notify() may wake the consumer. It finds the buffer empty and waits again. Now the producer still waits, and nobody is left to wake it. TLC finds this in 7 steps."
+>
+<ConcVerBlockingQueueDemo />
+</Predict>
+
+1. Read the 7-step trace. At step 5, c1 takes the value and wakes c2 instead of p1. Then c1 and c2 both find the buffer empty and wait.
+2. Select **notifyAll()**. Each Put or Get now empties the wait set, and no configuration deadlocks.
+3. Go back to **notify()** and read the map of all 27 configurations. 11 of them deadlock.
+4. Find the rule in the map. A configuration deadlocks exactly when the number of threads is more than twice the capacity. Kuppe's tutorial states the same rule.
+
+A test of the Java code could run for weeks without this schedule. The whole state graph of this model has only 14 states. There are two fixes. `notifyAll()` is simple, but it wakes every thread on every change. Two condition variables, one for "not full" and one for "not empty", wake only a thread that can proceed. Java's `ArrayBlockingQueue` uses one `ReentrantLock` with two `Condition` objects, and Go code does the same with two `sync.Cond` values.
+
+## Fairness and liveness
+
+Deadlock freedom is a safety property: a bad state never occurs. "Every value that is put is eventually taken" is a **liveness** property, written with `<>` ("eventually"). Because `Spec` allows stuttering forever, a liveness property fails unless the spec also says that steps must happen.
+
+**Weak fairness** `WF_vars(A)` says: if A stays enabled forever, then an A step eventually occurs. **Strong fairness** `SF_vars(A)` says: if A is enabled infinitely often, then infinitely many A steps occur. A typical spec is `Init /\ [][Next]_vars /\ WF_vars(Next)`. TLC checks such properties, given with `PROPERTY` in the configuration file, by searching the state graph for a bad cycle.
+
+## PlusCal and the wider toolbox
+
+Many engineers write **PlusCal**, Lamport's algorithm language (ICTAC 2009), which looks like pseudocode and translates to TLA+. Each label is one atomic step. This is the racy ticket from the previous lesson:
+
+```text
+(* --algorithm tickets
+variables next = 0;
+process worker \in 1..3
+variable t = 0;
+begin
+  Load:  t := next;
+  Store: next := t + 1;
+end process;
+end algorithm; *)
+```
+
+Amazon Web Services reported its use of TLA+ in "How Amazon Web Services Uses Formal Methods" (Newcombe et al., CACM, April 2015). Teams wrote specs for parts of S3, DynamoDB, EBS and an internal lock manager. In DynamoDB, TLC found 3 bugs. For one of them, "the shortest error trace exhibiting the bug contained 35 high level steps".
+
+TLC is not the only tool. **Apalache** is a symbolic model checker that translates TLA+ for SMT solvers such as Z3. **TLAPS**, the TLA+ Proof System, checks proofs for all sizes of a model, where TLC checks one finite instance.
+
+## Connect
+
+- [Model checking](/concurrency/verification/model-checking): the same search on code, with partial order reduction and bounds.
+- [Condition variables](/os/sync/condition-variables): why waits sit in a loop, and how `notify` can wake the wrong thread.
+- [Deadlock](/os/sync/deadlock): the conditions for a deadlock, and how to break them.
+- [Linearizability](/concurrency/verification/linearizability): a property that a TLA+ spec of an object can state.
+- [Raft leader election](/distributed/consensus/raft-leader-election): Diego Ongaro wrote a TLA+ spec of Raft.
+
+<Recall cards={[
+  { q: "What do Init and Next describe in a TLA+ spec, and what does a primed variable mean?", a: "Init gives the initial states. Next relates a state to the following state. A primed variable such as big' is its value after the step." },
+  { q: "Why must FillSmallJug say big' = big?", a: "An action must fix every variable. Without that conjunct, big could take any value in the step." },
+  { q: "What is a stuttering step, and why does [Next]_vars allow it?", a: "A step that changes none of the variables. It lets a finer spec implement a coarser one, whose variables do not change during the extra steps." },
+  { q: "Why is the counterexample that TLC prints for an invariant a shortest one?", a: "TLC searches breadth-first by default, so it reaches each state first by a path of minimal length. With several worker threads this can rarely fail." },
+  { q: "Why does the blocking queue with notify() deadlock with 1 producer, 2 consumers and 1 slot?", a: "A consumer can wake the other consumer instead of the producer. Both consumers then find the buffer empty and wait, and the producer still waits." },
+  { q: "State weak fairness in words.", a: "If action A stays enabled forever, then an A step eventually occurs." },
+]} />

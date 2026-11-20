@@ -1,0 +1,151 @@
+---
+summary: "When is a concurrent queue or stack correct? Histories, linearization points in real code (locks, Treiber, Michael-Scott, Herlihy-Wing), locality, and checking an implementation with random histories."
+---
+import { ConcVerLinPointsDemo, ConcVerHwQueueDemo, ConcVerRandomHistoryDemo } from "@/demos/conc/ConcVerLinDemos";
+
+A sequential queue has a simple contract: values come out in the order that they went in. A **concurrent object** is an object that several threads call at the same time, such as `ConcurrentLinkedQueue` in Java or a channel in Go. Its calls overlap in time, so "the order that they went in" is not clear. We need a rule that says which results are correct.
+
+**Linearizability** is the usual rule. Each operation must seem to take effect at one instant between its call and its return. The [distributed linearizability lesson](/distributed/consistency/linearizability) applies this rule to replicated registers and Jepsen histories. This lesson applies it to data structures in memory. It asks where the instant is in real code, and how to test an implementation.
+
+A **history** is a record of what the callers saw. Each operation has a **call** time, a **return** time and a result. Two operations are **concurrent** if their intervals overlap.
+
+<Predict
+  id="overlap"
+  question="T0 runs enq(1), then deq() and gets 2. T1 runs enq(2), then deq() and gets 1. The enq(1) of T0 starts first. The two deqs overlap. Is this history linearizable?"
+  options={[
+    "No: enq(1) started first, so the first deq to start must return 1",
+    "Yes: the two deqs overlap, so the deq of T1 can take effect first",
+    "Only if the queue uses a lock",
+  ]}
+  answer={1}
+  explain="The two enqs overlap, and so do the two deqs. Put enq(1) before enq(2). Then put the point of T1's deq before the point of T0's deq. The run is enq(1), enq(2), deq → 1, deq → 2, which is legal. The order of the starts does not matter. Only the points matter."
+>
+<ConcVerLinPointsDemo />
+</Predict>
+
+1. Each bar is one operation, and each dot is its **linearization point**. The dots start in the middle of the bars, and the order under the bars fails. Drag the dot of T0's deq to the right, past the dot of T1's deq.
+2. Click **Show a valid order**. The search places the points for you. Compare its order with the order that you found.
+3. Select **Out of order**. T0 enqueues 1 and then 2, and T1 dequeues 2 first. No placement works, and the search agrees. This history is not even sequentially consistent.
+4. Select **Stale empty**. The deq starts after enq(1) returned, and it reports an empty queue. The history is sequentially consistent, but it is not linearizable.
+5. Select **Two queues**. Read the per-object lines. Each queue alone is sequentially consistent, but the two together are not.
+
+## The definition
+
+Maurice Herlihy and Jeannette Wing defined linearizability in "Linearizability: A Correctness Condition for Concurrent Objects" (ACM TOPLAS, July 1990). A history is linearizable if its operations have a total order with two properties.
+
+1. **Legal**: the order is a correct run of the sequential object. For a queue, each deq returns the oldest value that is still in the queue, or "empty".
+2. **Real time**: if operation a returns before operation b is called, then a comes before b in the order.
+
+The dots in the demo are an equal way to say this. Pick one instant inside each bar. If the instants, read from left to right, give a legal run, the history is linearizable.
+
+**Sequential consistency**, from Lamport (IEEE Transactions on Computers, 1979), drops the real-time rule. It keeps only the order of the operations inside each thread. So a deq that starts after enq(1) returned may still see an empty queue. The deq simply moves earlier in the order.
+
+The paper proves two properties that make linearizability practical. **Locality** (Theorem 1): a history is linearizable if and only if the history of each object is linearizable. So you can verify a queue and a map separately and then use them together. Sequential consistency is not local, as **Two queues** shows and the [sequential consistency lesson](/distributed/consistency/sequential-and-causal-consistency) explains. The paper also calls linearizability **nonblocking**: a pending call of a total operation never has to wait for another pending call to finish.
+
+| Condition | The order must respect | Local? |
+|---|---|---|
+| sequential consistency | the order inside each thread | no |
+| linearizability | real time, so also the order inside each thread | yes |
+| serializability | nothing about real time; units are transactions | does not apply |
+| strict serializability | real time, for transactions | does not apply |
+
+## Linearization points in real code
+
+To prove an implementation linearizable, you name the step at which each operation takes effect. Then you show that the abstract queue changes only at those steps.
+
+- **A lock.** Every operation runs inside one critical section. Any step inside it works as the point, because no other operation can run between the lock and the unlock.
+- **The Treiber stack.** A push or a pop takes effect at its successful CAS on `head`. A pop that finds the stack empty takes effect at the load that saw null. See the [lock-free stack](/concurrency/lock-free/lock-free-stack).
+- **The Michael-Scott queue.** The paper (PODC 1996) says it directly. "An enqueue takes effect when the allocated node is linked to the last node in the linked list. A dequeue takes effect when Head swings to the next node." See the [Michael-Scott queue](/concurrency/lock-free/michael-scott-queue).
+
+```rust
+fn pop(&self) -> Option<T> {
+    loop {
+        let h = self.head.load(Acquire);       // if h is null: the linearization point of "empty"
+        if h.is_null() { return None; }
+        let next = unsafe { (*h).next };
+        if self.head.compare_exchange(h, next, AcqRel, Acquire).is_ok() {
+            return Some(unsafe { take_value(h) }); // the successful CAS above was the point
+        }
+    }
+}
+```
+
+These points are fixed instructions in the operation's own code. That is the easy case. In some objects, the point depends on what other threads do later.
+
+<Predict
+  id="hw"
+  question="An enq takes a slot with an atomic increment of back, and then stores its value in that slot. A deq scans the slots from index 0. Which step is the linearization point of the enq?"
+  options={[
+    "The increment: it fixes the slot, so it fixes the order",
+    "The store: the value is not visible before it",
+    "Neither: in some runs only the increment works, in others only the store",
+  ]}
+  answer={2}
+  explain="Run the two scripts. In the first one, T1 fills slot 1 before T0 fills slot 0, and the deq returns 2. So the increment order is wrong. In the second one, T1 stores first, but the deq scans slot 0 first and returns 1: the store order is wrong. The order depends on a race with the dequeuer."
+>
+<ConcVerHwQueueDemo />
+</Predict>
+
+1. Click **Increment order is wrong**. T0 takes slot 0 and T1 takes slot 1. T1 stores 2, and the deq scans slot 0, finds null, and takes 2 from slot 1. Read the table: the increment rule puts enq(1) first, which is illegal.
+2. Click **Store order is wrong**. Both enqs store before the deq reads `back`. The deq takes 1 from slot 0. Now the store rule fails, because T1 stored first.
+3. In both runs, the last line of the table says "linearizable". The history is fine. Only the fixed rule is wrong.
+4. Be the scheduler yourself. Run the deq before any enq stores. It scans every slot, finds nothing, and starts again.
+
+This is the queue that Herlihy and Wing use in their paper. Enq does `i := INC(back)` and then `STORE(items[i], x)`. Deq reads `back` and does `SWAP(items[i], null)` on each slot in order, until it finds a value. The paper says: "the linearization order depends on a race condition". To prove the queue correct, the paper maps each state to a *set* of possible linearizations instead of one abstract value.
+
+The sim checks every schedule of this program in which the deq finds a value on its first scan. Of those 80 schedules, the increment rule fails in 20 and the store rule fails in 10. The search finds a valid order for all 80.
+
+```go
+// The Herlihy-Wing queue: back is an atomic.Int64, items a []atomic.Pointer[int].
+// Slots start nil. A deq on an empty queue spins.
+func (q *HWQueue) Enq(x *int) {
+	i := q.back.Add(1) - 1 // take a slot
+	q.items[i].Store(x)    // fill it
+}
+
+func (q *HWQueue) Deq() *int {
+	for {
+		n := q.back.Load()
+		for i := int64(0); i < n; i++ {
+			if x := q.items[i].Swap(nil); x != nil {
+				return x
+			}
+		}
+	}
+}
+```
+
+Helping has the same effect in other designs. If thread A finishes the half-done operation of thread B, then B can take effect at a step of A. A proof must allow this.
+
+## Checking an implementation
+
+A proof is best, but a test is cheaper. Run the object under many schedules, record each history, and search for a valid order. The search is the Wing and Gong search with the cache of Lowe, from the [Jepsen lesson](/distributed/consistency/checking-histories-like-jepsen). It costs little here, because a test of a data structure has a few threads and short histories.
+
+<ConcVerRandomHistoryDemo />
+
+1. The default is a **single-producer single-consumer** (SPSC) array queue, used by two producers. Each red square is a run with no valid order. In 200 seeded runs, 52 fail, and the first failure is seed 6.
+2. Read the failing history. Both producers read the same `tail` and wrote the same slot, so one value is lost. The checker reports the deq that cannot be explained.
+3. Set **Operations per thread** to 1. Now no run fails, although values are still lost. A lost value is only visible when a deq would have to return it. A test needs operations that observe the damage.
+4. Set **Producers** to 1 and **Consumers** to 2. Both consumers read the same `head` and return the same value. In 200 runs, 88 fail, and the first failure is seed 3.
+5. Select **spinlock** or **Herlihy–Wing**. Every run passes. That is evidence, not proof: the next lesson explores every schedule instead of a random sample.
+
+Real tools use this method. **Lincheck** for the JVM runs concurrent scenarios by stress testing or bounded model checking, and checks linearizability by default. **Porcupine** is a fast checker in Go. MIT's distributed systems course uses it to test the key-value stores of its students.
+
+Not every method of a concurrent class is linearizable. The Java documentation for `ConcurrentLinkedQueue` warns that `size` traverses the queue and "may report inaccurate results" under concurrent change. It also says that bulk operations such as `addAll` "are not guaranteed to be performed atomically". Its iterators are **weakly consistent**: they reflect the queue "at some point at or since the creation of the iterator". Read such notes before you rely on a method in a proof.
+
+## Connect
+
+- [Linearizability for replicated registers](/distributed/consistency/linearizability): the same rule across machines, and what it costs.
+- [Checking histories like Jepsen](/distributed/consistency/checking-histories-like-jepsen): the search, its cost, and why invalid histories are expensive.
+- [Michael-Scott queue](/concurrency/lock-free/michael-scott-queue) and [lock-free stack](/concurrency/lock-free/lock-free-stack): the linearization points above, in steppers.
+- [Happens-before](/concurrency/atomics/happens-before): a single atomic variable with sequentially consistent operations acts as a linearizable register.
+- [Model checking](/concurrency/verification/model-checking): explore every schedule instead of a random sample.
+
+<Recall cards={[
+  { q: "State the two conditions that a linearization order must meet.", a: "It is a legal run of the sequential object, and it respects real time: if a returns before b is called, a comes first." },
+  { q: "What does sequential consistency drop from linearizability, and what can then happen to a queue?", a: "The real-time rule. A deq that starts after enq(1) returned may still return empty, because the deq can move earlier in the order." },
+  { q: "What is locality, and why does it matter for a program that uses many objects?", a: "A history is linearizable if and only if each object's history is. So you can verify each object alone and combine them." },
+  { q: "Where is the linearization point of a Michael-Scott enqueue, and of a dequeue?", a: "The enqueue takes effect when its node is linked to the last node. The dequeue takes effect when Head swings to the next node." },
+  { q: "Why does the Herlihy-Wing queue have no fixed linearization point for enq?", a: "The order of two enqs depends on which slot a later deq scans first. In some runs the increment order is wrong, in others the store order." },
+  { q: "Two producers on an SPSC queue lose a value, but a random test with one enq per producer never fails. Why?", a: "No deq ever has to return the lost value, so every history still has a valid order. The test must observe the damage." },
+]} />

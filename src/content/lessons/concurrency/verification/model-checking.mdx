@@ -1,0 +1,163 @@
+---
+summary: "Explore every interleaving instead of a random few: the state explosion, state hashing, partial order reduction and DPOR, preemption bounding (CHESS), randomized search (PCT), and the tools that do it for real code: loom, Shuttle, GenMC, CBMC and SPIN."
+---
+import { ConcVerExplosionDemo, ConcVerGridDemo, ConcVerBugHuntDemo } from "@/demos/conc/ConcVerMcDemos";
+
+A test of concurrent code runs one schedule, chosen by the operating system. A bug that needs a rare order of steps can pass a million runs and then fail in production. A **model checker** removes the luck. It explores every reachable state of a model of the program and checks a property in each one.
+
+Edmund Clarke and Allen Emerson introduced model checking at Harvard in 1981, and Jean-Pierre Queille and Joseph Sifakis developed a similar method independently in 1982. Clarke, Emerson and Sifakis shared the 2007 ACM Turing Award for it. For a concurrent program, a **state** is the memory plus the program counter and registers of each thread. A **transition** is one atomic step of one thread. The explorer of the [critical sections lesson](/os/sync/critical-sections) is a small model checker of this kind.
+
+A model checker can check two kinds of property. A **safety** property says that a bad state never occurs. Examples are a failed assertion, two threads in a critical section, or a deadlock. A counterexample is a finite schedule. A **liveness** property says that something good eventually occurs. Its counterexample is an infinite run, such as a loop in which a thread never gets the lock.
+
+<Predict
+  id="explode"
+  question="Three threads run 4 atomic steps each. How many different schedules (orders of the 12 steps) exist?"
+  options={["12", "About 1,700", "34,650"]}
+  answer={2}
+  explain="A schedule picks which 4 of the 12 positions belong to thread 0, then which 4 of the remaining 8 belong to thread 1. That is 495 × 70 = 34,650. The count grows faster than exponentially in the number of threads."
+>
+<ConcVerExplosionDemo />
+</Predict>
+
+1. Read the three bars for the default: 3 threads of 4 steps, where even steps write a shared x. There are 34,650 schedules, but only 301 distinct states and 90 traces.
+2. Move **Threads n** to 4 and **Steps per thread k** to 6. The schedules jump to about $2.3 \times 10^{12}$, while the states stay at 8,233.
+3. Select **its own variable**. No step conflicts with another thread, so all schedules form one trace.
+4. Select **x**. Every step conflicts, so every schedule is its own trace, and partial order reduction cannot help.
+5. Go back to the default and read the sleep-set line: 90 complete runs, one per trace, plus 595 dead ends.
+
+## Why it explodes
+
+With n threads of k steps each, a schedule chooses positions for each thread's steps:
+
+$$
+\frac{(nk)!}{(k!)^n}
+$$
+
+For 3 threads of 4 steps this is 34,650, and for 4 threads of 6 steps it is 2,308,743,493,056. Real programs have loops, so the steps per thread are not even fixed. This growth is the **state explosion problem**, and every tool below is a way to fight it.
+
+## Fight 1: remember states
+
+Many schedules reach the same state. An **explicit-state** model checker keeps a hash table of visited states and does not explore a state twice. If each thread writes only its own variable, a state is just the n program counters, so there are $(k+1)^n$ states. That is 125 for 3 threads of 4 steps, against 34,650 schedules.
+
+SPIN, by Gerard Holzmann at Bell Labs, works this way on models in its language Promela. It won the ACM Software System Award for 2001. TLC, the checker for TLA+, also stores states. The [next lesson](/concurrency/verification/tla-basics) shows its search step by step.
+
+Storing states needs a model that can copy and hash its whole state. Real programs have heaps, kernels and stacks, so that is hard. **Stateless model checking**, introduced by Patrice Godefroid in VeriSoft (POPL 1997), runs the real program again from the start for each schedule. It stores no states, so it needs another way to avoid redundant work.
+
+## Fight 2: skip equivalent orders
+
+Two steps of different threads are **independent** if they touch different variables, or if both only read. Independent steps commute: both orders reach the same state. Two schedules are **equivalent** if one turns into the other by swapping adjacent independent steps. An equivalence class is a **Mazurkiewicz trace**. Every schedule in a trace gives the same result, so a checker needs to run only one.
+
+<Predict
+  id="grid"
+  question="T0 writes x and then y. T1 reads y and then x. Each thread also does two local steps. Of the 70 schedules, how many are really different?"
+  options={["70: each order is a different run", "3", "1: the threads never write the same variable"]}
+  answer={1}
+  explain="Only the pairs (write x, read x) and (write y, read y) conflict. T1 can read both before T0 writes, read y before and x after, or read both after. The fourth combination is a cycle and cannot happen. So the 70 schedules fall into 3 traces."
+>
+<ConcVerGridDemo />
+</Predict>
+
+1. Each path from the top left to the bottom right is one schedule: a step right runs T0, a step down runs T1. Pink squares mark a pair of conflicting steps.
+2. With **Message passing**, click **Next** through the 3 traces. The blue paths of one trace differ only by going around grey squares. They never cross a pink square on the other side.
+3. Select **No sharing**. All 70 paths are one trace.
+4. Select **All on x**. Every square is pink, so there are 70 traces. Yet only 2 final states exist. Here state hashing helps and partial order reduction does not.
+5. Click a step of a thread to change what it does, and watch the traces and dead ends change.
+
+**Partial order reduction** (POR) explores one schedule per trace, or close to it. Godefroid's 1996 book, "Partial-Order Methods for the Verification of Concurrent Systems" (LNCS 1032), presents two classic tools. A **persistent set** is a subset of the threads that is enough to explore from a state. A **sleep set** holds threads whose next step was already explored from an earlier branch and is independent of everything since.
+
+```text
+explore(state, sleep):
+  for each thread t that can run, and is not in sleep:
+    a = next step of t
+    explore(state after a, { u in sleep : next step of u is independent of a })
+    sleep = sleep + { t }       // later siblings need not start with a
+```
+
+Sleep sets alone run each trace once, but they can still start runs that end in a dead end. That is the "dead ends" count in the demos. Flanagan and Godefroid made the method practical for real code with **dynamic POR** (DPOR, POPL 2005). DPOR finds conflicts while it runs, instead of from a static analysis, and adds backtracking points only where a conflict appeared. **Optimal DPOR** (Abdulla, Aronis, Jonsson and Sagonas, POPL 2014) "always explores exactly one interleaving per Mazurkiewicz trace, and never initiates any sleep set-blocked exploration".
+
+## Fight 3: search less, but where bugs are
+
+Even one run per trace can be too many. Two ideas trade completeness for reach.
+
+**Preemption bounding.** A **preemption** is a switch away from a thread that could still run. Musuvathi and Qadeer built this into CHESS ("Iterative Context Bounding for Systematic Testing of Multithreaded Programs", PLDI 2007). For n threads of k steps with no blocking, the number of executions with c preemptions is at most about $(n^2 k)^c \, n!$. That is polynomial in k and exponential only in c. They found 9 unknown bugs, "each of which was exposed by an execution with at most 2 preempting context switches".
+
+**Randomized search.** A random walk picks a random thread at each step. It is cheap, but a bug that needs one thread to run a long stretch alone becomes very unlikely. **PCT** (Burckhardt, Kothari, Musuvathi and Nagarakatte, ASPLOS 2010) gives random priorities to the threads and lowers the running thread's priority at $d-1$ random steps. Define the **depth** d of a bug as the smallest number of ordering constraints that make it happen. For n threads and k steps in total, PCT finds such a bug in one run with probability at least $1/(n k^{d-1})$.
+
+<Predict
+  id="hunt"
+  question="Three threads each run t = next; next = t + 1. The bug: all three get the same ticket. Can a search with at most 1 preemption find it?"
+  options={[
+    "Yes: one preemption is enough for any race",
+    "No: two threads must each be stopped between their load and their store",
+    "Only if the threads have no local work",
+  ]}
+  answer={1}
+  explain="All three loads must come before any store. The first thread to load must be preempted before its store, and so must the second. That is 2 preemptions. In general, n threads need n − 1. The table shows the bounded search failing at bound 1 and succeeding at bound 2."
+>
+<ConcVerBugHuntDemo />
+</Predict>
+
+1. Read the table for 3 threads with stagger 4. Breadth-first search visits 336 states and gives an 18-step counterexample. Bound 1 tries 96 schedules and finds nothing. Bound 2 finds the bug at schedule 128 of 896.
+2. Click **Play the shortest counterexample** and watch both preemptions in the schedule strip.
+3. Set the stagger to 0. A random walk now fails in 220 of 1,000 runs. Set it to 6: the random walk finds nothing in 1,000 runs, and PCT still fails 4 times.
+4. Set **Threads** to 4. Now bound 3 is needed. With a large stagger, bounded search runs out of its budget.
+
+The racy ticket is a small example, so a full search is cheap here. The point is the shape of the numbers. Exhaustive search grows with the state space. Bounded search grows polynomially in the length and finds shallow bugs. Random walks lose against long, narrow windows, and PCT keeps a guarantee for them.
+
+## Tools for real code
+
+| Tool | For | Method |
+|---|---|---|
+| SPIN | Promela models | explicit states, hashing, POR; a bitstate mode saves memory |
+| TLC | TLA+ specs | explicit states, breadth-first |
+| CBMC | C and C++ | bounded model checking with a SAT solver (Clarke, Kroening and Lerda, TACAS 2004) |
+| GenMC | C and C++, and Rust as an experimental option, as LLVM IR | stateless, optimal DPOR, with the SC, TSO, RA, RC11 and IMM memory models |
+| loom | Rust | exhaustive under the C11 memory model, after CDSChecker; optional preemption bound |
+| Shuttle | Rust | mainly randomized, including PCT, plus a DFS mode for small tests; not sound in random mode, but scales to large tests |
+| Lincheck | JVM | stress testing or bounded model checking of data structures |
+
+In Rust, **loom** replaces `std::sync` and `std::thread` in a test, and `loom::model` runs the closure many times, once for each execution that it explores.
+
+```rust
+use loom::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use loom::sync::Arc;
+use loom::thread;
+
+#[test]
+fn tickets_are_unique() {
+    loom::model(|| {
+        let next = Arc::new(AtomicUsize::new(0));
+        let hs: Vec<_> = (0..2).map(|_| {
+            let next = next.clone();
+            thread::spawn(move || {
+                let t = next.load(SeqCst);  // the bug: use fetch_add(1, SeqCst)
+                next.store(t + 1, SeqCst);
+                t
+            })
+        }).collect();
+        let t: Vec<usize> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_ne!(t[0], t[1]); // loom finds the schedule that breaks this
+    });
+}
+```
+
+By default loom explores without a bound. Its documentation says that "setting the thread pre-emption bound to 2 or 3 is enough to catch most bugs", with `LOOM_MAX_PREEMPTIONS=3`. It also lists its limits. It treats `SeqCst` accesses as `AcqRel`, which can give false alarms. It does not explore some load-buffering executions, so it can miss bugs.
+
+The two tools are often used together. The Amazon S3 team checked ShardStore (Bornholt et al., SOSP 2021) with both. They used loom for "small, correctness-critical code". They used **Shuttle** "to randomly check interleavings of larger test harnesses". They wrote Shuttle for that work. Its README states the trade: Shuttle "is not sound", but it "scales to much larger test cases than Loom".
+
+## Connect
+
+- [Critical sections](/os/sync/critical-sections): the exhaustive explorer on Peterson's algorithm.
+- [Happens-before](/concurrency/atomics/happens-before): the memory-model view that loom and GenMC must explore.
+- [Linearizability](/concurrency/verification/linearizability): the property to check for a concurrent object.
+- [TLA+ basics](/concurrency/verification/tla-basics): model checking a design instead of code.
+- [Deterministic simulation testing](/distributed/capstone/deterministic-simulation-testing): random schedules of a whole distributed system, replayable from a seed.
+
+<Recall cards={[
+  { q: "How many schedules do n threads of k atomic steps each have?", a: "$(nk)!/(k!)^n$. For 3 threads of 4 steps that is 34,650." },
+  { q: "When are two steps of different threads independent, and why does it matter?", a: "When they touch different variables or both only read. Independent steps commute, so schedules that differ only by swapping them reach the same state." },
+  { q: "What does stateless model checking store, and what must it use instead?", a: "It stores no states; it runs the program again for each schedule. It needs partial order reduction (such as DPOR) to avoid equivalent schedules." },
+  { q: "What did dynamic POR change, and what does optimal DPOR add?", a: "DPOR finds conflicts while it runs and adds backtracking points only there. Optimal DPOR runs exactly one interleaving per trace and never starts a sleep-set blocked run." },
+  { q: "Why does preemption bounding scale better than full search?", a: "The number of executions with c preemptions is polynomial in the length of the program, and exponential only in c. Most bugs need very few preemptions." },
+  { q: "What does PCT guarantee, and how does it differ from a uniform random walk?", a: "It finds a bug of depth d with probability at least $1/(n k^{d-1})$ per run. A random walk has no such bound, and loses against long, narrow windows." },
+]} />

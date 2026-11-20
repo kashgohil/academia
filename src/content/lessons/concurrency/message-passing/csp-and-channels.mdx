@@ -1,0 +1,124 @@
+---
+summary: "Hoare's Communicating Sequential Processes, channels as typed queues with a rule for waiting, what a buffer buys and what it cannot buy, the happens-before edges that a channel creates, ownership transfer, and channels in Go, Rust, Odin and occam."
+---
+import { ConcMsgCapacityDemo, ConcMsgHbDemo } from "@/demos/conc/ConcMsgCspDemos";
+
+Threads can cooperate in two ways. They can share memory and protect it with [locks](/os/sync/locks-and-spinlocks). Or they can keep their data private and send messages to each other. This module is about the second way.
+
+In 1978 Tony Hoare published "Communicating Sequential Processes" (CSP) in the Communications of the ACM. In CSP, a program is a set of sequential processes that share no variables. A process can do only two things with another process: send it a value (`P!x`) or receive a value from it (`P?y`). Both sides of a CSP communication wait for each other. This meeting is a **rendezvous**: the value moves only when the sender and the receiver are both ready.
+
+Hoare's 1985 book turned CSP into a process algebra with a full theory of traces and refinement. The occam language on the Inmos transputer used CSP as its model. Rob Pike carried the ideas through Newsqueak and Limbo into Go. Effective Go states the result as a slogan: "Do not communicate by sharing memory; instead, share memory by communicating."
+
+A **channel** is the object that carries the messages. Hoare's first paper named processes directly, but later CSP and Go use channels: anonymous, typed queues that any process with a reference can use. A channel has a **capacity** C. With C = 0 it is a rendezvous, as in Hoare's paper. With C > 0 it has a buffer: a send waits only when C values are already in it.
+
+<Predict
+  id="buffer"
+  question="A producer needs 20 µs per item and a consumer needs 30 µs per item. With an unbuffered channel, 24 items take 745 µs. How long do they take with a buffer of 8?"
+  options={[
+    "About 500 µs, because the producer no longer waits for the consumer",
+    "Still about 745 µs",
+    "About 250 µs, because 8 items can be in the buffer at once",
+  ]}
+  answer={1}
+  explain="The consumer does 24 × 30 = 720 µs of work, and it can never go faster. The buffer only changes where the producer waits. With 8 slots, the producer runs ahead, fills the buffer, and then blocks anyway."
+>
+<ConcMsgCapacityDemo />
+</Predict>
+
+1. Keep the defaults. The producer blocks 23 times, and 24 items take 745 µs. Move **Channel capacity** to 8. The time stays at 745 µs at every capacity, and the bar chart is flat.
+2. Set both work times to 20 µs. With capacity 0, each side blocks 12 times and the run takes 615 µs. With capacity 1, nobody blocks after the start, and the run takes 505 µs. The rendezvous costs a wake-up and a context switch for many items.
+3. Keep 20 µs on both sides and set the jitter to ±80%. The times are 649 µs with capacity 0, 566 µs with capacity 1 and 517 µs with capacity 4. A buffer absorbs short bursts when the two sides have the same mean speed.
+4. Make the producer slower than the consumer. Now the consumer waits on an empty buffer, and capacity does not matter again.
+
+## What a buffer buys
+
+A pipeline of two stages cannot be faster than its slower stage. If the consumer needs 30 µs per item, 24 items need at least 720 µs, whatever the channel. A buffer does not add capacity. It only lets the faster side run ahead by up to C items, and then that side blocks.
+
+A buffer is useful in two cases. First, when both sides have the same mean speed but each item takes a random time, the buffer absorbs the differences. Without it, a slow item on one side makes the other side wait, and that time is lost. Second, a buffer reduces the number of times a thread must block and wake up. Each wake-up costs a context switch, which is a model input of a few µs for an OS thread.
+
+A big buffer has a cost too. When the consumer is slower, the buffer is always full. Each item then waits behind C others, so its latency grows by C × 30 µs, and nothing gets faster. The lesson on [backpressure](/concurrency/message-passing/backpressure) shows this cost under overload.
+
+## What a channel orders
+
+A channel moves a value, and it also orders memory. The [Go memory model](/concurrency/atomics/happens-before) states four rules for channels:
+
+| Rule | Edge |
+|---|---|
+| Send | A send is synchronized before the completion of the corresponding receive |
+| Close | A close is synchronized before a receive that returns a zero value because the channel is closed |
+| Unbuffered | A receive from an unbuffered channel is synchronized before the completion of the corresponding send |
+| Capacity C | The kth receive is synchronized before the completion of the (k+C)th send |
+
+The first rule makes message passing safe. Everything that the sender wrote before the send is visible to the receiver after the receive. The second rule lets a close act as a broadcast signal to every receiver.
+
+The third and fourth rules go the other way, from the receiver to the sender. With C = 0, a completed send tells the sender that the receiver has the value. With C > 0, the sender learns less: when send k + C completes, receive k has happened. So a sender can be at most C values ahead of its receiver.
+
+<ConcMsgHbDemo />
+
+1. Keep C = 1 and click **Script: eager producer**. Send 2 blocks until receive 1 runs. Each red arrow goes from receive k to the completion of send k + 1.
+2. Select C = 0 and run the same script. Every send and its receive complete in the same step. The arrows go in both directions, because a rendezvous synchronizes both sides.
+3. Select C = 3 and step by hand. Click **Producer: send next** four times. The fourth send blocks, and the largest lead stays at 3.
+4. Click **Script: eager consumer**. Each receive blocks first, and the next send completes it directly, with no use of the buffer.
+
+The capacity rule has a famous use: a buffered channel is a counting semaphore. A send takes a token, and a receive returns it. So at most C goroutines run the protected code at the same time.
+
+```go
+var sem = make(chan struct{}, 8) // at most 8 requests run at once
+
+func handle(r *Request) {
+    sem <- struct{}{}        // wait for a free slot
+    defer func() { <-sem }() // give the slot back
+    process(r)
+}
+```
+
+## Ownership moves with the message
+
+A channel orders the handoff, not later use. Suppose that a producer sends a pointer to a buffer, and then writes to that buffer again. The send happens before the receive, but the second write has no edge to the consumer's read. This is a data race, even though every access went through a channel.
+
+So the rule of message passing is a rule of **ownership**. After a send, the sender must not touch the value again. The receiver owns it. Go cannot check this rule at compile time. The race detector (`go test -race`) finds a violation only when the racy code runs.
+
+Rust checks it in the compiler. `Sender::send` takes the value by move, so the sender has no name for it after the call. A `Sender` can move to another thread only if the value type is `Send`, which means that it is safe to move to another thread. An `Rc` is not `Send`, so you cannot pass an `Rc` to another thread this way.
+
+```rust
+use std::sync::mpsc;
+let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(0); // capacity 0: a rendezvous
+std::thread::spawn(move || {
+    let mut buf = vec![1, 2, 3];
+    tx.send(buf).unwrap();
+    // buf.push(4); // error[E0382]: borrow of moved value: `buf`
+});
+let got = rx.recv().unwrap();
+```
+
+## Channels in other languages
+
+| Language and library | Channel | Capacity 0 | Notes |
+|---|---|---|---|
+| Go | `chan T`, `make(chan T, n)` | yes, the default | Many senders and receivers. `select` waits on several channels |
+| Rust std | `mpsc::channel`, `mpsc::sync_channel(n)` | `sync_channel(0)` | One receiver. Since Rust 1.67 its code comes from crossbeam-channel |
+| Rust crossbeam | `bounded(n)`, `unbounded()` | `bounded(0)` | Many receivers, and a `select!` macro |
+| Rust Tokio | `tokio::sync::mpsc::channel(n)` | no: 0 panics | `send` is async and waits for capacity |
+| Odin | `core:sync/chan` | yes | Buffered and unbuffered channels, and a select |
+| occam | `CHAN OF INT c:` | the only kind | Pure CSP: `c ! x` and `c ? y` |
+
+Zig removed `std.event` and its channel in 0.12, after async functions stopped working in 0.11. Zig 0.16 added `std.Io.Queue`, a bounded queue that can be closed.
+
+Channels are not free of the problems of locks. Two processes that each wait to receive from the other are in a [deadlock](/os/sync/deadlock). When every goroutine waits, the Go runtime reports "all goroutines are asleep". A channel also hides a queue, and a queue needs a policy for when it is full. The next lessons take these problems one at a time.
+
+## Connect
+
+- [Pipes](/os/ipc/pipes): the kernel's byte channel between processes, with the same block-when-full rule.
+- [Happens-before](/concurrency/atomics/happens-before): the order that the channel rules add to.
+- [Go channels and select](/concurrency/message-passing/go-channels-and-select): how the Go runtime implements all of this.
+- [The actor model](/concurrency/message-passing/actor-model): named mailboxes instead of anonymous channels.
+- [Semaphores](/os/sync/semaphores): the counting semaphore that a buffered channel can replace.
+
+<Recall cards={[
+  { q: "In Hoare's CSP of 1978, when does a value move from sender to receiver?", a: "Only when both are ready: a rendezvous. The first of the two to arrive waits for the other." },
+  { q: "A consumer is slower than its producer. What does a larger channel buffer change?", a: "Not the throughput, which the slower stage sets. The buffer fills, the producer blocks anyway, and each item waits longer in the buffer." },
+  { q: "When does a buffer between two stages make a run faster?", a: "When the stages have similar mean speeds but variable item times. The buffer absorbs the bursts, and it also reduces block and wake-up costs." },
+  { q: "State the Go memory model rule for a channel of capacity C > 0 that goes from receiver to sender.", a: "The kth receive is synchronized before the completion of the (k+C)th send. So the sender is at most C values ahead." },
+  { q: "Why is sending a pointer and then writing through it a data race, although the send orders memory?", a: "The send orders only what came before it. The later write has no happens-before edge to the receiver's read." },
+  { q: "How does Rust stop a sender from using a value after it sends it?", a: "send takes the value by move, so the compiler rejects any later use. The Sender can cross to another thread only if the type is Send." },
+]} />

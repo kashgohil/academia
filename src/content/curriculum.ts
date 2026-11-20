@@ -32,6 +32,10 @@ export const LEVELS: Record<Level, string> = {
 
 /** Lessons with a written MDX page. Paths must match `src/content/lessons/<path>.mdx`. */
 export const LIVE = new Set<string>([
+  "concurrency/message-passing/actor-model",
+  "concurrency/message-passing/backpressure",
+  "concurrency/message-passing/csp-and-channels",
+  "concurrency/message-passing/go-channels-and-select",
   "electronics/transients/rc-charging-and-discharging",
   "statistics/limit-theorems/central-limit-theorem",
   "deep-learning/optimization/gradient-descent-on-loss-surfaces",

@@ -1,0 +1,141 @@
+---
+summary: "How the Go runtime implements channels: the hchan struct, its ring buffer and wait queues, direct handoff to a parked goroutine, close semantics, select's random poll order and address lock order, nil channels, and goroutine leaks after a timeout."
+---
+import { ConcMsgHchanDemo, ConcMsgSelectDemo, ConcMsgLeakDemo } from "@/demos/conc/ConcMsgGoDemos";
+
+A Go channel value is a pointer to a runtime struct, `hchan`, in `src/runtime/chan.go`. `make(chan T, n)` allocates it. Most of what a Go programmer must know about channels follows from its fields. In Go 1.24 they are:
+
+```go
+type hchan struct {
+    qcount   uint           // values in the buffer now
+    dataqsiz uint           // size of the circular buffer: the capacity
+    buf      unsafe.Pointer // the buffer: dataqsiz slots of elemsize bytes
+    elemsize uint16
+    synctest bool           // created inside a testing/synctest bubble
+    closed   uint32
+    timer    *timer         // the timer that feeds this channel, if any
+    elemtype *_type
+    sendx    uint           // next slot to write
+    recvx    uint           // next slot to read
+    recvq    waitq          // parked receivers
+    sendq    waitq          // parked senders
+    lock     mutex          // guards all the fields above
+}
+```
+
+The buffer is a ring of `dataqsiz` slots. The wait queues hold **sudogs**. A sudog records one parked goroutine. It points to the value that the goroutine sends, or to the place where it receives. One lock guards every field, so each send, receive and close is atomic with respect to the others.
+
+<Predict
+  id="refill"
+  question="make(chan int, 2) holds 1 and 2, and G2 is parked on sendq with the value 3. G4 receives. What happens?"
+  options={[
+    "G4 gets 3 directly from G2, and the buffer keeps 1 and 2",
+    "G4 gets 1. The value 3 goes into the slot that 1 left, and G2 becomes runnable",
+    "G4 gets 1. G2 stays parked until another goroutine receives",
+  ]}
+  answer={1}
+  explain="A receiver takes a value straight from a parked sender only on an unbuffered channel. Here the buffer is full, so FIFO order requires that the receiver takes the oldest value. The head and the tail are the same slot, so the runtime copies the sender's value into it and readies the sender."
+>
+<ConcMsgHchanDemo />
+</Predict>
+
+1. Click **full buffer, G2 waits to send**. Note `recvx` and `sendx`: both point to slot 0, because the buffer is full. Click `<-ch` on G4. It gets 1, the value 3 takes slot 0, and both indices move to slot 1.
+2. Reset, and click **G3 and G4 wait to receive**. Then send from G1. The value goes straight to G3, and `qcount` stays 0. This is the direct send.
+3. Park two receivers again and click **close** on G1. Both receivers become runnable with `0, ok = false`. Now send from G2: it panics.
+4. Fill the buffer, park G2 on `sendq`, and close the channel from G1. G2 panics. A receive from G3 still gets the buffered values first, and only then `ok = false`.
+5. Select **nil**. Send and receive block forever, and close panics.
+
+## Three fast paths and a slow one
+
+`chansend` takes the lock and checks three cases in order.
+
+1. If a receiver waits in `recvq`, the value goes straight to it. `sendDirect` copies the value into the receiver's stack, and `goready` makes the receiver runnable. The buffer is not used, even if it has room.
+2. Else, if the buffer has a free slot, the value goes to `buf[sendx]`, and `sendx` and `qcount` advance.
+3. Else, the sender puts a sudog on `sendq` and calls `gopark`. It sleeps until a receiver takes its value.
+
+`chanrecv` is the mirror image. A waiting sender and an unbuffered channel give a direct copy. A waiting sender and a full buffer give the refill from the predict question. The receiver takes the head, and the sender's value goes to the tail, which is the same slot. The comments in chan.go note that these direct copies are the only place where one running goroutine writes to the stack of another.
+
+A direct handoff saves one copy of the value. It also skips the buffer's cache lines. The element type must be smaller than 64 KiB; the compiler rejects a larger one with "channel element type too large".
+
+A parked goroutine costs no CPU time. Usually the Go scheduler parks it in user space, with no system call. A wake-up puts it on a run queue of a P (a logical processor of the scheduler). It wakes an OS thread only when one is needed. So a channel handoff between goroutines is much cheaper than a futex wake between OS threads. That is why Go code uses channels in places where C code would avoid them.
+
+## Close, nil and the three states
+
+| Operation | nil channel | open channel | closed channel |
+|---|---|---|---|
+| `ch <- v` | blocks forever | sends, or blocks | panics |
+| `v, ok := <-ch` | blocks forever | receives, or blocks | buffered values first, then zero value and `ok == false` |
+| `close(ch)` | panics | closes | panics |
+
+`closechan` sets `closed`, then readies every parked receiver with a zero value, and every parked sender, which then panics. A `for v := range ch` loop ends when the channel is closed and empty. So close is a broadcast that says "no more values".
+
+The rules give a convention. Only a sender closes a channel, and only when no other sender can still send. With several senders, a `sync.WaitGroup` waits for all of them, and then one goroutine closes. A receiver must never close a channel to stop its senders, because the next send panics. To stop senders, use a separate `done` channel or a `context.Context`.
+
+## Select
+
+`select` waits on several channel operations and runs one that is ready. The runtime function is `selectgo` in `src/runtime/select.go`. It works in passes:
+
+1. It builds a **poll order**: a random permutation of the cases, from `cheaprandn`. Cases on a nil channel are left out.
+2. It builds a **lock order**: the channels sorted by the address of their `hchan`. It locks all of them in that order. Two selects that share channels lock them in the same order, so they cannot deadlock each other.
+3. Pass 1 looks for a case that can go now, in poll order. If one exists, it runs it and unlocks. If none exists and the select has a `default` case, `default` runs.
+4. Pass 2 puts a sudog on the wait queue of every channel, and the goroutine parks.
+5. When one channel wakes it, pass 3 locks all the channels again and removes the sudogs from all the other queues.
+
+The random poll order is a fairness rule. If two cases are always ready, each wins about half the time. In the tests of this lesson, a select between two channels that always hold a value picks the first case 505 times in 1,000.
+
+<ConcMsgSelectDemo />
+
+1. Keep **select on both** with 90% load on high and 30% on low. The consumer is overloaded, but low gets all 606 of its items served, with an oldest wait of 0.3 ms. High collects the backlog.
+2. Select **priority idiom**. Now high gets served first, and low gets only 178 of 588 items. The oldest low item waits 14.1 ms.
+3. Move **Load on high** to 120%. With the priority idiom, low gets 1 item in 20 ms. That is starvation.
+4. Move **Load on high** below 60%. Both modes serve almost everything, and the two curves almost meet. Priority matters only under load.
+
+Go has no priority select. The idiom in the demo is the usual way to prefer one channel. The demo shows its cost: under sustained load, the other channel starves. Random choice also means that you cannot rely on case order for correctness. If a `done` case and a work case are both ready, select can pick either.
+
+A nil channel is never ready, so a case on it is disabled. This is the standard way to merge two channels until both close:
+
+```go
+for a != nil || b != nil {
+    select {
+    case v, ok := <-a:
+        if !ok { a = nil; continue } // a is closed: never select it again
+        out <- v
+    case v, ok := <-b:
+        if !ok { b = nil; continue }
+        out <- v
+    }
+}
+```
+
+## Timeouts and goroutine leaks
+
+A common handler starts a goroutine to call a slow backend, and then waits for the result or a timeout. The bug is in the case where the timeout wins.
+
+<ConcMsgLeakDemo />
+
+1. Keep the defaults. Three of five requests time out, and three workers block forever on their send. Each one shows a red mark.
+2. Move **Timeout** to 280 µs. No request times out, and nothing leaks. The leak appears only on the slow path, so a test with a fast backend does not see it.
+3. Select **buffer of 1** with the timeout back at 150 µs. The late worker puts its result in the buffer and exits. The garbage collector frees the channel later.
+4. Select **select on ctx.Done()**. The handler's `defer cancel()` closes the done channel, and a late worker sees it and returns.
+
+The runtime never frees a blocked goroutine. So it holds its stack and everything that it references until the process exits. In a server, the count grows with each timeout, and memory grows with it. Look at the goroutine profile (`/debug/pprof/goroutine`) for many goroutines parked on `chan send`. Since Go 1.27, the `goroutineleak` profile reports goroutines that are blocked on unreachable channels. In tests, the `goleak` package from Uber checks that no goroutine is left at the end.
+
+`time.After` had its own leak. Before Go 1.23, a timer was not collected until it fired, so `time.After(time.Hour)` in a busy loop kept many timers alive. Go 1.23 changed this: timers with no references are collected at once, and timer channels are unbuffered. In Go 1.23 to 1.26, the new behavior applied only when `go.mod` said `go 1.23.0` or later. Since Go 1.27, it always applies, and the `asynctimerchan` setting is gone.
+
+For new code, prefer `context.WithTimeout`. It gives one `Done` channel that the whole call tree can select on, and `cancel` releases the timer at once.
+
+## Connect
+
+- [CSP and channels](/concurrency/message-passing/csp-and-channels): what a channel orders in the memory model.
+- [Futexes](/os/sync/futexes): what parking costs for an OS thread, and what the Go scheduler avoids.
+- [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency): how to choose the timeout itself.
+- [Backpressure](/concurrency/message-passing/backpressure): what to do when a channel is always full.
+
+<Recall cards={[
+  { q: "Which fields of hchan describe the ring buffer?", a: "buf (the slots), dataqsiz (the capacity), qcount (the values in it), and sendx and recvx (the next slots to write and read)." },
+  { q: "A sender finds a parked receiver on a buffered channel with free slots. Where does the value go?", a: "Straight to the receiver (sendDirect into its stack), and goready wakes it. The buffer is not used." },
+  { q: "What do send, receive and close do on a closed channel?", a: "Send panics. Receive returns the buffered values, then the zero value with ok == false. Close panics." },
+  { q: "Why does selectgo lock the channels in order of their hchan address?", a: "So that two selects that share channels always lock them in the same order and cannot deadlock each other." },
+  { q: "How do you disable one case of a select in a loop?", a: "Set that channel variable to nil. A nil channel is never ready, so selectgo leaves the case out." },
+  { q: "Why does a worker leak when its handler times out, and what are two fixes?", a: "It blocks forever on a send to an unbuffered channel that nobody will receive from. Fixes: a buffer of 1, or a select on the send and ctx.Done()." },
+]} />

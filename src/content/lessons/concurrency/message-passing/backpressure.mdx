@@ -1,0 +1,112 @@
+---
+summary: "What happens to a queue when work arrives faster than it is served, the policies for a full queue (block, drop newest, drop oldest, shed, rate limit) and their APIs in Go, Java and Tokio, backpressure across a pipeline of stages, credit-based flow control with request(n), and how to size a buffer."
+---
+import { ConcMsgOverloadDemo, ConcMsgPipelineDemo, ConcMsgCreditDemo } from "@/demos/conc/ConcMsgBackpressureDemos";
+
+Every channel, mailbox and work queue sits between a producer and a consumer. When the producer is faster, the queue holds the difference. If nothing stops it, the queue grows until the process runs out of memory. **Backpressure** is a signal from a slow consumer that makes its upstream slow down. Without it, a system has only two choices under overload: grow the queue, or lose work.
+
+Two kinds of source behave differently. A **closed-loop** source waits for each result before it makes more work, like a fixed set of users who each wait for a reply. It slows down by itself when the system slows down. An **open-loop** source does not wait. Sensor readings, log lines and requests from many independent users arrive on their own schedule. Backpressure can slow the first kind, but it cannot slow the second.
+
+<Predict
+  id="over"
+  question="Items arrive at random at 12 per ms. One consumer serves 10 per ms, and the queue has no limit. After 200 ms, how long does a new item wait?"
+  options={[
+    "About 0.5 ms: the server is only 20% over its capacity",
+    "Tens of ms, and the wait still rises",
+    "About 0.1 ms, the service time, because the server is always busy",
+  ]}
+  answer={1}
+  explain="The queue grows by about 2 items per ms, so after 200 ms it holds about 400 items. A new item waits for all of them at 0.1 ms each: about 40 ms. There is no steady state, so the wait grows for as long as the overload lasts."
+>
+<ConcMsgOverloadDemo />
+</Predict>
+
+1. Keep the defaults. The queue grows almost in a straight line to 435 items. The latency rises with it: the median is 20.3 ms and the 99th percentile is 35.4 ms.
+2. Select **block the source**. The queue stops at 50, but the dashed line shows items piling up at the source. The latencies are exactly the same as before. Blocking moved the queue; it did not remove it.
+3. Select **drop newest**. 385 of 2,432 items are lost, which is 16%, and the 99th percentile falls to 5.1 ms.
+4. Select **drop oldest**. The loss is the same, but the items that survive are the newest ones. Use this policy when new data replaces old data.
+5. Move **Arrival rate** to 90%. Every policy now gives the same short queue. The policy matters only during overload.
+
+## Why the queue never settles
+
+Let the arrival rate be $\lambda$ and the service rate $\mu$. While $\lambda > \mu$, the queue grows by $\lambda - \mu$ items per unit of time. After a time $t$ it holds about $(\lambda - \mu)t$ items. Here that is 2 per ms for 200 ms, or 400 items; the run reached 435 because arrivals are random. A new item waits for all of them, so its wait is about $(\lambda - \mu)t/\mu$.
+
+[Little's law](/performance/systems/queueing-theory-and-littles-law) needs a stable system, and this one is not stable. No buffer size fixes it, because the queue does not converge to any size. A bounded queue turns the problem into a choice. The choice is which items to lose, or which producer to stop.
+
+A bounded queue also bounds the wait. With capacity $C$, an item waits for at most $C$ items before it, so its wait is at most about $C/\mu$. With $C$ = 50 and 0.1 ms per item, that is 5 ms, which matches the 99th percentile of the drop policies. This gives a rule for buffer size. Choose the longest wait $W$ that you accept, and set $C = W \mu$. A larger buffer only adds latency during overload, and it hides the overload from monitoring for longer.
+
+## Policies for a full queue
+
+| Policy | What happens | Use it when | Examples |
+|---|---|---|---|
+| Block | The producer waits for room | The source is closed loop, or the producer can push the wait further up | Go `ch <- v`, Java `put`, Tokio `send(v).await` |
+| Fail fast | The send returns an error, and the caller decides | The caller can retry later, report an error, or degrade | Go `select` with `default`, Java `offer`, Tokio `try_send` |
+| Drop newest | The new item is lost | Old items are still useful and late items are not | Network tail drop, Java `DiscardPolicy` |
+| Drop oldest | The oldest item is lost, and the new one goes in | Only fresh data matters: prices, positions, metrics | Java `DiscardOldestPolicy` |
+| Shed load | Reject at the front door, before any work is done | Requests have a deadline anyway | HTTP 503 or 429 |
+| Rate limit | Admit at a fixed rate, with a burst allowance | You know the capacity in advance | A token bucket |
+
+Java's `ThreadPoolExecutor` has four rejection policies. It calls one when its queue is full and all its threads are busy. The default `AbortPolicy` throws `RejectedExecutionException`. `CallerRunsPolicy` is a form of backpressure: the thread that calls `execute` runs the task itself. So a submitter that is too fast must do the work, and it cannot submit more work during that time.
+
+Load shedding works best at the edge. A request that the system rejects at once costs almost nothing. A request that the system accepts, queues for 30 s and then abandons after the client's timeout costs the full work for nothing.
+
+## Backpressure through a pipeline
+
+Real systems have chains of stages. Backpressure must travel from the slowest stage back to the source, through every stage. A bounded channel between each pair of stages does this by itself. The slow stage fills the channel before it. Then the stage before it blocks on its send, stops taking input, and fills its own input channel. The block moves upstream one stage at a time until it reaches the source.
+
+<ConcMsgPipelineDemo />
+
+1. Keep the defaults: capacity 2, and stage 3 is slow. Stages 1 and 2 block on send (thin grey lines), and the source blocks too. At most 10 items are in flight, the bound for 3 stages with capacity 2.
+2. Turn on **Unbounded channels**. The run takes the same 1,240 µs, because stage 3 sets the pace. But 28 items are in flight, and the mean latency rises from 333 µs to 588 µs.
+3. Set the capacity to 0. Only 4 items are in flight, and the mean latency is 142 µs. The throughput stays the same.
+4. Make **stage 1** the slow stage. Now only the source blocks on send. Stages 2 and 3 wait on receive, because the work reaches them slowly.
+
+With bounded channels, the items in flight are at most the sum of the capacities, plus one per stage and one in the source. By Little's law, the latency is then at most that number divided by the throughput. With unbounded channels, nothing limits the items in flight except the total amount of work.
+
+One unbounded queue anywhere in the chain breaks the backpressure, because the stages before it never see a full channel. Common examples:
+
+- An unbounded channel or an actor mailbox with no limit.
+- A new goroutine or task for each request (`go handle(r)`). The scheduler's run queue is then the unbounded queue.
+- A fire-and-forget call to another service, or a retry loop with no budget.
+
+## Credits: backpressure across a network
+
+A blocking send needs a shared memory or a shared kernel. Between machines, the consumer must send its permission explicitly. In **credit-based flow control**, the consumer grants the producer a number of items, and the producer sends only while it holds credit.
+
+Reactive Streams standardized this for the JVM, and Java 9 added the same interfaces as `java.util.concurrent.Flow`. A `Subscriber` calls `Subscription.request(n)` to grant `n` more items, and the `Publisher` must never send more than the total requested. Rule 3.9 says that `request` with `n` of zero or less must signal `onError` with an `IllegalArgumentException`. Rule 3.17 lets a publisher treat a demand of `Long.MAX_VALUE` as unbounded, which turns backpressure off.
+
+```java
+public void onSubscribe(Flow.Subscription s) { this.s = s; s.request(WINDOW); }
+public void onNext(Item item) {
+    process(item);
+    s.request(1);          // one more credit for each item finished
+}
+```
+
+<ConcMsgCreditDemo />
+
+1. Keep a window of 4. The subscriber is busy only 37% of the time, at 37.2 items per ms. Between batches it waits, because each new credit needs a round trip.
+2. Move the window to 12. The throughput reaches 100 items per ms, the subscriber's maximum. The dashed rule marks the window that fills the round trip: 11.1 items.
+3. Increase the window further. The throughput stays at 100, but more items can wait at the subscriber. The window is also a bound on its buffer.
+4. Move the link delay to 100 µs. The knee moves to the right, because a longer round trip needs a larger window.
+
+The throughput is about $\min(1/S, n/\text{RTT})$. Here $S$ is the service time, $n$ is the window, and RTT is the time from a credit to the item that it allows. To keep the consumer busy, the window must be at least $\text{RTT}/S$: the service rate times the round trip. This is the bandwidth-delay product again. TCP's receive window and HTTP/2's flow-control window are the same mechanism for bytes; the lesson on [flow control](/networking/transport/flow-control) covers them.
+
+A credit window gives two guarantees at once. The consumer never holds more than $n$ unprocessed items, and the producer never sends what nobody asked for. Too small a window wastes the link. Too large a window brings back the long queue of the first demo.
+
+## Connect
+
+- [Queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law): the wait near capacity, before overload.
+- [Flow control](/networking/transport/flow-control): credits in TCP, with zero windows and window scaling.
+- [Stream processing](/distributed/data-systems/stream-processing): how backpressure slows checkpoint barriers in Flink.
+- [Timeouts, retries and idempotency](/distributed/foundations/timeouts-retries-and-idempotency): retry budgets, which keep retries from bypassing backpressure.
+- [The actor model](/concurrency/message-passing/actor-model): what an unbounded mailbox does under load.
+
+<Recall cards={[
+  { q: "Arrivals exceed service by λ − μ. How fast does an unbounded queue grow, and what happens to the wait?", a: "By λ − μ items per unit of time. The wait of a new item grows with the queue, about (λ − μ)t/μ, with no limit." },
+  { q: "Why does blocking the producer not help when the source is open loop?", a: "The source does not slow down. The items wait at the source instead of in the queue, so the latency is the same." },
+  { q: "How do you size a bounded queue from a latency target?", a: "The wait is at most about C/μ. So choose the longest acceptable wait W and set C = W × μ." },
+  { q: "What does Java's CallerRunsPolicy do, and why is it backpressure?", a: "The thread that calls execute runs the rejected task itself. While it works, it cannot submit more tasks." },
+  { q: "In a pipeline with bounded channels, what limits the items in flight?", a: "The sum of the channel capacities, plus one item per stage and one in the source. Latency is bounded by that number over the throughput." },
+  { q: "How large must a credit window be to keep the consumer busy?", a: "At least the round-trip time divided by the service time: the service rate times the round trip, a bandwidth-delay product." },
+]} />

@@ -1,0 +1,124 @@
+---
+summary: "Actors as addresses with mailboxes that handle one message at a time: Hewitt's model and Agha's semantics, Erlang processes and the cost of selective receive on a long mailbox, links, monitors and supervisors with one_for_one, one_for_all and rest_for_one, Akka, and how actors differ from CSP."
+---
+import { ConcMsgMailboxDemo, ConcMsgSupervisorDemo } from "@/demos/conc/ConcMsgActorDemos";
+
+Carl Hewitt, Peter Bishop and Richard Steiger described the **actor** model at IJCAI in 1973, in "A Universal Modular ACTOR Formalism for Artificial Intelligence". Gul Agha gave it a precise semantics in his 1986 book "Actors: A Model of Concurrent Computation in Distributed Systems". In this model, everything that computes is an actor. An actor has an **address** and a **mailbox**. When a message arrives, the actor can do three things:
+
+1. Send messages to actors whose addresses it knows.
+2. Create new actors.
+3. Choose the behavior that it uses for the next message.
+
+An actor handles one message at a time, and no other actor can read its state. So the state of an actor needs no lock. The only way to change it is to send a message, and the actor applies the messages one after another. A mutex gives the same mutual exclusion, but here the queue of waiting work is visible: it is the mailbox.
+
+## Actors and CSP
+
+Both models replace shared memory with messages, but they make different choices.
+
+| Question | CSP and Go channels | Actors (Erlang, Akka) |
+|---|---|---|
+| What has a name? | The channel. Processes are anonymous | The actor. There is no channel object |
+| Does a send wait? | Yes, until a receiver takes the value or the buffer has room | No. The message goes into the mailbox |
+| Buffer | Fixed capacity, often 0 | A mailbox with no limit by default |
+| How does a receiver choose? | By channel, with `select` | By message pattern, with a selective receive |
+| Order | FIFO per channel | FIFO per pair of sender and receiver |
+| Across machines | Not part of the model | The same send works to a remote address |
+
+The asynchronous send is the big difference. A send never waits, so two actors cannot deadlock on a send. But a sender also gets no signal when the receiver is slow. The mailbox grows, and memory grows with it.
+
+In Erlang, a process is an actor. A process has its own heap and its own garbage collector, so one large heap does not pause the others. A message is copied into the heap of the receiver. Large binaries are the exception: processes share them with a reference count. Erlang guarantees that the messages from one process to another arrive in the order that they were sent. It gives no order between different senders.
+
+A local send with `!` does not block. A send to a remote node, or to a busy port, can suspend the sender, and `erlang:send/3` has a `nosuspend` option for that case.
+
+## Selective receive
+
+An Erlang `receive` does not take the next message. It scans the mailbox from the oldest message and takes the first one that matches one of its patterns. Messages that do not match stay where they are, in their order. If nothing matches, the process sleeps until a new message arrives, and then it checks only the new message.
+
+This makes protocols easy to write. A process can wait for one reply and leave every other message for later. A synchronous call (`gen_server:call`) works this way. It sends a request with a fresh reference and then waits for a reply that carries the same reference. 
+
+But a scan costs time for every message that it skips. A receive without help from the compiler skips every older message, so with 10,000 messages queued, it first skips 10,000 messages. The `gen_server:call` receive avoids this, as shown below.
+
+<Predict
+  id="tip"
+  question="A server can handle about 14 requests per ms, and 10 per ms arrive. A burst leaves 600 requests in its mailbox. Each request makes a call whose receive matches a pattern and scans from the oldest message. Does the backlog drain?"
+  options={[
+    "Yes, in about 150 ms: 600 messages at a net 4 per ms",
+    "No. The backlog grows without limit",
+    "Yes, but it takes about twice as long because of the scans",
+  ]}
+  answer={1}
+  explain="Each call skips the whole backlog. At 600 messages and 100 ns per message, that is 60 µs more per request. The server now handles fewer requests than arrive, so the backlog grows, and the scans get longer still."
+>
+<ConcMsgMailboxDemo />
+</Predict>
+
+1. Keep the defaults. The red line, a receive that matches a pattern, grows to 1,899 messages after 300 ms. The green line, a receive that matches a fresh reference, drains the same burst in about 180 ms.
+2. Move **Backlog at the start** down to 300. Both lines drain. Between 300 and 600 there is a tipping point, at about 400 in this model.
+3. Keep the backlog at 300 and move **Arrivals** to 12 per ms. The tipping point falls to about 230. Now the red line grows to 1,777 messages, and the green line still drains.
+4. Move **Cost to skip one message** to 25 ns. The tipping point moves up to about 1,600 messages. A cheaper scan does not remove the problem; it only delays it.
+
+## Why the backlog runs away
+
+The server handles one request in about $h + \max(d, cL)$. Here $h$ = 60 µs is the work and $d$ = 10 µs is the call. $c$ is the cost to skip one message, and $L$ is the backlog. The scan runs while the call is in flight, so only the longer of the two counts. The server keeps up while one request takes less than the time between arrivals, $1/\lambda$ = 100 µs. So the backlog drains only below
+
+$$
+L^{*} = \frac{1/\lambda - h}{c} = \frac{100 - 60\ \mu\text{s}}{0.1\ \mu\text{s}} = 400 \text{ messages.}
+$$
+
+Above $L^{*}$, the service rate falls as the backlog grows, so the backlog grows faster. This is a positive feedback loop. The system has two stable states for the same load, an empty mailbox and an ever-growing one. A short burst moves it from the first to the second, and it stays there after the burst ends. This is the **metastable failure** from the lesson on [timeouts and retries](/distributed/foundations/timeouts-retries-and-idempotency).
+
+The Erlang compiler and runtime remove this cost for the common case. Since OTP R14 (2010), a function can create a reference and then receive a message that must contain it. In that case, the runtime marks the position in the mailbox. The receive starts at the mark, because no older message can contain the new reference.
+
+OTP 24 applied the optimization in more cases, for example when the reference comes in as a function argument. `gen_server:call` uses it. A receive on a pattern with no fresh reference still scans from the oldest message, so the pathology remains for hand-written protocols.
+
+## Let it crash
+
+Erlang handles errors with a different idea. A process that finds an error it does not expect does not try to repair its state. It crashes, and another process restarts it in a known good state. Joe Armstrong described this approach in his 2003 thesis, "Making reliable distributed systems in the presence of software errors". Two primitives make it work:
+
+- A **link** joins two processes in both directions. When one dies, the other gets an exit signal and dies too, unless it traps exits. A process that traps exits gets the signal as an `'EXIT'` message instead.
+- A **monitor** works in one direction. The watcher gets a `'DOWN'` message when the target dies, and the watcher itself is not affected.
+
+A **supervisor** is a process that links to its children, traps exits, and restarts children by a **strategy**. The children start in a fixed order.
+
+| Strategy | When one child dies, the supervisor restarts |
+|---|---|
+| `one_for_one` | that child only. This is the default |
+| `one_for_all` | all children. It first terminates the others in reverse start order |
+| `rest_for_one` | that child and every child started after it |
+| `simple_one_for_one` | that child; all children run the same code and start on demand |
+
+Restarts have a limit. If more than `intensity` restarts occur within `period` seconds, the supervisor terminates all its children and then itself, with reason `shutdown`. The defaults are 1 restart in 5 seconds. The supervisor's own parent then applies its own strategy. So a fault climbs the tree until some level can fix it, or until the application stops.
+
+<ConcMsgSupervisorDemo />
+
+1. Click **crash cache**. Only cache restarts. It gets a new pid, and its count of served requests starts again at 0. A restart loses the state in memory.
+2. Click **crash cache** again at once. That is a second restart within 5 s, which is more than 1. The supervisor shuts down, and the parent restarts the whole subtree.
+3. Reset. Crash cache, click **wait 5 s**, and crash cache again. The supervisor still gives up. OTP counts a restart while now − time ≤ period, so a restart exactly 5 s old still counts. Try again with 6 s of waiting.
+4. Select **rest_for_one**, and crash `db_pool`. All three children restart, because cache and http started after it. Crash `http`, and only http restarts.
+5. Select **one_for_all**, and set intensity to 3. Crash any child. All children restart each time, until the fourth crash in the period.
+
+Start order encodes dependencies. Put a process that others need early in the child list, and use `rest_for_one`, so that its dependents restart with it. The intensity limit stops a restart loop. A child that crashes at once on every start would otherwise use all the CPU and fill the log.
+
+Keep state that must survive a crash outside the process: in a database, on disk, or in an ETS table that a longer-lived process owns. A restart is a cure only if the new process can rebuild its state.
+
+## Actors on the JVM and elsewhere
+
+Akka brings actors to the JVM. Its classic default mailbox is unbounded and uses a `ConcurrentLinkedQueue`, and Akka Typed uses another unbounded queue for one consumer. A `BoundedMailbox` blocks the sender when it is full, up to `mailbox-push-timeout-time`. A `NonBlockingBoundedMailbox` sends overflow messages to dead letters instead. Akka also has supervision, with a strategy for each parent.
+
+An unbounded mailbox does not remove overload. It only moves the failure from "a send waits" to "memory runs out". An Erlang node with one process whose mailbox grows will in the end run out of memory. The `max_heap_size` process flag can kill such a process first, but only if its messages are stored on the heap (`on_heap`). The next lesson, [backpressure](/concurrency/message-passing/backpressure), is about how to say "slow down" between actors and stages.
+
+## Connect
+
+- [CSP and channels](/concurrency/message-passing/csp-and-channels): the synchronous alternative, with named channels instead of named actors.
+- [Failure detectors](/distributed/foundations/failure-detectors): how a remote monitor decides that a node is dead.
+- [Queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law): why a server near its capacity has long queues even without scans.
+- [Deadlock](/os/sync/deadlock): actors can still deadlock, when two actors each wait for a reply from the other in a selective receive.
+
+<Recall cards={[
+  { q: "What three things can an actor do when it handles a message?", a: "Send messages to actors it knows, create new actors, and choose its behavior for the next message." },
+  { q: "Name two differences between actors and CSP channels.", a: "Actors have names and channels are anonymous. An actor send does not wait, while a channel send waits for a receiver or for buffer room." },
+  { q: "What order does Erlang guarantee for messages?", a: "Messages from one process to another arrive in the order they were sent. There is no order between different senders." },
+  { q: "Why can a long mailbox make a server slower and slower?", a: "A selective receive skips every older message that does not match. Each request then costs more, so the backlog grows, so the scans get longer." },
+  { q: "How does a receive that matches a fresh reference avoid the scan?", a: "No message older than the reference can contain it. The runtime marks the mailbox position when the reference is made and starts the scan there." },
+  { q: "What does rest_for_one restart, and what happens after too many restarts?", a: "The crashed child and every child started after it. After more than intensity restarts within period seconds, the supervisor terminates its children and itself, and its parent decides." },
+]} />

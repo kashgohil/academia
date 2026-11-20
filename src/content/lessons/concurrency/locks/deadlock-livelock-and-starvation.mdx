@@ -33,7 +33,9 @@ func transfer(a, b *Account, n int64) {
 }
 ```
 
-**Take all the locks at once.** C++ `std::scoped_lock` (C++17) takes several mutexes "using a deadlock avoidance algorithm", as `std::lock` does. The standard does not name the algorithm. Both libc++ and libstdc++ lock one mutex and try the others. If a try fails, they release everything, and the next attempt *blocks* on the mutex that was busy. The libc++ library yields the CPU between attempts. The libstdc++ library yields only when the mutexes have different types.
+**Take all the locks at once.** C++ `std::scoped_lock` (C++17) takes several mutexes "using a deadlock avoidance algorithm", as `std::lock` does. The standard does not name the algorithm.
+
+Both libc++ and libstdc++ lock one mutex and try the others. If a try fails, they release everything, and the next attempt *blocks* on the mutex that was busy. The libc++ library yields the CPU between attempts. The libstdc++ library yields only when the mutexes have different types.
 
 ```cpp
 std::scoped_lock lk(a.m, b.m);   // any order, from any number of threads: no deadlock

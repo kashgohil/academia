@@ -1,0 +1,116 @@
+---
+summary: Apply a function to every element in parallel, then combine the results with an associative operator. Why the operator must be associative, why floating-point sums change with the thread count, how to combine partial results, and what key skew does to a shuffle.
+---
+import { ConcPatFloatDemo, ConcPatCombineDemo, ConcPatSkewDemo } from "@/demos/conc/ConcPatMapReduce";
+
+**Map-reduce** is the data-parallel form of fork-join. The **map** step applies a function to each element on its own, so any number of threads can do it at the same time. The **reduce** step combines all results into one with a binary operator, such as `+`, `max`, or "merge two histograms". The map step is easy to run in parallel. The reduce step is where the subtle problems are.
+
+```rust
+use rayon::prelude::*;
+
+let total: f32 = xs.par_iter().map(|x| x * x).sum();        // map, then reduce with +
+
+let hist = xs.par_iter()
+    .fold(|| [0u32; 256], |mut h, &x| { h[x as usize] += 1; h })      // one partial per task
+    .reduce(|| [0u32; 256], |mut a, b| { for i in 0..256 { a[i] += b[i]; } a }); // combine partials
+```
+
+```c
+double sum = 0;
+#pragma omp parallel for reduction(+:sum)   /* each thread sums into a private copy */
+for (long i = 0; i < n; i++) sum += f(x[i]);
+```
+
+A parallel reduce works only if the operator lets the runtime regroup the operands. The operator must be **associative**: $(a \oplus b) \oplus c = a \oplus (b \oplus c)$. It also needs an **identity** element $e$ with $e \oplus a = a$, so that each thread can start its partial result from $e$. An associative operator with an identity is a **monoid**. If the runtime can also combine partials in any order, the operator must be **commutative** too.
+
+## Floating-point addition is not associative
+
+Integer addition is associative, so every grouping gives the same sum. Floating-point addition rounds after each operation, so the grouping changes the result.
+
+<Predict
+  id="float"
+  question="You sum 1,048,576 float32 values with one thread, and then with 2 threads that each sum one half. Do you get the same result?"
+  options={["Yes: addition gives the same result in any order", "No: the results differ, because each add rounds", "No, and 2 threads always give the exact sum"]}
+  answer={1}
+  explain="Each float32 add rounds the result to 24 significant bits. Two halves round at different values than one long chain does. In the demo, one chain is off by 11.5, and two halves are off by 0.06. More threads are often more accurate, but not always: 4 chunks are off by 1.03."
+>
+<ConcPatFloatDemo />
+</Predict>
+
+Things to try:
+
+1. Move **Threads P** from 1 to 64. All seven results in the table differ. One thread is off by 11.5 from the reference.
+2. Look at P = 1. The running sum grows to about 500,000. At that size, a float32 can only hold steps of 1/32, so every add of a value below 1 loses bits.
+3. Turn on **Kahan compensation**. Each chunk now keeps a second variable for the lost low bits. One chunk now gives an error below 0.001. With 64 chunks the error is 0.03, from the float32 adds that combine the partials.
+4. Compare **left to right** with **in a tree**. Here the partial sums have similar sizes, so the two orders give the same result.
+
+Let $\varepsilon$ be the machine epsilon. For a chain of n adds, the worst-case error bound is about $n \varepsilon$ times the sum of the absolute values. For a tree of adds (pairwise summation), it is about $\varepsilon \log_2 n$ times that sum. Typical errors grow more slowly. So a parallel reduction is often *more* accurate than the serial loop. But it is not reproducible: the result depends on P and on the schedule.
+
+Libraries say this in their documentation. Rayon's `sum` says that the order of the reduction is not specified, so for floating point "the results are not fully deterministic". C++17 `std::reduce` is non-deterministic when the operator is not associative or not commutative. If you need the same bits on every run, fix the grouping. Use a fixed number of chunks with fixed boundaries, and combine them in a fixed tree. Libraries such as ReproBLAS go further: their sums give the same bits for any grouping.
+
+## Combining partial results
+
+There are three common ways to combine the results of P threads:
+
+- **One shared accumulator.** Every thread adds each mapped value to one shared variable with an atomic add or under a lock.
+- **Partials, merged one by one.** Each thread reduces its own chunk into a private partial. At the end, the threads add their partials to the total one at a time.
+- **Partials, merged in a tree.** Pairs of threads merge their partials, then pairs of pairs, for $\log_2 P$ levels.
+
+<Predict
+  id="combine"
+  question="32 threads each build a histogram of 4,096 buckets from their chunk. Merging two histograms costs 2 ns per bucket. Which combine is faster: one by one under a lock, or a tree of joins?"
+  options={["One by one: a tree needs extra synchronization", "The tree: it does the merges of one level in parallel", "Both are the same: the merge work is the same"]}
+  answer={1}
+  explain="One by one does 32 merges of 8.2 µs in a row: about 266 µs after the map phase. The tree has only 5 levels, so it waits for 5 merges plus 5 wake-ups: 66 µs. The total work is similar, but the span is much shorter."
+>
+<ConcPatCombineDemo />
+</Predict>
+
+1. Look at the red line. The shared accumulator is slower than one thread at every count: 0.17 at 16 threads. Each of the 65,536 updates moves one cache line to another core, one at a time.
+2. With partials of 1 value (a sum), merged one by one is best: 29.28 at 32 threads. The tree gives 19.87, because each level waits for a join and a wake-up of about 5 µs (a model input).
+3. Set the partial size to 4,096. Now merged one by one gives 4.27 at 32 threads, and the tree gives 12.26.
+4. Select the **one by one** timeline at 4,096 values. The threads finish their maps together and then wait in a queue for the lock.
+
+So the right combine depends on the size of a partial result. For a scalar, any combine is cheap, and the cost of synchronization decides. For a big partial, such as a histogram, a hash map or a sorted run, the merge itself is the work. A tree divides its span by $P/\log_2 P$. Rayon's `reduce` and Java's parallel streams combine in a tree that follows the splits. OpenMP leaves the method to the implementation.
+
+The shared accumulator is the classic mistake. It turns a parallel loop into a serial chain of cache-line transfers. A per-thread counter in an array has a similar problem when the counters share a line (see [false sharing](/concurrency/patterns/false-sharing)).
+
+## Map-reduce on a cluster: the shuffle
+
+Dean and Ghemawat ("MapReduce: Simplified Data Processing on Large Clusters", OSDI 2004) used the same two steps on thousands of machines. A map task emits key-value pairs. The **shuffle** sends every pair with the same key to the same reduce task, usually by a hash of the key. Each reduce task then combines the values of each of its keys.
+
+The hash spreads keys evenly, but it cannot spread the *records of one key*. Real keys are often skewed: a few words, users or URLs are much more frequent than the rest. A common model is a Zipf distribution, where the key of rank k has a weight proportional to $1/k^{s}$.
+
+<ConcPatSkewDemo />
+
+1. With Zipf exponent 1 and 16 reducers, the hottest key has 13,460 of the 100,000 records. The busiest reducer gets 2.94 times the mean, so the reduce phase is only 5.44 times faster than one reducer.
+2. Set 64 reducers. The speedup grows only to 6.94, because the reducer with the hottest key still gets all its records.
+3. Turn on the **map-side combiner**. Each mapper now sends one record per key that it saw. Only 12,936 records reach the reducers, and the speedup is 12.61 of 16.
+4. Set the exponent to 0 (uniform keys). The imbalance is only 1.21: the hash alone is good enough.
+
+The paper's **combiner function** is this fix. It runs the reduce logic on the map side, and it is valid when the reduce function is commutative and associative. For a reduce that is not associative, such as a median, a combiner is not possible. Then the fix is to **salt** the hot key. Split it into k sub-keys, reduce each sub-key, and combine the k results in a second step.
+
+The paper also starts **backup tasks** near the end of a job, because a few slow machines (stragglers) would otherwise decide the total time. A hot key is a straggler that a backup task cannot fix, because the backup does the same work again.
+
+## When map-reduce breaks
+
+- **A non-associative operator.** The parallel result is a different, legal grouping. With floating point, this is a different number.
+- **A shared accumulator.** The reduce becomes serial and moves a cache line per update.
+- **Big partials, merged in a line.** The combine step adds P merges to the span.
+- **Skewed keys.** One reducer gets the hot key. More reducers do not help; a combiner or salting does.
+
+## Connect
+
+- [Fork-join](/concurrency/patterns/fork-join): a reduction tree is a DAG with span $\log_2 P$.
+- [False sharing](/concurrency/patterns/false-sharing): per-thread partials must not share a cache line.
+- [Hot keys](/distributed/partitioning/hot-keys) and [stream processing](/distributed/data-systems/stream-processing): the same skew and the same combiners, in distributed systems.
+- [Lock contention](/performance/concurrency/contention): why the shared accumulator does not scale.
+
+<Recall cards={[
+  { q: "Which two properties must a reduce operator have for a parallel reduction, and what is the third one for some runtimes?", a: "It must be associative and have an identity (a monoid). If the runtime can combine partials in any order, as C++ std::reduce can, it must also be commutative." },
+  { q: "Why can a parallel float sum differ from the serial sum, and from itself with another thread count?", a: "Each float add rounds. A different P groups the adds differently, so the rounding errors differ. Float addition is not associative." },
+  { q: "How does the error of a long chain of adds compare with a tree of adds?", a: "The worst-case bound of a chain grows like $n \\varepsilon$ times the sum of the absolute values. A tree (pairwise sum) grows like $\\varepsilon \\log_2 n$." },
+  { q: "Why is one shared accumulator slow, even with an atomic add?", a: "Every update needs the accumulator's cache line on its core. The line moves for each update, one at a time, so the updates are serial." },
+  { q: "When does a tree combine beat merging partials one by one?", a: "When a partial result is big, such as a histogram or a map. A tree merges in $\\log_2 P$ levels instead of P steps. For a scalar, the extra joins of a tree can make it slower." },
+  { q: "What does a combiner do in MapReduce, and when is it valid?", a: "It runs the reduce on the map side, so each mapper sends one record per key. It is valid when the reduce function is commutative and associative." },
+]} />

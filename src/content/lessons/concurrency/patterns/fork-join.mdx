@@ -1,0 +1,145 @@
+---
+summary: Split a problem, solve the halves in parallel, join the results. The work-span model tells you how fast this can go, and the grain size decides how close you get.
+---
+import { ConcPatDagDemo, ConcPatGrainDemo, ConcPatAlgoDemo } from "@/demos/conc/ConcPatForkJoin";
+
+**Fork-join** is the most common pattern of parallel code. A task **forks**: it starts a child task that can run in parallel with the rest of its own work. Later it **joins**: it waits for the child and uses the child's result. When the subproblems are halves of the problem, the program is a recursion that forks at each level.
+
+```rust
+fn sum(v: &[u64]) -> u64 {
+    if v.len() <= GRAIN {
+        return v.iter().sum(); // a leaf: plain serial code
+    }
+    let (a, b) = v.split_at(v.len() / 2);
+    let (x, y) = rayon::join(|| sum(a), || sum(b)); // fork both halves, join both
+    x + y
+}
+```
+
+The **grain** is the size at which the recursion stops forking and runs serial code. Cilk writes the same program with `cilk_spawn` and `cilk_sync`. Java writes it with a `RecursiveTask` and its `fork()` and `join()` methods. Go has no fork-join library in the standard library, so you write it with goroutines and a `sync.WaitGroup`:
+
+```go
+func sum(v []int64) int64 {
+	if len(v) <= grain {
+		var s int64
+		for _, x := range v {
+			s += x
+		}
+		return s
+	}
+	var left int64
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); left = sum(v[:len(v)/2]) }() // fork
+	right := sum(v[len(v)/2:])
+	wg.Wait() // join
+	return left + right
+}
+```
+
+## The program is a DAG
+
+Draw each piece of serial work as a node, and draw an edge when one piece must finish before another starts. The result is a directed acyclic graph (a **DAG**). A split node forks two children. A leaf adds up to one grain of elements. A join node waits for two partial sums and adds them.
+
+<Predict
+  id="lower-bound"
+  question="The DAG of a sum of 32 elements has 46 units of work. Its longest path is 10 units. Which time can no schedule on 2 cores beat?"
+  options={["10 units: the longest path, because the cores can follow it while they do the rest", "23 units: half of the work", "33 units: half of the work plus the longest path"]}
+  answer={1}
+  explain="Two cores can do at most 2 units of work per unit of time, so 46 units need at least 23. The longest path (10) is also a lower bound, but 23 is larger. A greedy schedule in the demo takes 26 units. 33 is an upper bound, not a lower bound."
+>
+<ConcPatDagDemo />
+</Predict>
+
+Things to try:
+
+1. Move **Time** from 0 to the end. Filled nodes are done. A ringed node runs now, and a dashed node is ready but waits for a core.
+2. Set **Cores P** to 8. The time drops to 10 units, the length of the red path. More cores cannot help, because each node on that path must wait for the node before it.
+3. Set the grain to 32. The DAG becomes one leaf, and every core count gives 32 units.
+4. Set the grain to 1 and the spawn cost to 6. The work grows from 32 units of useful adds to 32 + 31 × 6 + 31 units. The overhead is now most of the work.
+
+## Work, span and Brent's bound
+
+Two numbers describe a DAG. The **work** $T_1$ is the sum of the costs of all nodes: the time on one core. The **span** $T_\infty$ is the cost of the most expensive path: the time on an unlimited number of cores. Their ratio $T_1/T_\infty$ is the **parallelism**: the largest number of cores that can be useful on average.
+
+Two laws follow at once. P cores do at most P units of work per unit of time, so $T_P \ge T_1/P$ (the work law). No core count can run a node before its inputs exist, so $T_P \ge T_\infty$ (the span law). In the demo default, $T_1 = 46$ and $T_\infty = 10$, so no schedule on 2 cores can take less than 23 units.
+
+A **greedy** scheduler never leaves a core idle while a node is ready. Graham (1966, 1969) and Brent (1974) give its upper bound:
+
+$$
+T_P \le \frac{T_1}{P} + T_\infty
+$$
+
+<Steps>
+
+Look at one unit of time in a greedy schedule. Either all P cores are busy (a complete step), or some core is idle (an incomplete step).
+
+Complete steps do P units of work each. There are $T_1$ units in total, so there are at most $T_1/P$ complete steps.
+
+In an incomplete step, every ready node runs, so every node at the start of the remaining longest path runs. Each incomplete step makes that path one unit shorter, so there are at most $T_\infty$ incomplete steps.
+
+Add the two counts: $T_P \le T_1/P + T_\infty$. The same count with a little more care gives the sharper form $(T_1 - T_\infty)/P + T_\infty$.
+
+</Steps>
+
+Both terms are lower bounds on any schedule, so a greedy schedule is never worse than twice the best schedule. When $T_1/P$ is much larger than $T_\infty$, the span term is small, and the speedup is close to P. This is why parallel programs need **slack**: parallelism well above P. A common rule of thumb is about 10 P.
+
+## Grain size
+
+Each fork has a cost: the runtime creates a task record, pushes it where other workers can find it, and later checks whether the child finished. A small grain makes many tasks, so this cost multiplies. A large grain makes few tasks, so some cores have nothing to do.
+
+<ConcPatGrainDemo />
+
+1. Keep the spawn cost at 200 ns, a model input. Cilk-5 reports a spawn at 2 to 6 times a function call, and many pools cost more. At grain 64, the speedup on 8 cores is only 1.94. At grain 1,024 it is 6.68.
+2. Set the spawn cost to 1 µs. Grain 64 is now slower than the serial loop (0.48), and grain 1,024 gives 4.02.
+3. Set the spawn cost to 20 µs, the order of a new OS thread. Grain 1,024 now gives 0.38. One OS thread per task fails for fine-grained work.
+4. Look at the right side. When the grain gives fewer leaves than cores, cores idle. The last point, one leaf, has a speedup of 1.
+
+In this model every leaf costs the same and every core is free, so 8 tasks on 8 cores are enough. Real loops are less even, and other programs use some of the cores. The [work-stealing lesson](/concurrency/patterns/work-stealing) shows that a loop with uneven costs needs many more tasks than cores.
+
+Real runtimes pick a grain for you, or let you set a floor:
+
+| Runtime | How the grain is chosen |
+|---|---|
+| OpenCilk `cilk_for` | the runtime computes `min(2048, n / (8 P))`, unless a grainsize pragma sets it |
+| Rayon | decides splits at run time; `with_min_len(k)` stops any split below k items |
+| Java `ForkJoinPool` | your `compute()` method decides when to stop forking |
+| OpenMP `schedule(static, c)` | you give the chunk size c |
+
+The Cilk-5 paper (Frigo, Leiserson and Randall, PLDI 1998) states the **work-first principle**: move scheduling overhead off the work and onto the span. So a spawn must be cheap when nobody steals: the worker pushes a frame on its own deque and calls the child. The expensive part runs only when a thief takes work, and that is rare.
+
+## The span decides which algorithms scale
+
+Work tells you the cost on one core. Span tells you whether more cores can help. Two algorithms with the same work can have very different spans.
+
+<ConcPatAlgoDemo />
+
+1. At $n = 2^{20}$, the parallel sum has a parallelism of about 99,900. Its span is only 21 levels.
+2. Merge sort with a serial merge has a parallelism of 10.5. The top merge alone touches all n elements on one core, so the span is about 2n.
+3. Move n to the right end. The serial merge reaches only 15.5 at $n = 2^{30}$. It grows like $\log n$, so no realistic input fixes it.
+4. With a parallel merge, merge sort reaches about 6,300 at $n = 2^{20}$. A parallel merge splits on the median of the larger input and finds the split point in the other input with a binary search.
+
+With perfect pivots, quicksort with a serial partition has the same recurrences as the serial merge. The first partition touches all n elements on one core. The fix is the same: make the linear step parallel too, for example with a parallel prefix sum for the partition.
+
+## When fork-join breaks
+
+- **Joins that block threads.** A join that parks an OS thread wastes a worker. Cilk, Rayon and `ForkJoinPool` let a worker that waits at a join run other tasks instead. Go has no such rule, but a blocked goroutine only costs memory, not an OS thread.
+- **Hidden serial work.** A serial merge, a serial partition or a lock in a leaf adds to the span. Amdahl's law is the special case where the span is the serial part.
+- **Shared writes in leaves.** Leaves that write neighbor elements of one array can share cache lines (see [false sharing](/concurrency/patterns/false-sharing)).
+- **Uneven leaves.** Equal-size leaves with unequal costs need a scheduler that moves work at run time. That is work stealing.
+
+## Connect
+
+- [Amdahl's and Gustafson's laws](/concurrency/foundations/amdahls-and-gustafsons-laws): the serial fraction is a special case of the span.
+- [Work stealing](/concurrency/patterns/work-stealing): how a real runtime gets close to Brent's bound with per-worker deques.
+- [Map-reduce](/concurrency/patterns/map-reduce): fork-join over data, with an associative combine.
+- [Multiprocessor scheduling](/os/scheduling/multiprocessor-scheduling): the same balancing problem one level down, in the kernel.
+
+<Recall cards={[
+  { q: "Define work, span and parallelism.", a: "Work $T_1$: the total cost of all nodes, the time on one core. Span $T_\\infty$: the cost of the most expensive path, the time with unlimited cores. Parallelism: $T_1/T_\\infty$." },
+  { q: "State the two lower bounds on the time with P cores.", a: "The work law, $T_P \\ge T_1/P$, and the span law, $T_P \\ge T_\\infty$." },
+  { q: "State Brent's bound and the idea of its proof.", a: "A greedy schedule has $T_P \\le T_1/P + T_\\infty$. Complete steps do P units of work, so there are at most $T_1/P$ of them. Each incomplete step shortens the remaining longest path, so there are at most $T_\\infty$ of them." },
+  { q: "Why does merge sort with a serial merge not scale?", a: "The top merge is serial and touches all n elements, so the span is about 2n. The parallelism is only about $(\\log_2 n)/2$: 10.5 at about one million elements." },
+  { q: "What goes wrong when the grain is too small, and what goes wrong when it is too large?", a: "Too small: the spawn cost multiplies with the number of tasks and becomes most of the work. Too large: there are fewer tasks than cores, or too few to balance uneven costs, so cores idle." },
+  { q: "What is the work-first principle of Cilk?", a: "Move scheduling overhead off the work and onto the span. A spawn is almost free when nobody steals, and the runtime pays the real cost only when a thief takes a task." },
+]} />

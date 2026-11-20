@@ -1,0 +1,121 @@
+---
+summary: Where parallel patterns put unrelated writes on one cache line, how to lay out data so they do not, and what C++, Rust, Go and Java give you for it. True sharing, read-mostly fields, chunk sizes and the cost of padding.
+---
+import { ConcPatLayoutDemo, ConcPatChunkDemo } from "@/demos/conc/ConcPatFalseSharing";
+
+A cache keeps memory in **lines** of 64 bytes on most x86 cores and many ARM cores, and 128 bytes on Apple's M-series cores. A core must own a line alone before it can write to it. When two cores write the same line, the line moves between their caches on almost every write. **False sharing** occurs when the cores write *different* variables that happen to share a line. The program shares no data, but the hardware sees one shared line.
+
+The [performance lesson on false sharing](/performance/concurrency/false-sharing) shows the cost and how to find it with `perf c2c`. The [MESI lesson](/architecture/multicore/cache-coherence-mesi) shows the protocol. This lesson looks at the problem from the side of the program. Which parallel patterns create it? Which layouts avoid it? What does each language give you to control the layout?
+
+## Lay out the fields yourself
+
+The demo below is a small coherence model. Each slot is 8 bytes, and each row is one 64-byte line. Every thread runs on its own core and repeats its accesses. A read hits if the core has the line, owned or shared. A write hits only if the core owns the line alone. Any other access moves the line, which takes 100 ns, and the moves of one line happen one at a time.
+
+A hit takes 1 ns. These costs are model inputs.
+
+<Predict
+  id="readers"
+  question="Three threads read a config field that nobody writes. Two of them also update their own counters, which sit in the same line as config. Do the reads slow down?"
+  options={["No: reads of an unchanged field can always share the line", "Yes: each counter write takes the line away, so the next read of config misses", "Only the writers slow down; readers keep their copy"]}
+  answer={1}
+  explain="Coherence works on whole lines. A write to a counter invalidates every other copy of the line, including the copies that the readers need for config. In the model, this layout reaches 13.3 accesses per µs. Move config to its own line and it reaches 952.5, close to the 1,000 of a layout where every access hits."
+>
+<ConcPatLayoutDemo />
+</Predict>
+
+Things to try:
+
+1. With **config + stats**, click `config` and then a slot in line 1. The line moves drop to almost zero, and the speed goes from 1% to 95% of the hit-only speed.
+2. Select **counters**. Four threads write four adjacent slots of `long counts[4]`. The line moves on every write: 10 accesses per µs against 1,333 if every write hit. Click **One 64-byte line each** to fix it.
+3. Now turn on **Count 128-byte pairs as one line**. Lines 0 and 1 form one unit, and so do lines 2 and 3. The padded counters share units again, and the speed falls to 20. This is the worst case of the adjacent-line prefetcher, which pulls the pair of a line into the cache.
+4. Select **queue indices**. The producer writes `tail` and reads `head`; the consumer does the opposite. Put them on separate lines. The speed rises only from 13.3 to 19.6, and every access still misses. This is **true sharing**: each thread really reads what the other writes.
+5. Select **lock + data**. The lock word moves between T0 and T1 on every acquire. Move `table`, which all threads read, away from the lock and from `hits`.
+
+## False sharing, true sharing and read-mostly data
+
+There are three different problems here, and they need different fixes:
+
+| Problem | Example | Fix |
+|---|---|---|
+| False sharing | per-thread counters in one array; two locks in one struct | put each written field on its own line, or keep it private to the thread |
+| A read-mostly field next to a written one | a config pointer next to a hit counter; a lock next to the data it protects | separate the fields that are read by many from the fields that are written |
+| True sharing | the head and tail of a queue; one global counter | change the algorithm: read the other index less often, or shard the counter |
+
+Padding fixes only the first two. For a single-producer, single-consumer queue, a common trick is a **cached index**. The producer keeps a private copy of `head` and reads the real `head` only when its copy says that the queue is full. Then most operations touch only lines that one thread writes.
+
+## Where parallel patterns create it
+
+The danger is in the patterns of this module, not in exotic code:
+
+- **Per-thread partial results** in [map-reduce](/concurrency/patterns/map-reduce): `partial[tid] += f(x)` inside the loop. The partials sit next to each other in one array.
+- **Output arrays with small chunks** in a parallel loop. Two threads that write neighbor elements share a line at each chunk boundary.
+- **Worker state** in [work stealing](/concurrency/patterns/work-stealing): an array of per-worker structs, each with a deque's `top` (written by thieves) and `bottom` (written by the owner).
+- **Queue indices between pipeline stages** in [pipelines](/concurrency/patterns/pipelines): true sharing that padding cannot remove.
+
+<Predict
+  id="chunks"
+  question="A parallel loop on 4 threads writes out[i] = f(i), 8 bytes per element, 5 ns of work each. Chunks of 1 element go to the threads in turn, like OpenMP schedule(static, 1). What is the speedup over one thread?"
+  options={["About 4", "About 2, because the threads share lines", "Less than 1"]}
+  answer={2}
+  explain="With chunks of 1, the 8 elements of each line belong to 4 different threads. Every write needs the line from another core. In the model, 4 threads are 6 times slower than one thread: a speedup of 0.16. With chunks of 8 elements (one line), the speedup is 4."
+>
+<ConcPatChunkDemo />
+</Predict>
+
+1. With a chunk of 1, every line has 4 writers. The timeline is mostly hatched: cores stall while they wait for lines.
+2. Set the chunk to 4. Each line now has 2 writers, and the speedup is 0.77.
+3. Set the chunk to 8, one line. No line has two writers, and the speedup is exactly 4. Larger chunks stay at 4.
+4. Raise **Work per element** to 100 ns. The stalls are now a smaller part of the time, so false sharing hurts less. It hurts most in tight loops.
+
+The rule for parallel loops is simple. Give each thread contiguous blocks of at least a few lines, and start each block at a line boundary. A recursive split in fork-join does this naturally, because its leaves are contiguous ranges. OpenMP's `schedule(static)` with no chunk size also gives each thread one contiguous block. Only the boundaries between blocks can share a line, and the threads write them at different times.
+
+## Privatize first, pad second
+
+The best fix is often not padding. Accumulate in a local variable and write the shared slot once, at the end:
+
+```c
+// Slow: every iteration writes a line that other threads also write.
+for (long i = lo; i < hi; i++) partial[tid] += f(x[i]);
+
+// Fast: the register or stack variable is private. One write at the end.
+double s = 0;
+for (long i = lo; i < hi; i++) s += f(x[i]);
+partial[tid] = s;
+```
+
+A compiler cannot always do this change for you. If `f` or the loop body may write through another pointer, the compiler must assume that `partial[tid]` can change. So it keeps the store in the loop. Rayon's `fold` and OpenMP's `reduction` clause give each task or thread a private accumulator for this reason. Java's `LongAdder` spreads updates over padded cells.
+
+When the shared slot must stay hot, as with a statistics counter that a monitor reads at any time, pad it. Java's `LongAdder` keeps a table of cells, and contending threads hash to different cells. Its cell class has the `@Contended` annotation, so the JVM pads each cell.
+
+## The tools in each language
+
+| Language | Tool | Size |
+|---|---|---|
+| C++17 | `alignas(std::hardware_destructive_interference_size)` from the header `<new>` | the compiler picks it for the target; GCC warns (`-Winterference-size`) when a header uses it, because the value can change with the flags and break the ABI |
+| Rust | `crossbeam_utils::CachePadded<T>` | 128 on x86-64, aarch64 and powerpc64; 256 on s390x; 32 on arm, mips, sparc and hexagon; 16 on m68k; 64 elsewhere |
+| Go | `cpu.CacheLinePad` in `golang.org/x/sys/cpu`; the runtime uses `internal/cpu.CacheLinePad` | the runtime's size is 64 on amd64, 128 on arm64, 256 on s390x |
+| Java | `@Contended` (`jdk.internal.vm.annotation`, JDK 9 and later) | 128 bytes by default (`-XX:ContendedPaddingWidth`); user classes need `-XX:-RestrictContended` and an `--add-exports` of the package |
+| Zig | `align(std.atomic.cache_line)` on a field | an estimate that avoids false sharing: 128 on x86-64 and aarch64, like crossbeam |
+
+The sizes differ for a reason. The crossbeam source explains its 128 on x86-64. Starting with Sandy Bridge, Intel's spatial prefetcher pulls pairs of 64-byte lines, so two fields 64 bytes apart can still interfere. Go picks 128 on arm64 because Apple's M1 has 128-byte lines. The Go runtime pads each entry of the heap's array of `mcentral` structs to a multiple of `CacheLinePadSize`. So threads that allocate from different size classes do not share lines.
+
+## What padding costs
+
+Padding is not free. A padded 8-byte counter uses 128 bytes, so 64 padded counters use 8 KiB instead of 512 bytes. Padded data fills more of the cache and needs more memory bandwidth to read. So pad only fields that different cores *write* often. Do not pad data that is mostly read. Do not pad each element of a large array; split the array into per-thread blocks instead.
+
+## Connect
+
+- [False sharing in the performance track](/performance/concurrency/false-sharing): the cost curve and `perf c2c`.
+- [Cache coherence and MESI](/architecture/multicore/cache-coherence-mesi): why a write needs the line alone.
+- [Map-reduce](/concurrency/patterns/map-reduce): per-thread partials, the main source of false sharing in parallel code.
+- [Lock contention](/performance/concurrency/contention): true sharing on a lock or a counter.
+- [Struct of arrays and array of structs](/performance/memory/struct-of-arrays-vs-array-of-structs): layout choices that decide which fields share a line.
+
+<Recall cards={[
+  { q: "A field that nobody writes is in the same line as a counter that another core writes. Why do reads of the field miss?", a: "Coherence works on whole lines. Each write to the counter invalidates all other copies of the line, so the next read of the field must fetch the line again." },
+  { q: "Why does padding not fix the head and tail of a single-producer, single-consumer queue?", a: "It is true sharing: each side reads the index that the other side writes. The fix is a private cached copy of the other index, read again only when needed." },
+  { q: "A parallel loop writes 8-byte elements. What chunk size avoids false sharing on 64-byte lines?", a: "At least 8 elements per chunk, with chunks that start at line boundaries. Contiguous blocks of many lines are better still." },
+  { q: "Why does crossbeam's CachePadded use 128 bytes on x86-64?", a: "Since Sandy Bridge, Intel's spatial prefetcher pulls pairs of 64-byte lines. Two fields 64 bytes apart can still interfere." },
+  { q: "Why is a private accumulator often better than padding?", a: "The loop writes only a register or stack variable, and the shared slot is written once at the end. It also uses no extra memory." },
+  { q: "Name the padding tools of C++, Rust, Go and Java.", a: "C++: alignas(std::hardware_destructive_interference_size). Rust: crossbeam_utils::CachePadded. Go: cpu.CacheLinePad. Java: @Contended (with -XX:-RestrictContended for user code)." },
+]} />

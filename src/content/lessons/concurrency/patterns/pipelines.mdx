@@ -1,0 +1,124 @@
+---
+summary: Stages connected by bounded queues. The slowest stage sets the throughput, queues set the latency, and replicas, ordering, tokens and batches decide the rest. With Go channels and the oneTBB parallel_pipeline.
+---
+import { ConcPatPipeDemo, ConcPatOrderDemo, ConcPatBatchDemo } from "@/demos/conc/ConcPatPipeline";
+
+A **pipeline** splits the processing of each item into **stages**. Each stage runs on its own thread (or threads) and passes the item to the next stage through a queue. While stage 2 works on item 5, stage 1 can already work on item 6. So the stages run in parallel on different items, even when each item must go through the stages in order.
+
+Pipelines appear everywhere. An image service reads, decodes, resizes and writes. A compiler lexes, parses and generates code. A log shipper reads, parses, filters and sends. In Go, the usual form is a chain of goroutines connected by channels:
+
+```go
+func stage[In, Out any](ctx context.Context, in <-chan In, f func(In) Out) <-chan Out {
+	out := make(chan Out, 2) // a bounded queue to the next stage
+	go func() {
+		defer close(out) // when the input closes, close the output: shutdown flows downstream
+		for x := range in {
+			select {
+			case out <- f(x):
+			case <-ctx.Done(): // cancellation: stop without leaking the goroutine
+				return
+			}
+		}
+	}()
+	return out
+}
+```
+
+Sameer Ajmani's post "Go Concurrency Patterns: Pipelines and cancellation" (go.dev blog, 2014) describes this form. A stage closes its output when its input is done, and every send also watches a cancellation channel.
+
+## The slowest stage sets the throughput
+
+<Predict
+  id="bottleneck"
+  question="Four stages take 20, 60, 30 and 10 µs per item, with one thread each. The source has items ready at all times. How many items per second leave the pipeline?"
+  options={["One per 120 µs: about 8,300 per second", "One per 60 µs: about 16,700 per second", "One per 30 µs, the mean stage: about 33,000 per second"]}
+  answer={1}
+  explain="In steady state every stage must pass the same number of items per second. The 60 µs stage can pass at most one item per 60 µs, so the others wait for it. The sum of the stages (120 µs) is the latency of one item in an empty pipeline, not the time between two items."
+>
+<ConcPatPipeDemo />
+</Predict>
+
+Things to try:
+
+1. Read the timeline. Resize is busy all the time (97%). Parse runs, then waits on a full queue. Encode and write wait on empty queues.
+2. Click **+** on resize. Two threads double its capacity, and the throughput goes from 16.7k to 33.3k items per second.
+3. Click **+** again. Encode (30 µs) is now the bottleneck, and the throughput stays at 33.3k. Give encode a second thread: 50k, and parse is the limit.
+4. Move **Queue capacity** from 0 to 8 with the default stages. The throughput stays at 16.7k, but the mean latency goes from 222 µs to 916 µs.
+
+The capacity of stage s with $r_s$ threads and a cost of $c_s$ per item is $r_s / c_s$. With enough cores, the throughput of the pipeline is
+
+$$
+X = \min_s \frac{r_s}{c_s}
+$$
+
+The latency of one item is at least $\sum_s c_s$, the time that it spends in service. Everything above that is time in queues. When the source is faster than the bottleneck, every queue before the bottleneck fills up. Each full queue adds about its capacity times the bottleneck's cost to the latency. That is why step 4 shows longer latency with larger queues and no gain in throughput. Little's law, $L = X \cdot W$, ties the two: at a fixed throughput, more items in queues means a longer wait (see [queueing theory](/performance/systems/queueing-theory-and-littles-law)).
+
+So a pipeline needs **bounded** queues. An unbounded queue before a slow stage grows without limit, and the program runs out of memory or latency. A bounded queue blocks the producer instead: this is **backpressure**, and it propagates upstream to the source.
+
+## Replicas and ordering
+
+A stage that keeps no state between items can run on several threads: it is a **parallel** stage. A stage with state, such as a writer that appends to one file, must stay **serial**. oneTBB names these modes in its `parallel_pipeline`:
+
+```cpp
+tbb::parallel_pipeline(/* max_number_of_live_tokens */ 16,
+    tbb::make_filter<void, Img*>(tbb::filter_mode::serial_in_order,
+        [&](tbb::flow_control& fc) -> Img* { Img* p = read_next(); if (!p) fc.stop(); return p; }) &
+    tbb::make_filter<Img*, Img*>(tbb::filter_mode::parallel, [](Img* p) { return resize(p); }) &
+    tbb::make_filter<Img*, void>(tbb::filter_mode::serial_in_order, [&](Img* p) { write(p); }));
+```
+
+A `serial_in_order` filter sees items in input order, even after a parallel filter has mixed them up. A `serial_out_of_order` filter takes items in any order. The first argument limits the **live tokens**: the number of items in the whole pipeline at one time. In Go, you replicate a stage by starting several goroutines that read the same input channel (fan-out). A `sync.WaitGroup` then closes the shared output channel when all of them finish (fan-in).
+
+<Predict
+  id="order"
+  question="A transform stage has 4 threads. Its cost is 60 µs on average, but some items take much longer. The output must keep the input order. What does the order cost?"
+  options={["Nothing: the same items leave at the same rate", "Latency: fast items wait in a reorder buffer for slow earlier items", "Throughput only: the stage runs one item at a time again"]}
+  answer={1}
+  explain="A slow item blocks the output of every later item that has finished. Those items wait in a reorder buffer. The throughput stays the same while the buffer and the tokens allow it. But the mean latency rises from 109 µs to 168 µs."
+>
+<ConcPatOrderDemo />
+</Predict>
+
+1. Compare the lines. Each red peak is a slow item, and the items after it wait for it. In order, the mean latency is 168 µs, and without order it is 109 µs.
+2. Read **largest reorder buffer**: 18 items. That is memory that ordered output needs. Without order, 269 of the 400 items arrive before an earlier item.
+3. Set **live tokens** to 8. The reorder buffer now holds at most 8 items. But the source must wait for tokens, and the ordered throughput drops from about 49.4k to 38.2k per second.
+4. Select **always 60 µs**. With equal costs, the items finish almost in order, and ordering costs little.
+
+So ordering is a trade between latency, memory and throughput. Keep order only where the consumer needs it, and put the ordered stage as late as possible.
+
+## Batching
+
+Each handoff between stages has a fixed cost. It takes a lock or atomic operations on the queue, cache misses on the queue's lines, and often a wake-up. When the work per item is small, this cost dominates. A **batch** moves many items in one handoff.
+
+<ConcPatBatchDemo />
+
+1. Keep 2 µs of work per item and 3 µs per handoff (model inputs). With batch 1, each stage needs 5 µs per item: 200k items per second.
+2. Move to batch 128. The handoff cost per item is now about 0.02 µs. The throughput is 494k items per second, close to the 500k limit of the work alone.
+3. Now read the latency: 29.5 µs with batch 1, 920 µs with batch 128. An item waits until its batch is full and then until the whole batch is done.
+4. Set the handoff cost to 0. Batching gains nothing, and it still adds latency.
+
+Real systems batch at every level. The `writev` call writes many buffers in one system call. With `io_uring`, one system call submits many I/O requests. Kafka producers batch records per partition, and network cards coalesce interrupts. A good batch policy has a size limit and a time limit, so that a quiet stream does not wait forever for a full batch.
+
+## When pipelines break
+
+- **One slow stage.** Throughput is the minimum, so adding threads to other stages does nothing. Measure each stage's busy time first.
+- **Unbounded queues.** Memory and latency grow without limit when the source is faster than the bottleneck.
+- **Too many threads.** A replica needs a core. With more busy threads than cores, the stages share cores, and the model's minimum no longer holds.
+- **Ordered output with a long tail.** One slow item holds back every later item.
+- **Shutdown and errors.** A stage that stops reading leaves its producer blocked forever. Close channels downstream, and cancel with a done channel, as the Go post shows. Today a `context.Context` does the same job.
+
+## Connect
+
+- [Queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law): the latency of the queues between stages.
+- [Stream processing](/distributed/data-systems/stream-processing): the same pipeline across machines, with watermarks and checkpoints.
+- [Fork-join](/concurrency/patterns/fork-join) and [map-reduce](/concurrency/patterns/map-reduce): the other two shapes of parallel work.
+- [False sharing](/concurrency/patterns/false-sharing): the head and tail of a queue between two stages are a classic case.
+
+<Recall cards={[
+  { q: "What sets the throughput of a pipeline, and what sets the latency of one item?", a: "Throughput: the slowest stage, $\\min_s r_s/c_s$ with $r_s$ threads and cost $c_s$. Latency: at least the sum of the stage costs, plus the time in queues." },
+  { q: "Why must the queues between stages be bounded?", a: "When the source is faster than the bottleneck, an unbounded queue grows without limit. A bounded queue blocks the producer, so backpressure reaches the source." },
+  { q: "The bottleneck stage gets a second thread. When does the throughput not double?", a: "When another stage becomes the slowest, or no core is free for the new thread. Also when the stage has state and must stay serial." },
+  { q: "What do oneTBB's serial_in_order, serial_out_of_order and parallel filters mean?", a: "serial_in_order: one item at a time, in input order. serial_out_of_order: one item at a time, any order. parallel: many items at the same time." },
+  { q: "What does ordered output cost when stage times vary?", a: "Latency and memory: finished items wait in a reorder buffer for a slow earlier item. With a token limit, the source also waits, so throughput can drop." },
+  { q: "What does batching trade?", a: "It divides the fixed cost of a handoff among many items, so throughput rises. Each item waits for its batch, so latency rises." },
+]} />

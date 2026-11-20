@@ -1,0 +1,141 @@
+---
+summary: Each worker keeps its own deque of tasks and works at one end. Idle workers steal from the other end. Why this balances load with almost no synchronization, and how Go, Tokio, Rayon and Java do it.
+---
+import { ConcPatDequeDemo, ConcPatShareDemo } from "@/demos/conc/ConcPatStealing";
+
+A fork-join program makes tasks at run time, and nobody knows in advance how long each task takes. A scheduler must give these tasks to P workers (threads, one per core). It must keep every worker busy, and it must not make the workers wait for each other while it does that.
+
+**Work stealing** solves this with one data structure per worker: a **deque**, a double-ended queue. A worker pushes the tasks that it creates at the **bottom** of its own deque and pops its next task from the bottom too. When its deque is empty, the worker becomes a **thief**. It picks another worker, the **victim**, and takes the task at the **top** of the victim's deque. Cilk, Rayon and Java's `ForkJoinPool` use this design. Go and Tokio use a variant with bounded FIFO queues, described below.
+
+## Deques, step by step
+
+The demo runs a loop of 128 items with a grain of 8. A worker splits its range in half and pushes the right half at the bottom of its deque. It goes on with the left half until 8 items are left. At the start, W0 holds the whole loop and the other workers hold nothing.
+
+<Predict
+  id="first-steal"
+  question="W0 has split 0–128 three times, so its deque holds 64–128, 32–64 and 16–32 (top first). W1 steals. Which task does it get?"
+  options={["16–32, the newest task", "64–128, the oldest task", "A random task from the deque"]}
+  answer={1}
+  explain="A thief takes the top, the oldest task. In a recursive split, the oldest task is the largest one: here half of the whole loop. So one steal gives the thief a lot of work, and thieves need to steal rarely."
+>
+<ConcPatDequeDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Next** until the first steal. W1 takes 64–128 from the top of W0's deque, the largest task that exists.
+2. Go to the last event. Three workers ran 16 leaf tasks with only 4 steals. Most deque operations were pushes and pops at the owner's own end.
+3. Look at the grey spans in the timeline. They are steal attempts. At the end of the run, the deques are almost empty, so 6 attempts fail.
+4. Select **top (FIFO)** for the owner. The owner now takes its oldest task, the same end that thieves use. In this small run the result changes little; the next demo shows the cost at a larger size.
+
+## Why the two ends matter
+
+The owner works at the bottom, in **LIFO** order (last in, first out). So it runs the task that it created last: the smallest, most recent piece of its current subproblem. This is depth-first order. It has three effects:
+
+- **Memory.** The deque holds at most one pending task per level of the split tree. In the next demo, 65,536 items with a grain of 256 need at most 8 levels. With LIFO, the longest deque is 7 tasks. With FIFO, the owner runs breadth-first and the longest deque is 23 tasks.
+- **Locality.** The newest task works on data that the owner touched a moment ago. That data is still in its cache.
+- **Few conflicts.** The owner and the thieves work at different ends. They compete only when one task is left.
+
+Thieves work at the top, in FIFO order. The oldest task is the largest one, so a thief gets much work with one steal. Blumofe and Leiserson ("Scheduling Multithreaded Computations by Work Stealing", J. ACM 1999) prove that a randomized work-stealing scheduler runs a fully strict computation in expected time $T_1/P + O(T_\infty)$. That is Brent's bound from the [fork-join lesson](/concurrency/patterns/fork-join), up to a constant factor on the span. The expected number of steal attempts is $O(P \cdot T_\infty)$, which does not depend on the work.
+
+## Three ways to share a loop
+
+<Predict
+  id="central"
+  question="A loop of 65,536 items, 10 ns each, runs on 8 workers. All workers take chunks of 16 items from one queue that one mutex protects. What is the speedup over one worker?"
+  options={["About 8", "About 6", "Less than 1"]}
+  answer={2}
+  explain="Each chunk is 160 ns of work, and each trip through the lock costs about as much. Only one worker can be inside the lock. The lock serializes the workers, and blocked workers pay wake-ups. The model gives 0.94: slower than one thread."
+>
+<ConcPatShareDemo />
+</Predict>
+
+1. Keep **grows with i**: item i costs 2i/n times the mean, like the inner loop of a triangular matrix. Static blocks give 4.27 on 8 workers, because the last block has almost twice the mean cost. The central queue gives 6.91, and stealing gives 7.28.
+2. Set the grain to 16 and the cost to **uniform**. The central queue drops to 0.94, and stealing still gives 5.84. At 16 workers, the queue gives 0.92 and stealing gives 10.97.
+3. Select the **central queue** timeline at grain 16. The hatched and thin spans are workers that spin or sleep on the lock.
+4. Set the grain to 8,192 with the triangular cost. There are only 8 tasks, so stealing cannot balance them: 5.26. Work stealing needs slack, as the fork-join lesson says.
+
+The model inputs are 10 ns per item, 50 ns per split and 50 ns inside the queue lock. A steal attempt costs 300 ns: a few cache misses and a CAS. The Runtime adds its lock and wake-up costs.
+
+## The deque itself
+
+A work-stealing deque must let the owner push and pop without a lock, because the owner does that for every task. Thieves can pay more. Arora, Blumofe and Plaxton (SPAA 1998) gave the first non-blocking deque of this kind. Chase and Lev ("Dynamic Circular Work-Stealing Deque", SPAA 2005) made it a circular array that can grow. Lê, Pop, Cohen and Zappa Nardelli (PPoPP 2013) gave a portable C11 version with explicit memory orders. They proved an optimized version correct on the POWER and ARM memory models.
+
+```cpp
+// After Lê et al. 2013, simplified: grow() is not shown.
+void push(Task* x) {                       // owner only
+    long b = bottom.load(relaxed), t = top.load(acquire);
+    if (b - t == N) grow();                // the real deque copies to a larger buffer
+    buf[b % N].store(x, relaxed);
+    atomic_thread_fence(release);
+    bottom.store(b + 1, relaxed);
+}
+Task* pop() {                              // owner only
+    long b = bottom.load(relaxed) - 1;
+    bottom.store(b, relaxed);
+    atomic_thread_fence(seq_cst);          // the store to bottom must be seen before top is read
+    long t = top.load(relaxed);
+    if (t > b) { bottom.store(b + 1, relaxed); return nullptr; }       // empty
+    Task* x = buf[b % N].load(relaxed);
+    if (t == b) {                          // the last task: race with thieves for it
+        if (!top.compare_exchange_strong(t, t + 1, seq_cst, relaxed)) x = nullptr;
+        bottom.store(b + 1, relaxed);
+    }
+    return x;
+}
+Task* steal() {                            // any thief
+    long t = top.load(acquire);
+    atomic_thread_fence(seq_cst);
+    long b = bottom.load(acquire);
+    if (t >= b) return nullptr;            // empty
+    Task* x = buf[t % N].load(relaxed);
+    if (!top.compare_exchange_strong(t, t + 1, seq_cst, relaxed)) return RETRY;
+    return x;
+}
+```
+
+The owner's fast path has no compare-and-swap (CAS). Only the last task needs a CAS, because the owner and a thief can both want it. Thieves always CAS on `top`, so two thieves cannot take the same task. The `seq_cst` fence in `pop` is the expensive part. Without it, the owner and a thief can each miss the other's update, and both take the last task. Rust's `crossbeam-deque` implements this deque, and its `Worker::new_lifo`, `Worker::new_fifo` and `Stealer::steal` match the two ends.
+
+## Work-first and help-first
+
+When a task spawns a child, a runtime can run the child at once and leave the **continuation** (the rest of the parent) for thieves. This is the work-first policy of Cilk. Or it can push the child and keep running the parent: the help-first policy. Rayon's `join(a, b)` is close to help-first: it pushes `b`, runs `a`, then pops `b` if no thief took it. Guo, Barik, Raman and Sarkar (IPDPS 2009) compare the two. Help-first works better when one parent spawns many children in a loop, because thieves then find the children at once.
+
+A join that finds its child stolen must not block the worker. Rayon's worker runs other tasks while it waits for the thief. Java's `ForkJoinTask.join` also runs other tasks while it waits.
+
+## Real schedulers
+
+| Runtime | Local queue | Other sources of work | Steal |
+|---|---|---|---|
+| Go (`proc.go`, go1.25) | 256 goroutines per P, plus one `runnext` slot | global run queue, checked when `schedtick % 61 == 0`; a full local queue moves half of it there | half of the victim's queue; up to 4 passes over all Ps in random order |
+| Tokio multi-thread (1.54) | 256 tasks, plus a LIFO slot for a task woken by the current one | an injection queue; the check interval tunes itself (since 1.29) | half of the victim's queue; the LIFO slot cannot be stolen |
+| Rayon | a Chase-Lev deque per worker (`crossbeam-deque`) | a global injector queue for jobs from outside the pool | one job from the top |
+| Java `ForkJoinPool` | a deque per worker; `asyncMode` makes it FIFO for tasks that are never joined | shared submission queues; the common pool has max(1, CPUs − 1) workers | from the top |
+
+Go and Tokio do not use a Chase-Lev deque. Their local queues are bounded FIFO rings, and the owner and thieves both take from the head. Only the `runnext` slot or the LIFO slot gives LIFO order for the newest task.
+
+The `runnext` slot and Tokio's LIFO slot solve one problem. A task that wakes another task, as in a channel send, should hand over the core at once. Go steals the `runnext` goroutine only on the last of its 4 passes, and only when the victim's queue is empty. If the victim is running, the thief first sleeps for about 3 µs. Then a quick send and receive can finish on the victim's P. On Windows, OpenBSD and NetBSD it yields instead.
+
+The check of the global queue every 61 ticks stops the local queues from starving goroutines in the global queue.
+
+## When work stealing breaks
+
+- **Too few tasks.** With fewer tasks than workers, or a few huge ones, there is nothing to steal.
+- **Blocking tasks.** A task that blocks in a system call or on a lock holds its worker. Go hands its P to another thread. Tokio has `spawn_blocking` for this.
+- **Locality across sockets.** A random victim can sit on another NUMA node. Some runtimes try nearby victims first (see [NUMA](/architecture/multicore/numa)).
+- **Idle spinning.** Thieves that find nothing burn CPU. Real runtimes park idle workers after a few failed rounds and wake them when new work arrives.
+
+## Connect
+
+- [Fork-join](/concurrency/patterns/fork-join): the work-span model that the stealing bound uses.
+- [Compare-and-swap](/concurrency/atomics/compare-and-swap) and [fences](/concurrency/atomics/fences): the atomics inside the Chase-Lev deque.
+- [Multiprocessor scheduling](/os/scheduling/multiprocessor-scheduling): the Linux kernel pulls tasks to idle CPUs with the same idea.
+- [Lock contention](/performance/concurrency/contention): why one central queue stops scaling.
+
+<Recall cards={[
+  { q: "At which end of its deque does the owner work, and at which end do thieves work? Why?", a: "The owner pushes and pops at the bottom (LIFO): depth-first order, a short deque and warm caches. Thieves take the top (FIFO): the oldest and largest task, so steals are rare and the two sides seldom conflict." },
+  { q: "What is the expected time of randomized work stealing (Blumofe and Leiserson)?", a: "$T_1/P + O(T_\\infty)$ for a fully strict computation. The expected number of steals is $O(P \\cdot T_\\infty)$." },
+  { q: "In a Chase-Lev deque, when does the owner need a CAS?", a: "Only when it pops the last task, because a thief can want the same task. All other pushes and pops are plain loads and stores with fences." },
+  { q: "How does Go balance goroutines across Ps?", a: "Each P has a local queue of 256 goroutines and a runnext slot. An idle P steals half of a random victim's queue, up to 4 passes. Every 61 schedule ticks a P checks the global queue." },
+  { q: "Why does one central task queue stop scaling with small tasks?", a: "Every task needs one trip through one lock, and only one worker can be inside it. When a task is about as short as the lock trip, the workers serialize and pay wake-ups." },
+  { q: "What is the difference between work-first and help-first?", a: "Work-first runs the spawned child at once and leaves the parent's continuation for thieves (Cilk). Help-first pushes the child and keeps running the parent." },
+]} />

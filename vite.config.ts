@@ -24,7 +24,7 @@ export default defineConfig({
           [rehypeShiki, {
             themes: { light: "github-light", dark: "github-dark" },
             defaultColor: false,
-            langs: ["rust", "go", "zig", "c", "cpp", "ts", "sql", "sh", "bash", "toml", "text"],
+            langs: ["rust", "go", "zig", "c", "cpp", "ts", "sql", "sh", "bash", "toml", "text", "riscv", "verilog"],
             // Shiki's asm grammar treats // comments in GNU assembler as code. Plain text is better than wrong colors.
             langAlias: { asm: "text" },
             fallbackLanguage: "text",

@@ -18,6 +18,16 @@ describe("event loops: the step model", () => {
   test("Node (CommonJS): nextTick before promises, and again after a promise queues one", () => {
     expect(out("tick")).toBe("sync tick 1 promise tick 2 timeout");
   });
+  test("Node: a nextTick queued by a promise job waits until every queued promise job has run (Node 26: p1 p2 T)", () => {
+    const p = {
+      ...prog("tick"),
+      main: { name: "script", body: [
+        { k: "micro" as const, cb: { name: "p1", body: [{ k: "log" as const, text: "p1" }, { k: "tick" as const, cb: { name: "T", body: [{ k: "log" as const, text: "T" }] } }] } },
+        { k: "micro" as const, cb: { name: "p2", body: [{ k: "log" as const, text: "p2" }] } },
+      ] },
+    };
+    expect(runLoop(p).at(-1)!.state.out.join(" ")).toBe("p1 p2 T");
+  });
   test("Node: inside an I/O callback, setImmediate runs before setTimeout(0)", () => {
     expect(out("phases")).toBe("tick immediate timeout");
   });
@@ -128,11 +138,11 @@ describe("futures: combinators", () => {
 });
 
 describe("async/await desugared", () => {
-  test("the future is as large as its largest state: 1,072 B with the array, 72 B with a Vec", () => {
+  test("the future is as large as its largest state: 1,096 B with the array, 96 B with a Vec", () => {
     const arr = stateLayout(handlerStates(false)), vec = stateLayout(handlerStates(true));
-    expect(arr.bytes).toBe(1_072);
-    expect(arr.variants.map((v) => v.bytes)).toEqual([24, 1_072, 72, 72, 1]);
-    expect(vec.bytes).toBe(72);
+    expect(arr.bytes).toBe(1_096);
+    expect(arr.variants.map((v) => v.bytes)).toEqual([24, 1_072, 1_096, 72, 1]);
+    expect(vec.bytes).toBe(96);
   });
   test("one poll per Pending, plus the last: 4 polls; ready sub-futures merge polls", () => {
     expect(pollTrace([false, false, false]).map((s) => `${s.from}>${s.to}`)).toEqual(["Unresumed>Suspend0", "Suspend0>Suspend1", "Suspend1>Suspend2", "Suspend2>Returned"]);

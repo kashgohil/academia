@@ -104,20 +104,26 @@ export function runLoop(p: LoopProgram, maxFrames = 200): LoopFrame[] {
     s.running = null;
     return ok;
   };
-  /** The microtask checkpoint. In Node the nextTick queue drains first, then promise jobs, until both are empty. */
+  /**
+   * The microtask checkpoint. In Node the nextTick queue drains first, then the whole promise job queue (V8 runs
+   * every job, also jobs queued meanwhile, before Node looks at nextTick again), and this repeats until both are empty.
+   */
   const drain = (): boolean => {
     const back = s.phase;
+    let inPromiseJobs = false;
     for (;;) {
-      if (p.mode === "node" && s.tick.length) {
+      if (p.mode === "node" && s.tick.length && !(inPromiseJobs && s.micro.length)) {
+        inPromiseJobs = false;
         s.phase = "microtasks";
         const it = s.tick.shift()!;
         if (!run("tick", it, `Run the nextTick callback "${it.cb.name}".`, "Node empties the nextTick queue before it runs any promise job.")) return false;
         continue;
       }
       if (s.micro.length) {
+        inPromiseJobs = true;
         s.phase = "microtasks";
         const it = s.micro.shift()!;
-        if (!run("micro", it, `Run the microtask "${it.cb.name}".`, p.mode === "node" ? "After a callback, Node drains nextTick, then the microtask queue, until both are empty." : "After each task, the loop runs microtasks until the microtask queue is empty.")) return false;
+        if (!run("micro", it, `Run the microtask "${it.cb.name}".`, p.mode === "node" ? "Node runs all nextTick callbacks, then all promise jobs, and repeats until both queues are empty." : "After each task, the loop runs microtasks until the microtask queue is empty.")) return false;
         continue;
       }
       s.phase = back;

@@ -64,7 +64,7 @@ export function handlerStates(heapBuf: boolean): StateVariant[] {
   return [
     { name: "Unresumed", line: 0, fields: [ref("sock", "&mut TcpStream"), ref("db", "&Db")], note: "Created, not polled yet. It holds only the arguments." },
     { name: "Suspend0", line: 2, fields: [ref("sock", "&mut TcpStream"), ref("db", "&Db"), buf, { name: "read_fut", ty: "Read<'_>", bytes: 24, align: 8 }], note: heapBuf ? "Waits for the read. buf is a Vec: 24 bytes here, 1 KiB on the heap." : "Waits for the read. buf is live, and read_fut points into it." },
-    { name: "Suspend1", line: 4, fields: [ref("sock", "&mut TcpStream"), ref("db", "&Db"), { name: "get_fut", ty: "Get<'_>", bytes: 48, align: 8 }], note: "Waits for the database. buf and n are dead, so they are not stored." },
+    { name: "Suspend1", line: 4, fields: [ref("sock", "&mut TcpStream"), ref("db", "&Db"), buf, { name: "get_fut", ty: "Get<'_>", bytes: 48, align: 8 }], note: "Waits for the database. n is dead, but buf was borrowed, so rustc keeps it until its scope ends." },
     { name: "Suspend2", line: 5, fields: [ref("sock", "&mut TcpStream"), { name: "row", ty: "Vec<u8>", bytes: 24, align: 8 }, { name: "write_fut", ty: "WriteAll<'_>", bytes: 32, align: 8 }], note: "Waits for the write. row is live because write_fut borrows it." },
     { name: "Returned", line: 6, fields: [], note: "Done. A poll now panics." },
   ];
@@ -171,7 +171,7 @@ export function pinTrace(actions: ("poll" | "move")[], pinned: boolean): PinFram
  * - A goroutine: its stack, 2 KiB at the start (Go's minimum since Go 1.4), doubled by copying while the deepest
  *   frame chain does not fit; plus the g struct, about 400 bytes.
  * - An OS thread: the stack pages that the thread touched (4 KiB pages), plus the kernel's stack for the thread
- *   (16 KiB on x86-64) and its task struct, about 10 KiB. Its 8 MiB stack reservation is virtual memory only.
+ *   (16 KiB on x86-64) and its task struct, about 10 KiB. Its stack reservation (8 MiB by default on Linux with glibc, from RLIMIT_STACK) is virtual memory only.
  */
 export const MEM_MODEL = { taskHeader: 64, goMinStack: 2048, gStruct: 400, page: 4096, kernelStack: 16384, taskStruct: 10240, threadReserve: 8 << 20 } as const;
 

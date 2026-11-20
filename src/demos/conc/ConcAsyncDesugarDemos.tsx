@@ -52,7 +52,7 @@ export function ConcAsyncStateMachineDemo() {
           </pre>
         </div>
         <div style={{ minWidth: 0 }}>
-          <SmallLabel>The generated enum. Each variant stores what is live across its await.</SmallLabel>
+          <SmallLabel>The generated enum. Each variant stores what is live across its await, and borrowed locals still in scope.</SmallLabel>
           <MiniTable
             head={["variant", "fields", "bytes"]}
             rows={layout.variants.map((v) => [

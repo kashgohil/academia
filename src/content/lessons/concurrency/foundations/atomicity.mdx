@@ -1,0 +1,131 @@
+---
+summary: "When a group of steps must look like one step: atomicity violations over two variables, torn Go interfaces and slice headers, and five ways to make a compound action atomic, with what each one costs under load."
+---
+import { ConcFoundTransferDemo, ConcFoundTornDemo, ConcFoundSnapshotCostDemo } from "@/demos/conc/ConcFoundAtomicityDemos";
+
+An action is **atomic** when every other thread sees either none of it or all of it, never a part. The [atomic operations](/concurrency/atomics/atomic-operations) lesson covers one operation on one memory location. This lesson covers **compound actions**: several steps, often on several locations, that must look like one step.
+
+An **atomicity violation** occurs when another thread sees or changes the state between the steps of such an action. Lu, Park, Seo and Zhou studied 105 real concurrency bugs in MySQL, Apache, Mozilla and OpenOffice (ASPLOS 2008). About 34% of the non-deadlock bugs involved more than one variable. Per-variable atomics cannot fix those bugs.
+
+<Predict
+  id="transfer"
+  question="A transfer runs A -= 30, then B += 30, each as an atomic add. An audit reads A, then reads B, and adds them. Both accounts start at 100. Can the audit see a total other than 200?"
+  options={["No: each update is atomic", "Yes, but only 170", "Yes: 170 or 230"]}
+  answer={2}
+  explain="The audit can read A after the debit and B before the credit, and see 170. It can also read A before the debit and B after the credit, and see 230. Each add is atomic, but the transfer is two steps. 2 of the 6 schedules give a wrong total."
+>
+<ConcFoundTransferDemo />
+</Predict>
+
+1. Run the transfer once, then the audit twice. The audit sees 170. Click **Show a wrong audit** to replay a short failing schedule.
+2. Read the totals under the demo: 170 in 1 schedule, 200 in 4 and 230 in 1.
+3. Select **Lock in the transfer only**. 5 of 15 schedules are still wrong. A lock protects data only from threads that also take the lock.
+4. Select **Lock in transfer and audit**. Both schedules are correct.
+5. Select **Both balances in one word, CAS**. The two balances share one 64-bit word, so one load reads both and one CAS writes both. All 3 schedules see 200.
+6. Select **Seqlock: the audit retries**. Run the first `seq++`, then try to run the audit. It waits while the counter is odd. Interleave the audit reads with the writes, and the audit retries. All 36 schedules see 200.
+7. Select **Copy-on-write, swap a pointer**. The transfer builds a new snapshot that nobody can see, then publishes it with one pointer store. All 20 schedules see 200.
+
+## Atomic, isolated, ordered
+
+Three words describe different guarantees, and the fields that use them do not agree.
+
+- **Atomic**, in concurrency, means indivisible as other threads see it. The audit must not see half a transfer.
+- **Atomic**, in the ACID properties of databases, means all or nothing under failure: a crash or an abort undoes every write. The "I" in ACID, **isolation**, is the concurrency meaning. Haerder and Reuter named ACID in 1983. The [ACID](/databases/transactions/acid) lesson compares the four letters.
+- **Ordered** means that effects become visible to other threads in a known order. A relaxed atomic add is atomic but not ordered. The [memory orderings](/concurrency/atomics/memory-orderings-relaxed-acquire-release-seq-cst) lesson covers this.
+- **Linearizable** is the standard target for a concurrent object. Each operation appears to take effect at one instant between its call and its return. The [linearizability](/concurrency/verification/linearizability) lesson checks it.
+
+The bug above needs no data race. Every access is an atomic add or an atomic load. The bug is in the size of the indivisible unit, which is one add and not one transfer.
+
+## Torn values
+
+<Predict
+  id="torn"
+  question="In Go, one goroutine assigns a new value to an interface variable while another goroutine reads it, with no synchronization. Can the reader get the type of the new value with the data pointer of the old value?"
+  options={["No: Go is memory-safe", "Yes: an interface is two words, and a race can tear them", "Only in code that imports unsafe"]}
+  answer={1}
+  explain="An interface value is two words: a type word and a data word. Two plain stores write them. A reader between the stores gets a mixed value and calls the methods of one type on the data of another. The Go memory model says that races on multiword values can corrupt memory."
+>
+<ConcFoundTornDemo />
+</Predict>
+
+1. Run the writer once, then the reader twice. The reader has the type `*Big` with the data `&small`. The methods of `*Big` read past the end of the small object.
+2. Read the numbers: 2 of 6 schedules tear, and both are memory-unsafe.
+3. Select **Go slice header: 3 words**. A slice is a pointer, a length and a capacity. 3 of 10 schedules tear. In 2 of them, the reader has length 1000 over a 4-element array, so a bounds check passes and the read leaves the array.
+4. Select **atomic.Pointer to an immutable value**. The writer publishes one pointer with one atomic store. Both schedules give a whole value.
+
+Russ Cox described this hole in "Off to the Races" (2010). A data race on an interface value lets a Go program break its own type safety. A value is **torn** when it mixes words from two writes. Any value wider than the atomic accesses of the machine can tear. Examples are a struct copy, a 16-byte pair without `cmpxchg16b`, and a 64-bit counter on a 32-bit CPU.
+
+The fix is the same as for the transfer. Make the unit of publication one atomic word. Put the value behind a pointer, never change the value after you publish it, and swap the pointer. Go 1.19 added the generic `atomic.Pointer[T]` for this.
+
+## Five ways to make a compound action atomic
+
+| Method | Readers | Writers | Limit |
+|---|---|---|---|
+| One mutex | Wait for each other and for writers | Wait for everybody | Serializes all access |
+| Reader-writer lock | Run in parallel | Exclusive | Readers still write the lock word; writers can starve or stall readers |
+| Pack into one word, CAS | One load | One CAS loop | The state must fit in 8 bytes, or 16 with a double-width CAS |
+| Seqlock | Never write shared memory; retry on overlap | Bump a counter twice, under a lock | Readers must tolerate torn data until the check |
+| Copy-on-write, swap a pointer | One pointer load, never wait | Copy, change, swap | Each write copies; old copies need safe reclamation |
+
+A packed word needs only one CAS loop. In Rust, two 32-bit balances fit in one `AtomicU64`:
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+
+fn transfer(ab: &AtomicU64, amount: u32) {
+    let mut old = ab.load(Ordering::Acquire);
+    loop {
+        let (a, b) = ((old >> 32) as u32, old as u32);
+        let new = (u64::from(a - amount) << 32) | u64::from(b + amount);
+        match ab.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(cur) => old = cur, // another thread changed the word: retry
+        }
+    }
+}
+```
+
+A **seqlock** is a sequence counter plus a writer lock. Writers increment the counter at the start and at the end of each write, so an odd value means that a write is in progress. A reader notes the counter, copies the data, and retries if the counter changed. The Linux kernel uses seqlocks for data that is rarely written, such as the system time:
+
+```c
+unsigned seq;
+do {
+    seq = read_seqbegin(&lock);
+    a = acct.a;
+    b = acct.b;
+} while (read_seqretry(&lock, seq));
+```
+
+**Copy-on-write** gives readers the cheapest path: one pointer load. The cost moves to the writers and to memory reclamation. A writer must not free the old copy while a reader still uses it. The [hazard pointers](/concurrency/lock-free/hazard-pointers) and [epoch-based reclamation](/concurrency/lock-free/epoch-based-reclamation) lessons solve that, and Linux uses [RCU](/os/sync/read-copy-update).
+
+**Transactions** are the general tool. Software transactional memory runs a block of reads and writes as one unit and retries on conflict. Haskell's STM comes from "Composable Memory Transactions" (Harris, Marlow, Peyton Jones and Herlihy, PPoPP 2005). Databases do the same work at a larger scale with [optimistic concurrency control](/databases/transactions/optimistic-concurrency-control).
+
+## What each method costs
+
+<ConcFoundSnapshotCostDemo />
+
+Each thread does other work, then reads or updates a record of two fields that must stay equal. A read copies the record out. The demo runs each scheme on the shared runtime and counts the reads that saw two different fields.
+
+1. Look at the default: 8 threads, 90% reads, 256 bytes. **No protection** is fast, but 16 reads saw a mixed record. That is the bug.
+2. Compare **Mutex** and **Copy-on-write**. The mutex gives 5.4 reads per µs, with a mean read time of 834 ns. Copy-on-write gives 12.9 reads per µs at 46 ns, the same as no protection.
+3. **Seqlock** is almost as fast, at 12.6 reads per µs. Its readers retried 289 times.
+4. **RW lock** gives only 0.9 reads per µs. Its waiters park, and each wake-up costs 5 µs (a model input). With 10% writes, the fair lock makes readers queue behind each writer.
+5. Set reads to 50% and the record to 4096 bytes. Copy-on-write now copies 4 KiB for each write and does 1.6 writes per µs. The seqlock does 3.0 writes per µs, but its readers retry 2,798 times.
+
+The rule of thumb follows. Copy-on-write suits small or rarely written data, such as configuration and routing tables. A seqlock suits small, often read data with short writes, such as a clock. A mutex is the simple default when the critical section is short and contention is low. The [lock contention](/concurrency/locks/lock-contention) lesson measures that boundary.
+
+## Connect
+
+- [Race conditions](/concurrency/foundations/race-conditions) shows check-then-act, the most common compound action.
+- [Compare-and-swap](/concurrency/atomics/compare-and-swap) is the instruction behind the packed-word method.
+- [Isolation levels and anomalies](/databases/transactions/isolation-levels-and-anomalies) shows the audit anomaly between database transactions, where it is called read skew.
+- [Linearizability](/concurrency/verification/linearizability) defines when a concurrent object is correct.
+
+<Recall cards={[
+  { q: "A transfer debits A and credits B with two atomic adds. What totals can an audit that reads A, then B, see?", a: "200, 170 (A read after the debit, B before the credit) or 230 (A before the debit, B after the credit)." },
+  { q: "Why does a lock in the transfer alone not fix the audit?", a: "A lock excludes only threads that also take it. The audit reads without the lock, so it can still run between the two updates." },
+  { q: "What does atomic mean in ACID, and which ACID letter matches atomicity in concurrency?", a: "In ACID, atomic means all or nothing under failure. Isolation, the I, is the concurrency meaning: no transaction sees another one half-done." },
+  { q: "How can a data race break memory safety in Go?", a: "An interface (2 words) or a slice header (3 words) is written with several plain stores. A reader can mix the words of two values, such as a long length with a short array." },
+  { q: "How does a seqlock reader get a consistent copy?", a: "It reads the sequence counter, copies the data, and reads the counter again. If the counter is odd or changed, a write overlapped, and it retries." },
+  { q: "What does copy-on-write cost, and who pays?", a: "Writers pay: each write copies the whole value. Old copies also need safe reclamation. Readers pay only one pointer load." },
+]} />

@@ -1,0 +1,102 @@
+---
+summary: "Concurrency is the structure of a program, and parallelism is how it runs. Why one core speeds up I/O-bound work but not CPU-bound work, how many threads a pool needs, and what Go, Rust, Node and Python give you."
+---
+import { ConcFoundMixDemo, ConcFoundPoolDemo } from "@/demos/conc/ConcFoundParallelDemos";
+
+**Concurrency** is a property of the structure of a program. The program is made of tasks that can make progress independently, and the lifetimes of the tasks overlap. **Parallelism** is a property of the execution. Two or more computations run at the same instant, on different hardware.
+
+Rob Pike gave the short form in his talk "Concurrency is not parallelism" at Heroku's Waza conference in January 2012. "Concurrency is about dealing with lots of things at once. Parallelism is about doing lots of things at once." A concurrent program can run on one core. The tasks then take turns, and no two of them run at the same instant.
+
+<Predict
+  id="io-one-core"
+  question="Four tasks each spend 80% of their time waiting for I/O. You run them as four threads on ONE core, instead of one after another. How much sooner do they finish?"
+  options={["Not sooner: one core can run only one thing at a time", "About 1.25 times sooner", "About 3.5 times sooner"]}
+  answer={2}
+  explain="A thread that waits for I/O does not need the core. Another thread uses the core during the wait. In this run, the finish time goes from 20 ms to 5.62 ms, a speedup of 3.56. The core is busy 71% of the time, not 20%."
+>
+<ConcFoundMixDemo />
+</Predict>
+
+Each task runs 5 rounds. In each round, it computes and then waits for I/O, for 1 ms in total. All timing comes from the shared runtime of this track, a deterministic simulator of threads on cores.
+
+1. Select **One after another**. The core is busy only 20% of the time. The gaps are I/O waits, and nothing else can use the core. The tasks finish at 20 ms.
+2. Select **One thread per task**. The core runs another task while one task waits. The finish time drops to 5.62 ms on the same single core. This is concurrency without parallelism.
+3. Set the I/O time to **0%**. Each task now only computes. Four threads on one core finish at 20.006 ms. There is no gain, and 6 µs go to context switches.
+4. Keep 0% and set **Cores** to 4. Each task gets its own core, and the finish time drops to 5 ms. This is parallelism.
+5. Set the I/O time back to 80%, **Cores** to 1 and **Tasks** to 8. The speedup is 4.5, and the core is busy 90% of the time. More tasks fill more gaps, until the core becomes the limit.
+
+## Two separate questions
+
+Concurrency answers the question "how is the work divided?". Parallelism answers the question "how many parts run at the same time?". The structure decides what *can* run in parallel. The hardware and the runtime decide what *does* run in parallel.
+
+| | One core | Many cores |
+|---|---|---|
+| Sequential structure | One thing at a time | One core works, and the other cores are idle |
+| Concurrent structure | Interleaving: it helps when tasks wait | Parallel execution: it also helps when tasks compute |
+
+Parallelism without concurrency also exists. A SIMD instruction can add 8 numbers in one step, and a superscalar core runs several independent instructions in each cycle. There are no tasks and no scheduler, only data that the hardware processes at the same time. The lessons on [SIMD](/performance/cpu/simd-by-hand) and [instruction-level parallelism](/performance/cpu/instruction-level-parallelism) cover that level.
+
+## Why one core helps only I/O-bound work
+
+A task is **CPU-bound** when its speed depends on the processor. It is **I/O-bound** when it spends most of its time in waits for a disk, a network or a database. Let each of N tasks compute for a time C and then wait for a time W, on P cores. Two limits apply to each round:
+
+$$
+T_{\text{round}} \ge \max\left(C + W,\ \frac{N C}{P}\right)
+$$
+
+The first term says that each task must still do its own compute and its own wait. The second term says that the cores must do the compute of all tasks. One after another, a round takes $N(C + W)$. So the speedup has this limit:
+
+$$
+S \le \min\left(N,\ P\left(1 + \frac{W}{C}\right)\right)
+$$
+
+With C = 200 µs, W = 800 µs and P = 1, the limit is 5. Four tasks can give at most 4. The demo gives 3.56. All four tasks start at the same instant, so the last task waits about 0.6 ms for the core in the first round. It stays that far behind until the end.
+
+For CPU-bound work, W = 0, and the limit is P. On one core, threads add context switches and nothing else. A **context switch** is the change of the core from one thread to another. In this model it costs 2 µs of core time, which is a model input. The real cost depends on the hardware and the cache, as the [context switching](/os/processes/context-switching) lesson shows.
+
+## How many threads does a pool need?
+
+<Predict
+  id="pool-size"
+  question="A server has 4 cores. Each job computes for 50 µs, then waits 200 µs for a database. How many threads must the pool have before more threads stop helping?"
+  options={["4, one per core", "8, two per core", "About 20"]}
+  answer={2}
+  explain="Each thread uses a core only 1/5 of the time. To keep 4 cores busy, you need 4 × 5 = 20 threads. In general, the knee is P(1 + W/C)."
+>
+<ConcFoundPoolDemo />
+</Predict>
+
+1. Read the grey line: CPU-bound jobs with W = 0. The speedup stops at 4 when the pool has 4 threads. More threads only wait in the run queue.
+2. Read the blue line. It rises to the knee at 20 threads and stays flat at 18.6. It does not reach 20, because all threads compute at the start and wait at the same time later.
+3. Set **Cores** to 1. The knee moves to 5. The knee scales with the number of cores.
+4. Set **W / C** to 15. The knee is now 64 on 4 cores. A server that blocks on I/O needs many threads.
+
+The same number follows from **Little's law**. The mean number of jobs in a system equals the arrival rate times the mean time in the system. The 4 cores finish at most 4 jobs per 50 µs, which is 80 jobs per ms. Each job holds a thread for C + W = 250 µs. So 80 jobs per ms × 0.25 ms = 20 threads are busy. The lesson on [Little's law](/performance/systems/queueing-theory-and-littles-law) derives it.
+
+The rule has limits. W and C vary from job to job, so measure them and treat the formula as a start. Each blocked thread also holds a stack and a kernel task. At 10,000 connections, that cost leads to the other design: tasks that do not hold a thread while they wait. The [event loops](/concurrency/async/event-loops) lesson covers that design.
+
+## What each runtime gives you
+
+- **Go.** Goroutines give concurrency. `GOMAXPROCS` limits the number of OS threads that run Go code at the same time, so it sets the parallelism. Threads that are blocked in system calls do not count against it.
+- **Go defaults.** Since Go 1.5, `GOMAXPROCS` defaults to the number of logical CPUs. Before that release, the default was 1. Since Go 1.25 on Linux, the default also respects the CPU limit of the cgroup, and the runtime updates the value when the limit changes.
+- **Rust.** `std::thread::spawn` starts an OS thread, so threads can run in parallel. Async tasks give concurrency. The default runtime of `#[tokio::main]` is multi-threaded, with one worker thread per CPU. The `current_thread` flavor runs all tasks on one thread: concurrency without parallelism.
+- **JavaScript.** One thread runs your JavaScript, and the event loop interleaves the callbacks. Node's libuv thread pool runs file system calls, `dns.lookup()`, and async crypto and zlib work. It has 4 threads by default. The Node documentation says that `worker_threads` help CPU-intensive work and "do not help much with I/O-intensive work".
+- **Python.** The global interpreter lock (GIL) lets only one thread run Python bytecode at a time. So threads overlap I/O, but they do not run Python code in parallel. CPython 3.13 added a build without the GIL as an experiment (PEP 703). Since Python 3.14, this free-threaded build is officially supported, but it is not the default.
+
+The [threads](/os/processes/threads) lesson shows how Go maps goroutines to threads with its G, M and P structures.
+
+## Connect
+
+- [Amdahl's and Gustafson's laws](/concurrency/foundations/amdahls-and-gustafsons-laws) give the limit of parallel speedup when part of the work is serial.
+- [Race conditions](/concurrency/foundations/race-conditions) start as soon as concurrent tasks share data, even on one core.
+- [Blocking, non-blocking and async I/O](/os/io/blocking-non-blocking-and-async-i-o) shows how a task can wait without a thread.
+- [Latency vs throughput](/performance/systems/latency-vs-throughput) explains why more threads can raise throughput and also raise latency.
+
+<Recall cards={[
+  { q: "Define concurrency and parallelism in one sentence each.", a: "Concurrency is a structure: independent tasks whose lifetimes overlap. Parallelism is an execution: computations that run at the same instant on different hardware." },
+  { q: "Four tasks compute 20% and wait 80% of the time. Why do four threads on one core finish about 3.5 times sooner than one after another?", a: "A waiting thread does not use the core, so another thread computes during the wait. The core goes from 20% busy to about 71% busy." },
+  { q: "Why do threads give no speedup to CPU-bound work on one core?", a: "The core must still do all the compute, one thread at a time. The threads only add context switches." },
+  { q: "What pool size keeps P cores busy when each job computes C and waits W?", a: "About P(1 + W/C). Each thread uses a core only C/(C + W) of the time. Little's law gives the same number." },
+  { q: "What does GOMAXPROCS limit, and what is its default?", a: "The number of OS threads that run Go code at the same time. The default is the number of logical CPUs (since Go 1.5), and since Go 1.25 on Linux it also respects the cgroup CPU limit." },
+  { q: "Give an example of parallelism without concurrency.", a: "A SIMD instruction that adds 8 numbers at once, or a superscalar core that runs independent instructions in the same cycle. There are no tasks to schedule." },
+]} />

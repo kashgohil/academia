@@ -1,0 +1,129 @@
+---
+summary: "A race condition is a timing bug, and a data race is a precise rule of the language. Check-then-act, lazy initialization and TOCTOU, why a race can hide from 100 tests, and how happens-before detectors such as ThreadSanitizer and Go -race find data races."
+---
+import { ConcFoundCheckActDemo, ConcFoundWindowDemo, ConcFoundDetectorDemo } from "@/demos/conc/ConcFoundRaceDemos";
+
+A **race condition** is a bug where the result depends on the order or timing of events that the program does not control. A **data race** is narrower, and the language defines it exactly. Two threads access the same memory location, at least one access writes, at least one access is not atomic, and nothing orders the two accesses. The two terms name different things, and each can occur without the other.
+
+The [critical sections](/os/sync/critical-sections) lesson shows the classic lost update of a counter. This lesson shows the races that remain when every single access is safe.
+
+<Predict
+  id="withdraw"
+  question="The balance is 100. Two threads each withdraw 80: if balance < 80, refuse; else balance -= 80. The read and the subtraction are each atomic, so there is no data race. Can the balance end at -60?"
+  options={["No: every access is atomic", "Yes, in some orders of the steps", "Only on a weak memory model such as ARM"]}
+  answer={1}
+  explain="Both threads can read 100 before either thread subtracts. Each check passes, and each thread subtracts 80. Atomic steps prevent torn values and data races. They do not join the check and the act into one step. 4 of the 6 orders overdraw."
+>
+<ConcFoundCheckActDemo />
+</Predict>
+
+You are the scheduler. Click **Run T0** and **Run T1** to choose the order of the steps.
+
+1. Run T0, then T1, then T0, then T1. Both threads pay 80, and the balance is -60. Each step was atomic.
+2. Read the numbers under the demo. 4 of the 6 complete schedules overdraw.
+3. Select **Withdraw: one lock**. The lock makes the check and the act one critical section. Both schedules are correct.
+4. Select **Withdraw: CAS loop**. The thread reads the balance and then subtracts with a compare-and-swap. The CAS fails if the balance changed after the read, and the thread checks again. All 6 schedules are correct.
+5. Select **Lazy init: if nil, create**. In 4 of 6 schedules, both threads create a config, and the threads use different objects.
+6. Select **TOCTOU: access, open**. Click **Show the bug**. The attacker swaps the file for a symbolic link between the check and the use.
+
+## Race condition, data race, or both
+
+| | Data race | No data race |
+|---|---|---|
+| **Race condition** | A counter with plain `count++` in two threads | The withdrawal above, with atomic steps |
+| **No race condition** | A plain flag that "works" on x86 (still undefined behavior in C++) | Correct locking |
+
+The C++ standard defines the data race in [intro.races]. Two actions *conflict* if one of them modifies a memory location and the other reads or modifies the same location. A data race is two potentially concurrent conflicting actions, at least one not atomic, where neither happens before the other. Any such data race is undefined behavior.
+
+The Go memory model has the version date June 6, 2022. It defines a data race as a write concurrent with another read or write of the same location. Accesses through `sync/atomic` are the exception. Go limits the damage of some races. A race on a value no larger than a machine word reads a value that some write wrote. A race on a multiword value can read an inconsistent value and corrupt memory.
+
+Safe Rust has no data races. The borrow rules stop two threads from holding a `&mut` to the same data. The `Send` and `Sync` traits stop unsafe sharing of types with interior mutability, such as `Cell` and `Rc`. The Rustonomicon also states the limit: Rust "does not prevent general race conditions". The withdrawal above compiles in safe Rust with `AtomicI64`, and it still overdraws.
+
+## The patterns
+
+- **Check-then-act.** A thread checks a condition and acts on it later. Another thread changes the condition in between. Examples: "if the key is absent, insert it", "if the balance is enough, pay".
+- **Read-modify-write.** A thread reads a value, computes, and writes the result. The lost update of a counter is the smallest example. The [atomic operations](/concurrency/atomics/atomic-operations) lesson covers it.
+- **Lazy initialization.** "If nil, create" is a check-then-act. Double-checked locking adds a lock after the first check. The "Double-Checked Locking is Broken" declaration showed that it fails in Java without `volatile`. From JDK 5, a `volatile` field makes it correct.
+- **TOCTOU** (time of check to time of use). A program checks a file, then uses the file by name. The man page of `access(2)` warns that this check "creates a security hole". A user can change the file in the short time between the check and the open.
+
+Each fix makes the check and the act one indivisible step, or it acts on a thing that cannot change:
+
+| Pattern | Fix |
+|---|---|
+| Check-then-act on memory | One lock around both, or a CAS loop that fails when the value changed |
+| Lazy initialization | Go `sync.Once`, Rust `std::sync::OnceLock` (stable since 1.70), C++ `std::call_once` or a function-local `static` |
+| Create a file only if absent | `open` with `O_CREAT \| O_EXCL`: it fails with `EEXIST` if the path exists, and it does not follow a symbolic link |
+| Check a file, then use it | Open first with `O_NOFOLLOW`, then check the open descriptor with `fstat`. Or drop privileges and let `open` do the check |
+
+`O_NOFOLLOW` makes `open` fail with `ELOOP` if the last part of the path is a symbolic link. After `open`, the descriptor names one file, and nobody can swap it. But `O_NOFOLLOW` does not check the directories in the path, and it does not stop hard links. So the `fstat` check of the owner is necessary.
+
+## Why tests do not find it
+
+<Predict
+  id="window"
+  question="A check-then-act has a 20 ns window between the check and the act. Two threads on two cores each run it every 10 µs. What is the chance that a test of 100 operations sees the bug even once?"
+  options={["Almost 100%: 100 operations is plenty", "About 18%", "About 0.2%"]}
+  answer={1}
+  explain="The chance per operation is about w / (T + w) = 20 / 10,020, which is 0.2%. The chance that 100 operations all miss is 0.998 to the power 100, about 82%. So 4 of 5 test runs pass."
+>
+<ConcFoundWindowDemo />
+</Predict>
+
+1. Read the default: 0.20% per operation, one firing in about 501 operations, and an 18% chance for a 100-operation test.
+2. Move **Operations in one test run** up to about 2,300. Only then does a test find the bug with a chance of 99%.
+3. Set the window to 1 µs. A page fault, a log call or a cache miss chain inside the window can do this. The chance per operation rises to 9%.
+4. Select **2 threads, 1 core**. The window breaks only when the time slice ends inside it. The chance drops to 2 in 100,000, and a 99% chance needs 230,257 operations.
+5. The red dots are full Runtime runs, and they follow the line. On one core, each firing loses tens of increments at once, because the other thread runs a whole time slice inside the window.
+
+The estimate is short to derive. Thread A holds its window for w out of every T + w. A write of thread B lands at a random moment, so it falls inside the window with a chance of w / (T + w). With n threads on n cores, the chance per operation is about (n − 1) w / (T + w). A test of k operations misses the bug with a chance of $(1 - p)^k$.
+
+So a race that is rare in a test can be frequent in production. Production runs more threads, on more cores, for many more operations. To make a race show up in a test, widen the window with a sleep or a yield, add threads and cores, and repeat. Better still, use a tool that does not depend on luck: a race detector for data races, and a [model checker](/concurrency/verification/model-checking) for all interleavings.
+
+## How a race detector works
+
+<Predict
+  id="detector"
+  question="T0 locks m and increments x. T1 increments x and forgets the lock. In one run, T1 finishes before T0 starts, and x ends at 2, the right value. Does a happens-before race detector report a race?"
+  options={["No: the result is right", "Yes: nothing orders T1's write before T0's read", "Only if the two threads overlap in time"]}
+  answer={1}
+  explain="The detector checks order, not time. T1 released no lock that T0 acquired, so happens-before does not order the accesses. The detector reports the race in all 15 schedules, and only 9 of them give a wrong result."
+>
+<ConcFoundDetectorDemo />
+</Predict>
+
+1. Click **Run T1** twice, then run T0. At T0's read, the detector reports a race: the last write is 1@T1, but T0 knows T1 only up to 0. The result is still 2.
+2. Read the numbers under the demo. 9 of 15 schedules give a wrong result. The detector reports a race in all 15.
+3. Select **Counter: both threads lock**. Watch `unlock(m)`: L(m) takes T0's clock. Watch `lock(m)` in T1: its clock takes the maximum with L(m). Now T1 knows T0's write, and no race appears.
+4. Select **Publish: plain flag**. The result is always 42 on this machine, but the detector reports races on `done` and `data`. In C++, the compiler can read `done` once and loop forever.
+5. Select **Publish: release/acquire flag**. The release store and the acquire load form the edge, and no race appears.
+
+A **vector clock** is one counter per thread. Entry u of the clock of thread t is the last epoch of thread u that t knows about through synchronization. An **epoch** c@u is the value c of thread u's own counter. A release copies the clock of the thread into the lock and starts a new epoch. An acquire takes the element-wise maximum. An earlier access c@u happens before thread t's access exactly when c ≤ C(t)[u].
+
+The detector keeps **shadow memory**: for each location, it stores the last write as an epoch and the last reads. On each access, it compares these with the clock of the thread. The [happens-before](/concurrency/atomics/happens-before) lesson defines the relation, and the [vector clocks](/distributed/time/vector-clocks) lesson uses the same structure for messages.
+
+Real detectors bound this work:
+
+- **FastTrack** (Flanagan and Freund, PLDI 2009) stores most last accesses as one epoch, not a full vector, so most checks take constant time.
+- **ThreadSanitizer** maps each aligned 8 bytes of memory to a few shadow cells. Version 2 used 2, 4 or 8 cells, and the current version 3 uses 4. When the cells are full, it overwrites a random cell, so it can miss a race with an older access.
+- **Cost.** The Clang documentation gives a typical slowdown of 5x to 15x and a memory overhead of 5x to 10x.
+- **Go `-race`** is built on the ThreadSanitizer runtime library. The Go documentation gives 5x to 10x memory and 2x to 20x time. Go 1.19 moved it to version 3, which is about twice as fast. It finds only races in code that runs.
+- **Lockset** detectors, such as Eraser (1997), check that one lock always protects each shared variable. They also flag other correct patterns, such as a flag with release and acquire, as races.
+
+A detector sees data races only. The withdrawal in the first demo has no data race, so ThreadSanitizer reports nothing. That bug needs a design review, a lock around the whole check-then-act, or a model checker.
+
+## Connect
+
+- [Atomicity](/concurrency/foundations/atomicity) asks the next question: which groups of steps must look like one step?
+- [Critical sections](/os/sync/critical-sections) shows the lost update and the properties of a correct lock.
+- [Happens-before](/concurrency/atomics/happens-before) defines the order that a detector checks.
+- [Isolation levels](/databases/transactions/isolation-levels-and-anomalies) shows the same races between database transactions, where they are called anomalies.
+- [Model checking](/concurrency/verification/model-checking) explores every interleaving instead of the ones that happen to run.
+
+<Recall cards={[
+  { q: "Define a data race, as C++ and Go define it.", a: "Two conflicting accesses to the same location (at least one writes), at least one not atomic, that happens-before does not order. In C++ it is undefined behavior." },
+  { q: "Give a race condition that has no data race.", a: "A check-then-act with atomic steps: two withdrawals both read 100 and both subtract 80. Each access is atomic, but the check and the act are separate steps." },
+  { q: "What does Rust's type system guarantee about races?", a: "Safe Rust has no data races, through Send and Sync. It does not prevent race conditions, such as a check-then-act on atomics." },
+  { q: "A race window is 20 ns, and each of 2 threads on 2 cores runs the operation every 10 µs. Roughly how often does it fire, and how often does a 100-operation test catch it?", a: "About 0.2% of operations, so about once in 500. A 100-operation test catches it only about 18% of the time." },
+  { q: "How does a vector-clock detector decide that two accesses race?", a: "Each access records its epoch c@u. A later access by thread t races with it if they conflict and c > C(t)[u], so no chain of release and acquire orders them." },
+  { q: "How do you fix the TOCTOU bug of access() followed by open()?", a: "Open first, with O_NOFOLLOW, and check the open descriptor with fstat. Or drop privileges and let open() do the permission check." },
+]} />

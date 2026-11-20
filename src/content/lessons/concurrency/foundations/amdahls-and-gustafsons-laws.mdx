@@ -1,0 +1,121 @@
+---
+summary: "Derive Amdahl's and Gustafson's laws, then measure them on a simulated machine. Why a locked serial part beats Amdahl until lock costs make a convoy, how Karp-Flatt finds the serial fraction in your measurements, and how the Universal Scalability Law explains throughput that falls."
+---
+import { ConcFoundAmdahlDemo, ConcFoundUslDemo } from "@/demos/conc/ConcFoundScalingDemos";
+
+The **speedup** on P cores is the time on one core divided by the time on P cores. Ideal speedup is P. Real programs fall short for three reasons: work that only one core can do, extra work that parallelism adds, and waits between cores. This lesson derives the classic laws for the first reason and measures all three on the shared runtime of this track.
+
+The [contention](/performance/concurrency/contention) lesson states Amdahl's formula and plots it. Here the speedup comes from simulated runs, so you can see when the formula holds and when it does not.
+
+<Predict
+  id="locked-serial"
+  question="10% of the one-core time is an update inside one mutex. Other threads keep working while one thread holds the mutex. Locking costs nothing. What is the speedup on 8 cores?"
+  options={["4.7, as Amdahl's law says", "About 7.8", "10, the limit 1/s"]}
+  answer={1}
+  explain="Amdahl's law assumes that nothing else runs during the serial part. Here the locked update of one thread overlaps the parallel work of the other threads. The run gives 7.77 on 8 cores. The mutex still runs only one update at a time, so the speedup stops below 1/s = 10, at 9.55."
+>
+<ConcFoundAmdahlDemo />
+</Predict>
+
+The one-core job is 192 iterations of 20 µs. A fraction s of each iteration is serial. The dots are measured runs, and the dashed line is the formula.
+
+1. Look at the default. The dots stay above Amdahl's line up to 8 cores, then stop at 9.55. In the timeline, the threads rarely wait.
+2. Select **a phase alone**. The main thread runs the serial part alone, then forks one worker per core. The dots now lie on the line: 4.71 on 8 cores and 8.77 on 64.
+3. Select **a locked update** again and turn the runtime costs on. The speedup on 8 cores falls to 2.63, and on 64 cores it is 2.84. Each handoff of the 2 µs critical section now costs a 5 µs wake-up and a 2 µs context switch (model inputs). The lock is busy with handoffs, and the threads queue behind it: a **convoy**.
+4. Select **grows with cores (weak)**. The parallel work grows with the core count, and the serial work stays the same. On 64 cores the speedup is 57.7, as Gustafson's law predicts.
+5. Set the serial part to 0%. The dots follow the ideal line.
+
+## Amdahl's law
+
+Gene Amdahl presented the argument at the AFIPS Spring Joint Computer Conference in 1967. Let the time on one core be 1, and let a fraction s of it be serial.
+
+<Steps>
+<div><b>One core:</b> $T(1) = s + (1 - s) = 1$.</div>
+<div><b>P cores:</b> the serial part still takes s. The parallel part divides evenly, so $T(P) = s + (1 - s)/P$.</div>
+<div><b>Speedup:</b> $S(P) = 1 / (s + (1 - s)/P)$.</div>
+<div><b>Limit:</b> as P grows, $(1 - s)/P$ goes to 0, so $S \to 1/s$. With s = 10%, no number of cores gives more than 10.</div>
+<div><b>Half of the limit:</b> $S(P) = P/2$ when $s(P - 1) = 1$. With s = 10%, 11 cores give a speedup of 5.5, and half of every core is lost.</div>
+</Steps>
+
+The law assumes that the serial part runs alone. A serial phase, such as reading the input or merging the results, fits that assumption. A lock does not fit it exactly. Other threads keep working while one thread holds the lock, so the curve rises faster and stops at the same limit 1/s. The limit holds because the lock can serve at most 1/s threads' worth of updates.
+
+## Gustafson's law
+
+John Gustafson argued in "Reevaluating Amdahl's Law" (Communications of the ACM, 1988) that people do not run a fixed problem on a bigger machine. They run a bigger problem in the same time.
+
+<Steps>
+<div><b>Measure on P cores:</b> let the run take 1, and let a fraction s′ of that time be serial.</div>
+<div><b>The same work on one core:</b> the serial part takes s′, and the parallel part takes P times longer: $s' + P(1 - s')$.</div>
+<div><b>Scaled speedup:</b> $S = s' + P(1 - s') = P - s'(P - 1)$. It grows without a limit.</div>
+</Steps>
+
+The two laws do not disagree. They define the serial fraction differently. Amdahl's s is a share of the one-core time, and Gustafson's s′ is a share of the P-core time. A run with s′ = 10% on 64 cores has a scaled speedup of 57.7. For that grown problem, the serial share of the one-core time is only 0.17%.
+
+| | Strong scaling | Weak scaling |
+|---|---|---|
+| Problem size | Fixed | Grows with the core count |
+| Question | How much sooner is one job done? | How much more work in the same time? |
+| Law | Amdahl | Gustafson |
+| Examples | Build one binary, render one frame, answer one query | Finer simulation grids, more data per node, more requests per server |
+
+## Find the serial fraction in your measurements
+
+Alan Karp and Horace Flatt (Communications of the ACM, 1990) inverted Amdahl's law. From a measured speedup S on p cores, the **Karp-Flatt metric** is the serial fraction that would explain it:
+
+$$
+e = \frac{1/S - 1/p}{1 - 1/p}
+$$
+
+If e stays constant as p grows, the program has a fixed serial part. If e grows with p, something else costs more as p grows: communication, synchronization or load imbalance. In the first demo, the phase program gives e = 0.100 at every core count. The locked program without costs gives 0.090 at 64 cores, because the lock overlaps with parallel work.
+
+## When throughput falls: the Universal Scalability Law
+
+Neil Gunther presented the **Universal Scalability Law** (USL) in 1993. It adds a second overhead to Amdahl's law:
+
+$$
+C(N) = \frac{N}{1 + \sigma (N - 1) + \kappa N (N - 1)}
+$$
+
+C(N) is the throughput with N workers, relative to one worker. The **contention** σ is the share that waits for a shared resource, and it is Amdahl's s. The **coherency** κ is the cost of making the workers agree. That cost grows with the number of pairs of workers, so the term grows as N(N − 1). With κ > 0, the curve has a peak at $N^* = \sqrt{(1 - \sigma)/\kappa}$, and throughput falls after it.
+
+<Predict
+  id="retrograde"
+  question="Each operation holds a spin lock for 60 ns, plus 4 ns for each other thread. The lock's cache line must leave every other core. You go from 16 threads to 32 threads, one per core. What happens to throughput?"
+  options={["It nearly doubles", "It stays flat: the lock is full", "It falls"]}
+  answer={2}
+  explain="The time inside the lock grows from 120 ns at 16 threads to 184 ns at 32 threads, and only one thread can be inside. Throughput falls from 8.59 to 6.78 times one thread. This is retrograde scaling: more cores, less work done."
+>
+<ConcFoundUslDemo />
+</Predict>
+
+1. Read the dots. Throughput peaks at 8.88 times one thread, at 12 threads, and then falls. The USL fit gives σ = 0.0011, κ = 0.0034 and a peak at 17.2 threads.
+2. The dashed line keeps the fitted σ and sets κ = 0. Amdahl's law cannot draw a curve that falls.
+3. Read the Karp-Flatt plot. The value e rises from 0.017 at 8 threads to 0.197 at 64. A rising e is the sign of an overhead that grows with the thread count.
+4. Set **Extra lock time per other thread** to 0. The dots now rise to a ceiling of 11.45 and stay flat. The fit still finds a small κ, because a full lock makes a sharper corner than the USL can draw. A fit summarizes the data, and it does not prove a cause.
+5. Set **Work inside the lock** to 200 ns. The ceiling drops to 6.79.
+
+What causes κ in real systems? Every cache line that all cores write, such as a shared counter or a lock word, moves between the cores on each write. A broadcast or a global barrier makes each worker wait for every other worker. The [false sharing](/performance/concurrency/false-sharing) lesson shows one source that is easy to miss.
+
+## Using the laws
+
+- **Measure throughput at several core counts**, and include some past the count you plan to use. Compute e or fit the USL. Two points cannot show a trend.
+- **Reduce σ** with shorter critical sections, sharded data, batching, or work outside the lock. The [lock contention](/concurrency/locks/lock-contention) lesson measures these.
+- **Reduce κ** by removing writes that every core shares, and by replacing all-to-all communication with local work and occasional merges.
+- **Remember the constants.** The formulas ignore spawn, join, wake-up and switch costs. The third step of the first demo shows that these costs can matter more than the serial fraction.
+- **Choose the right question.** For the latency of one job, use strong scaling. For the throughput of a service, the load usually grows with the machine, which is weak scaling, until σ and κ stop it.
+
+## Connect
+
+- [Concurrency vs parallelism](/concurrency/foundations/concurrency-vs-parallelism) shows the other limit: I/O waits, not serial work.
+- [Contention](/performance/concurrency/contention) shows how much each kind of lock and counter costs per operation.
+- [Fork-join](/concurrency/patterns/fork-join) and [work stealing](/concurrency/patterns/work-stealing) are the standard ways to split the parallel part.
+- [Queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law) explains why a busy lock makes threads queue.
+
+<Recall cards={[
+  { q: "State Amdahl's law and its limit.", a: "S(P) = 1 / (s + (1 − s)/P), where s is the serial share of the one-core time. As P grows, S approaches 1/s." },
+  { q: "State Gustafson's law. Why does it not contradict Amdahl's law?", a: "S = P − s′(P − 1), where s′ is the serial share of the time on P cores. It answers a different question: a problem that grows with the machine (weak scaling)." },
+  { q: "Why can a lock-protected serial part give more speedup than Amdahl's law predicts?", a: "Other threads do parallel work while one thread holds the lock. Amdahl assumes that nothing else runs during the serial part. The limit 1/s still holds." },
+  { q: "What is the Karp-Flatt metric, and what does a rising value mean?", a: "e = (1/S − 1/p)/(1 − 1/p), the serial fraction that explains a measured speedup. A rising e means overhead that grows with p, such as communication or synchronization." },
+  { q: "Write the Universal Scalability Law and its peak.", a: "C(N) = N / (1 + σ(N − 1) + κN(N − 1)). With κ > 0, the peak is at N* = √((1 − σ)/κ), and throughput falls after it." },
+  { q: "Name two sources of the coherency term κ.", a: "Cache lines that all cores write, such as a shared counter or lock word, and all-to-all communication, such as broadcasts or global barriers." },
+]} />

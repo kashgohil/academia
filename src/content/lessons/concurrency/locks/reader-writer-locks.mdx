@@ -1,0 +1,146 @@
+---
+summary: Shared and exclusive modes, the preference policy that each library picks for you, why a recursive read lock deadlocks in Go, when a reader-writer lock is slower than a mutex, and seqlocks.
+---
+import { ConcLockGoRwDemo, ConcLockRwPolicyDemo, ConcLockSeqlockDemo } from "@/demos/conc/ConcLockRwDemos";
+
+A **reader-writer lock** has two modes. Many readers can hold it in **shared** mode at the same time. One writer holds it in **exclusive** mode, with no readers. The [semaphores lesson](/os/sync/semaphores) builds one from semaphores and compares the policies under random arrivals. This lesson looks at the locks that libraries ship. Each one has a policy, and the policy changes what your code may do.
+
+The **policy** decides who goes next when a writer waits and a new reader arrives. With **reader preference**, the new reader joins the readers that are inside. With **writer preference**, the new reader waits behind the writer. A **fair** lock serves requests in arrival order.
+
+## Go's RWMutex and the recursive read
+
+Go's `sync.RWMutex` blocks new readers as soon as a writer waits. The documentation says that, after a call to `Lock`, new calls to `RLock` "will block until the writer has acquired (and released) the lock". It adds: "Note that this prohibits recursive read-locking."
+
+<Predict
+  id="recursive"
+  question="Goroutine R1 holds a read lock on a Go RWMutex. Goroutine W calls Lock and waits. Now R1 calls RLock again, in a helper function, before its RUnlock. What happens?"
+  options={[
+    "R1 gets the second read lock at once, because readers share the lock",
+    "R1 and W wait for each other for ever: a deadlock",
+    "W gets the lock first, and then R1 continues",
+  ]}
+  answer={1}
+  explain="W has announced itself, so R1's second RLock sleeps until W is done. W waits until R1 releases its first read lock, which happens only after the second RLock returns. Each waits for the other. The search below finds this schedule in 8 steps."
+>
+<ConcLockGoRwDemo />
+</Predict>
+
+1. Click **Show the deadlock**. R1 takes a read lock, W announces itself, and R1's second `RLock` sees a negative count and sleeps.
+2. Read `readerCount`. While a writer is pending, it is the real count minus $2^{30}$, so it is negative. That one number tells every new reader to wait.
+3. Clear **R1 takes a second read lock**. The search covers 650 states and finds no deadlock.
+4. Select it again, and then select **glibc default: readers first**. The recursive read now works, and the search finds no deadlock in 426 states. The price is that a stream of readers can starve W.
+
+The Go code is short. A pending writer subtracts `rwmutexMaxReaders` (`1 << 30`) from `readerCount`, and a reader that sees a negative count sleeps.
+
+```go
+func (rw *RWMutex) RLock() {
+	if rw.readerCount.Add(1) < 0 {
+		runtime_SemacquireRWMutexR(&rw.readerSem, false, 0) // a writer is pending
+	}
+}
+
+func (rw *RWMutex) Lock() {
+	rw.w.Lock()                                    // one writer at a time
+	r := rw.readerCount.Add(-rwmutexMaxReaders) + rwmutexMaxReaders
+	if r != 0 && rw.readerWait.Add(r) != 0 {      // r readers are still inside
+		runtime_SemacquireRWMutex(&rw.writerSem, false, 0)
+	}
+}
+```
+
+`readerWait` counts the readers that were inside when the writer arrived. Each of them decrements it in `RUnlock`, and the last one wakes the writer. New readers do not count, because they sleep on `readerSem`.
+
+Other libraries made the opposite choice, or no choice:
+
+| Lock | Policy | Recursive read lock |
+|---|---|---|
+| Go `sync.RWMutex` | A pending writer blocks new readers | Prohibited: it can deadlock |
+| glibc `pthread_rwlock_t` | `PTHREAD_RWLOCK_PREFER_READER_NP` by default | Works, because POSIX requires it |
+| glibc with `PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP` | Writers first | The application promises not to do it |
+| Rust `std::sync::RwLock` | "dependent on the underlying operating system's implementation" | The docs show an example that "may deadlock". On Linux, a waiting writer blocks new readers, so a recursive read lock can deadlock there |
+| Java `ReentrantReadWriteLock` | Unfair by default, or fair | A reader may re-enter |
+
+The glibc manual page explains why its writer-preference flag `PTHREAD_RWLOCK_PREFER_WRITER_NP` does nothing. With the POSIX rule for recursive read locks, it "would cause this option to create trivial deadlocks". So glibc offers a separate kind with "NONRECURSIVE" in its name. The rule for portable code is simple: never take a read lock that you already hold.
+
+## Who waits
+
+The demo below runs readers and one writer on 8 cores of the shared runtime. Each reader holds the read lock for 4 µs and then sleeps for about 1 µs. The writer wants the lock for 2 µs every 20 µs.
+
+<ConcLockRwPolicyDemo />
+
+1. With 6 readers and reader preference, the writer never gets the lock. It waits for 190 µs, which is the whole run after its first request.
+2. Select **RW, writer pref.** All 10 writes happen, and the longest writer wait is 9.1 µs. Reads drop from 1,195 to 570 per ms, because each pending writer blocks the readers.
+3. Select **plain mutex**. Reads drop to 190 per ms, and a reader waits 24.4 µs on average.
+4. With reader preference, move **Readers** to 4. Now there are moments with no reader inside, and all 10 writes happen.
+
+Reader preference starves the writer when the read sections overlap with no gap. With 6 readers that each hold the lock 4 µs out of every 5 µs, there is always a reader inside. Writer preference fixes the writer and costs read throughput. The right policy depends on what must not starve.
+
+## When a reader-writer lock is slower than a mutex
+
+A reader does not wait for other readers. But it still writes shared memory. `RLock` and `RUnlock` each do an atomic add on `readerCount`, and that cache line moves to the reader's core each time. So every read pays one or two cache-line transfers, and they happen one at a time across the machine.
+
+If the read section is about as long as that transfer, the lock gains nothing from sharing. The [RCU lesson](/os/sync/read-copy-update) measures this limit. A reader-writer lock is also bigger and slower than a mutex when there is no contention. Use one only when read sections are long, reads are frequent, and writes are rare. Otherwise a plain mutex is simpler and often faster.
+
+## Seqlocks: readers that write nothing
+
+A **seqlock** (sequence lock) removes the shared write from the read path. The writer increments a sequence number before and after its update, so the number is odd during a write. A reader reads the number, reads the data, and reads the number again. If the number was odd, or changed, the reader retries.
+
+<ConcLockSeqlockDemo />
+
+1. Click **Show a torn read**. The writer stores x = 1, and the reader reads x = 1 and y = 0. That pair never existed.
+2. Turn on **Reader checks the sequence and retries**. The search covers 397 states, and every finished read is (0, 0), (1, 1) or (2, 2).
+3. Run the writer to `x = 1`, and then run the reader. It sees an odd `seq` and retries. Watch the **retries** box.
+
+The Linux kernel uses sequence counters for data such as the system time. A reader of a `seqlock_t` calls `read_seqbegin` and `read_seqretry` in a loop. The kernel documentation states the rule. The count at the start must be even, and the reader must read the same count again at the end.
+
+The cost moves to the readers. A reader may retry many times if writes are frequent, so a seqlock suits small data that changes rarely. The reader also sees torn data before it retries. So it must not follow a pointer that it read inside the section.
+
+In C++ and Rust, the racy reads of the data are a data race unless they are atomic. Hans Boehm's paper "Can Seqlocks Get Along with Programming Language Memory Models?" (2012) works out the correct form:
+
+```rust
+fn read(&self) -> (u64, u64) {
+    loop {
+        let s1 = self.seq.load(Acquire);
+        if s1 & 1 == 1 { std::hint::spin_loop(); continue; }
+        let a = self.x.load(Relaxed);
+        let b = self.y.load(Relaxed);
+        fence(Acquire);                       // the data loads come before the second seq load
+        if self.seq.load(Relaxed) == s1 { return (a, b); }
+    }
+}
+
+fn write(&self, v: u64) {                     // writers are serialized by a mutex
+    let s = self.seq.load(Relaxed);
+    self.seq.store(s + 1, Relaxed);
+    fence(Release);                           // the odd seq comes before the data stores
+    self.x.store(v, Relaxed);
+    self.y.store(v, Relaxed);
+    self.seq.store(s + 2, Release);
+}
+```
+
+Java's `StampedLock` (Java 8) offers the same idea as an optimistic read. You call `tryOptimisticRead()`, read the fields, and then `validate(stamp)`.
+
+| Tool | Reader cost | Writer cost | Use when |
+|---|---|---|---|
+| Mutex | One lock, waits for everyone | Same | Short sections, or writes are common |
+| Reader-writer lock | Atomic adds on a shared line | Waits for all readers | Long read sections, rare writes |
+| Seqlock | Two loads, retry on a write | Never waits for readers | Small plain data, rare writes |
+| [RCU](/os/sync/read-copy-update) | Almost nothing | Copies, waits a grace period to free | Pointer-linked data, very rare writes |
+
+## Connect
+
+- [Semaphores](/os/sync/semaphores) build reader-writer locks and compare the policies under random arrivals.
+- [Read-copy-update](/os/sync/read-copy-update) measures why read locks stop scaling.
+- [Fences](/concurrency/atomics/fences) explain the fences in the seqlock code.
+- [Mutexes](/concurrency/locks/mutexes) cover the plain lock and its unlock policy.
+- [Two-phase locking](/databases/transactions/two-phase-locking-and-deadlocks) uses shared and exclusive locks on rows.
+
+<Recall cards={[
+  { q: "Why can a recursive read lock deadlock in Go's RWMutex?", a: "A pending writer blocks new readers. The second RLock waits for the writer, and the writer waits for the first read lock to be released. Each waits for the other." },
+  { q: "How does a Go RLock know that a writer is pending, with one atomic add?", a: "The writer subtracts $2^{30}$ (rwmutexMaxReaders) from readerCount. A reader that sees a negative result after its add goes to sleep." },
+  { q: "Why does glibc ignore PTHREAD_RWLOCK_PREFER_WRITER_NP?", a: "POSIX requires recursive read locks to work. With writer preference, a recursive read lock would deadlock. glibc offers a separate NONRECURSIVE kind instead." },
+  { q: "Why can a reader-writer lock be no faster than a mutex for short reads?", a: "Each RLock and RUnlock is an atomic add on one shared cache line, so readers serialize on the line. For short read sections, that transfer costs as much as the section." },
+  { q: "How does a seqlock reader know that its read was consistent?", a: "It reads the sequence number before and after. The read is good only if the first value was even and the second value is the same." },
+  { q: "Why must a seqlock reader not follow a pointer that it read inside the section?", a: "The data can be torn or stale until the final check. The pointer can point to freed or half-written memory." },
+]} />

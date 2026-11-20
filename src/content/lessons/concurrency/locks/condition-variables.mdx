@@ -1,0 +1,137 @@
+---
+summary: How to design with condition variables. The monitor recipe, the API shapes in C++, Rust, Go, Java and POSIX, the generation number that makes a barrier reusable, timeouts that never fire, and when a channel is the better tool.
+---
+import { ConcLockBarrierDemo, ConcLockTimedWaitDemo } from "@/demos/conc/ConcLockCondDemos";
+
+A **condition variable** lets a thread sleep until another thread says that some shared state may have changed. The [OS lesson](/os/sync/condition-variables) covers the protocol, why the check is a loop, signal against broadcast, and the futex code under it. This lesson is about design. How do you choose the predicates? How do the library APIs help you? Which bugs remain when the loop is correct?
+
+## The monitor recipe
+
+Hoare (1974) and Brinch Hansen described the **monitor**: shared data, one lock that every operation takes, and condition variables for waits. Lampson and Redell (1980) built monitors into the Mesa language. In Mesa, a signal is only a hint, so the waiter must check again. Almost every library today uses these **Mesa semantics**. A monitor is a recipe that you can apply by hand in any language:
+
+1. Put the shared state in one place, and write down its **invariant**: the rule that is true whenever nobody holds the lock.
+2. Protect all of the state with one mutex.
+3. For each thing that a thread waits for, write a **predicate**: a test on the state, such as "the queue is not empty".
+4. Wait in a loop until the predicate is true. Use one condition variable for each predicate, or broadcast on a shared one.
+5. After every change that can make a predicate true, signal or broadcast its condition variable.
+
+The libraries put step 4 into the API, so that you cannot forget the loop:
+
+| API | Wait with a predicate | Timed wait | Notes |
+|---|---|---|---|
+| C++ `std::condition_variable` | `cv.wait(lock, pred)` | `wait_for(lock, d, pred)`, `wait_until(lock, t, pred)` return a `bool` | Needs a `std::unique_lock<std::mutex>` |
+| Rust `std::sync::Condvar` | `cv.wait_while(guard, \|s\| cond)` | `wait_timeout_while` returns the guard and a `WaitTimeoutResult` | Since Rust 1.42; the docs warn of spurious wakeups |
+| Go `sync.Cond` | A `for` loop around `c.Wait()` | None | `c.L` is the lock; no `select` either |
+| Java monitor | A `while` loop around `obj.wait()` | `wait(ms)` | One wait set for each object, so code often needs `notifyAll` |
+| Java `Lock.newCondition()` | A `while` loop around `cond.await()` | `await(time, unit)`, `awaitNanos` | Many conditions on one lock |
+| POSIX | A `while` loop around `pthread_cond_wait` | `pthread_cond_timedwait` with an absolute time | The default clock is the system clock |
+
+```cpp
+std::unique_lock lk(m);
+cv.wait(lk, [&] { return !queue.empty() || closed; });   // same as: while (!pred()) cv.wait(lk);
+```
+
+The predicate overload is exactly the loop, as cppreference states. The rest of the design is still yours: which predicate, which variable, and who notifies.
+
+## A barrier that hangs
+
+A **barrier** makes N threads wait until all of them arrive, then lets all of them go. A **reusable** barrier does this round after round. Here is a version that many programmers write first:
+
+```c
+lock(m);
+arrived++;
+if (arrived == N) { arrived = 0; broadcast(cv); }   // the last thread resets and wakes all
+else while (arrived != 0) wait(cv, m);              // "wait until the last thread resets"
+unlock(m);
+```
+
+<Predict
+  id="barrier"
+  question="Four threads do rounds of about 10 µs of work and meet at this barrier. The loop is correct Mesa style, and the broadcast wakes every waiter. Can the program hang?"
+  options={[
+    "No, because broadcast wakes every waiter and each one sees arrived == 0",
+    "Yes: a fast thread can arrive in the next round before the sleepers check, so they see arrived != 0 and sleep again",
+    "Only if the implementation has spurious wakeups",
+  ]}
+  answer={1}
+  explain="Broadcast only makes the waiters runnable. Each must wake up and take the mutex again, one after the other. The last thread leaves, works, and arrives in the next round, which sets arrived to 1. A waiter that checks after that sleeps again, and the next round never gets all N threads."
+>
+<ConcLockBarrierDemo />
+</Predict>
+
+1. With the defaults, the program hangs at 32.8 µs, and no round completes. Find the thread that went back to sleep after its wake-up.
+2. Select `while (gen == my_gen)`. All 8 rounds finish at 194.5 µs.
+3. Go back to the first condition, and move **Mean work per round** to 20 µs. The run finishes, at 285.7 µs, the same time as the generation version. The bug is still there, and it waits for a faster round.
+4. Move **Threads** to 8. The first condition hangs even at 100 µs of work, because the chain of wake-ups through the mutex is longer.
+
+The predicate `arrived != 0` describes the *current* state, and another thread can change that state again before the waiter looks. The waiter needs a fact that stays true: "the round that I joined has ended". A **generation** number gives that fact. It only grows, so once it changes, it stays changed.
+
+```c
+lock(m);
+int my_gen = gen;
+if (++arrived == N) { arrived = 0; gen++; broadcast(cv); }
+else while (gen == my_gen) wait(cv, m);
+unlock(m);
+```
+
+Real barriers use this idea. Java's `CyclicBarrier` has a private `Generation` class: "Each use of the barrier is represented as a generation instance." C++20 `std::barrier` calls it a **phase**. The rule applies to any monitor: wait for an event that cannot be undone, not for a value that can come back. The wake-up cost in the demo (5 µs) is a model input. A shorter wake-up makes the hang rarer, but it cannot remove it.
+
+## A timeout that never fires
+
+A timed wait returns when the predicate is true or the time is up. The trap is a loop around a *relative* timeout.
+
+```cpp
+// Wrong: every wake-up starts a new 10 ms timeout.
+while (!ready) cv.wait_for(lk, 10ms);
+
+// Right: one deadline for the whole wait.
+cv.wait_for(lk, 10ms, [&] { return ready; });            // equals wait_until(lk, now + 10ms, pred)
+```
+
+<ConcLockTimedWaitDemo />
+
+1. With broadcasts every 4 ms, the relative loop never returns. The waiter wakes 14 times in 60 ms, and each time it starts a new 10 ms timeout.
+2. Select `wait_until(start + 10 ms)`. The wait times out at 10.0 ms.
+3. Move the broadcasts to 11 ms. Now both forms time out at 10.0 ms, because no broadcast arrives before the first timeout.
+
+The bug appears when one condition variable serves more than one predicate, or when the notifier uses broadcast. Each wake-up for another reason resets the timer. In C++, the overload with a predicate computes the deadline once, from `steady_clock`. Rust's `wait_timeout_while` does the same. A hand-written loop around `wait_for` or `wait_timeout` has the bug.
+
+The clock also matters. `pthread_cond_timedwait` takes an absolute time, and by default that time is on the system clock, `CLOCK_REALTIME`. If an administrator or NTP steps the clock, the wait can end early or late. Call `pthread_condattr_setclock` with `CLOCK_MONOTONIC` when you create the condition variable.
+
+## Signal inside or outside the lock
+
+POSIX allows a signal or a broadcast with or without the mutex held. It recommends the mutex for predictable scheduling. Each choice has a cost:
+
+- **Signal while you hold the lock.** The waiter can wake before you unlock, and then it blocks on the mutex at once. Some implementations move the waiter straight to the mutex queue to avoid this.
+- **Signal after the unlock.** The waiter can take the mutex at once. But another thread can see the predicate first and change it, which is harmless with a loop. The real danger is lifetime: a waiter that sees the predicate can destroy the condition variable before your signal touches it.
+
+The safe default is to signal while you hold the lock. Move the signal out only if a profile shows the extra blocking.
+
+## Go: use a channel when you can
+
+Go has `sync.Cond`, but its documentation prefers channels for many simple use cases. It says that users "will be better off using channels than a Cond". Broadcast "corresponds to closing a channel", and Signal "corresponds to sending on a channel". A `Cond` cannot have a timeout, and `select` cannot wait on it.
+
+```go
+done := make(chan struct{})
+go func() { <-done; cleanup() }()   // many goroutines can wait like this
+close(done)                         // a broadcast that also stays true for late arrivals
+```
+
+A closed channel is a generation that changed for ever: a goroutine that arrives later still sees it. That is exactly the property that fixed the barrier. The [channels lessons](/concurrency/message-passing/go-channels-and-select) cover the rest.
+
+## Connect
+
+- [Condition variables in the OS track](/os/sync/condition-variables) show the loop, the herd and the futex code.
+- [Semaphores](/os/sync/semaphores) solve the bounded buffer with counts.
+- [Mutexes](/concurrency/locks/mutexes) are the lock that every monitor uses.
+- [Go channels and select](/concurrency/message-passing/go-channels-and-select) replace many uses of a condition variable.
+- [Deadlock, livelock and starvation](/concurrency/locks/deadlock-livelock-and-starvation) covers the bugs between monitors.
+
+<Recall cards={[
+  { q: "What is the invariant of a monitor?", a: "A rule about the shared state that is true whenever no thread holds the monitor's lock. Each operation may break it only while it holds the lock." },
+  { q: "Why does the barrier that waits for arrived != 0 hang?", a: "The last thread resets the count and leaves. It can arrive in the next round and set the count to 1 before a sleeper checks. The sleeper sees a non-zero count and sleeps again." },
+  { q: "What makes a generation number a good thing to wait on?", a: "It only grows. Once the round ends, the waiter's condition stays true, whatever other threads do before it checks." },
+  { q: "Why can while (!ready) cv.wait_for(lk, 10ms) wait for ever?", a: "Each wake-up for another reason starts a new 10 ms timeout. If notifications come more often than every 10 ms, the timeout never expires. Use one deadline." },
+  { q: "Which clock does pthread_cond_timedwait use by default, and how do you change it?", a: "The system clock, CLOCK_REALTIME, which can jump. Use pthread_condattr_setclock with CLOCK_MONOTONIC." },
+  { q: "What does Go's documentation map Broadcast and Signal to?", a: "Broadcast corresponds to closing a channel, and Signal corresponds to sending on a channel." },
+]} />

@@ -1,0 +1,119 @@
+---
+summary: Three ways for threads to stop making progress. Lock order and std::scoped_lock in practice, try-lock with back-off and the livelock it can cause, what Go, Java and Rust can detect, and starvation from unfair locks and priorities.
+---
+import { ConcLockLivelockDemo, ConcLockAbbaDemo } from "@/demos/conc/ConcLockDeadlockDemos";
+
+A program can be correct and still stop. Three failures share this result, and each has a different cause and a different fix.
+
+- **Deadlock.** A set of threads wait for each other in a cycle, so none of them can ever run. They use no CPU.
+- **Livelock.** Threads keep running and keep changing state, but none of them makes progress. They burn CPU.
+- **Starvation.** The program makes progress, but one thread waits with no limit, because others always win.
+
+Coffman, Elphick and Shoshani (1971) listed the four conditions that a deadlock needs: mutual exclusion, hold and wait, no preemption, and a circular wait. The [OS lesson on deadlock](/os/sync/deadlock) covers the conditions, resource graphs, the banker's algorithm and Linux lockdep. This lesson is about the code that you write and the tools that your language gives you.
+
+## Break the cycle
+
+A deadlock needs a cycle of waits. Real code breaks the cycle in one of three ways.
+
+**A global lock order.** Every thread takes locks in the same order, so no cycle can form. When the locks have no natural order, sort them by a stable key such as an ID. Large code bases give each lock a **level** and assert that a thread only takes locks of a lower level than the ones it holds. Then a code review or a debug build catches an order error before it deadlocks.
+
+```go
+// Two accounts in any order: always lock the lower ID first.
+func transfer(a, b *Account, n int64) {
+	first, second := a, b
+	if b.id < a.id {
+		first, second = b, a
+	}
+	first.mu.Lock()
+	defer first.mu.Unlock()
+	second.mu.Lock()
+	defer second.mu.Unlock()
+	a.balance -= n
+	b.balance += n
+}
+```
+
+**Take all the locks at once.** C++ `std::scoped_lock` (C++17) takes several mutexes "using a deadlock avoidance algorithm", as `std::lock` does. The standard does not name the algorithm. Both libc++ and libstdc++ lock one mutex and try the others. If a try fails, they release everything, and the next attempt *blocks* on the mutex that was busy. The libc++ library yields the CPU between attempts. The libstdc++ library yields only when the mutexes have different types.
+
+```cpp
+std::scoped_lock lk(a.m, b.m);   // any order, from any number of threads: no deadlock
+```
+
+**Try, and back off.** Take the first lock, try the second with `try_lock`, and on failure release the first, wait, and start again. This gives up the "hold and wait" condition. It also invites a new failure.
+
+<Predict
+  id="livelock"
+  question="Two threads move money in opposite directions. Each locks its first account, reads it for 1 µs, and tries to lock the second. On failure, it undoes its work, unlocks, and sleeps exactly 2 µs before it tries again. On 2 cores, what happens?"
+  options={[
+    "One thread wins the first round, and then they take turns",
+    "Neither thread ever finishes a transfer: they fail, back off and retry in step",
+    "They deadlock, and both threads block for ever",
+  ]}
+  answer={1}
+  explain="Both threads start together, take their first lock together, fail together and sleep for the same time. So they meet again in the same state. Nothing is blocked, and both use CPU, but no transfer completes. That is a livelock. In the simulation, they fail 124 times in 200 µs."
+>
+<ConcLockLivelockDemo />
+</Predict>
+
+1. With no jitter, no transfer completes in 200 µs, and the try-locks fail 124 times.
+2. Move **Back-off jitter** to ±5%. The threads slip out of step sometimes: 7 of 20 transfers in 200 µs.
+3. Move it to ±50%. All 20 transfers finish at 72.6 µs, with 15 failed try-locks.
+4. Select **std::lock style**. It finishes at 65.8 µs with 2 failures, because the second attempt waits for the busy lock, not for a timer.
+5. Select **lock order**. It finishes at 62.0 µs with no failures, because there is never a cycle to break.
+
+A fixed back-off keeps two symmetric threads symmetric. They follow the same path in the same time, so they collide again. A random back-off breaks the symmetry: soon one thread retries while the other sleeps. Ethernet uses the same idea for collisions on a shared wire. The std::lock style removes the timer altogether. A thread that failed on lock B blocks on B, so it wakes up only when B is free.
+
+In this model, switches, acquires and cache-line transfers have the shared runtime's default costs (model inputs). A sleep has no extra cost. On a real machine, timer slack and scheduler noise add some randomness by themselves, so an exact livelock is rare. A partial livelock is not rare. Threads fail many times before they get through, and the time to finish varies widely from run to run.
+
+## What runtimes can detect
+
+Most runtimes do not prevent deadlock. Some can report it after it happens.
+
+<ConcLockAbbaDemo />
+
+1. With T2 starting after 1 µs, both threads hold one lock and wait for the other. The runtime reports the deadlock at 6.02 µs.
+2. Move **T2 starts after** to 5.5 µs. T1 already holds both locks when T2 starts, so there is no deadlock. The bug is still in the code.
+3. Go back to 1 µs and turn on the background goroutine. T1 and T2 are stuck for ever, but nothing is reported.
+
+Go prints `fatal error: all goroutines are asleep - deadlock!` only when no goroutine can ever run again. A goroutine that waits on a timer, a ticker or a network socket counts as one that can still run. So in a server, a deadlock between two request handlers shows up as a hang, not as a crash. The useful tool there is a stack dump. Send `SIGQUIT` to the process, or read `/debug/pprof/goroutine?debug=2`. Look for goroutines that wait in `sync.(*Mutex).Lock` for minutes.
+
+| Language or tool | What it finds |
+|---|---|
+| Go runtime | A global deadlock only: every goroutine blocked |
+| Java `jstack`, `ThreadMXBean.findDeadlockedThreads()` | Cycles of platform threads that wait for monitors or exclusive locks such as `ReentrantLock`; not cycles with virtual threads |
+| Rust `parking_lot`, feature `deadlock_detection` | Cycles among `parking_lot` locks, checked by a call that you run in a background thread |
+| Linux lockdep | Order violations, before any deadlock happens ([OS lesson](/os/sync/deadlock)) |
+| Database lock managers | Cycles in the waits-for graph, broken by aborting a transaction ([two-phase locking](/databases/transactions/two-phase-locking-and-deadlocks)) |
+
+Detection after the fact is a diagnosis tool, not a fix. A program that holds locks cannot safely kill one thread and continue, because the data that the thread was changing is half-done. Databases can abort a transaction, because they can roll it back. Ordinary programs cannot, so prevention by order is the main defense.
+
+## Starvation
+
+Starvation is the opposite trade to the convoy in the [mutexes lesson](/concurrency/locks/mutexes). A lock that lets running threads barge has high throughput, and a parked thread can lose every race. In that lesson's Go demo, without starvation mode, three goroutines got no lock at all in 8 ms. A reader-preference [reader-writer lock](/concurrency/locks/reader-writer-locks) starves writers in the same way.
+
+The fix is some form of order: a FIFO handoff, a timeout after which the lock becomes fair (Go's 1 ms rule), or a ticket. Each fix costs throughput, so libraries usually apply it only when a wait gets long.
+
+Priorities create a harder form. In **priority inversion**, a high-priority thread waits for a lock that a low-priority thread holds, and medium-priority threads keep the low one off the CPU. The [real-time scheduling lesson](/os/scheduling/real-time-scheduling) shows it, with the Mars Pathfinder case of 1997 and priority inheritance. In library terms, POSIX offers `PTHREAD_PRIO_INHERIT` and `PTHREAD_PRIO_PROTECT` as mutex attributes. Go goroutines have no priorities, so this form does not arise inside one Go program.
+
+| Failure | Threads use CPU? | Detect it by | Prevent it with |
+|---|---|---|---|
+| Deadlock | No | A cycle in the waits-for graph; stack dumps | A lock order, or all locks at once |
+| Livelock | Yes | High CPU, many retries, no progress | Random back-off, or block on the busy lock |
+| Starvation | Others do | A wait that grows with no limit | FIFO handoff, fairness after a timeout |
+
+## Connect
+
+- [Deadlock in the OS track](/os/sync/deadlock) covers the Coffman conditions, the banker's algorithm and lockdep.
+- [Mutexes](/concurrency/locks/mutexes) show starvation under barging and Go's starvation mode.
+- [Real-time scheduling](/os/scheduling/real-time-scheduling) shows priority inversion and priority inheritance.
+- [Two-phase locking and deadlocks](/databases/transactions/two-phase-locking-and-deadlocks) compares detection, wait-die and wound-wait.
+- [Model checking](/concurrency/verification/model-checking) finds deadlocks by search over all schedules.
+
+<Recall cards={[
+  { q: "What is the difference between a deadlock and a livelock?", a: "In a deadlock, the threads block and use no CPU. In a livelock, they keep running and changing state, but none of them makes progress." },
+  { q: "Why does try-lock with a fixed back-off livelock, and what fixes it?", a: "Symmetric threads fail at the same time and sleep for the same time, so they collide again. A random back-off breaks the symmetry." },
+  { q: "What do libc++ and libstdc++ do in std::lock when a try_lock fails?", a: "They release the locks they hold, and the next attempt blocks on the mutex that was busy, then tries the others." },
+  { q: "When does Go report 'all goroutines are asleep - deadlock'?", a: "Only when no goroutine can ever run again. A goroutine that waits on a timer or the network hides a deadlock between other goroutines." },
+  { q: "Why can a database recover from a deadlock by aborting, but an ordinary program cannot kill a thread?", a: "The database can roll back the aborted transaction's changes. A killed thread leaves the data that it was changing half-done." },
+  { q: "Give two ways that a lock can starve a thread.", a: "Barging, where running threads always win the lock over a parked one, and reader preference, where overlapping readers never leave a gap for a writer." },
+]} />

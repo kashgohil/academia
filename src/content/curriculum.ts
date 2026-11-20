@@ -32,6 +32,11 @@ export const LEVELS: Record<Level, string> = {
 
 /** Lessons with a written MDX page. Paths must match `src/content/lessons/<path>.mdx`. */
 export const LIVE = new Set<string>([
+  "concurrency/locks/condition-variables",
+  "concurrency/locks/deadlock-livelock-and-starvation",
+  "concurrency/locks/lock-contention",
+  "concurrency/locks/mutexes",
+  "concurrency/locks/reader-writer-locks",
   "concurrency/foundations/amdahls-and-gustafsons-laws",
   "concurrency/foundations/atomicity",
   "concurrency/foundations/concurrency-vs-parallelism",

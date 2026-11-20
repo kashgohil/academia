@@ -1,0 +1,146 @@
+---
+summary: What a user-space mutex does for you and to you. Lock data, not code. Handoff or barging at unlock, and Go's sync.Mutex with its starvation mode. Also Rust, C++, glibc, Java and parking_lot.
+---
+import { ConcLockHandoffDemo, ConcLockGoMutexDemo } from "@/demos/conc/ConcLockMutexDemos";
+
+A **mutex** (mutual exclusion lock) lets one thread at a time into a critical section. A **critical section** is code that reads or writes shared data. The OS track shows the machinery under a mutex: [spinlocks](/os/sync/locks-and-spinlocks) and [futexes](/os/sync/futexes). This lesson takes the view of the programmer and the library author.
+
+What do the APIs promise? What choices does a mutex make for you? What do those choices cost?
+
+## Lock data, not code
+
+A mutex protects data. The code that touches the data changes over time, but the rule "hold `m` to read or write `balance`" must stay true. Good APIs make the rule hard to break.
+
+```rust
+use std::sync::Mutex;
+
+struct Account { balance: Mutex<u64> }       // the mutex owns the data
+
+fn deposit(a: &Account, n: u64) {
+    let mut b = a.balance.lock().unwrap();   // MutexGuard<u64>: the only way in
+    *b += n;
+}                                            // the guard drops here, and that unlocks
+```
+
+In Rust, `Mutex<T>` owns the value. You can reach it only through the `MutexGuard` that `lock()` returns. The guard unlocks when it goes out of scope. This pattern is **RAII** (resource acquisition is initialization): an object owns the lock, and its destructor releases it. So you cannot forget the unlock, and you cannot keep a reference after it.
+
+`lock()` returns `LockResult<MutexGuard<T>>`, not a plain guard. If a thread panics while it holds the guard, the mutex becomes **poisoned**. Later calls to `lock()` return an error, because the data can be half-updated. `PoisonError::into_inner` gives the guard back if you know that the data is still valid.
+
+C++ separates the mutex from the data, so the rule lives in comments or in annotations. `std::lock_guard` is the RAII guard. `std::unique_lock` can unlock early and moves between scopes, and condition variables need it. `std::scoped_lock` (C++17) takes several mutexes at once without deadlock. Clang's thread safety analysis can check the rule at compile time with `GUARDED_BY(m)`.
+
+```go
+type Account struct {
+	mu      sync.Mutex // guards balance
+	balance uint64
+}
+
+func (a *Account) Deposit(n uint64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.balance += n
+}
+```
+
+Go puts the mutex next to the data by convention. A `sync.Mutex` must not be copied after first use, and `go vet` reports copies. Go's mutex is not tied to a goroutine, so one goroutine may lock it and another may unlock it. None of these mutexes are re-entrant. A second `Lock` in the same goroutine deadlocks in Go. For Rust, the documentation leaves it unspecified, but the call never returns normally: "it might panic or deadlock".
+
+## Who gets the lock at unlock?
+
+When a thread unlocks a mutex with waiters, the mutex must make a choice. It can give the lock to the oldest waiter. That is a **handoff**. Or it can free the lock and wake a waiter, which must then compete for it. Any running thread can take the free lock first. That is **barging**.
+
+<Predict
+  id="handoff"
+  question="Four threads loop: lock, 1 µs of work, unlock, about 2 µs of other work. A parked thread needs 5 µs to wake up. Which unlock policy gives more lock acquisitions per millisecond?"
+  options={[
+    "Handoff to the oldest waiter, because no thread loses its turn",
+    "Barging, about 2.8 times more, because the lock never waits for a thread to wake up",
+    "Both give the same rate, because the critical section is the same",
+  ]}
+  answer={1}
+  explain="With handoff, the lock belongs to a sleeping thread for the whole 5 µs wake-up, and nobody can use it. That limits the rate to about 1 / (1 µs + 5 µs). With barging, a running thread takes the free lock at once. The simulation gives 466 acquisitions per ms for barging and 166 for handoff."
+>
+<ConcLockHandoffDemo />
+</Predict>
+
+1. With the defaults, compare the two policies. Barging gives 466 acquisitions per ms, and handoff gives 166.
+2. Read **longest wait**. Barging gives 55.3 µs and handoff gives 17.4 µs. Handoff is slower but fairer.
+3. Select handoff and read **lock held or reserved**. It is 100%, but much of that time is a wake-up, not work.
+4. Move **Threads** to 8. Barging rises to 634 per ms, and handoff falls to 139 per ms.
+5. Move **Work outside the lock** to 10 µs. Fewer threads wait, and the two policies come closer.
+
+The handoff limit comes straight from the model. Each acquisition holds the lock for the critical section, plus the wake-up of the next owner, plus the acquire cost.
+
+$$
+\text{rate} \le \frac{1}{t_{\text{cs}} + t_{\text{wake}} + t_{\text{acquire}}} = \frac{1}{1\,\mu s + 5\,\mu s + 0.12\,\mu s} \approx 163 \text{ per ms}
+$$
+
+The simulation gives 166 per ms, because a few acquisitions find the lock free and pay no wake-up. The wake-up (5 µs) and the acquire (20 ns, plus 100 ns for a move between cores) are model inputs of the shared runtime. They are not measurements of one machine.
+
+This is the **lock convoy**: a queue of threads that each take the lock for a short time, with a slow wake-up between each pair. Barging breaks the convoy, because a thread that is already running uses the gap. The price is fairness. In the demo, the slowest thread of four gets 0.87 times as many turns as the fastest. With handoff, the ratio is 0.98.
+
+## Inside Go's sync.Mutex
+
+Go's mutex uses barging by default and adds a safety valve. Its state is one 32-bit word, plus a semaphore for parked goroutines. Since Go 1.24 the code is in `src/internal/sync/mutex.go`, and `sync.Mutex` wraps it.
+
+| Bits of `state` | Name | Meaning |
+|---|---|---|
+| bit 0 | `mutexLocked` | Some goroutine holds the lock |
+| bit 1 | `mutexWoken` | A waiter is awake or spinning, so `Unlock` must not wake another one |
+| bit 2 | `mutexStarving` | Starvation mode: the lock goes to the head of the queue |
+| bits 3 and up | waiter count | `state >> mutexWaiterShift`, with `mutexWaiterShift` = 3 |
+
+- **Fast path.** `Lock` does `CompareAndSwap(0, mutexLocked)`. With no contention, that is the whole lock.
+- **Spinning.** A goroutine spins at most 4 rounds (`active_spin`), each a `procyield(30)` loop of pause instructions. It spins only on a multicore machine with `GOMAXPROCS` above 1, at least one other running P, and an empty local run queue.
+- **Queueing.** Then it adds itself to the waiter count and parks on the semaphore. A woken waiter that loses the race goes back to the *front* of the queue, not the back.
+- **Starvation mode.** A waiter that has waited more than 1 ms (`starvationThresholdNs`) sets `mutexStarving`. Then `Unlock` hands the lock straight to the first waiter. New goroutines do not spin and do not take the lock, even when it looks free.
+- **Back to normal.** The mode ends when a waiter that gets the lock is the last one in the queue, or when it waited less than 1 ms.
+
+The demo below runs a model of this code on the shared runtime. The bit layout, the 4 spin rounds and the 1 ms threshold come from the Go source. The time of one spin round (500 ns) and the wake-up (5 µs) are model inputs.
+
+<ConcLockGoMutexDemo />
+
+1. Keep the work between `Unlock` and the next `Lock` at 0. G0 takes the lock 3,909 times, and the others get 7 turns each. The longest wait is 1.03 ms.
+2. Turn off starvation mode. This is Go 1.8 and earlier. G0 now takes all 4,001 locks, and the others wait for the whole 8 ms run.
+3. Move **Look at time** across a red band. In starvation mode, `mutexStarving` is 1, and the lock passes along the queue.
+4. Set the work between locks to 500 ns. No wait reaches 1 ms, and starvation mode never starts. The two settings give the same run.
+
+Why does G0 win every time? It unlocks and locks again at once, while it still runs on a core. A woken waiter needs 5 µs before it can run, and by then G0 holds the lock again. Barging rewards the thread that is already on a core, and that is the point: it keeps the cache warm and avoids a switch.
+
+Starvation mode bounds the damage. It costs some throughput: 491 instead of 500 locks per ms in this run, because each handoff waits for a wake-up. The mode was on for only 2.4% of the run. The Go 1.9 release notes say only "Mutex is now more fair", but the change added this mode.
+
+## The same choice in other libraries
+
+| Library | Uncontended path | Waiting | Fairness |
+|---|---|---|---|
+| glibc `pthread_mutex_t` | One CAS on a futex word | Parks at once by default. `PTHREAD_MUTEX_ADAPTIVE_NP` spins first, up to `glibc.pthread.mutex_spin_count` times (default 100) | Barging |
+| Rust `std::sync::Mutex` (Linux) | One CAS; futex based since Rust 1.62 | Spins up to 100 times while no other thread waits, then parks with `futex_wait` | Barging |
+| `parking_lot::Mutex` | One CAS on 1 byte of lock state | Spins, then parks in a global table | 0.12: a fair unlock about every 0.5 ms on average. 0.13 removed that; `unlock_fair` stays |
+| Java `ReentrantLock` | One CAS | Parks in the queue of `AbstractQueuedSynchronizer` | Unfair by default; `new ReentrantLock(true)` is fair |
+| Go `sync.Mutex` | One CAS | 4 spin rounds, then the semaphore | Barging, with starvation mode after 1 ms |
+
+The Java documentation states the trade plainly. Fair locks "may display lower overall throughput (i.e., are slower; often much slower)". Even a fair `ReentrantLock` lets the untimed `tryLock()` barge.
+
+A `pthread_mutex_t` is 40 bytes on x86-64 Linux. A Go `sync.Mutex` is 8 bytes, and a `parking_lot` mutex needs 1 byte of lock state. Small locks let you put one lock in each object, which helps the striping in the [contention lesson](/concurrency/locks/lock-contention).
+
+## Rules for using a mutex
+
+- **Keep the critical section short.** Compute outside, then lock only to publish. Every nanosecond inside the lock is serial.
+- **Do not call unknown code while you hold a lock.** A callback can take another lock and make a cycle. See [deadlock](/concurrency/locks/deadlock-livelock-and-starvation).
+- **Do not hold a lock across a blocking call or an await.** A Rust `std::sync::MutexGuard` is not `Send`. So `tokio::spawn` does not compile a future that holds one across an `.await`.
+- **Pick the scope by the invariant, not by the line count.** Two fields that must change together need one lock.
+
+## Connect
+
+- [Futexes](/os/sync/futexes) show how the fast path and the parked path work in the kernel.
+- [Locks and spinlocks](/os/sync/locks-and-spinlocks) compare test-and-set, ticket and MCS locks, and when to spin.
+- [Reader-writer locks](/concurrency/locks/reader-writer-locks) let readers share the lock.
+- [Lock contention](/concurrency/locks/lock-contention) measures what a busy lock costs and how to split it.
+- [Compare-and-swap](/concurrency/atomics/compare-and-swap) is the instruction under every fast path here.
+
+<Recall cards={[
+  { q: "What is the difference between handoff and barging at unlock?", a: "Handoff gives the lock to the oldest waiter. Barging frees the lock and wakes a waiter, which must compete, so a running thread can take the lock first." },
+  { q: "Why is handoff slow when waiters are parked?", a: "The lock belongs to a thread that is still waking up. Nobody can use it for the wake-up time, so the rate is at most 1 / (critical section + wake-up)." },
+  { q: "What does Go's mutexWoken bit do?", a: "It says that a waiter is already awake or spinning. Unlock then does not wake another waiter, so it does not cause a needless wake-up." },
+  { q: "When does Go's sync.Mutex enter and leave starvation mode?", a: "It enters when a waiter has waited more than 1 ms. It leaves when the waiter that gets the lock is the last in the queue, or waited less than 1 ms." },
+  { q: "What does a poisoned Rust Mutex tell you, and how do you get the data anyway?", a: "A thread panicked while it held the guard, so the data may be half-updated. PoisonError::into_inner returns the guard." },
+  { q: "Why does Rust's Mutex<T> make the rule 'hold m to touch the data' hard to break?", a: "The mutex owns the value, and the only way to reach it is the guard that lock() returns. The guard unlocks when it is dropped." },
+]} />

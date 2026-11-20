@@ -1,0 +1,100 @@
+---
+summary: What a busy lock costs and how to see it. The throughput limit of one lock, why a blocking mutex gets slower with more threads, hold time against wait time, mutex profiles and perf lock, and striping with its limit on hot keys.
+---
+import { ConcLockScalingDemo, ConcLockStripeDemo } from "@/demos/conc/ConcLockContentionDemos";
+
+**Contention** means that threads want a lock at the same time, so some of them wait. The [performance lesson on contention](/performance/concurrency/contention) shows the hardware limit: a cache line moves between cores one transfer at a time. This lesson works one level up. A lock is a server with one seat. How much work can it serve, what happens when more threads ask, and how do you find and split a hot lock?
+
+## The limit of one lock
+
+Only one thread at a time can be inside the critical section. So the lock serves at most one critical section per **hold time**. That is the time from acquire to release, plus the cost to pass the lock on. That gives a hard limit on throughput, whatever the number of cores:
+
+$$
+\text{acquisitions per second} \le \frac{1}{t_{\text{hold}}}
+$$
+
+Each thread also wants the lock once per pass of its loop. With N threads and a pass of length $t_{\text{pass}}$, the demand is $N / t_{\text{pass}}$. Demand meets the limit at $N^{*} = t_{\text{pass}} / t_{\text{hold}}$ threads. Beyond that, extra threads only wait.
+
+Take 2 µs inside the lock in a 10 µs pass. The acquire adds 0.12 µs to the hold time, so $N^{*}$ is about 4.7 threads. This is Amdahl's law in another form: the critical section is the serial part.
+
+<Predict
+  id="collapse"
+  question="8 cores. Each pass of a thread's loop is 2 µs inside a blocking mutex and about 8 µs outside. You go from 8 threads to 32 threads. What happens to the number of lock acquisitions per millisecond?"
+  options={[
+    "It rises to the lock limit of about 470 per ms, because more threads keep the lock busy",
+    "It stays at the 8-thread value, because the lock is already the limit",
+    "It falls, from about 410 to about 310 per ms",
+  ]}
+  answer={2}
+  explain="With 8 threads, each thread has its own core. With 32 threads, a woken waiter must also wait for a core and pay a context switch before it can take a free lock. The lock sits free during that time. The simulation gives 408 acquisitions per ms at 8 threads and 314 at 32."
+>
+<ConcLockScalingDemo />
+</Predict>
+
+1. Read the three curves at 4 threads. All are below the lock limit, and the threads still add throughput.
+2. Read them from 8 to 32 threads. Spin stays at the limit, 472 per ms. Adaptive stays near 390. Block falls from 408 to 314.
+3. Read the bars for 32 threads. Spin keeps all 8 cores busy, and 41% of that is spinning. Block leaves 53% of the cores idle, because most threads sleep.
+4. Move the share inside the lock to 10%. The limit rises to 893 per ms. Spin reaches 733, and block reaches 563 and stays near it.
+5. Move it to 30%. All three curves stop near 4 threads, and block reaches only 252 per ms.
+
+A blocking mutex adds a cost to the critical path. When the holder unlocks and no running thread wants the lock, the lock waits until a parked thread wakes up and gets a core. That gap is pure loss for the lock, even if the cores are idle. More threads than cores make the gap longer, because the woken thread also waits for a core and a context switch. This is the **convoy phenomenon**, which Blasgen, Gray, Mitoma and Price described in 1979 for a database lock.
+
+Spinning closes the gap, because the next owner is already on a core. It pays for that with whole cores that do nothing useful.
+
+In this model, the spinners give way at the end of each 100 µs time slice. So the holder rarely loses its core, and spin stays at the limit. On a real machine with more threads than cores, the holder can be preempted, and all spinners then wait for it. The [lock-free lesson](/performance/concurrency/lock-free-vs-locked-in-practice) shows that stall. Adaptive locks such as glibc's `PTHREAD_MUTEX_ADAPTIVE_NP` and Go's `sync.Mutex` spin briefly and then park, which is the usual compromise.
+
+The costs in the demo are model inputs of the shared runtime. A wake-up is 5 µs, a context switch 2 µs, an acquire 20 ns and a cache-line transfer 100 ns. Change them, and the numbers move. The shape stays: a limit at $1/t_{\text{hold}}$, and a fall beyond the core count for a lock that parks.
+
+## Hold time and wait time
+
+Two numbers describe a contended lock. The **hold time** is how long one owner keeps it. The **wait time** is how long threads queue for it. Hold time is the cause, and wait time is the symptom. The wait grows faster than linearly as the lock gets busier, because a queue forms. So a small cut in hold time can remove most of the wait.
+
+Measure both, and attribute them to code:
+
+- **Go.** Call `runtime.SetMutexProfileFraction(rate)`, and read `/debug/pprof/mutex`. On average, the profile records 1 of every `rate` contention events. The stack in the profile is where the lock was *released*: the end of the critical section that made others wait. Since Go 1.22, the profile scales the delay by the number of waiters, and it also covers locks inside the runtime. The block profile (`runtime.SetBlockProfileRate`) shows where goroutines waited.
+- **Linux.** `perf lock contention` (perf in Linux 6.0 and later) summarizes kernel lock waits. With `-b` it collects them with BPF and low overhead.
+- **Any runtime that blocks OS threads.** **Off-CPU analysis** records the stacks of threads when they leave the CPU and how long they stay off. Lock waits show up as time under `futex_wait`. A [flame graph](/performance/measurement/flame-graphs) of off-CPU time points at the hot lock. In Go, use the mutex and block profiles instead, because a waiting goroutine does not block a thread.
+
+High CPU with low throughput suggests spinning or livelock. Low CPU with low throughput suggests parked waiters on a lock or on I/O. The mutex profile tells you which lock, and the holder's stack tells you why the hold time is long.
+
+## Split the lock
+
+If the critical section cannot get shorter, give each piece of data its own lock. **Striping** keeps k locks for one structure and maps each key to lock (hash mod k). Two operations collide only when their keys share a stripe.
+
+<ConcLockStripeDemo />
+
+1. With 1 stripe and uniform keys, the map does 665 operations per ms.
+2. Move **Stripes** to 8, and then to 64. Throughput rises to 1,494 and then 1,891 per ms. The limit with no lock at all is 2,000.
+3. Move **Key skew** to 2.0. Now one key gets about 60% of the operations. With 64 stripes, the map does only 972 per ms.
+4. With skew 2.0, look at the mutex profile. One stripe has nearly all the wait time. More stripes cannot split one key.
+
+Java's `ConcurrentHashMap` shows how this design evolved. Up to Java 7, it had segments, each one a lock, with a default `concurrencyLevel` of 16. Java 8 rewrote it to lock each bin. The first node of a bin is the lock, and an insert into an empty bin is a single CAS. Java 8 also added `LongAdder`, a counter that spreads updates over a set of variables that "may grow dynamically to reduce contention". The Linux kernel has `percpu_counter` for the same purpose.
+
+Striping has costs. An operation that needs the whole structure, such as a resize or a size count, must take every stripe, in order. Stripes that share a cache line contend through [false sharing](/performance/concurrency/false-sharing), so pad them. A hot key needs another fix: cache its value, batch its updates, or give it a counter per core.
+
+## A checklist
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| Throughput flat as threads grow, cores idle | One lock at its limit, waiters parked | Shorter critical sections, or split the lock |
+| Throughput falls beyond the core count | Wake-up and switch on the critical path | Fewer threads than cores, an adaptive lock, or batching |
+| High CPU, low throughput | Spinning, or a livelock | Park after a short spin, add jitter to back-off |
+| One stripe has all the wait | A hot key | Per-core counters, caching, or batching for that key |
+| Many readers wait for each other | A read lock's shared counter | A seqlock or [RCU](/os/sync/read-copy-update) |
+
+## Connect
+
+- [Contention in the performance track](/performance/concurrency/contention) shows the cache-line limit and Amdahl's law.
+- [Mutexes](/concurrency/locks/mutexes) explain handoff, barging and the convoy.
+- [Reader-writer locks](/concurrency/locks/reader-writer-locks) cover read-mostly data.
+- [False sharing](/performance/concurrency/false-sharing) explains why striped locks need padding.
+- [Amdahl's and Gustafson's laws](/concurrency/foundations/amdahls-and-gustafsons-laws) treat the serial part in general.
+
+<Recall cards={[
+  { q: "What is the maximum throughput of one lock?", a: "One acquisition per hold time: 1 / (critical section + the cost to pass the lock on), whatever the number of cores." },
+  { q: "At how many threads does a lock saturate?", a: "Near $N^{*} = t_{\\text{pass}} / t_{\\text{hold}}$, where the pass is one loop of a thread. Beyond that, extra threads only wait." },
+  { q: "Why can a blocking mutex get slower with more threads than cores?", a: "When the lock is freed, the next owner must wake up and get a core, with a context switch. The lock sits free during that time, and more threads make the wait for a core longer." },
+  { q: "Where does Go's mutex profile put the stack of a contention event?", a: "At the release of the lock (the Unlock), so it points at the critical section that made others wait." },
+  { q: "Why does striping not help with a hot key?", a: "All operations on one key map to one stripe. That stripe's lock has the same limit as a single lock." },
+  { q: "What did Java 8 change in ConcurrentHashMap?", a: "It replaced the segment locks with a lock on each bin (its first node) and a CAS for an insert into an empty bin." },
+]} />

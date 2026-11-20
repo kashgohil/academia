@@ -5,7 +5,7 @@
  * halves, a leaf adds up to `grain` elements, and a join node adds two partial results. `workSpan` gives the work T1
  * (the sum of all costs) and the span T∞ (the most expensive path). `greedy` is a list scheduler on P processors: it
  * never leaves a processor idle while a node is ready. Every greedy schedule meets Brent's bound
- * T_P ≤ T1/P + T∞ (Graham 1969 gives the sharper (T1 − T∞)/P + T∞), and no schedule beats max(T1/P, T∞).
+ * T_P ≤ T1/P + T∞ (Brent 1974 gives the sharper (T1 − T∞)/P + T∞; Graham 1966 the list-scheduling bound), and no schedule beats max(T1/P, T∞).
  *
  * `algoWorkSpan` evaluates the work and span recurrences of three algorithms with unit costs, so that a lesson can
  * compare their parallelism T1/T∞ as n grows.

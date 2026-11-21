@@ -84,7 +84,7 @@ export function OooRenameSweepDemo() {
       </>}
     >
       <MiniTable
-        head={["Core", "Cycles", "Instructions per cycle", ""]}
+        head={["Core", "Cycles", "Instructions per cycle", "Cycles, as a bar"]}
         highlight={CHOICES.indexOf(pick)}
         rows={CHOICES.map((c, i) => {
           const r = res[i];

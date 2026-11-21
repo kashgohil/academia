@@ -1,0 +1,148 @@
+---
+summary: Packed SIMD with a fixed width against vector-length-agnostic designs (Arm SVE, RISC-V V), masks and tails, register groups, and the roofline that decides whether wider lanes help.
+---
+import { ArchParStripMineDemo, ArchParVregDemo, ArchParRooflineDemo } from "@/demos/arch/ArchParSimdDemos";
+
+A **vector unit** does the same operation on several data elements in one instruction. Each element position is a **lane**. The lesson [SIMD by hand](/performance/cpu/simd-by-hand) shows how to write such code with intrinsics. This lesson looks at the hardware side.
+
+It asks three questions. How wide is the unit? How does a loop fit that width? When does a wider unit make the loop faster?
+
+There are two families of design. **Packed SIMD** puts the width into the instruction set. **Vector-length-agnostic** designs let each CPU choose its width and tell the program at run time.
+
+| ISA | Register width | Registers | Masks |
+|---|---|---|---|
+| x86 SSE | 128 bits (`xmm`) | 16 in 64-bit mode | none (compare results are vectors) |
+| x86 AVX, AVX2 | 256 bits (`ymm`) | 16 | none (masked loads and stores take a vector as the mask) |
+| x86 AVX-512 | 512 bits (`zmm`) | 32 | 8 mask registers, `k0` to `k7` |
+| Arm Advanced SIMD (NEON) | 128 bits | 32 (`v0` to `v31`) | none |
+| Arm SVE, SVE2 | a power of two from 128 to 2048 bits, chosen by the CPU (the first SVE text allowed any multiple of 128) | 32 (`z0` to `z31`) | 16 predicate registers, `p0` to `p15` |
+| RISC-V V | VLEN bits, chosen by the CPU | 32 (`v0` to `v31`) | the mask is in `v0` |
+
+With packed SIMD, a new width needs new instructions and a new compiled binary. An AVX2 binary uses 256 bits on a CPU that has 512-bit units. A vector-length-agnostic binary uses the full width of every CPU that runs it. Real SVE widths differ. The Arm Neoverse V1 uses 256 bits, the Neoverse V2 uses 128 bits, and the Fujitsu A64FX supports up to 512 bits.
+
+## One loop on many widths
+
+The loop `c[i] = a[i] + b[i]` must process n elements. The width of the unit rarely divides n exactly. The **tail** is the part that does not fill a whole vector.
+
+<Predict
+  id="vla-trips"
+  question="One SVE binary adds two arrays of n = 100 floats. It runs on a CPU with 128-bit SVE and then on a CPU with 512-bit SVE. How many trips through the loop body does each CPU make?"
+  options={["25 on both: the binary fixes the width", "25 and 7", "7 on both"]}
+  answer={1}
+  explain="The SVE code does not contain a width. The incw instruction adds the lane count of the CPU that runs it. A 128-bit CPU has 4 lanes of 32 bits, so it needs 25 trips. A 512-bit CPU has 16 lanes and needs 7 trips. The last trip has a predicate with only 4 active lanes."
+>
+<ArchParStripMineDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **SVE** and change the width from 128 to 512 bits. The trip count goes from 25 to 7. The listing does not change.
+2. Select **Fixed + scalar tail**, 512 bits, and set n to 200. There are 12 vector trips and 8 scalar trips. Each scalar trip occupies the whole unit for one element.
+3. Set n to 15. The fixed loop makes no vector trip at all. All 15 elements go through the scalar tail.
+4. Select **Fixed + masked tail**. One masked trip replaces the scalar tail. AVX-512 makes this easy, because every instruction can take a mask register.
+5. Select **RVV**. Each trip asks the hardware how many elements it will process. The listing has 11 instructions per trip, but it never needs a separate tail.
+
+## Three answers to the tail
+
+**Scalar tail.** SSE and AVX2 code usually runs a vector loop on `n - n % lanes` elements and a scalar loop on the rest. This needs two copies of the loop body. For short arrays, the tail can be a large part of the work. With 16 lanes and n = 1,000, the loop makes 62 vector trips and 8 scalar trips.
+
+**Masks.** AVX-512 adds 8 mask registers. An instruction such as `vaddps zmm0{k1}{z}, zmm0, [mem]` writes only the lanes where `k1` has a 1. The `{z}` suffix sets the other lanes to zero. Encoding `k0` as the write mask means "no mask". Masked memory operands do not fault on the inactive lanes, so the tail load cannot touch an unmapped page.
+
+AVX2 has only masked loads and stores (`vpmaskmovd`), which read the mask from the sign bits of a vector.
+
+**Predication in every trip.** SVE and RISC-V V make the partial vector the normal case. In SVE, `whilelo p0.s, x4, x3` sets the predicate lanes for which `x4 + lane < x3`. Every load, add and store uses `p0`. The loop ends when the first lane is inactive (`b.first`).
+
+RISC-V V does the same with a length instead of a predicate. The instruction `vsetvli t0, a0, e32, m1, ta, ma` receives the elements left in `a0`. This count is the **application vector length** (AVL). It returns the number of elements for this trip, `vl`, in `t0`. Every vector instruction then works on elements 0 to vl − 1. This style of loop is called **strip mining**.
+
+```riscv
+# c[i] = a[i] + b[i]; a0 = n, a1 = c, a2 = a, a3 = b
+loop:
+    vsetvli  t0, a0, e32, m1, ta, ma   # t0 = vl, at most VLMAX
+    vle32.v  v0, (a2)
+    vle32.v  v1, (a3)
+    vfadd.vv v2, v0, v1
+    vse32.v  v2, (a1)
+    sub      a0, a0, t0
+    slli     t0, t0, 2
+    add      a2, a2, t0
+    add      a3, a3, t0
+    add      a1, a1, t0
+    bnez     a0, loop
+```
+
+## The register file of RISC-V V
+
+The `vsetvli` instruction also sets the **vector type** (`vtype`). It has two main fields. **SEW** (selected element width) is the size of one element: 8, 16, 32 or 64 bits. **LMUL** (length multiplier) joins 2, 4 or 8 registers into one **register group**, or uses a fraction of one register.
+
+<ArchParVregDemo />
+
+1. Start with VLEN = 128, e32 and LMUL = 1. One register holds 4 elements, so VLMAX = 4. AVL = 20 needs 5 trips.
+2. Set LMUL to 8. The group v8 to v15 holds 32 elements, and AVL = 20 needs one trip. But now only 4 groups exist: v0, v8, v16 and v24.
+3. Set LMUL to 4, so that VLMAX = 16, and keep AVL = 20. The trips are 16 and 4. Now set **vl choice** to **split the last two trips**. The trips become 10 and 10.
+4. Set SEW to e8. The same register now holds 16 elements. The mask in v0 still uses 1 bit per element, at every SEW.
+
+The rule that the demo follows is in the RVV 1.0 specification. When AVL is at most VLMAX, vl equals AVL. When AVL is at least twice VLMAX, vl equals VLMAX. Between these two, the hardware may choose any vl from AVL/2 (rounded up) to VLMAX. This freedom lets an implementation balance the last two trips.
+
+The `ta` and `ma` flags mean **tail agnostic** and **mask agnostic**. The hardware may then keep the old value of each tail element and each masked-off element, or set all its bits to 1. A wide machine with register renaming can then skip the read of the old destination value.
+
+## Old ideas: the Cray-1
+
+Vector registers are not new. The Cray-1 (1976) had 8 vector registers, each with 64 elements of 64 bits. A **vector length register** set how many elements an instruction processed, as `vl` does in RISC-V V today. The Cray-1 also had **chaining**. The result of a multiply could flow element by element into an add, before the multiply had finished all 64 elements. Modern out-of-order cores get a similar overlap from forwarding between execution units.
+
+## Wider is not free
+
+**Gather and scatter.** A gather loads each lane from its own address, for example `a[idx[i]]`. AVX2 added gathers, AVX-512 added scatters, SVE and RISC-V V have indexed loads and stores. Each lane can touch a different cache line, so a gather costs about as much as one load per lane. It saves instructions, not memory traffic.
+
+**Clock frequency and power.** A 512-bit unit uses more power than a 256-bit unit. The first Xeon Scalable generation (Skylake-SP) lowers its turbo frequency for heavy AVX2 code, and more for heavy AVX-512 code. Newer Xeons lose much less. The slower clock then also slows the scalar code that runs on that core.
+
+**Memory bandwidth.** This is the most common limit. The next demo shows it.
+
+## The roofline
+
+The **roofline model** (Williams, Waterman and Patterson, CACM, 2009) puts every kernel on one chart. The x-axis is the **arithmetic intensity**: floating-point operations per byte of DRAM traffic. The paper calls this the operational intensity. The attainable speed is the smaller of two roofs:
+
+$$
+\text{attainable} = \min(\text{peak FLOP/s},\ \text{intensity} \times \text{bandwidth})
+$$
+
+The **ridge point** is where the two roofs meet. A kernel to the left of it is **memory bound**. A kernel to the right of it is **compute bound**.
+
+<Predict
+  id="roofline-wider"
+  question="A loop computes c[i] = a[i] + b[i] on float arrays much larger than the caches. You move it from AVX2 (8 lanes) to AVX-512 (16 lanes). About how much faster does it run?"
+  options={["About 2 times", "About 1.3 times", "No faster"]}
+  answer={2}
+  explain="The loop does 1 add for every 12 bytes it moves: 1/12 FLOP per byte. At 50 GB/s that is 4.17 GFLOP/s, about 0.5% of the 768 GFLOP/s peak of the model CPU. Doubling the lanes doubles the peak, but the loop waits for DRAM, so its speed does not change."
+>
+<ArchParRooflineDemo />
+</Predict>
+
+1. Switch between the three widths. The flat roof moves. The sloped roof does not move, and the stream add, triad and dot product stay on it.
+2. Move **Your kernel** to the right. It reaches the ridge at 15.4 FLOP per byte with AVX2 and at 30.7 with AVX-512. Wider lanes move the ridge to the right.
+3. Look at the GEMM with 128 × 128 blocks. It does 32 FLOP per byte. It reaches the AVX2 peak of 768 GFLOP/s and it doubles to 1,536 GFLOP/s with AVX-512.
+4. Raise the bandwidth to 400 GB/s, about what a server with many DDR5 channels gives. The stencil now gets more speed, but the stream add still uses less than 5% of the peak.
+
+The peak of the model CPU is a product: 8 cores × 3 GHz × 2 FMA units × 8 lanes × 2 FLOP = 768 GFLOP/s. These are model inputs, not the numbers of a named product. The method is the important part: count the units, then compare the kernel's bytes with its operations.
+
+## What this means for your code
+
+- First compute the arithmetic intensity of your loop. If it is below the ridge, wider vectors do nothing. Reduce the bytes: fuse loops, block for the cache, use smaller types.
+- Prefer one loop body with masks (AVX-512, SVE, RVV) to a vector loop plus a scalar tail when arrays are short.
+- For SVE and RISC-V V, do not hard-code the lane count. Use `svcntw()`, `vsetvli` or the compiler's scalable types, so that one binary uses every width.
+- Measure the clock frequency when you add 512-bit code to a program that is mostly scalar.
+
+## Connections
+
+- [SIMD by hand](/performance/cpu/simd-by-hand) and [auto-vectorization](/performance/cpu/auto-vectorization) show the software side of the same lanes.
+- [Struct of arrays](/performance/memory/struct-of-arrays-vs-array-of-structs) explains the data layout that makes contiguous vector loads possible.
+- [Multi-level caches](/architecture/caches/multi-level-caches) and [prefetching](/architecture/caches/prefetching) decide the bandwidth roof.
+- [GPU architecture](/architecture/parallel/gpu-architecture) takes the same idea much further: thousands of lanes and a memory system built for bandwidth.
+
+<Recall cards={[
+  { q: "What is the difference between packed SIMD and a vector-length-agnostic ISA?", a: "Packed SIMD puts the width in the instructions (SSE, AVX2, AVX-512). A vector-length-agnostic ISA (SVE, RISC-V V) lets each CPU choose its width, and the code reads the width at run time." },
+  { q: "What does vsetvli return when AVL is at least twice VLMAX? And when AVL is at most VLMAX?", a: "VLMAX in the first case, and AVL in the second. Between the two, any value from AVL/2 rounded up to VLMAX is allowed." },
+  { q: "How does LMUL change VLMAX and the number of register groups?", a: "VLMAX = LMUL × VLEN / SEW. A larger LMUL makes longer vectors, but leaves only 32/LMUL groups: with LMUL = 8, only v0, v8, v16 and v24." },
+  { q: "Name three ways to handle the tail of a loop.", a: "A scalar tail loop, one masked final trip (AVX-512 mask registers), or predication or vl in every trip (SVE whilelo, RISC-V vsetvli)." },
+  { q: "What is the ridge point of the roofline, and why does it matter for SIMD width?", a: "The arithmetic intensity where the bandwidth roof meets the compute roof. Kernels below it are memory bound, so wider lanes do not make them faster. Wider lanes move the ridge to the right." },
+  { q: "What was chaining in the Cray-1?", a: "The result of one vector unit flowed element by element into another unit. So a multiply and a dependent add overlapped, and did not run one after the other." },
+]} />

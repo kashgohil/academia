@@ -32,6 +32,11 @@ export const LEVELS: Record<Level, string> = {
 
 /** Lessons with a written MDX page. Paths must match `src/content/lessons/<path>.mdx`. */
 export const LIVE = new Set<string>([
+  "architecture/parallel/gpu-architecture",
+  "architecture/parallel/simd-and-vector-units",
+  "architecture/parallel/systolic-arrays",
+  "architecture/parallel/tensor-cores",
+  "architecture/parallel/warps-and-divergence",
   "architecture/data/character-encoding-and-utf-8",
   "architecture/data/endianness",
   "architecture/data/ieee-754-floating-point",

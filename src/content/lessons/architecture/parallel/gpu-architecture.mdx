@@ -1,0 +1,123 @@
+---
+summary: Streaming multiprocessors, warps, the register file as the largest memory, occupancy from per-SM limits, latency hiding by warp switching (Little's law), coalescing into 32-byte sectors, and shared-memory banks.
+---
+import { ArchParOccupancyDemo, ArchParLatencyDemo, ArchParCoalesceDemo, ArchParBankDemo } from "@/demos/arch/ArchParGpuDemos";
+
+A CPU core spends most of its transistors to make one thread fast. It has large caches, branch predictors and out-of-order windows. A GPU spends them on many simple lanes and on a memory system with very high bandwidth. It does not try to remove memory latency. It hides the latency with other work.
+
+This lesson uses the NVIDIA A100 (the Ampere architecture, compute capability 8.0) as its example. NVIDIA publishes its limits in detail. AMD GPUs follow the same plan with other names.
+
+## The parts of a GPU
+
+- A **thread** runs your kernel code on one lane. Its variables live in registers.
+- A **warp** is 32 threads that execute one instruction together. On AMD, the same unit is a **wavefront**: 64 work-items on GCN and CDNA, and 32 or 64 on RDNA.
+- A **block** (a thread block, or a work-group on AMD) is a group of warps that run on the same SM and can share memory.
+- A **streaming multiprocessor** (SM) runs many blocks at the same time. AMD calls it a **compute unit** (CU). The A100 has 108 SMs.
+
+One A100 SM has 64 FP32 lanes, 4 tensor cores, a 256 KB register file, and 192 KB of L1 cache and shared memory. The NVIDIA whitepaper shows the SM as four partitions. Each partition has its own warp scheduler, 16 FP32 lanes and one tensor core. All SMs share a 40 MB L2 cache and HBM2 memory with 1,555 GB/s of bandwidth (on the 40 GB model).
+
+Look at those sizes again. The **register file is the largest memory on the SM**. It is larger than the L1 cache and the shared memory together. A CPU core has a few kilobytes of architectural registers. An SM has 65,536 registers of 32 bits, because it keeps the state of up to 64 warps on chip at the same time.
+
+## Occupancy
+
+A warp stays on its SM until it finishes. A warp that is on an SM is **resident**. The number of resident warps depends on four limits per SM. For compute capability 8.0 they are 64 warps, 32 blocks, 64K registers and 164 KB of shared memory. **Occupancy** is the ratio of resident warps to the 64 warp slots.
+
+<Predict
+  id="occupancy-regs"
+  question="A kernel uses blocks of 256 threads, and the compiler gives each thread 64 registers. How many of the 64 warp slots of an A100 SM can be filled?"
+  options={["All 64: 8 blocks of 8 warps", "32", "16"]}
+  answer={1}
+  explain="One warp needs 32 × 64 = 2,048 registers, and one block of 8 warps needs 16,384. The SM has 65,536 registers, so only 4 blocks fit: 32 warps, 50% occupancy. The warp-slot limit would allow 8 blocks, but the registers run out first."
+>
+<ArchParOccupancyDemo />
+</Predict>
+
+1. Set the registers to 32. The register file now holds 8 blocks, and the occupancy is 100%.
+2. Set the registers to 40. One warp needs 1,280 registers, so 51 warps fit by registers. That is 6 blocks of 8 warps, which gives 48 warps and 75%.
+3. Set 128 threads per block and 48 KB of shared memory. Three blocks fit in 164 KB, so the occupancy is 12 of 64 warps. Select the H100: its 228 KB holds 4 blocks.
+4. Set 32 threads per block. The limit of 32 blocks per SM now stops the SM at 32 warps.
+
+In CUDA, `__launch_bounds__(256, 4)` asks the compiler to fit at least 4 blocks of 256 threads on each SM. The compiler then limits the registers per thread, and it can **spill** values to local memory. Use `nvcc -Xptxas -v` or Nsight Compute to see the real count of registers.
+
+Higher occupancy is not always faster. It is a means to hide latency, and the next demo shows how much you need.
+
+## Hiding latency by switching warps
+
+A load from DRAM takes hundreds of cycles. A CPU tries to avoid the wait with caches and prefetchers. A GPU warp simply waits. Each cycle, each warp scheduler picks a warp that is ready and issues its next instruction. If enough warps are resident, some warp is always ready. Switching costs nothing, because every warp keeps its registers on chip.
+
+<ArchParLatencyDemo />
+
+1. Keep the defaults: each warp does 4 instructions per load, and a load takes 200 cycles. With 4 warps, the scheduler issues in only 10% of the cycles.
+2. Raise the warps to 16. The use goes up to 39%. An A100 SM has 64 warp slots and 4 schedulers, so a scheduler cannot have more than 16 warps.
+3. Set **Independent loads per warp** to 4. Each warp now has 4 loads in flight. With 16 warps, the use rises to 62%.
+4. Set **Instructions per load** to 40. Now 6 warps are enough. More work per byte needs fewer warps.
+
+This is **Little's law**. The number of requests in flight equals the latency times the rate at which you start them. To issue one instruction per cycle, the scheduler needs enough warps to cover one full period of a warp:
+
+$$
+\text{warps needed} = \left\lceil \frac{\text{latency} + \text{instructions per load} + \text{loads} - 1}{\text{instructions per load} + \text{loads}} \right\rceil
+$$
+
+With a latency of 200 cycles and 4 instructions per load, a scheduler needs 41 warps. It can hold only 16. So real kernels also need **instruction-level parallelism**: several independent loads in each thread, as in [instruction-level parallelism](/performance/cpu/instruction-level-parallelism). Vasily Volkov's talk "Better Performance at Lower Occupancy" (GTC 2010) showed this trade: fewer warps, each with more independent work, can match full occupancy.
+
+The latency of 200 cycles and the issue model are model inputs. The demo scheduler is **greedy then oldest**: it keeps one warp while that warp is ready, and then takes the oldest ready warp. NVIDIA does not publish its exact policy.
+
+## Coalescing: the 32 threads ask together
+
+A warp executes a load for all 32 threads at once. The memory system collects the 32 addresses and fetches whole **32-byte sectors**. A cache line has four sectors: 128 bytes. If the 32 addresses fall into few sectors, the access is **coalesced**, and little bandwidth is wasted.
+
+<Predict
+  id="coalesce-stride"
+  question="Each thread i of a warp reads the float a[2 × i] in place of a[i]. How many bytes does the memory system move, compared with a[i]?"
+  options={["The same", "2 times as many", "32 times as many"]}
+  answer={1}
+  explain="With a[i], the 32 floats are 128 contiguous bytes: 4 sectors. With a[2 × i], they span 256 bytes: 8 sectors. Half of every sector is unused, so the warp moves twice the bytes for the same useful data. Strides of 8 floats or more put each thread in its own sector."
+>
+<ArchParCoalesceDemo />
+</Predict>
+
+1. With stride 1, the warp touches 4 sectors and uses 100% of the bytes.
+2. Set the stride to 2 and then to 8. The warp touches 8 and then 32 sectors. Above 8, the count stays at 32: one sector for each thread.
+3. Select **a[i + k]** and set the slider to 2, which is an offset of one float. The 128 bytes now cross a sector border, so the warp needs 5 sectors and uses 80% of the bytes.
+4. Select **struct field** with 3 words: a 12-byte struct of three floats, and each thread reads one field. The warp touches 12 sectors and uses one third of the bytes. This is the [struct of arrays](/performance/memory/struct-of-arrays-vs-array-of-structs) problem again, on a larger scale.
+5. Select **16 (float4)**. Each thread loads 16 bytes. The warp moves 512 bytes in 16 sectors, all of them used.
+
+The rule for your code: thread i of a warp should touch element i, or a contiguous run, of an array. Put the fastest-changing index on `threadIdx.x`.
+
+## Shared memory and its banks
+
+**Shared memory** is a scratchpad on the SM that the program controls. The threads of a block use it to share data, for example a tile of a matrix. It is divided into 32 **banks**. Consecutive 32-bit words go to consecutive banks, and each bank delivers one 32-bit word per cycle. If several threads of a warp need different words from the same bank, the accesses wait for each other. This is a **bank conflict**.
+
+<ArchParBankDemo />
+
+1. Stride 1: every thread uses its own bank, so the access takes one cycle.
+2. Stride 2: threads 0 and 16 both use bank 0. Each bank serves two words, so the access takes 2 cycles.
+3. Stride 32: all 32 threads use bank 0. The access takes 32 cycles.
+4. Stride 33: the conflict is gone. Any odd stride uses all 32 banks.
+5. Select **word 0 (all threads)**. When threads read the same word, the bank sends it to all of them. This **broadcast** costs one cycle.
+
+The conflict degree for a stride of s words is $\gcd(s, 32)$. The classic fix is padding. A transpose kernel that reads a column of `float tile[32][32]` has stride 32. If you declare `tile[32][33]`, each row starts one bank later, and the column read uses all 32 banks.
+
+## What this means for your code
+
+- Check registers per thread and shared memory per block against the per-SM limits before you tune anything else.
+- Give each thread several independent loads when occupancy is low. Unroll loops that load.
+- Make warps read contiguous memory. Use SoA layouts and vector loads such as `float4`.
+- Pad shared-memory arrays whose column you read.
+- Most GPU kernels are memory bound. The [roofline](/architecture/parallel/simd-and-vector-units) applies: at 1,555 GB/s, a kernel needs about 12.5 FLOP per byte to reach the 19.5 TFLOP/s FP32 peak of the A100.
+
+## Connections
+
+- [Warps and divergence](/architecture/parallel/warps-and-divergence) shows what happens when the 32 threads of a warp disagree at a branch.
+- [Tensor cores](/architecture/parallel/tensor-cores) adds the matrix units that hold most of the FLOPs of a modern GPU.
+- [Latency vs throughput](/performance/systems/latency-vs-throughput) and [queueing theory and Little's law](/performance/systems/queueing-theory-and-littles-law) give the general form of the latency-hiding rule.
+- [Cache organization](/architecture/caches/cache-organization-and-access-patterns) explains sectors and lines from the CPU side.
+
+<Recall cards={[
+  { q: "Which is the largest memory on an A100 SM?", a: "The register file: 64K 32-bit registers, 256 KB. The L1 cache and shared memory together have 192 KB." },
+  { q: "Name the four per-SM limits that decide occupancy on compute capability 8.0.", a: "64 resident warps, 32 resident blocks, 64K registers, and 164 KB of shared memory (plus 1 KB reserved per block)." },
+  { q: "Why can a GPU switch between warps in every cycle at no cost?", a: "Every resident warp keeps its registers in the large register file. Nothing has to be saved or restored." },
+  { q: "How many warps does a scheduler need to hide a latency of L cycles when each warp issues c instructions per load?", a: "About (L + c) / (c + 1), by Little's law. With L = 200 and c = 4, 41 warps: more than the 16 that one A100 scheduler can hold." },
+  { q: "How many 32-byte sectors does a warp touch when each thread reads a float with a stride of 8 floats?", a: "32: one sector for each thread, so only 4 of every 32 bytes are used." },
+  { q: "Why does tile[32][33] avoid the bank conflicts of tile[32][32]?", a: "A column read then has a stride of 33 words. Because gcd(33, 32) = 1, the 32 threads use 32 different banks." },
+]} />

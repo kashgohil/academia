@@ -1,0 +1,98 @@
+---
+summary: "Kung's idea: a grid of multiply-accumulate cells that pass data to their neighbours on every clock. Weight-stationary and output-stationary dataflows, fill and drain, and why the 256 × 256 array of the TPU v1 was idle most of the time."
+---
+import { ArchParSystolicDemo, ArchParTpuDemo } from "@/demos/arch/ArchParSystolicDemos";
+
+A GPU feeds its arithmetic units from a register file. Each operand travels from the register file to a unit and back. A **systolic array** removes most of that travel. It is a grid of small **processing elements** (PEs). Each PE does one multiply-accumulate (MAC) per cycle and passes its inputs to its neighbours through registers. Data enters at the edges, and each value is used by every PE that it passes.
+
+Kung and Leiserson described systolic arrays in 1978 ("Systolic Arrays (for VLSI)"). Kung explained the idea in "Why Systolic Architectures?" (IEEE Computer, January 1982). The name comes from the heart: data is pumped through the array in a regular beat. The main argument is about bandwidth. An array of $n \times n$ PEs does $n^2$ MACs per cycle, but it reads only about $2n$ values per cycle from its edges.
+
+## Weight stationary, cycle by cycle
+
+In a **weight-stationary** array, PE(r, c) holds one weight $W_{rc}$ for the whole computation. Row m of the input matrix X enters from the left, one value per row of PEs. Each value moves one PE to the right per cycle. Partial sums move one PE down per cycle. The output $Y_{mc} = \sum_r X_{mr} W_{rc}$ leaves at the bottom of column c.
+
+The inputs must arrive with a **skew**. Row r of the array receives its value of input row m in cycle $m + r$. So the value meets the partial sum that comes down from row $r - 1$ at the correct moment.
+
+<Predict
+  id="systolic-cycles"
+  question="A 4 × 4 weight-stationary array multiplies 4 input rows by its 4 × 4 weight matrix. How many cycles pass from the first multiply-add until the last output is complete?"
+  options={["4: one row per cycle", "10", "16: one PE after the other"]}
+  answer={1}
+  explain="The last input row starts 3 cycles after the first. Its value for the last array row enters 3 cycles later, because of the skew. It then needs 3 more cycles to reach the last column. So the last multiply-add is in cycle 3 + 3 + 3 = 9, counted from 0: 10 cycles. In general, the run takes M + R + C − 2 cycles, where M is the number of input rows."
+>
+<ArchParSystolicDemo />
+</Predict>
+
+1. Press **Step** a few times. In cycle 0, only PE(0, 0) works. In cycle 1, three PEs work. The busy PEs form a diagonal wave.
+2. Step to cycle 3. The first output, $Y_{00}$, leaves the bottom of column 0. The outputs of the other columns follow one cycle apart.
+3. Step to the end. The result equals the plain matrix product. The array was busy for 64 of 160 PE-cycles: 40%.
+4. Set the stream length to 12. The run takes 18 cycles, and the use rises to 67%. The fill and drain cost the same, but they are shared by more rows.
+5. Select **Output stationary**. Now PE(i, j) holds the sum for $C_{ij}$. A values move right and B values move down. The cycle count has the same form: k + R + C − 2.
+
+## Fill, drain and the choice of dataflow
+
+The time of a run is
+
+$$
+T = S + R + C - 2
+$$
+
+for a stream of S vectors on an array of $R \times C$ PEs. The useful work is $S \cdot R \cdot C$ MACs, so the utilization is $S / (S + R + C - 2)$. The array is efficient only when the stream is much longer than the array is wide. On a 256 × 256 array with a stream of 256 rows, the run takes 766 cycles, and the utilization is only 33%.
+
+Each dataflow keeps one operand in place and streams the other two:
+
+| Dataflow | Stays in the PE | Moves | The streamed dimension |
+|---|---|---|---|
+| Weight stationary | one weight | inputs right, partial sums down | batch (rows of X) |
+| Output stationary | one output sum | A right, B down | the inner dimension k |
+| Input stationary | one input value | weights and partial sums | output columns |
+
+Weight stationary is good when the same weights are used for many inputs: inference with a large batch. Output stationary is good when the inner dimension is long: the sums never leave the array until they are complete. Real accelerators combine these choices with buffers that hold the next tile while the current one computes.
+
+## The Google TPU v1
+
+Jouppi et al. described the first Tensor Processing Unit in "In-Datacenter Performance Analysis of a Tensor Processing Unit" (ISCA 2017). Its center is a **Matrix Multiply Unit** of 256 × 256 = 65,536 8-bit MACs at 700 MHz. That gives 92 tera-operations per second. The paper describes the dataflow of this lesson. The weights are preloaded from the top, data flows in from the left, and the partial sums go to 4 MiB of 32-bit accumulators below.
+
+The unit holds one 64 KiB tile of weights plus a second for double buffering. The weights come from 8 GiB of DDR3 memory at 34 GB/s. The activations live in a 24 MiB on-chip **Unified Buffer**. The chip was made in a 28 nm process.
+
+Now compare the two rates. At 34 GB/s and 700 MHz, the memory delivers about 48.6 bytes per cycle. One 64 KiB tile of weights takes 1,349 cycles to arrive. A tile is used once for each input row of the batch. So unless the batch has about 1,350 rows, the array waits for weights. The paper puts the ridge point of its roofline at 1,350 operations per byte of weight memory.
+
+<Predict
+  id="tpu-batch"
+  question="An MLP layer with a 2048 × 2048 weight matrix runs on the TPU v1 with a batch of 16 inputs. About what share of the 92 TOPS peak does it reach?"
+  options={["About 90%", "About 25%", "About 1%"]}
+  answer={2}
+  explain="The layer needs 64 tiles of 256 × 256 weights. Each tile takes 1,349 cycles to load, but only 16 rows use it. The model gives 1.2% of the peak. With a batch of 1,350 or more, the same layer reaches about 98%."
+>
+<ArchParTpuDemo />
+</Predict>
+
+1. Raise the batch to 200. The use rises to 14.5%: still weight bound.
+2. Raise the batch to 1,350. Each tile now computes for as long as the next tile takes to load. The use reaches 98%.
+3. Click **First conv layer 27 × 64**. A 3 × 3 convolution on 3 color channels has only 27 weight rows. Only 2.6% of the PEs hold a real weight, so even a batch of 4,096 gives only 1.8%.
+4. Click **300 × 300**. The layer needs 4 tiles, and three of them are mostly padding. Only 34% of the PEs do useful work.
+
+This is a model with three inputs from the paper: the array size, the clock and the weight bandwidth. It ignores the activation traffic and the time of the other units. The paper measured the real numbers. Its Table 3 reports that the six production applications used 23% of the MACs of the array on average. The two MLPs used 12.5% and 9.4%, and the best CNN used 78.2%.
+
+TPU v2 to v5 used arrays of 128 × 128 PEs. Norrie et al. describe TPU v2 and v3 in IEEE Micro (2021). TPU v2 has a 128 × 128 systolic array per matrix unit, and TPU v3 has twice as many matrix units. Smaller arrays waste less on small or odd-shaped layers. TPU v6e (Trillium) went back to 256 × 256 arrays. The training chips also use high-bandwidth memory in place of DDR3.
+
+## What this means for your code
+
+- On any matrix unit, the batch (or the reused dimension) must be large enough to cover the time to load the weights.
+- Pad or group small layers. A layer that is much smaller than the array wastes most of it.
+- Compute the time to load a weight tile and compare it with the rows that use it. This is the roofline of the [SIMD lesson](/architecture/parallel/simd-and-vector-units) in the units of the accelerator.
+
+## Connections
+
+- [Tensor cores](/architecture/parallel/tensor-cores) give the GPU answer to the same problem: operand reuse inside small matrix tiles.
+- [Pipelines](/concurrency/patterns/pipelines) are the software form of the same idea: stages that pass data to the next stage on every step.
+- [Interconnects](/architecture/multicore/interconnects) compares meshes and other on-chip networks; a systolic array is a mesh with only nearest-neighbour links.
+
+<Recall cards={[
+  { q: "What is a systolic array?", a: "A grid of processing elements that each do one multiply-accumulate per cycle and pass their operands to their neighbours through registers. Data enters only at the edges." },
+  { q: "Why is a systolic array good for bandwidth?", a: "An $n \\times n$ array does $n^2$ multiply-adds per cycle, but it reads only about 2n values per cycle at its edges. Each value is reused by every PE it passes." },
+  { q: "How many cycles does a weight-stationary R × C array need for a stream of S input rows?", a: "S + R + C − 2. The fill and drain cost R + C − 2 cycles, so the utilization is S / (S + R + C − 2)." },
+  { q: "What stays in place in a weight-stationary array, and in an output-stationary array?", a: "Weight stationary: one weight per PE, with inputs moving right and partial sums moving down. Output stationary: one output accumulator per PE, with A moving right and B moving down." },
+  { q: "Give the size, data type and clock of the TPU v1 matrix unit.", a: "256 × 256 = 65,536 MACs on 8-bit integers at 700 MHz, about 92 TOPS." },
+  { q: "Why did most TPU v1 applications use a small share of the array?", a: "The weights came from DDR3 at 34 GB/s. A 64 KiB tile took about 1,350 cycles to load, and small batches used each tile for far fewer cycles. Small layers also left most PEs with padding." },
+]} />

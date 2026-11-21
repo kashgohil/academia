@@ -1,0 +1,141 @@
+---
+summary: Matrix multiply-accumulate units (D = A×B + C on small tiles), why operand reuse beats SIMD, mixed precision from FP32 to FP8, peak FLOPs as a product of units, and why batch size decides whether you reach it. With Intel AMX and Arm SME.
+---
+import { ArchParReuseDemo, ArchParAccumDemo, ArchParBatchDemo, ArchParTiles3DDemo } from "@/demos/arch/ArchParTensorDemos";
+
+A **tensor core** is a unit that does a small matrix multiply-accumulate in one operation:
+
+$$
+D = A \times B + C
+$$
+
+Here A is an $m \times k$ tile, B is $k \times n$, and C and D are $m \times n$. NVIDIA added tensor cores in Volta (V100, 2017). Today most of the FLOPs of a data-center GPU are in these units, not in its FP32 lanes. On an A100, the FP32 lanes give 19.5 TFLOP/s, and the tensor cores give 312 TFLOP/s of dense FP16.
+
+Why is a matrix unit so much faster than more SIMD lanes? The answer is not the multipliers. It is the cost of moving the operands to them.
+
+## Operand reuse
+
+A vector FMA of 8 lanes reads three vectors (a, b and c) from the register file and writes one. It does 8 multiply-adds for 24 values read. The register file needs 3 reads for every multiply-add. Register-file ports and wires use much of the energy of an arithmetic operation. A wider SIMD unit makes this ratio no better.
+
+<Predict
+  id="mma-reads"
+  question="A vector FMA of 8 floats does 8 multiply-adds and reads 24 values from registers. One m16n8k16 MMA does 16 × 8 × 16 = 2,048 multiply-adds. How many values does it read from registers?"
+  options={["About 6,000: 3 per multiply-add", "512", "2,048"]}
+  answer={1}
+  explain="It reads A (16 × 16 = 256 values), B (16 × 8 = 128) and C (16 × 8 = 128): 512 values. That is 0.25 reads per multiply-add, against 3 for the vector FMA: 12 times less register traffic for the same work."
+>
+<ArchParReuseDemo />
+</Predict>
+
+1. Click **m8n8k4**, the shape of Volta. It does 256 multiply-adds for 128 reads: 2 multiply-adds per read.
+2. Click **m64n256k16**. This is the largest FP16 shape of the Hopper `wgmma` instruction. FP8 inputs allow k = 32. It does 262,144 multiply-adds for 21,504 reads: about 12 per read.
+3. Set m, n and k to 1. This is one scalar FMA: 3 reads for 1 multiply-add.
+4. Double k with m and n fixed. The work doubles, but only A and B grow. The accumulator traffic stays the same.
+
+The work of a tile grows as $m \cdot n \cdot k$, but its inputs grow only as $m k + k n$. Each value of A is used n times, and each value of B is used m times. Bigger tiles give more reuse. This is the same argument as cache blocking in [cache-friendly code](/performance/memory/cache-friendly-code), moved down to the register file.
+
+## The instructions
+
+Tensor cores are used by warp-level instructions. In PTX (NVIDIA's virtual ISA), `mma.sync` takes A, B and C fragments spread over the registers of the 32 threads of a warp. The shapes depend on the type:
+
+| PTX instruction | Types of A and B | Shapes (m n k) | Accumulator |
+|---|---|---|---|
+| `mma.sync` | FP16 | m8n8k4, m16n8k8, m16n8k16 | FP16 or FP32 |
+| `mma.sync` | BF16 | m16n8k8, m16n8k16 | FP32 |
+| `mma.sync` | TF32 | m16n8k4, m16n8k8 | FP32 |
+| `mma.sync` | INT8 | m8n8k16, m16n8k16, m16n8k32 | INT32 |
+| `mma.sync` | FP8 (E4M3, E5M2) | m16n8k32 (and m16n8k16 from PTX 8.7), sm_89 and later | FP32 or FP16 |
+| `wgmma.mma_async` (sm_90a) | FP16 | m64nNk16, N = 8 to 256 in steps of 8 | FP16 or FP32 |
+| `wgmma.mma_async` (sm_90a) | BF16 | m64nNk16, N = 8 to 256 in steps of 8 | FP32 |
+
+The Hopper `wgmma` instruction works on a **warpgroup**: four contiguous warps, 128 threads. Its B operand (and optionally A) comes straight from shared memory. The tile is larger, so the reuse is larger.
+
+A large GEMM is cut into such tiles. The 3D view below shows the iteration space of a small GEMM: one cube for every multiply-add $C_{ij} \mathrel{+}= A_{ik} B_{kj}$.
+
+<ArchParTiles3DDemo />
+
+1. Step through the tiles. For each output tile, the loop walks along k. The accumulator stays in registers, and only new pieces of A and B come in.
+2. Compare the tile volume (2,048 multiply-adds) with the two faces (384 inputs). The volume is the work; the faces are the data.
+3. Select **m8n8k4**. The tile volume drops to 256, but the faces drop only to 64. The ratio is worse.
+
+## Mixed precision
+
+Tensor cores take narrow inputs and accumulate in a wider format. Narrow inputs halve or quarter the bytes to move and the size of the multipliers. The accumulator needs more precision, because it adds thousands of products.
+
+| Format | Sign | Exponent bits | Fraction bits | Largest value |
+|---|---|---|---|---|
+| FP32 | 1 | 8 | 23 | $3.4 \times 10^{38}$ |
+| TF32 | 1 | 8 | 10 | about the same as FP32 |
+| FP16 | 1 | 5 | 10 | 65,504 |
+| BF16 | 1 | 8 | 7 | about the same as FP32 |
+| FP8 E4M3 | 1 | 4 | 3 | 448 |
+| FP8 E5M2 | 1 | 5 | 2 | 57,344 |
+
+**TF32** is FP32 with the fraction cut to 10 bits. Tensor cores accept it, so FP32 code can use them with no change to the data. **BF16** keeps the range of FP32 with less precision, so values rarely overflow. **FP8** comes in two variants (Micikevicius et al., "FP8 Formats for Deep Learning", 2022): E4M3 has more precision, and E5M2 has more range.
+
+<ArchParAccumDemo />
+
+1. At K = 4,096, the exact sum is 1,000.6. The FP32 accumulator is correct to about one part in a million.
+2. The FP16 accumulator gives 937.5, which is 6.3% too small. Near 1,000, the spacing of FP16 values is 0.5. Each product is about 0.25, so many of them are rounded away.
+3. The BF16 accumulator stops at 256, which is 74% too small. With 7 fraction bits, the spacing at 256 is 2, and a product below 1 cannot move the sum.
+4. Move K down to 64. All three accumulators are still close. The error grows with the length of the sum.
+
+So FP16 or FP8 inputs need an FP32 accumulator for long dot products. The inputs of the demo are FP16, and their products are exact in FP32. An FP16 value has 11 significant bits, so a product has at most 22. The rounding happens in the running sum.
+
+## Peak FLOPs is a product of units
+
+The peak of a GPU is the product of its unit counts and its clock:
+
+$$
+\text{peak} = \text{SMs} \times \text{tensor cores per SM} \times \text{FMA per clock} \times 2 \times \text{clock}
+$$
+
+For the A100: $108 \times 4 \times 256 \times 2 \times 1.41\ \text{GHz} = 311.9$ TFLOP/s. For the V100: $80 \times 8 \times 64 \times 2 \times 1.53\ \text{GHz} = 125.3$ TFLOP/s. These match the published 312 and 125 TFLOP/s. Each A100 tensor core does 4 times the work of a V100 tensor core per clock. So 4 of them per SM do twice the work of 8.
+
+<Predict
+  id="batch-one"
+  question="A language model generates one token at a time (batch 1). One layer multiplies a 4096 × 4096 FP16 weight matrix by one vector on an A100. What share of the 312 TFLOP/s peak can this GEMM reach?"
+  options={["About 50%", "About 10%", "Less than 1%"]}
+  answer={2}
+  explain="The layer does 2 FLOPs per weight, and each weight is 2 bytes that must come from DRAM: about 1 FLOP per byte. At 1,555 GB/s, that is 1.55 TFLOP/s, or 0.5% of the peak. The tensor cores wait for memory."
+>
+<ArchParBatchDemo />
+</Predict>
+
+1. Move the batch N from 1 to 64. The speed rises to 31% of the peak, but the time of the GEMM barely changes. The weights must cross DRAM once, whatever N is.
+2. At N = 128, the GEMM reaches 60%. From N = 223, it is compute bound. The ridge point of the A100 is 312 TFLOP/s ÷ 1,555 GB/s = 201 FLOP per byte.
+3. Select the V100. Its ridge point is lower, at 139 FLOP per byte. Its peak is 2.5 times lower than that of the A100, but its 900 GB/s of bandwidth is only 1.7 times lower.
+
+Tiles also waste work when the matrix does not fill them. A matrix-vector product with N = 1 on m16n8k16 tiles pads n from 1 to 8. Then 7 of every 8 multiply-adds are on zeros: 12.5% of the issued work is useful. A 100 × 100 × 100 GEMM uses 76.7% of its padded tiles.
+
+## Matrix units on CPUs
+
+CPUs have added the same kind of unit:
+
+- **Intel AMX** (from Sapphire Rapids) adds 8 tile registers, `tmm0` to `tmm7`. Each holds up to 16 rows of 64 bytes, which is 1 KiB. `ldtilecfg` sets their shapes. `tdpbf16ps` multiplies BF16 tiles into FP32, and `tdpbssd` multiplies INT8 tiles into INT32.
+- **Arm SME** (Scalable Matrix Extension) adds a **streaming SVE mode** and a two-dimensional array **ZA**. For a streaming vector length of SVL bytes, ZA holds SVL × SVL bytes. Outer-product instructions such as `fmopa` add an outer product of two vectors to a tile of ZA. LLVM lists SME and SME2 for the Apple M4.
+
+The pattern is the same everywhere: a large accumulator next to the multipliers, and narrow operands that stream past it.
+
+## What this means for your code
+
+- Use the libraries (cuBLAS, cuDNN, CUTLASS, oneDNN) or a compiler such as Triton. They choose tile shapes and data movement for each architecture.
+- Keep FP32 accumulation for long sums, even with FP16, BF16 or FP8 inputs.
+- Small batches are memory bound. Batching requests is often the largest speedup for inference.
+- Make matrix sizes multiples of the tile shapes, for example multiples of 8 or 16. Padding inside the library costs real time.
+
+## Connections
+
+- [Systolic arrays](/architecture/parallel/systolic-arrays) shows another way to build a matrix unit, used by the Google TPU.
+- [GPU architecture](/architecture/parallel/gpu-architecture) explains the SMs, registers and bandwidth that feed the tensor cores.
+- [SIMD and vector units](/architecture/parallel/simd-and-vector-units) introduces the roofline that this lesson applies to GEMMs.
+- [Cache-friendly code](/performance/memory/cache-friendly-code) uses the same blocking argument one level up.
+
+<Recall cards={[
+  { q: "Why does a matrix unit need much less register-file traffic than SIMD for the same multiply-adds?", a: "A tile of m × n × k does m·n·k multiply-adds but reads only m·k + k·n + m·n values. A vector FMA reads 3 values per multiply-add." },
+  { q: "How many values does an m16n8k16 MMA read, and how many multiply-adds does it do?", a: "512 values (256 of A, 128 of B, 128 of C) for 2,048 multiply-adds: 0.25 reads per multiply-add." },
+  { q: "What are the exponent and fraction widths of TF32 and BF16?", a: "TF32: 8 exponent bits and 10 fraction bits. BF16: 8 exponent bits and 7 fraction bits." },
+  { q: "Why accumulate in FP32 when the inputs are FP16?", a: "In a long sum, the running total grows until the spacing between FP16 values is larger than the products, which then round away. In the demo, an FP16 sum of 4,096 products is 6.3% too small." },
+  { q: "Compute the A100 dense FP16 tensor peak from its units.", a: "108 SMs × 4 tensor cores × 256 FMA per clock × 2 FLOPs × 1.41 GHz ≈ 312 TFLOP/s." },
+  { q: "Why does a batch-1 matrix-vector product reach less than 1% of the tensor peak?", a: "It does about 1 FLOP per byte of weights, far below the ridge point of about 200 FLOP per byte. It waits for DRAM." },
+]} />

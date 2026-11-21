@@ -1,0 +1,115 @@
+---
+summary: SIMT and the active mask, why an if/else in a warp runs both sides, reconvergence at the immediate post-dominator, loops with different trip counts, Volta's independent thread scheduling, and warp-level intrinsics.
+---
+import { ArchParDivergenceDemo, ArchParSimtStepperDemo } from "@/demos/arch/ArchParWarpDemos";
+
+NVIDIA calls its execution model **SIMT**: single instruction, multiple threads. You write the code for one thread. The hardware runs 32 threads of a warp with one instruction stream. Each thread has its own registers, so each thread can compute a different branch condition.
+
+When the threads of a warp disagree at a branch, the warp cannot go two ways at once. The hardware keeps an **active mask**: one bit for each of the 32 lanes. An instruction changes the registers only of the lanes whose bit is 1. The other lanes sit idle in that cycle. This is **divergence**.
+
+## Both sides of an if/else
+
+<Predict
+  id="divergence-one-lane"
+  question="A warp runs if (c) { 20 instructions } else { 20 instructions }. Lanes 0 to 30 take the if part, and only lane 31 takes the else part. How long does the warp take, compared with all lanes taking the if part?"
+  options={["About 3% longer", "About 2 times as long", "The same: lane 31 runs on its own lane"]}
+  answer={1}
+  explain="The warp issues the 20 instructions of the if part for 31 lanes. Then it issues the 20 instructions of the else part for 1 lane. With the branch and the jump, that is 42 issued instructions against 22: 1.91 times as long. One lane is enough to make the warp pay for both sides."
+>
+<ArchParDivergenceDemo />
+</Predict>
+
+1. Click **All lanes**. The warp skips the else part entirely: 22 instructions and 100% lane utilization.
+2. Click **lane < 16**. The time is again 42 instructions. The cost depends on whether the paths diverge, not on how many lanes take each path.
+3. Click **Even lanes**. The time is the same as lane < 16. The pattern of the lanes does not matter, only the outcome.
+4. Set both parts to 4 instructions and select **Even lanes**. The warp issues 10 instructions against 6 without divergence.
+5. Make the else part 1 instruction long. Divergence now costs almost nothing. Short, unbalanced branches are cheap.
+
+The cost of a divergent if/else is the sum of both sides, not the maximum. The idle lanes still use issue slots. For short bodies, the compiler often replaces the branch with **predicated** instructions. Each instruction carries a predicate register, and lanes where it is false do nothing. PTX writes this as `@p add.f32 ...`. Predication removes the branch, but both sides still issue.
+
+## Where do the paths meet again?
+
+After a divergent branch, the warp should run with all lanes again as soon as possible. The right meeting point is the **immediate post-dominator** (IPDOM) of the branch. A post-dominator of an instruction is an instruction that every path from it to the end of the program must pass. The immediate one is the nearest of these. For an if/else, it is the first instruction after both parts.
+
+The textbook model of older NVIDIA GPUs (before Volta) is a **reconvergence stack**. On real GPUs, the compiler marks the reconvergence points. Fung, Sham, Yuan and Aamodt describe this stack as the baseline in "Dynamic Warp Formation and Scheduling for Efficient GPU Control Flow" (MICRO 2007). At a divergent branch, the hardware:
+
+<Steps>
+<div>Changes the PC of the top entry to the IPDOM. This entry now waits there with the full mask.</div>
+<div>Pushes one entry for each path, with its own mask and the IPDOM as its reconvergence PC.</div>
+<div>Runs the top entry. When its PC reaches its reconvergence PC, it pops the entry.</div>
+<div>When both paths are popped, the waiting entry runs with the full mask again.</div>
+</Steps>
+
+<ArchParSimtStepperDemo />
+
+1. Step through **if / else** with x = lane. The odd lanes jump to 4 and the even lanes fall through. Watch two entries appear on the stack, then disappear at instruction 5. The run issues 7 instructions at 71% lane utilization.
+2. Select **nested if**. The inner branch pushes its own entries on top of the outer ones. The stack is as deep as the nesting.
+3. Select **loop of x trips** with x = lane. Lane 7 runs 7 trips, and lane 0 runs none. The lanes that leave the loop wait at instruction 5 until the last lane is done. The run issues 33 instructions at 58% utilization.
+4. Select **x = 3 for all**. All lanes take the same path, and the stack never grows.
+5. Select **spin lock** and step to the end. Read on to see why this warp never finishes.
+
+The rule for loops: a warp runs as many trips as its slowest lane. Lanes with fewer trips wait. Sort or bin work items so that the threads of one warp do similar amounts of work.
+
+## Volta: independent thread scheduling
+
+The stack has a hidden problem. Look at the spin lock:
+
+```cpp
+while (atomicCAS(&lock, 0, 1) != 0) { }  // spin until we get the lock
+count = count + 1;                       // critical section
+atomicExch(&lock, 0);                    // release
+```
+
+One lane wins the compare-and-swap. The other lanes take the loop branch back. The IPDOM of that branch is the instruction after the loop. So the winner waits there, and the stack keeps running the loop for the losers. They spin on a lock that the winner can never release. The warp hangs.
+
+Volta (2017) introduced **independent thread scheduling**. The V100 whitepaper says that each thread now has its own program counter and call stack. The scheduler can run the divergent groups of a warp in turns, so the winner finishes the critical section and releases the lock. Select **Independent threads (model)** in the demo. The spin lock now finishes, with count = 8.
+
+This has a cost. The hardware no longer promises that the lanes meet again at the IPDOM. Select **loop of x trips** with the independent model.
+
+The lanes that leave the loop early run the code after the loop alone. The warp issues 54 instructions at 35% utilization, against 33 with the stack. Select **loop + __syncwarp**. The early lanes wait at `__syncwarp()`, the warp meets again, and it issues 41 instructions.
+
+The scheduler of the demo is a model: it runs the groups of lanes in turn, in order of their PC. NVIDIA does not publish its real policy. But the lesson for code holds on real hardware. Since Volta, code must not assume that the 32 threads of a warp run in lockstep. Old "warp-synchronous" code that shares data through memory without a barrier can break.
+
+## Warp-level intrinsics
+
+CUDA 9.0 added `_sync` versions of the warp intrinsics, with a mask of the lanes that must take part. It deprecated the old forms without a mask. On devices of compute capability 7.x and later, the old forms are not available.
+
+- **Vote**: `__all_sync`, `__any_sync` and `__ballot_sync` combine one predicate from each lane. `__ballot_sync` returns a 32-bit mask.
+- **Shuffle**: `__shfl_sync`, `__shfl_up_sync`, `__shfl_down_sync` and `__shfl_xor_sync` read a register of another lane. No shared memory is needed.
+- **Mask**: `__activemask()` returns the lanes that are active now.
+
+```cpp
+// Sum of one float per lane. After 5 steps, lane 0 holds the total.
+__device__ float warp_sum(float v) {
+    for (int d = 16; d > 0; d /= 2)
+        v += __shfl_down_sync(0xffffffff, v, d);
+    return v;
+}
+```
+
+The reduction needs $\log_2 32 = 5$ steps. Each step is one shuffle and one add for the whole warp, so it is much faster than a reduction through shared memory.
+
+AMD hardware makes the mask visible in its ISA. The **EXEC** register on GCN and CDNA is a 64-bit mask, one bit per lane of a wavefront. The compiler saves and changes EXEC around each divergent branch, so the stack lives in ordinary scalar registers.
+
+## What this means for your code
+
+- Divergence costs the sum of both paths. Move work out of rare branches, or handle the rare case in a second kernel.
+- Make the branch condition uniform across a warp when you can. In a one-dimensional block, a condition on `blockIdx` or on `threadIdx.x / 32` never diverges inside a warp.
+- Balance loop trip counts within a warp: sort by length, or split long work items.
+- Use the `_sync` intrinsics with an explicit mask, and use `__syncwarp()` when lanes of one warp share data through memory.
+
+## Connections
+
+- [GPU architecture](/architecture/parallel/gpu-architecture) explains the warp schedulers and the register file that hold all these lanes.
+- [SIMD and vector units](/architecture/parallel/simd-and-vector-units) shows masks on CPUs: AVX-512 mask registers and SVE predicates follow the same idea, but the programmer or compiler manages them.
+- [Branch prediction and branchless code](/performance/cpu/branch-prediction-and-branchless-code) is the CPU view of the same trade: compute both sides and select.
+- [Mutexes](/concurrency/locks/mutexes) and [futexes](/os/sync/futexes) show why progress guarantees matter for locks.
+
+<Recall cards={[
+  { q: "What does the active mask of a warp do?", a: "It has one bit per lane. An instruction changes the registers only of the lanes whose bit is 1; the other lanes are idle in that cycle." },
+  { q: "What does a divergent if/else cost a warp?", a: "The sum of both sides, because the warp issues the if part for some lanes and then the else part for the others." },
+  { q: "Where does a pre-Volta warp reconverge after a branch?", a: "At the immediate post-dominator of the branch: the nearest instruction that every path from the branch must pass." },
+  { q: "Why can a spin lock inside one warp hang on a GPU with a reconvergence stack?", a: "The lane that wins the lock waits at the reconvergence point after the loop, while the stack keeps running the losers in the loop. The winner can never release the lock." },
+  { q: "What did Volta's independent thread scheduling change, and what does code now need?", a: "Each thread has its own PC and call stack, so divergent groups can run in turns. Lanes no longer reconverge for sure, so code needs __syncwarp() and the _sync intrinsics with a mask." },
+  { q: "How many shuffle steps does a sum over 32 lanes need?", a: "$\\log_2 32 = 5$, with offsets 16, 8, 4, 2 and 1." },
+]} />

@@ -1,0 +1,160 @@
+---
+summary: "Hardware as code you can run: Verilog modules, wires and regs, combinational and clocked logic, how a simulator settles the logic and fires the clock edge, the blocking and nonblocking swap bug, a state machine, and the HDLs beyond Verilog."
+---
+import { ArchHwPlayground, ArchHwSwapDemo, ArchHwFsmDemo } from "@/demos/arch/ArchHwVerilogDemos";
+
+A **hardware description language** (HDL) describes circuits as text. The text looks like a program, but it does not run line by line. Each statement describes a piece of hardware, and all the pieces work at the same time. The two main HDLs are Verilog and VHDL.
+
+The same text has two uses. A **simulator** runs it on your computer, so you can test the design before you build it. A **synthesis** tool turns it into gates for a chip or an FPGA (the next two lessons). This lesson is about the first use. The demos run a small Verilog simulator that this site implements in TypeScript.
+
+## A module is a circuit
+
+A Verilog **module** is a box with **ports**: inputs and outputs. Inside, you declare signals and connect them. This is a 4-bit counter:
+
+```verilog
+module counter(input clk, input rst, input en,
+               output reg [3:0] q, output wrap);
+  always @(posedge clk)
+    if (rst) q <= 4'd0;
+    else if (en) q <= q + 4'd1;
+
+  assign wrap = en && (q == 4'd15);
+endmodule
+```
+
+- `[3:0]` gives a signal 4 bits, numbered 3 down to 0. `4'd15` is a **sized literal**: 4 bits, decimal 15. `8'hFF` is 8 bits in hex.
+- A `wire` is a connection. Something must drive it all the time, for example an `assign`.
+- A `reg` is a variable that keeps its value until a block writes it again. The name is misleading. A `reg` becomes a hardware register only when a clocked block writes it.
+
+There are two kinds of logic in this module. **Combinational logic** has no memory: its output is a function of its inputs now. The `assign` line is combinational. **Sequential logic** has memory. The `always @(posedge clk)` block runs only at the **rising edge** of the clock, the moment when `clk` changes from 0 to 1.
+
+The memory element is a **flip-flop**. At each rising edge, it copies its input D to its output Q, and Q then holds until the next edge. The input must be stable for a short time before the edge (the **setup time**) and after it (the **hold time**). Static timing analysis checks these times, after synthesis and again after place and route; a simulator at this level assumes that they are met.
+
+<Predict
+  id="hw-counter-en"
+  question="The counter's en input is 0 in cycles 6, 7 and 8. The counter shows 5 in cycle 6. What does q show in cycle 9?"
+  options={["8: the counter keeps counting inside", "5", "6"]}
+  answer={1}
+  explain="q changes only at a rising edge, and the block adds 1 only when en is 1 at that edge. The edges at the ends of cycles 6, 7 and 8 all see en = 0, so q holds 5. It shows 6 in cycle 10."
+>
+<ArchHwPlayground />
+</Predict>
+
+Things to try:
+
+1. Click cycle 9 in the waveform and read the values. Then click cycle 19: `wrap` is 1 while q is 15, before the edge that takes q back to 0.
+2. Select **LFSR**. The 4-bit register visits all 15 non-zero values before it repeats. Real chips use the same circuit for test patterns and scramblers.
+3. Delete a semicolon. The simulator reports the line. Then write `#1` before a value: delays are left out, because synthesis ignores them.
+4. Change `q <= q + 4'd1` to `q <= q + 4'd3`. Edit the code, and the waveform follows at once.
+
+## How a simulator runs the design
+
+The simulator in the demos works in cycles. Each cycle has two phases:
+
+1. **Settle.** Set the inputs. Then run the combinational logic until no signal changes. Each `assign` and each `always @*` block runs only when one of its inputs has changed. The simulator sorts them so that a writer runs before its readers, so a design with no loop settles in one pass. A loop that does not settle is an error, as it would oscillate in real hardware.
+2. **Edge.** Run every `always @(posedge clk)` block, apply their writes, and settle again.
+
+The waveform shows each signal after the settle phase, just before the edge at the end of the cycle. A real Verilog simulator is event-driven and has a finer model of time. For a synchronous design with one clock, it gives the same values at each edge. The demo simulator has two states per bit, 0 and 1. Real Verilog has four: 0, 1, x (unknown) and z (not driven). So a `reg` starts at 0 here, and at x in a real simulator.
+
+| In the subset | Left out (an error with the line) |
+|---|---|
+| one module with ANSI ports, `wire`, `reg`, memories, up to 32 bits | x and z, `initial`, delays (`#`), `$display` |
+| `assign`, `always @(posedge clk)`, `always @*` | `negedge`, asynchronous reset, several clocks |
+| `if`, `case`, `=` and `<=` | `for`, `casez`, functions, tasks, module instances |
+| `+ - & \| ^ ~ << >> >>>`, comparisons, `?:`, selects, `{a, b}`, `$signed` | `*`, `/`, `%` |
+
+## Blocking and nonblocking assignment
+
+Verilog has two assignment operators. A **blocking** assignment `a = b` writes `a` at once, and the next statement sees the new value. A **nonblocking** assignment `a <= b` works in two steps. First it reads `b` and remembers the value. Then, after all blocks have run for this edge, it writes `a`. This is the scheduling rule of the standard (IEEE 1364, "Scheduling semantics").
+
+<Predict
+  id="hw-swap"
+  question="At a clock edge, a = 1 and b = 2. One always @(posedge clk) block runs a = b; then b = a; with blocking assignments. What are a and b after the edge?"
+  options={["a = 2, b = 1: they swap", "a = 2, b = 2", "a = 1, b = 1"]}
+  answer={1}
+  explain="The first statement writes a = 2 at once. The second statement reads the new a, so b = 2. The value 1 is lost. With nonblocking assignments, both right sides are read before any write, so the registers swap."
+>
+<ArchHwSwapDemo />
+</Predict>
+
+1. Step through the nonblocking swap. Lines 5 and 6 only queue their writes. The writes apply after both statements, so a and b swap on every edge.
+2. Select **blocking `=`** and step again. Line 5 changes a at once, and line 6 copies the new a. Both registers hold 2 from then on.
+3. Select **two always blocks** with **blocking `=`**. The result now depends on which block runs first. This simulator runs them in source order. A real simulator may pick either order, so the design has a **race**.
+4. Select **two always blocks** with **nonblocking `<=`**. The order of the blocks no longer matters. This is why the rule exists.
+
+The nonblocking rule copies what flip-flops do. All flip-flops sample their inputs at the same edge, and their outputs change a little later. A software analogy is double buffering: every block reads the old frame and writes the new one.
+
+Clifford Cummings wrote the usual coding guidelines in "Nonblocking Assignments in Verilog Synthesis, Coding Styles That Kill!" (SNUG 2000). Guideline 1: use nonblocking assignments for sequential logic. Guideline 3: use blocking assignments in a combinational `always` block. The demo simulator warns when code breaks either rule.
+
+## A state machine
+
+A **finite state machine** (FSM) is a state register plus combinational logic. The **next-state logic** computes the next state from the current state and the inputs. In a **Moore** machine, the outputs depend only on the state. This one finds the bit pattern 1011 in a serial input:
+
+```verilog
+always @* begin
+  case (state)
+    IDLE:  next = din ? S1    : IDLE;
+    S1:    next = din ? S1    : S10;
+    S10:   next = din ? S101  : IDLE;
+    S101:  next = din ? S1011 : S10;
+    S1011: next = din ? S1    : S10;
+    default: next = IDLE;
+  endcase
+end
+always @(posedge clk) state <= rst ? IDLE : next;
+assign found = state == S1011;
+```
+
+Each state name records how much of the pattern the machine has seen. After 1011, an input of 0 leaves the suffix 10, so the machine goes to S10 and not to IDLE. That is how it finds patterns that overlap.
+
+<ArchHwFsmDemo />
+
+1. Move the cycle slider. The thick arrow is the edge that the current input selects. The state changes only at the edge.
+2. The default input contains 1011 three times. `found` is 1 in cycles 5, 8 and 15. The patterns that end in cycles 4 and 7 overlap.
+3. Click input bits to make a new pattern. Can you make `found` 1 in two cycles in a row? You cannot: after S1011, every input leads to S1 or S10.
+4. Note that `found` comes one cycle after the last input bit. That is the cost of a Moore output. A **Mealy** machine computes its output from the state and the input, so it can answer in the same cycle.
+
+## Simulation and synthesis
+
+Verilog was designed for simulation first. Synthesis tools accept a subset of it, and the subsets are not the same:
+
+| Construct | Simulation | Synthesis |
+|---|---|---|
+| `#5` delay | waits 5 time units | ignored: real gate delays come from the cells |
+| `initial` block | runs once at time 0 | ignored by many flows, or used for FPGA power-up values |
+| `$display` | prints | ignored |
+| `always @(posedge clk)` | runs at each edge | flip-flops |
+| `always @*` with a path that does not assign `y` | `y` keeps its value | a latch (see [Synthesis](/architecture/hw-design/synthesis)) |
+
+So a test bench, the code that drives a design in simulation, can use the whole language. The design itself must stay in the synthesizable subset. Verilog-2001 (IEEE 1364-2001) added `always @*`, `$signed` and signed declarations. IEEE 1364-2005 was the last Verilog standard on its own. In 2009 it merged into SystemVerilog, IEEE 1800.
+
+## Other HDLs
+
+| Language | Based on | Notes |
+|---|---|---|
+| VHDL | Ada-like syntax | IEEE 1076. Strongly typed and verbose. Common in Europe and in defense and aerospace. |
+| SystemVerilog | Verilog | IEEE 1800. Adds `logic`, `always_ff`, `always_comb`, interfaces, assertions and a large test bench language. |
+| Chisel | Scala | Berkeley, DAC 2012. A Scala program builds the circuit, then emits Verilog. Used for the Rocket and BOOM RISC-V cores. |
+| SpinalHDL | Scala | A set of Scala libraries; VexRiscv is written in it. |
+| Amaranth | Python | Formerly nMigen. Python code builds the circuit. |
+| Clash | Haskell | Compiles Haskell functions to VHDL, Verilog or SystemVerilog. |
+
+The newer languages are **generators**: a program in a general-purpose language runs and builds the circuit. Loops and functions in the host language make many copies of hardware. The output is usually plain Verilog or VHDL, so the rest of the flow does not change.
+
+## What this means for your code
+
+- **Think in signals over time.** Each line is a circuit that always works. A waveform, not a stack trace, is the main debugging tool.
+- **Concurrency is the default.** Two `always` blocks are two circuits that run in parallel. A shared variable with blocking writes is a race, as in [Race conditions](/concurrency/foundations/race-conditions).
+- **Nonblocking in clocked blocks, blocking in combinational blocks.** Most beginner bugs break this rule.
+- **Simulate first.** A simulation run takes seconds. A synthesis run takes minutes to hours, and a chip takes months.
+
+Next: [Synthesis](/architecture/hw-design/synthesis) turns this code into gates. The [single-cycle datapath](/architecture/datapath/single-cycle-datapath) and its [control unit](/architecture/datapath/control-unit) are the circuits that [Building a RISC-V core](/architecture/hw-design/building-a-risc-v-core) writes in this Verilog subset.
+
+<Recall cards={[
+  { q: "What is the difference between a wire and a reg in Verilog?", a: "A wire is a connection that something drives all the time, such as an assign. A reg keeps the last value that a block wrote. It becomes a flip-flop only when a clocked block writes it." },
+  { q: "What are the two phases of each cycle in the demo simulator?", a: "Settle: run the combinational logic until no signal changes. Edge: run the clocked blocks, apply their writes, and settle again." },
+  { q: "Why does a <= b; b <= a; swap two registers, but a = b; b = a; does not?", a: "A nonblocking assignment reads its right side at once but writes after all blocks have run, so both reads see the old values. A blocking assignment writes at once, so the second statement reads the new a." },
+  { q: "What are Cummings's guidelines 1 and 3?", a: "Use nonblocking assignments for sequential logic. Use blocking assignments in a combinational always block." },
+  { q: "Why does the 1011 detector go from S1011 to S10, not to IDLE, on an input of 0?", a: "The last two inputs are 1 and 0, which are the start of the pattern. The state records the longest suffix of the input that is a prefix of the pattern, so overlapping patterns are found." },
+  { q: "Name two constructs that simulate but do not synthesize to logic.", a: "Delays (#5) and $display. Synthesis ignores them. An initial block is ignored by many flows or used only for FPGA power-up values." },
+]} />

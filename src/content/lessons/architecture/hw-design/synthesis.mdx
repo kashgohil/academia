@@ -1,0 +1,129 @@
+---
+summary: "From Verilog to gates: two-level minimization with Karnaugh maps and Quine-McCluskey, what each construct becomes, static timing and the critical path, ripple-carry against Kogge-Stone adders, and the latch that an incomplete if infers."
+---
+import { ArchHwKmapDemo, ArchHwAdderTimingDemo, ArchHwLatchDemo } from "@/demos/arch/ArchHwSynthDemos";
+
+**Synthesis** turns a register-transfer level (RTL) description into a **netlist**: a list of gates and flip-flops and the wires between them. RTL means that the code describes registers and the logic between them. Synthesis does not describe transistors or wire lengths. Those come later, in place and route.
+
+A synthesis flow has a few steps:
+
+1. **Elaborate.** Parse the code, resolve widths and signedness, and find the registers and the combinational logic.
+2. **Optimize.** Simplify the logic: share equal parts, remove constants, and restructure it to be smaller or faster.
+3. **Map.** Express the logic with the cells that the target has. An ASIC library has gates such as NAND2 and full adders. An FPGA has lookup tables (see [FPGAs](/architecture/hw-design/fpgas)).
+4. **Check timing.** Find the slowest path and compare it with the clock period.
+
+This lesson builds each step at a small scale. The demos run a synthesizer in TypeScript on the same Verilog subset as the [previous lesson](/architecture/hw-design/hdls-verilog-basics).
+
+## Two-level logic
+
+Any function of a few bits can be written as a **sum of products** (SOP): an OR of AND terms. The simplest SOP has one AND term for each row of the truth table where the output is 1. Each term is a **minterm**, and it uses every input once. That works, but it is large. Minimization finds a smaller SOP with the same truth table.
+
+A **Karnaugh map** (Karnaugh, 1953) draws the truth table as a grid. The rows and columns go in Gray code, so two neighbouring cells differ in one input. Two neighbouring 1s can merge into one term without that input: $AB'CD + AB'CD' = AB'C$. A group of 4 drops two inputs. The map wraps around at its edges.
+
+<Predict
+  id="hw-kmap"
+  question="A 4-input function is 1 for 10 of its 16 input combinations. The sum of minterms has 10 product terms. How many product terms does the smallest sum of products need?"
+  options={["10: each 1 needs its own term", "5", "3"]}
+  answer={2}
+  explain="The ones form three groups. Four cells B'C' wrap from the top row to the bottom row. There is also a column of four CD', and a pair A'BD. Every 1 is in a group, so three terms cover the function. The 2-input gate count drops from 39 to 6."
+>
+<ArchHwKmapDemo />
+</Predict>
+
+Things to try:
+
+1. Read the colours. Each colour is one product term, and the dots show which terms cover each cell. The cells 0, 2, 8 and 10 are neighbours because the map wraps.
+2. Click **Parity**. No two 1s are neighbours, so nothing merges. Parity needs 8 terms and 31 two-input gates as an SOP. An XOR tree needs only 3 gates.
+3. Click a 0 twice to make it an **x**: an input whose output does not matter. The minimizer may count it as 1 if that makes a group larger. An x comes from an input that never occurs, such as a state code that the FSM never uses.
+4. Switch to 3 inputs and enter the majority function (cells 3, 5, 6 and 7). The result is $AB + AC + BC$.
+
+The demo uses the **Quine-McCluskey** method (Quine 1952, McCluskey 1956). It is the K-map in table form, so a program can run it:
+
+<Steps>
+<div>List the minterms and the x cells. Merge every pair that differs in exactly one bit. Mark the merged bit as a dash: 0101 and 0111 give 01-1.</div>
+<div>Repeat with the merged terms until nothing merges. The terms that never merged are the <b>prime implicants</b>: groups that cannot grow.</div>
+<div>A prime that is the only one to cover some minterm is <b>essential</b>. Take all essential primes.</div>
+<div>Cover the remaining minterms with the fewest other primes. Petrick's method (1956) solves this exactly. The demo searches all subsets, which is fast for 4 inputs.</div>
+</Steps>
+
+The last step is a set-cover problem, which is NP-hard. The number of primes can also grow exponentially with the number of inputs. So real tools do not minimize large functions exactly. They use heuristics, and they work on **multi-level** logic, where gates feed gates and shared parts are computed once. The ABC system from Berkeley, which the open Yosys flow calls, works this way.
+
+## What each construct becomes
+
+| Verilog | Hardware |
+|---|---|
+| `assign y = a & b;` | one AND gate per bit |
+| `if (c) y = a; else y = b;` | a 2-to-1 multiplexer per bit, with c as select |
+| `case (s)` with N items | a chain or tree of multiplexers, and a comparator per label |
+| `a + b` | an adder: a ripple-carry chain, or a faster parallel-prefix tree |
+| `a < b` | a subtractor; for unsigned operands the borrow out is the answer, and a signed compare also uses the sign bits |
+| `x << 3` | wires only: a shift by a constant moves bits |
+| `x << n` | a barrel shifter: one row of multiplexers per bit of n |
+| `always @(posedge clk) q <= d;` | one flip-flop per bit of q |
+
+The synthesizer in the demos shares equal gates (**structural hashing**) and folds constants. For example, `x & 0` becomes 0, and `x ^ x` becomes 0. A real tool does much more, but these two steps already remove most of the waste that a direct translation makes.
+
+## Timing: the critical path
+
+A combinational path starts at an input or a flip-flop output and ends at an output or a flip-flop input. Its **delay** is the sum of the gate delays along it. The **arrival time** of a gate is the latest arrival of its inputs plus its own delay. One pass over the gates in order computes every arrival time. This is **static timing analysis**: it needs no input values.
+
+The longest path is the **critical path**, and it sets the shortest clock period:
+
+$$
+T_{clk} \ge t_{clk \to Q} + t_{path} + t_{setup}
+$$
+
+The flip-flop needs $t_{clk \to Q}$ to show its new value, and the next flip-flop needs $t_{setup}$ before the edge.
+
+The demo uses a simple delay model. The gate delays are **model inputs**, in units of τ (one simple gate delay): AND and OR take 1 τ, XOR and MUX take 1.5 τ, and NOT takes 0.5 τ. They are not the numbers of any real cell library.
+
+<Predict
+  id="hw-adder-delay"
+  question="In the demo's model, a 32-bit ripple-carry adder has a critical path of 63 τ. A Kogge-Stone adder computes the same sum. What is its critical path?"
+  options={["About 32 τ, half as long", "12 τ", "63 τ: the sum needs every carry anyway"]}
+  answer={1}
+  explain="The ripple carry passes through every bit, 2 gates per bit, so the delay grows as 2w − 1. Kogge-Stone combines carry information over spans of 1, 2, 4, 8 and 16 bits. So the path has $\\log_2 32 = 5$ levels of carry logic: 12 τ in total. It costs 436 gates against 154."
+>
+<ArchHwAdderTimingDemo />
+</Predict>
+
+1. Move the width from 2 to 32 with **ripple-carry**. The delay is $2w - 1$ τ: 15 τ at 8 bits, 31 τ at 16 bits and 63 τ at 32 bits.
+2. Select **Kogge-Stone**. From 4 bits up, the delay is $2 \log_2 w + 2$ τ: 8 τ at 8 bits and 12 τ at 32 bits. The curve is almost flat.
+3. Compare the gate counts at 32 bits: 154 against 436. The fast adder is about 5 times faster and almost 3 times larger.
+4. At 4 or 8 bits, read the thick path in the netlist. In the ripple adder it climbs through every carry gate. In the Kogge-Stone adder it is short and wide.
+
+**Why the ripple adder is slow.** Bit i of the sum needs the carry into bit i, and that carry needs the carry into bit i − 1. So the carry ripples through every bit. Kogge and Stone (1973) showed how to compute such a chain as a parallel prefix. Each bit has a **generate** signal $g = ab$ (this bit makes a carry) and a **propagate** signal $p = a \oplus b$ (this bit passes a carry on). Level k of the tree combines spans of $2^k$ bits, so $\log_2 w$ levels give every carry.
+
+Other prefix adders use fewer gates. They pay with more levels, as Brent-Kung does, or with high fan-out, as Sklansky does. Synthesis tools pick an adder architecture to meet the timing that you ask for. This is the main trade in synthesis: area against delay.
+
+## What does not synthesize: the inferred latch
+
+A combinational `always @*` block must assign every output on every path. If some path does not assign `y`, then `y` must keep its old value in that case. Plain gates cannot remember anything, so synthesis builds a **latch**: a storage element that is open while an enable signal is 1.
+
+<ArchHwLatchDemo />
+
+1. Read the shaded cycles. In each one, `sel` is 2 or 3, no branch assigns `y`, and `y` keeps its value from the cycle before.
+2. Read the netlist. The inputs `y (held)` are the latch's own output, fed back into its multiplexers.
+3. Check **Assign a default first**. Every path now assigns `y`, the feedback goes away, and the warning goes away. In the shaded cycles `y` is 0.
+4. Delete the default line by hand and add `else y = 2'd3;` at the end of the chain. That also removes the latch.
+
+Latches are legal hardware, but in a synchronous design an inferred latch is almost always a bug. Its output can change at any time while it is open, so timing analysis is harder. FPGA tools warn about them, and lint tools flag them. SystemVerilog adds `always_comb`, which lets a tool report the problem at the source.
+
+Other constructs that simulate but do not become logic: delays such as `#5`, `$display`, and most `initial` blocks. Division and modulo by a variable are legal in many tools, but they build very large circuits.
+
+## What this means for your code
+
+- **Every operator is hardware.** A `+` is an adder and a `case` is a multiplexer tree. Wide comparisons and variable shifts cost real area.
+- **The slowest path sets the clock for everything.** One long carry chain slows the whole design. That is why [pipelines](/architecture/pipelining/five-stage-pipeline) cut long paths with registers.
+- **Give every combinational output a default.** Assign it at the top of the block, then override it.
+- **Software has the same trade.** A parallel prefix sum on a GPU or with SIMD does more work in fewer steps, exactly like the Kogge-Stone adder. See [Instruction-level parallelism](/performance/cpu/instruction-level-parallelism).
+
+The [single-cycle datapath](/architecture/datapath/single-cycle-datapath) shows the critical path of a whole processor. [FPGAs](/architecture/hw-design/fpgas) maps these gates to lookup tables.
+
+<Recall cards={[
+  { q: "What is a prime implicant, and what makes one essential?", a: "A product term that covers only ones and x cells and cannot be merged into a larger group. It is essential if it is the only prime that covers some minterm." },
+  { q: "Why do real synthesis tools not minimize large functions with Quine-McCluskey?", a: "The number of primes can grow exponentially, and choosing the smallest cover is a set-cover problem, which is NP-hard. Tools use heuristics on multi-level logic instead." },
+  { q: "What sets the minimum clock period of a synchronous circuit?", a: "The critical path: clock-to-Q of the launching flip-flop, plus the longest combinational delay, plus the setup time of the capturing flip-flop." },
+  { q: "Why does a ripple-carry adder grow linearly in delay, and how does Kogge-Stone avoid it?", a: "Each carry needs the carry before it. Kogge-Stone computes generate and propagate over spans that double at each level. All carries are ready after $\\log_2 w$ levels, at the cost of more gates." },
+  { q: "When does synthesis infer a latch from an always @* block, and how do you prevent it?", a: "When some path through the block does not assign an output, so the output must keep its old value. Assign a default at the top of the block, or give every if an else and every case a default." },
+]} />

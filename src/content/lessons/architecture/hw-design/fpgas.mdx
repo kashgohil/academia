@@ -1,0 +1,123 @@
+---
+summary: "How a chip becomes any circuit: the LUT as a 16- or 64-bit memory, slices with flip-flops and carry chains, block RAM and DSP blocks, technology mapping with cuts, placement by simulated annealing, routing as most of the delay, the bitstream, and the open toolchain."
+---
+import { ArchHwLutDemo, ArchHwMapDemo, ArchHwPlaceDemo } from "@/demos/arch/ArchHwFpgaDemos";
+
+A **field-programmable gate array** (FPGA) is a chip that can become almost any digital circuit. It has a large grid of small configurable logic blocks, and a network of programmable wires between them. A file called the **bitstream** sets every configuration bit. On most FPGAs, the configuration is in SRAM, so the chip loads the bitstream again at each power-on.
+
+The same [synthesis](/architecture/hw-design/synthesis) flow builds a design for an FPGA or for a custom chip (an **ASIC**, application-specific integrated circuit). Only the last steps differ. An ASIC flow maps to standard cells and makes masks, which takes months. An FPGA flow maps to the blocks that the FPGA has and writes a bitstream, which takes minutes to hours.
+
+## A LUT is a small memory
+
+The basic logic element is a **lookup table** (LUT). A k-input LUT is a memory of $2^k$ bits. The k inputs form an address, and the output is the bit at that address. So the memory holds the truth table of the function, and one LUT can compute any function of its k inputs.
+
+<Predict
+  id="hw-lut-count"
+  question="How many different Boolean functions of 4 inputs can one 4-input LUT compute?"
+  options={["16, one for each memory bit", "65,536", "Only the common ones, such as AND, OR and XOR"]}
+  answer={1}
+  explain="The LUT holds 16 bits, and each pattern of 16 bits is a different truth table. So there are $2^{16}$ = 65,536 functions, and the LUT computes every one of them in the same time."
+>
+<ArchHwLutDemo />
+</Predict>
+
+Things to try:
+
+1. Toggle the inputs. Each input drives one level of 2-to-1 multiplexers: D the first level, A the last. The highlighted path goes from one memory bit to the output.
+2. Click the presets. **AND** has one 1 in its table, at address 15. **XOR** has eight 1s, and no two of them are neighbours. Both take one LUT and the same time. As a sum of products, AND needs 1 term and XOR needs 8.
+3. Click memory bits to make your own function. The caption shows the minimal sum of products of whatever you enter.
+4. Read the hex value under the tree. AMD tools write the same 16 bits as the `INIT` attribute of a `LUT4` primitive.
+
+A LUT is a memory followed by a multiplexer tree. That is why its delay does not depend on the function. A 4-LUT has 15 two-to-1 multiplexers, and a 6-LUT has 63. The cost grows as $2^k$, so vendors stopped at 6 inputs. Some combine two LUTs to make wider functions.
+
+## Inside a real FPGA
+
+| Family | Logic element | Per block |
+|---|---|---|
+| AMD 7 series (UG474) | 6-input LUT, which can also act as two 5-input LUTs with shared inputs | a CLB has 2 slices; a slice has four 6-LUTs, 8 flip-flops and a 4-bit carry chain (CARRY4) |
+| AMD UltraScale (UG574) | 6-input LUT | a CLB has 1 slice with eight 6-LUTs, 16 flip-flops and an 8-bit carry chain (CARRY8) |
+| Intel Stratix 10 | ALM: an 8-input fracturable LUT that does any 6-input function | 4 registers per ALM |
+| Lattice iCE40 (DS-02029) | logic cell: one 4-input LUT, one D flip-flop and carry logic | a PLB has 8 logic cells |
+
+Each LUT has a flip-flop next to it, so a register costs almost nothing. The **carry chain** is a dedicated fast path for the carry of an adder. It runs straight up through the slices, with no programmable routing in it. In the 7 series, some slices (SLICEM) can also use their LUTs as 64-bit RAMs or as 32-bit shift registers (SRL32).
+
+FPGAs also have **hard blocks**: fixed circuits for jobs that LUTs do badly.
+
+- **Block RAM.** A 7-series block RAM stores 36 Kb. It can split into two 18 Kb RAMs, and it has two independent ports (UG473). An iCE40 embedded RAM block has 4 Kb.
+- **DSP slices.** A 7-series DSP48E1 has a 25 × 18 two's-complement multiplier and a 48-bit accumulator (UG479). A multiplier built from LUTs would be much larger and slower.
+- **Clock management, high-speed transceivers and I/O.** Larger parts also add hard processor cores and memory controllers.
+
+## Technology mapping
+
+**Technology mapping** covers the gate netlist with LUTs. A LUT can hold any group of gates whose inputs, from outside the group, number at most k. Such a set of inputs is a **cut**. The mapper picks one cut for each LUT that it needs. The aim is usually the fewest **LUT levels** on the critical path, and then the fewest LUTs.
+
+<Predict
+  id="hw-map-levels"
+  question="A 4-bit adder synthesizes to 17 gates in 7 levels. It is mapped to 4-input LUTs. How many LUT levels does the critical path have?"
+  options={["7: one LUT per gate level", "3", "1: one LUT holds the whole adder"]}
+  answer={1}
+  explain="A 4-LUT can absorb several levels of gates, as long as the group has at most 4 inputs. The carry into bit 2 depends on a0, b0, a1 and b1, which fits one LUT. So the mapper needs 7 LUTs in 3 levels. One LUT cannot hold the adder: the carry out depends on all 8 inputs."
+>
+<ArchHwMapDemo />
+</Predict>
+
+1. Read the colours. Each colour is one LUT, and the gates inside it vanish into its truth table. The table under the netlist lists the inputs and the contents of each LUT.
+2. Move K from 3 to 6 with the 4-bit adder. The LUT levels drop from 4 to 2.
+3. Select the **4-to-1 mux**. With K = 6, one LUT holds a whole output bit: 4 data inputs and 2 select inputs. So the mux takes 2 LUTs in 1 level.
+4. Select the **8-bit adder**. With K = 3 it needs 17 LUTs in 8 levels. With K = 4 it needs 21 LUTs in 5 levels. The mapper copies gates into several LUTs to cut levels, so fewer levels can cost more LUTs.
+
+The mapper in the demo has three steps. It enumerates the cuts of each gate from the cuts of its inputs. It labels each gate with its best depth: one more than the deepest input of its best cut. With all cuts kept, this labelling gives the minimum depth. Cong and Ding proved this and computed it in polynomial time with network flow (FlowMap, IEEE TCAD 1994).
+
+The demo keeps the best 10 cuts per gate, as ABC does. Then it covers the netlist from the outputs and saves LUTs where the depth allows. The ABC system does this kind of mapping in the open Yosys flow (`abc -lut`).
+
+Step 4 shows why FPGAs have carry chains. A ripple carry through LUTs costs one LUT level per few bits. The CARRY4 chain computes 4 bits of carry per slice in dedicated logic, so synthesis maps most adders to it.
+
+## Placement and routing
+
+**Placement** decides which LUT site holds each LUT. **Routing** then connects them through programmable switches. Each switch and wire segment adds delay, so the distance between two LUTs matters. The classic placer, in VPR (Betz and Rose, 1997), uses **simulated annealing**. It swaps two blocks, keeps the swap if the total wire length drops, and sometimes keeps a worse swap to escape local minima. The chance of a worse swap falls as the temperature falls.
+
+The demo places the LUTs of a mapped design on a small grid. Its delays are **model inputs**: a LUT takes 1 unit, and a wire takes 0.3 units plus 0.25 per grid step. They are not the numbers of a real device.
+
+<ArchHwPlaceDemo />
+
+1. Start at round 0, a random placement. The critical path of the 8-bit adder is 14.05 units, and 64% of it is wire.
+2. Move the slider to round 30. Annealing cuts the critical path to 10.71 units. Wires are still 53% of it.
+3. Press **New random start** a few times. The start changes a lot, and the end changes little. That is the point of annealing.
+4. Select the **4-to-1 mux**. It has only 6 LUTs, so the gain is small.
+
+On a real FPGA, the timing report of Vivado splits the delay of each path into logic delay and route delay. It also gives the share of each. The placement and the routing can decide the clock rate as much as the logic does. A design that is fast in simulation can still fail timing after place and route.
+
+## The toolchain
+
+1. **Synthesis**: Verilog to a LUT netlist. Vendor tools: AMD Vivado, Intel Quartus. Open: Yosys.
+2. **Place and route**: the netlist onto the device. Open: nextpnr, a timing-driven tool that supports iCE40 and ECP5, among others.
+3. **Static timing analysis**: check every path against the clock.
+4. **Bitstream generation**: write the configuration bits. The formats are not public. Project IceStorm documented the iCE40 format, and Project Trellis documented the ECP5 format. These are what make a fully open flow possible.
+
+A small open design flows like this: `yosys -p "synth_ice40 -json top.json" top.v`, then `nextpnr-ice40 --up5k --package sg48 --pcf top.pcf --json top.json --asc top.asc`, then `icepack top.asc top.bin`. Give the device, package and pin file for your board.
+
+## FPGA, ASIC or CPU
+
+- **CPU.** Fixed hardware that runs any program. It is the cheapest choice for most jobs, and a programmer can change the program in seconds.
+- **FPGA.** Hardware that you can change in minutes. It wins when the job has fine-grained parallelism, needs a fixed latency of a few cycles, or uses custom bit widths. Examples are network packet processing, signal processing and chip prototypes. The programmable routing and LUTs make each function larger, slower and more power-hungry than the same function in custom silicon.
+- **ASIC.** The fastest and most efficient choice per function, but the masks are expensive and a change takes months. It pays only at high volume or for the highest performance.
+
+Most chip teams use all three. They test the RTL in simulation, then run it on an FPGA prototype for software bring-up, then make the ASIC.
+
+## What this means for your code
+
+- **Write for the hard blocks.** A `*` maps to a DSP slice, and a memory array with a clocked read port maps to block RAM. Code that hides these patterns gets LUTs instead.
+- **Register the outputs of long paths.** Registers are free next to each LUT, and they cut the routing delay into short pieces.
+- **Read the timing report after place and route.** The logic depth from synthesis is only an estimate.
+- **Count LUT levels, not gates.** A 6-input function of any shape costs one LUT level.
+
+[Systolic arrays](/architecture/parallel/systolic-arrays) show a design shape that FPGAs and ASICs both like: short wires and regular blocks. [Building a RISC-V core](/architecture/hw-design/building-a-risc-v-core) puts a whole processor in the Verilog subset.
+
+<Recall cards={[
+  { q: "Why can one k-input LUT compute any function of k inputs?", a: "It is a memory of $2^{k}$ bits addressed by the inputs. The bits are the truth table, and any truth table can be loaded." },
+  { q: "What does a 7-series slice contain?", a: "Four 6-input LUTs (each can act as two 5-LUTs with shared inputs), eight flip-flops and a 4-bit carry chain, CARRY4." },
+  { q: "What is a K-feasible cut, and what does a mapper do with it?", a: "A set of at most K nodes that separates a gate from the primary inputs. The gate's logic over the cut fits in one K-LUT, so the mapper picks a cut for each LUT it builds." },
+  { q: "Why can depth-optimal mapping need more LUTs than a deeper mapping?", a: "To save levels, it copies shared gates into several LUTs. The 8-bit adder takes 17 LUTs in 8 levels with K = 3, but 21 LUTs in 5 levels with K = 4." },
+  { q: "What does simulated annealing do in placement, and why accept worse moves?", a: "It swaps blocks to cut the total wire length. Accepting some worse swaps at a high temperature lets it leave local minima; the chance falls as it cools." },
+  { q: "Which open tools make a complete iCE40 flow?", a: "Yosys for synthesis, nextpnr for place and route, and the IceStorm tools (icepack) for the bitstream." },
+]} />

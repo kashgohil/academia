@@ -1,0 +1,117 @@
+---
+summary: "A single-cycle RV32I core in fewer than 150 lines of Verilog, run on an RTL simulator and checked instruction by instruction against a reference model. Inject real bugs and see which tests catch them, then meet riscv-tests, riscv-formal, and small open cores."
+---
+import { ArchHwCoreStepDemo, ArchHwLockstepDemo } from "@/demos/arch/ArchHwCoreDemos";
+
+This lesson puts the module together. It writes a RISC-V processor in the Verilog subset of [HDLs and Verilog basics](/architecture/hw-design/hdls-verilog-basics). It runs real programs on it in the RTL simulator, and it tests it against a reference. The design follows the [single-cycle datapath](/architecture/datapath/single-cycle-datapath) and its [control unit](/architecture/datapath/control-unit). Those lessons explain why each unit is there. This one is about how you write the core, run it, and find its bugs.
+
+The core implements **RV32I**, the 32-bit base integer instruction set of RISC-V (see [RISC-V basics](/architecture/isa/risc-v-basics)). It has no multiply, no interrupts and no privilege modes. So it runs the sample programs of the track that use no `mul` or `div`: 8 of the 10.
+
+## The core in fewer than 150 lines
+
+The whole core is one module with one clocked block. Everything else is combinational, and the clock edge is the only place where state changes.
+
+- **Fetch.** `instr = mem[pc[15:2]]`. One 64 KiB memory holds code and data, as in the reference model, the **hart** of this track.
+- **Decode.** Fixed bit fields: `opcode = instr[6:0]`, `rd = instr[11:7]`, and so on. RISC-V keeps the register fields in the same place in every format, so decode is only wiring.
+- **Immediates.** Five formats, each a concatenation of instruction bits. The sign bit is always `instr[31]`, so sign extension is a replication of one wire.
+- **Execute.** An ALU `case` on `funct3`, a branch `case`, and an adder for load and store addresses.
+- **Write back and next pc.** A `case` on the opcode picks the value for `rd`, and a chain of `?:` picks the next pc.
+
+```verilog
+// the B-type immediate: the bits are scrambled in the encoding, and bit 0 is always 0
+wire [31:0] imm_b = {{20{instr[31]}}, instr[7], instr[30:25], instr[11:8], 1'b0};
+
+wire [31:0] sra = $signed(a) >>> shamt;   // arithmetic shift in its own wire: see below
+
+always @(posedge clk) begin
+  if (rst) pc <= 0;
+  else pc <= next_pc;
+  if (wen) regs[rd] <= wb;                 // wen includes rd != 0: x0 is never written
+  if (store) mem[addr[15:2]] <= (word & ~bytes) | (wdata & bytes);
+end
+```
+
+Register x0 always reads 0. The ISA manual says that x0 is hardwired to 0. Here the write enable excludes rd = 0, so `regs[0]` keeps its reset value of 0, and the read port needs no special case. A byte store reads the word, merges the new byte under a mask, and writes the word back, all in the one cycle.
+
+<Predict
+  id="hw-core-cycles"
+  question="The sum program retires 46 instructions on the hart. How many clock cycles does this single-cycle core need after reset?"
+  options={["46", "230: five stages for each instruction", "More than 46, because loads wait for memory"]}
+  answer={0}
+  explain="Every instruction starts and finishes in one cycle, so the core needs 46 cycles: CPI = 1. The price is the clock period. It must fit the slowest instruction, a load that goes through instruction memory, the register file, the address adder, data memory and the write-back mux."
+>
+<ArchHwCoreStepDemo />
+</Predict>
+
+Things to try:
+
+1. Step through the first cycles of **Sum of an array**. The `la` pseudo-instruction becomes `auipc` and `addi`, and you can read both in the bit fields.
+2. Find the `lw` in the loop. In the same cycle, `addr` is the address, `wb` is the loaded word, and `rf_we` is 1.
+3. Find `bnez t1, loop`. `rf_we` is 0, and `next_pc` jumps back while t1 is not 0.
+4. Select **memcpy**. Find a `sb`: `mem_we` is 1, and only one byte of the word changes.
+
+## Testing hardware against a golden model
+
+A core can run a program to the end and still be wrong. A bad value may never reach the exit code, or two bugs may cancel. So the test compares the core with a **golden model**, a simple implementation that you trust. Here the golden model is the hart of the track's RISC-V toolkit, a functional simulator in TypeScript.
+
+The two run in **lockstep**. The core reports each instruction on a **trace port**. The port shows the pc, the next pc, and the register write with its value. It also shows any store with its address, byte mask and data. After each cycle, the test bench steps the hart once and compares:
+
+1. the pc, and the next pc;
+2. the register write: the same register and the same value, or no write on both sides;
+3. the store: the same bytes at the same address, or no store on both sides.
+
+The first difference stops the run and names the instruction. The trace port has the same idea as **RVFI**, the RISC-V Formal Interface of riscv-formal, which has signals such as `rvfi_pc_rdata`, `rvfi_rd_addr` and `rvfi_mem_wmask`. The test bench also plays the kernel. When the core runs `ecall`, the test bench reads a7 and does the exit or the write.
+
+<Predict
+  id="hw-core-blt"
+  question="The bug: blt compares its operands as unsigned numbers. The 8 RV32I sample programs run in lockstep with the hart. How many of them catch the bug?"
+  options={["All 8: every program has branches", "About half", "None"]}
+  answer={2}
+  explain="Signed and unsigned compares give different answers only when exactly one operand is negative. The sample programs compare small non-negative counts and values, so the bug never shows. Only the directed test t-branch, which compares −1 with 1, catches it."
+>
+<ArchHwLockstepDemo />
+</Predict>
+
+1. Start with **I-immediate zero-extended**. 14 of the 16 tests fail. In sum, instruction 7 is `addi t1, t1, -1`. The hart writes t1 = 7, and the core writes t1 = 4103, because −1 became 4095.
+2. Select **blt compares unsigned**, then **lb zero-extends**. Each one passes all 8 sample programs and fails exactly one directed test.
+3. Select **x0 can be written**. Sum passes, because it never jumps with `j`. In fib, instruction 8 is `j loop`, and the core writes 36 into x0. The check catches the write at once, not later when a wrong value finally reaches a result.
+4. Select **sra inside a mixed ?:**. The line looks correct. But Verilog makes an expression signed only if all its operands are signed. The other arm of the `?:` is unsigned, so `>>>` shifts in zeros, and srai of −16 by 2 gives 1073741820.
+5. Choose **No bug** and break the core yourself: change `pc + 4` to `pc + 8` in the write-back case, or delete `&& !rst`.
+
+**Directed tests.** The sample programs were written to show the pipeline, not to test the corners. So the demo adds 8 small **directed tests** in the style of riscv-tests. Each one exercises a group of instructions with edge values, such as negative numbers, bytes of 0x80 or more, and stores at every byte offset. Each one exits with 0 on a correct machine. They catch the three bugs that every sample program misses.
+
+## Beyond lockstep tests
+
+- **riscv-tests** (github.com/riscv-software-src/riscv-tests) is the official set of self-checking unit tests. The `rv32ui` tests check each user-level integer instruction and report pass or fail by themselves.
+- **riscv-formal** (github.com/YosysHQ/riscv-formal) checks a core through RVFI with formal methods, using the SymbiYosys flow. A test checks the inputs that you thought of. A formal check covers every input sequence up to a chosen number of cycles. Its generated checks are bounded model checks. See [Model checking](/concurrency/verification/model-checking) for the same idea in software.
+- **Random instruction streams** run millions of generated programs in lockstep with a golden model, and they find the corner cases that nobody wrote.
+
+Each method catches bugs that the one before it misses. Real teams use all of them.
+
+## From this core to real ones
+
+This core is the starting point. The [five-stage pipeline](/architecture/pipelining/five-stage-pipeline) cuts its long combinational path into stages, and [data hazards and forwarding](/architecture/pipelining/data-hazards-and-forwarding) make the stages work together. Small open cores show other points in the design space:
+
+| Core | HDL | Design point |
+|---|---|---|
+| PicoRV32 (Claire Wolf) | Verilog | Size-optimized RV32IMC. "Optimized for size and fmax, not performance"; average CPI about 4. |
+| SERV (Olof Kindgren) | Verilog | Bit-serial: it handles one bit per cycle. Described as the world's smallest RISC-V CPU. |
+| VexRiscv (Charles Papon) | SpinalHDL | Configurable pipeline from 2 to 5 or more stages, with plugins for caches and an MMU. |
+
+Read PicoRV32 after this lesson. It is one Verilog file, and you will recognize the decoder and the ALU.
+
+## What this means for your code
+
+- **Differential testing works for software too.** Run two implementations on the same inputs and compare after every step. Compiler and database teams fuzz this way.
+- **Check state at every step, not only the result.** The x0 bug did not change the exit code of sum. A per-instruction check found it in fib at instruction 8.
+- **Coverage is about values, not lines.** Every line of the branch unit ran in the sample programs, but no program compared a negative number. Write tests for the edge values.
+- **Know your language's typing rules.** The `sra` bug is a typing rule, the same kind as integer promotion in C or the signedness of shifts in Java.
+
+<Recall cards={[
+  { q: "Why does the core never need a special case to make x0 read 0?", a: "The write enable excludes rd = 0, so regs[0] keeps its reset value of 0, and every read of x0 returns 0." },
+  { q: "What does the lockstep test compare after each instruction?", a: "The pc and the next pc, the register write (register and value, or none on both sides), and any store (address, byte mask and data)." },
+  { q: "Why did no sample program catch the 'blt compares unsigned' bug?", a: "Signed and unsigned compares differ only when one operand is negative, and the sample programs only compare non-negative values. A directed test with −1 and 1 catches it." },
+  { q: "Why does $signed(a) >>> n inside c ? $signed(a) >>> n : a >> n shift in zeros?", a: "Verilog makes an expression signed only if all its operands are signed. The other arm is unsigned, so the whole ?: is unsigned, and >>> on an unsigned operand is a logical shift." },
+  { q: "What does riscv-formal add over riscv-tests?", a: "The riscv-tests suite checks chosen programs. The riscv-formal checks compare the core with the ISA through RVFI for every input sequence up to a bound." },
+  { q: "What is the cost of CPI = 1 in a single-cycle core?", a: "The clock period must fit the slowest instruction. A load goes through instruction memory, the register file, the address adder, data memory and the write-back mux." },
+]} />

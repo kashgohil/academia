@@ -55,5 +55,8 @@ export function muxInputs(layout: "real" | "naive"): number[] {
   return Array.from({ length: 32 }, (_, k) => new Set(w.map((x) => x[k]!)).size);
 }
 
-/** The sum over all immediate bits: a simple measure of the mux cost of the immediate decoder. */
-export const totalMuxInputs = (layout: "real" | "naive") => muxInputs(layout).reduce((a, b) => a + b, 0);
+/**
+ * The mux inputs of the immediate decoder: the sum over the immediate bits that have more than one source. A bit
+ * with one source (bit 31: always instruction bit 31) is a wire and needs no mux. A simple measure of the mux cost.
+ */
+export const totalMuxInputs = (layout: "real" | "naive") => muxInputs(layout).filter((n) => n > 1).reduce((a, b) => a + b, 0);

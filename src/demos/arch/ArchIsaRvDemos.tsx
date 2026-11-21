@@ -138,13 +138,13 @@ export function IsaImmediateDemo() {
         </svg>
       </div>
       <Stats items={[
-        { label: "Mux inputs, all immediate bits", value: totalMuxInputs(layout) },
+        { label: "Mux inputs (bits with more than one source)", value: totalMuxInputs(layout) },
         { label: "Largest mux (inputs)", value: Math.max(...mux) },
       ]} />
       <Banner tone={layout === "real" ? "good" : "warn"} style={{ marginTop: 6 }}>
         {layout === "real"
           ? `RISC-V: immediate bits 10 to 5 come from instruction bits 30 to 25 in I, S, B and J. The B and J layouts rotate a few bits so that this stays true. Total: ${totalMuxInputs("real")} mux inputs.`
-          : `Naive: B and J store offset ÷ 2 as contiguous bits, so most low immediate bits now have one more possible source. Total: ${totalMuxInputs("naive")} mux inputs, against ${totalMuxInputs("real")} for RISC-V.`}
+          : `Naive: B and J store offset ÷ 2 as contiguous bits. Immediate bits 1 to 10 each get two more possible sources, one from B and one from J, and bits 12 to 19 get one more. Total: ${totalMuxInputs("naive")} mux inputs, against ${totalMuxInputs("real")} for RISC-V.`}
       </Banner>
     </Demo>
   );

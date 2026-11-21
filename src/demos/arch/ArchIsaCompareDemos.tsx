@@ -32,7 +32,7 @@ export function IsaCompareDemo() {
         ...(l.perIter ? [{ label: "Loop body (x86 / Arm / RV)", value: `${l.perIter.x86} / ${l.perIter.arm} / ${l.perIter.rv}` }] : []),
       ]} />
       <Banner tone={run.ok ? "good" : "bad"} label="hart" style={{ marginTop: 6 }}>
-        RISC-V: {run.ok ? "the hand-written code ran on the hart and gave the C result" : "wrong result"} ({run.result}). x86-64 and AArch64: clang -O2. The ret rows count here.
+        RISC-V: {run.ok ? "the hand-written code ran on the hart and gave the C result" : "wrong result"} ({run.result}). x86-64 and AArch64: clang -O2 -fno-builtin -fno-vectorize, with alignment nops left out. The ret rows count here.
       </Banner>
     </Demo>
   );

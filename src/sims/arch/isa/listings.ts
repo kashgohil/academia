@@ -2,9 +2,10 @@
  * Small C functions and their machine code on three ISAs, for the addressing-mode and ISA-comparison lessons.
  *
  * - x86-64 and AArch64: the output of Apple clang 21 (LLVM) with
- *   `-O2 -fno-vectorize -fno-slp-vectorize -fno-unroll-loops -fno-asynchronous-unwind-tables`, targets
- *   x86_64-linux-gnu and aarch64-linux-gnu, read back with objdump. Bytes are copied from the object file. Alignment
- *   padding (nop) between functions is left out. The relocations of `glob` are shown as the symbol name.
+ *   `-O2 -fno-builtin -fno-vectorize -fno-slp-vectorize -fno-unroll-loops -fno-asynchronous-unwind-tables`
+ *   (without -fno-builtin, clang turns slen into a tail call to strlen), targets x86_64-linux-gnu and
+ *   aarch64-linux-gnu, read back with objdump. Bytes are copied from the object file. Alignment nops inside and
+ *   between functions are left out (a 7-byte nop before the x86 sum loop, a 9-byte nop in the x86 slen). The relocations of `glob` are shown as the symbol name.
  * - RISC-V: hand-written RV32IM in the style of GCC and LLVM output, because the local compiler has no RISC-V
  *   backend. Each listing is assembled by the shared assembler and run on the shared hart by the tests, so it is
  *   correct code. Its bytes come from the assembler.

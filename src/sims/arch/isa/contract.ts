@@ -88,7 +88,7 @@ export type Change = "none" | "no-m" | "rv32e" | "swap-sub";
 export const CHANGES: { id: Change; name: string; about: string }[] = [
   { id: "none", name: "Same ISA (RV32IM)", about: "The binary runs on a core that implements the contract." },
   { id: "no-m", name: "No M extension (RV32I core)", about: "mul, div and rem are not in the ISA. Their encodings are illegal." },
-  { id: "rv32e", name: "16 registers (RV32E)", about: "Only x0 to x15 exist. An encoding that names x16 to x31 is illegal." },
+  { id: "rv32e", name: "16 registers (RV32E)", about: "Only x0 to x15 exist. Encodings that name x16 to x31 are reserved. This model traps on them, as many cores do." },
   { id: "swap-sub", name: "add and sub swap encodings", about: "A different ISA that gives bit 30 the opposite meaning: add decodes as sub, sub as add." },
 ];
 

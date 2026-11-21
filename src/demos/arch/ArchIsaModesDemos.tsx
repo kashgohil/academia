@@ -50,7 +50,7 @@ export function IsaPatternDemo() {
         The RISC-V code ran on the hart: {CALLS[id]!.about} = {run.result}, and C says {run.expect}. It retired {run.dynamic} instructions in the function, ret included.
       </Banner>
       <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>
-        x86-64 and AArch64: clang -O2 output, bytes from the object files. RISC-V: hand-written RV32, assembled by the track's assembler.
+        x86-64 and AArch64: clang -O2 -fno-builtin -fno-vectorize output, bytes from the object files, alignment nops left out. RISC-V: hand-written RV32, assembled by the track's assembler.
       </div>
       <Legend items={(["rex", "opcode", "modrm", "disp"] as const).map((k) => ({ label: `x86 ${PART_LABEL[k]}${k === "modrm" ? " and SIB" : k === "disp" ? " and immediate" : ""}`, color: PART_COLOR[k] }))} />
     </Demo>

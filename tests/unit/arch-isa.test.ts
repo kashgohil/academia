@@ -70,9 +70,13 @@ describe("immediate wiring", () => {
     expect(realWiring("U")[12]).toBe(12);
     for (const f of ["I", "S", "B", "J"] as const) expect(realWiring(f).slice(5, 11)).toEqual([25, 26, 27, 28, 29, 30]);
   });
-  test("both layouts encode the same value; the naive one needs more mux inputs: 70 against 98", () => {
-    expect(totalMuxInputs("real")).toBe(70);
-    expect(totalMuxInputs("naive")).toBe(98);
+  test("both layouts encode the same value; the naive one needs more mux inputs: 69 against 97", () => {
+    expect(totalMuxInputs("real")).toBe(69);
+    expect(totalMuxInputs("naive")).toBe(97);
+    expect(muxInputs("real")[31]).toBe(1); // bit 31 is a wire, not a mux
+    const r = muxInputs("real"), n = muxInputs("naive");
+    for (let k = 1; k <= 10; k++) expect(n[k]! - r[k]!, `bit ${k}`).toBe(2);
+    for (let k = 12; k <= 19; k++) expect(n[k]! - r[k]!, `bit ${k}`).toBe(1);
     expect(Math.max(...muxInputs("real"))).toBe(4);
     expect(muxInputs("real")[11]).toBe(4); // imm[11]: inst[31], inst[7], inst[20] or 0
     expect(muxInputs("real").slice(5, 11).every((x) => x === 2)).toBe(true); // imm[10:5]: inst[30:25] or 0
@@ -306,8 +310,10 @@ describe("x86 length decoder", () => {
     expect(decodeAt([0xf6, 0x07, 0x01], 0).len).toBe(3);
     expect(decodeAt([0xf7, 0x17], 0).len).toBe(2);
     expect(decodeAt([0x17], 0).valid).toBe(false);
+    expect(decodeAt([0x8f, 0x48, 0xff], 0).valid).toBe(false); // 8F /1: only 8F /0 (pop r/m) is defined
+    expect(decodeAt([0x8f, 0x00], 0).len).toBe(2);
   });
-  test("the lesson's stream (sum, max2, addf, slen): 55 bytes, 22 instructions; from byte 1 back in step at 3, from 8 at 18", () => {
+  test("the lesson's stream (sum, max2, addf, slen): 55 bytes, 22 instructions; from byte 1 back in step at 3, from 14 at 18", () => {
     const s = ["sum", "max2", "addf", "slen"].flatMap((id) => listingById(id).x86.flatMap((m) => m.bytes));
     const truth = decodeStream(s);
     expect(s.length).toBe(55);
@@ -315,9 +321,12 @@ describe("x86 length decoder", () => {
     expect(Math.max(...truth.map((t) => t.len))).toBe(7);
     expect(resyncAt(truth, 1, s)).toBe(3);
     expect(decodeStream(s, 1)[0]!.len).toBe(2);
-    expect(resyncAt(truth, 8, s)).toBe(18);
-    expect(decodeStream(s, 8).filter((d) => d.start < 18).length).toBe(3);
-    expect(decodeStream(s, 8).filter((d) => d.start < 18).every((d) => d.valid)).toBe(true);
+    expect(resyncAt(truth, 14, s)).toBe(18);
+    const from14 = decodeStream(s, 14).filter((d) => d.start < 18);
+    expect(from14.map((d) => [d.len, d.valid])).toEqual([[4, true]]);
+    const from8 = decodeStream(s, 8).filter((d) => d.start < 12);
+    expect(from8.map((d) => d.valid)).toEqual([true, false]); // one valid instruction, then 8F 48: invalid
+    expect(resyncAt(truth, 8, s)).toBe(12);
     expect(Math.min(...truth.map((t) => t.len))).toBe(1);
     expect(s[1]).toBe(0x85);
     expect(s[4]).toBe(0x17);

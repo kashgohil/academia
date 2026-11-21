@@ -165,6 +165,7 @@ export function decodeAt(bytes: ArrayLike<number>, at: number): X86Inst {
     parts.push({ kind: "modrm", start: i, len: 1 }); i++;
     const opb = bytes[opStart]!;
     if (opStart === i - 2 && (opb === 0xf6 || opb === 0xf7) && reg <= 1) imm = opb === 0xf6 ? 1 : opsize16 ? 2 : 4; // test r/m, imm
+    if (opStart === i - 2 && opb === 0x8f && reg !== 0) return bad(); // only 8F /0 (pop r/m) is defined; others are #UD (XOP on AMD)
     let disp = mod === 1 ? 1 : mod === 2 ? 4 : 0;
     if (mod !== 3 && rm === 4) {
       if (i >= n) return bad();

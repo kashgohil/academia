@@ -101,7 +101,11 @@ Nested walks in virtual machines multiply the reads of each level. The OS lesson
 
 - A TLB miss costs a few cycles when the PTE line is in L1 or L2. It costs a DRAM access when the program jumps across gigabytes. Pointer chasing over a large heap pays both costs.
 - Huge pages remove the last level, so a walk needs one read fewer and its leaf covers 2 MiB. See [huge pages](/os/vm/huge-pages).
-- On Linux x86, `perf stat -e dtlb_load_misses.walk_completed,dtlb_load_misses.walk_active` shows how often walks happen and how long they take. Event names differ between CPU models.
+- On Linux x86, the `perf stat` command below shows how often walks happen and how long they take. Event names differ between CPU models.
+
+  ```sh
+  perf stat -e dtlb_load_misses.walk_completed,dtlb_load_misses.walk_active ./app
+  ```
 
 ```rust
 // The Sv39 walk without the permission and A/D steps: one read per level.

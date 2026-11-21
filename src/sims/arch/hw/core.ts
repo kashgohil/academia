@@ -191,7 +191,7 @@ export const BUGS: Bug[] = [
   },
   {
     id: "sb-word", title: "sb writes a whole word",
-    about: "The byte mask of sb is 1111, so a byte store also clears the 3 bytes next to it.",
+    about: "The byte mask of sb is 1111, so a byte store also overwrites the 3 other bytes of the word.",
     find: "wire [3:0] mask = (funct3 == 3'b000) ? 4'b0001 << addr[1:0]", replace: "wire [3:0] mask = (funct3 == 3'b000) ? 4'b1111",
   },
   {

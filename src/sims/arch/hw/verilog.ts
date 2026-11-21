@@ -20,8 +20,9 @@
  * Widths and signedness follow the rules of IEEE 1364-2005 (5.4 and 5.5): an operator such as + takes the largest width
  * of its operands and of its context (the left side of the assignment); a comparison sizes its two operands to each
  * other and gives 1 bit; a shift amount, a concatenation part and a condition are self-determined. An expression is
- * signed only if all its operands are signed. An unsized decimal is a signed 32-bit value. Selects and concatenations
- * are unsigned. The elaborator writes these rules into the IR as explicit `resize` nodes, so the simulator and the
+ * signed only if all its operands are signed. An unsized decimal is signed and 32 bits here (the standard says at least
+ * 32 bits). Selects and concatenations are unsigned. Exception: a parameter or localparam is always a signed 32-bit
+ * value here; IEEE 1364-2005 (12.2) gives an untyped, unranged parameter the width and sign of its final value. The elaborator writes these rules into the IR as explicit `resize` nodes, so the simulator and the
  * gate-level synthesizer read one meaning.
  *
  * Left out, each with a clear error: values wider than 32 bits, x and z, `initial`, delays (`#`), `*` `/` `%`,

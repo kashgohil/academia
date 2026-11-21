@@ -1,0 +1,129 @@
+---
+summary: Write-after-read and write-after-write hazards are not real dependences. They come from too few register names. How a rename table and a free list remove them, and how many physical registers a core needs.
+---
+import { OooRenameStepDemo, OooRenameSweepDemo } from "@/demos/arch/ArchOooRenameDemos";
+
+A program names its values with registers. RISC-V has 32 integer registers, and a compiler reuses them all the time. When two unrelated values share a register name, the hardware sees an order that the program did not need. An out-of-order core removes this order. It gives each new value its own **physical register**, a hidden register that the program cannot name. This is **register renaming**, and it is the first way that a core finds parallelism the program did not write.
+
+This module builds one out-of-order core, step by step. It runs real RISC-V code on the track's shared hart and checks every committed result against it. The pipelining module covers the [in-order pipeline](/architecture/pipelining/five-stage-pipeline) and its [data hazards](/architecture/pipelining/data-hazards-and-forwarding). Here we go past one instruction at a time.
+
+## Three kinds of dependence
+
+Look at two instructions, an older one A and a younger one B.
+
+- **Read after write (RAW)**: B reads a register that A writes. B needs the value of A. This is a **true dependence**, and renaming cannot remove it.
+- **Write after read (WAR)**: B writes a register that A reads. If B writes first, A reads the wrong value.
+- **Write after write (WAW)**: both write the same register. If B writes first, the final value is wrong.
+
+WAR and WAW are **false dependences** (also called name dependences). No value goes from A to B. The two instructions only share a name. Give B a different name, and the order between A and B no longer matters.
+
+This loop sums the squares of 16 words. It uses only two temporaries, `t3` and `t4`, as a register allocator does when registers are short:
+
+```riscv
+loop:
+        lw   t3, 0(t0)
+        mul  t4, t3, t3
+        add  a0, a0, t4
+        lw   t3, 4(t0)      # t3 again: WAW with the first lw, WAR with the mul
+        mul  t4, t3, t3     # t4 again
+        add  a0, a0, t4
+        addi t0, t0, 8
+        addi t1, t1, -1
+        bnez t1, loop
+```
+
+The second `lw t3` has no real link to the first `mul`. But without renaming, it cannot write `t3` until that `mul` has read `t3`. The next iteration has the same problem with every register it reuses. So the iterations run one after the other.
+
+## What renaming buys
+
+<Predict
+  id="rename-speedup"
+  question="The core is 4 wide with a 64-entry reorder buffer. Without renaming, the squares loop takes 77 cycles. With renaming and 64 physical registers, about how many cycles does it take?"
+  options={["About 77: renaming does not remove a real dependence", "About 38", "About 20"]}
+  answer={1}
+  explain="Renaming removes the WAR and WAW stalls, so iterations overlap. The loop takes 38 cycles. It does not go lower, because the adds into a0 form one true chain, and the core can only fetch 4 instructions per cycle."
+>
+<OooRenameSweepDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **Renaming** off. In the timeline, each `lw t3` waits for the `mul` before it. The run takes 77 cycles, about 1 instruction per cycle.
+2. Select **On**, with 64 physical registers. Loads of the next iterations start early, and the run takes 38 cycles, 2.05 instructions per cycle.
+3. Move **Physical registers** to 33. One physical register is free, so the core can rename only one new value at a time. The run takes 227 cycles. This is worse than no renaming, because each new value must wait for a commit to free a register.
+4. Look at the bar chart. The gain stops at 64 registers. From there, the loop chain and the fetch width are the limits, not the names.
+
+## How renaming works
+
+The core keeps a **rename table** (also called a register alias table, or RAT). It maps each architectural register to the physical register that holds its newest value. A **free list** holds the physical registers that no value uses.
+
+<Steps>
+<div><b>Read the sources.</b> For each source register, look up the rename table. The instruction now names the physical register. This keeps every RAW dependence: the reader names exactly the register that its producer will write.</div>
+<div><b>Take a new destination.</b> Take a register from the head of the free list and write it into the rename table for <code>rd</code>. Remember the old mapping of <code>rd</code> in the instruction's reorder-buffer entry.</div>
+<div><b>Free at commit.</b> When the instruction commits, the old physical register is free again. No older instruction can still need it, and no recovery can need it.</div>
+<div><b>Restore on a squash.</b> A wrong-path instruction puts its old mapping back into the table and returns its register to the free list. The core does this youngest first, so the table ends exactly as it was.</div>
+</Steps>
+
+<OooRenameStepDemo />
+
+Things to try:
+
+1. Click **Next** until cycle 7. The first `lw t3` gets physical register p36. The rename table shows the new name in bold, because it differs from the committed map.
+2. Step on to cycle 10. The second `lw t3` gets p39, a different physical register. The first value of `t3` still exists, so the `mul` can still read it.
+3. Set **Physical registers** to 33. Only one register is free. Rename stops with "no free physical register" until a commit frees one. In this run, rename waits 140 cycles for registers.
+4. Set it to 36, then to 40. The waits drop to 24 cycles, then to 0. This core renames only one instruction per cycle, so it needs fewer spare registers.
+
+## How many physical registers
+
+The 32 architectural values must always exist, because a squash or an exception can return to them. So only the rest can name results in flight. Each instruction in flight that writes a register needs one. A core whose reorder buffer holds $N$ instructions therefore wants about
+
+$$
+P \approx 32 + N_{\text{writers in flight}}
+$$
+
+physical registers for each register class. Fewer registers make rename stall before the reorder buffer is full. More registers cost area, power and read time, because the register file is read and written every cycle by every unit.
+
+Real cores make this trade in different ways:
+
+| Core | Physical registers | Instructions in flight | Source |
+|---|---|---|---|
+| MIPS R10000 (1996) | 64 integer, 64 floating-point | 32 (active list) | Yeager, IEEE Micro, 1996 |
+| Alpha 21264 (1998) | 80 integer, 72 floating-point | 80 | Kessler, IEEE Micro, 1999 |
+| AMD Zen 4 | 224 integer | 320 macro-ops (retire queue) | AMD Software Optimization Guide for Zen 4 |
+
+The R10000 shows the formula well: 32 architectural registers plus 32 instructions in flight gives 64. The Zen 4 has fewer integer registers than retire-queue entries. Many instructions, such as stores, branches and floating-point operations, write no integer register.
+
+## Two designs for the values
+
+This model uses a **merged register file**, as the R10000 does. All values, committed or not, live in one physical register file. Commit only moves a pointer: the committed map points at the new register. Older designs, such as Intel's P6 family, kept results in the reorder buffer. They copied each value into an architectural register file at commit. The copy costs ports and power, and modern high-end cores mostly avoid it.
+
+## Free work at rename
+
+Rename sees every instruction early, so it can finish some of them at once:
+
+- **Move elimination.** A register-to-register move only makes a second name for the same value. Rename can point the destination at the source's physical register, with no execution. Intel's optimization manual describes zero-latency MOV instructions from the Ivy Bridge generation. Only some moves qualify, and some later cores turn it off.
+- **Zero idioms.** On x86, `xor eax, eax` sets a register to zero. Cores recognize this pattern and do not wait for the old value of `eax`.
+- **The zero register.** RISC-V `x0` is never renamed. It always reads 0, and writes to it are dropped.
+
+## What this means for your code
+
+- You and the compiler can reuse registers freely. Renaming removes the cost of name reuse inside the window.
+- Renaming cannot remove a true chain. A sum into one accumulator stays one chain. Use several accumulators, as [instruction-level parallelism](/performance/cpu/instruction-level-parallelism) shows.
+- Register pressure still matters in another way. A value that the compiler spills to the stack becomes a store and a load, and those use the memory system.
+- Memory has no rename table. Two stores to the same address are ordered for real. The [memory disambiguation](/architecture/ooo/memory-disambiguation) lesson shows what the core does about memory.
+
+## Connect
+
+- [Tomasulo's algorithm](/architecture/ooo/tomasulos-algorithm) did renaming in 1967, with tags in place of physical registers.
+- [The reorder buffer](/architecture/ooo/reorder-buffer) holds the old mappings until commit, and so makes renaming safe to undo.
+- [Superscalar issue](/architecture/pipelining/superscalar-issue) explains why an in-order core cannot use this parallelism.
+- [Instruction-level parallelism](/performance/cpu/instruction-level-parallelism) shows the software view: latency, throughput and independent chains.
+
+<Recall cards={[
+  { q: "Why are WAR and WAW hazards called false dependences?", a: "No value goes from the older instruction to the younger one. They only share a register name. A different name removes the order." },
+  { q: "What does rename do with a source register and with a destination register?", a: "A source is looked up in the rename table and becomes a physical register. A destination gets a new physical register from the free list, and the table points rd at it." },
+  { q: "When is a physical register freed, and why not earlier?", a: "When the next instruction that writes the same architectural register commits. Until then, older readers or a recovery can still need the old value." },
+  { q: "How many physical registers does a core with N writers in flight need?", a: "About 32 + N for 32 architectural registers. The committed values must always exist, and each value in flight needs one more." },
+  { q: "In the squares loop, why are 33 physical registers worse than no renaming?", a: "Only one register is free. Each new value waits for a commit to free a register, so rename stalls on almost every instruction." },
+  { q: "What is move elimination?", a: "Rename points the destination of a register move at the source's physical register. When elimination succeeds, the move needs no execution unit and has zero latency. It does not always succeed." },
+]} />

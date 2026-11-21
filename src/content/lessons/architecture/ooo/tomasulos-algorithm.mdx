@@ -1,0 +1,132 @@
+---
+summary: The 1967 design of the IBM System/360 Model 91 floating-point unit. Reservation stations, tags and a common data bus let instructions run when their operands arrive, and they rename registers without a rename table.
+---
+import { OooTomasuloDemo, OooCdbDemo } from "@/demos/arch/ArchOooTomasuloDemos";
+
+In 1967, Robert Tomasulo described the floating-point unit of the IBM System/360 Model 91. The paper is "An Efficient Algorithm for Exploiting Multiple Arithmetic Units", in the IBM Journal of Research and Development. The machine had only four floating-point registers, and its divide took many cycles. Programs had to reuse the four registers all the time. So most instructions waited for a name, not for a value.
+
+Tomasulo's design let each instruction start as soon as its operands existed, in any order. It did this with three parts: **reservation stations**, **tags** and a **common data bus**. Every out-of-order core since then uses the same ideas, with different names.
+
+## The three parts
+
+- A **reservation station** is a waiting slot in front of a functional unit. It holds one instruction and its two operands. The Model 91 had three stations for the adder and two for the multiply/divide unit.
+- A **tag** names a result that does not exist yet. In the Model 91, the tag named the station (or load buffer) that would produce the value. Each register also had a tag field. A register with a tag means: "my newest value will come from that station".
+- The **common data bus** (CDB) carries each finished result, with its tag, to every station and every register at the same time. Whoever waits for that tag copies the value.
+
+## The three steps
+
+<Steps>
+<div><b>Issue.</b> Take the next instruction in program order. Find a free station for its unit, or stall. For each source register: if the register holds a value, copy the value into the station (the V field). If the register holds a tag, copy the tag (the Q field). Then write this station's tag into the destination register.</div>
+<div><b>Execute.</b> When both operands of a station are values, and the unit is free, start the operation. Stations whose operands are ready go in any order.</div>
+<div><b>Write result.</b> Put the result and its tag on the common data bus. Every station with that tag in a Q field takes the value. The destination register takes it only if it still holds that tag. Free the station.</div>
+</Steps>
+
+The last condition in step 3 does the renaming. A register keeps only the tag of its newest producer. An older producer that finishes late does not overwrite the register. And an older reader that issued earlier already copied a value or a tag. So write-after-read and write-after-write hazards cannot happen. [Register renaming](/architecture/ooo/register-renaming) does the same thing with an explicit table.
+
+## The classic sequence
+
+Hennessy and Patterson use one sequence to teach this algorithm. Here it is with integer registers in place of floating-point ones (F6 is `a6`, F2 is `a2`, F0 is `t0`, F8 is `t3`, F10 is `t5`):
+
+```riscv
+        lw   a6, 32(a0)     # F6 = 42
+        lw   a2, 44(a0)     # F2 = 6
+        mul  t0, a2, a4     # F0 = F2 * F4
+        sub  t3, a6, a2     # F8 = F6 - F2
+        div  t5, t0, a6     # F10 = F0 / F6
+        add  a6, t3, a2     # F6 = F8 + F2: a WAR hazard with the div
+```
+
+The `div` reads `a6`, and the later `add` writes `a6`. The `sub` here takes its operands in the other order from the book. The dependences are the same.
+
+An in-order machine without renaming must let the `div` read first.
+
+<Predict
+  id="tomasulo-war"
+  question="The div waits for the 6-cycle mul. The add after it writes a6, which the div reads. In which cycle can the add put its result on the bus?"
+  options={["After the div starts, in cycle 15 or later", "Long before: in cycle 11", "Only after the div finishes, in cycle 26"]}
+  answer={1}
+  explain="The div copied the value of a6 (42) into its station when it issued. The add writes a new tag, so it can finish whenever its own operands are ready. Its result is on the bus in cycle 11. The div starts in cycle 14 and finishes in cycle 26."
+>
+<OooTomasuloDemo />
+</Predict>
+
+Things to try:
+
+1. Step to cycle 8. The `mul` and the `sub` start together. The `div` gets a station in this cycle. Its first operand shows "wait p37", the tag of the `mul`, and its second operand is the value 42.
+2. Step to cycle 11. The `add` result is on the bus. The register status now gives `a6` the tag of the `add`. The `div` still holds its own copy of the old `a6`.
+3. Step to cycle 14. The `mul` result goes on the bus. The `div` station copies it and starts.
+4. Set **Divide latency** to 24. The `div` finishes later, but the `add` still finishes in cycle 11. The two instructions no longer depend on each other.
+5. Look at the instruction status table. The write-result column is not in program order. That is the whole point, and also the problem that the next lesson solves.
+
+## The bus is a shared resource
+
+The common data bus reaches every station. In the Model 91 it carried one result per cycle. When two units finish in the same cycle, one must wait.
+
+<OooCdbDemo />
+
+Things to try:
+
+1. Keep **1** result bus. The 67 instructions take 72 cycles. Every add is ready at once, but only one result per cycle can be written.
+2. Select **2**, then **4**. The run takes 39 cycles, then 23 cycles. With 4 buses, the fetch width of 4 is the limit.
+3. Look at the column of results that waited. Each wait is a cycle in which a finished result could not wake up its users.
+
+Modern cores have several result buses, usually one for each execution port. The broadcast is still expensive. Each result tag goes to every waiting entry, and each entry compares it with its own source tags. This **wakeup** logic and the **select** logic, which picks the ready entries for each unit, must finish in one cycle. Otherwise two dependent one-cycle operations cannot run in back-to-back cycles. This is why issue queues stay small compared with reorder buffers.
+
+## A station in hardware
+
+Each operand of a station is a small register with a ready bit. In every cycle, it compares the bus tag with its own tag:
+
+```verilog
+// One operand of one reservation station.
+always @(posedge clk) begin
+  if (issue) begin                    // filled at issue
+    ready <= src_ready;
+    tag   <= src_tag;
+    value <= src_value;
+  end else if (!ready && cdb_valid && cdb_tag == tag) begin
+    ready <= 1'b1;                    // snoop the common data bus
+    value <= cdb_value;
+  end
+end
+```
+
+The station can start when both operands have `ready` set. A real design also forwards the bus value in the same cycle, so that a dependent operation does not lose a cycle.
+
+## From 1967 to now
+
+| Tomasulo (Model 91) | A modern core (this module's model) |
+|---|---|
+| Reservation stations per unit | A unified issue queue, or a few queues shared by groups of ports |
+| Tag = the producing station | Tag = the physical register of the result |
+| Register tag field | The rename table |
+| Common data bus | Result buses and the bypass network |
+| Results go straight to registers | Results wait in a reorder buffer and commit in order |
+
+The model on this page uses distributed stations, as the Model 91 did. It has three for the ALU, two each for the multiplier and the divider, and three for loads and stores. Its tags are physical register numbers, so the names in the demo look like the next lessons.
+
+## The weak point: imprecise state
+
+In Tomasulo's design, a result goes to its register as soon as it is done. A later instruction can write its register before an earlier one finishes. Now suppose the earlier instruction raises an exception. The registers then hold some later results and miss some earlier ones. No single point in the program matches this state. A companion paper in the same issue of the journal (Anderson, Sparacio and Tomasulo) says that some interrupts of the Model 91 are imprecise.
+
+An operating system cannot easily restart a program from such a state. A branch mispredict has the same problem: there is nothing to undo. [The reorder buffer](/architecture/ooo/reorder-buffer) fixes both. It lets results finish in any order, but makes them visible in program order.
+
+## What this means for your code
+
+- A long-latency operation does not block independent work behind it. This holds only while the waiting instructions fit in the stations or the issue queue.
+- Many independent results per cycle need many result ports. Tools such as llvm-mca and uiCA model the ports of real x86 and Arm cores.
+- A chain of dependent operations runs at the latency of each step, whatever the window. See [instruction-level parallelism](/performance/cpu/instruction-level-parallelism).
+
+## Connect
+
+- [Register renaming](/architecture/ooo/register-renaming) is the same idea with a table and a free list.
+- [The reorder buffer](/architecture/ooo/reorder-buffer) adds in-order commit and precise exceptions.
+- [Data hazards and forwarding](/architecture/pipelining/data-hazards-and-forwarding) is the in-order version of the bus: a result goes to the next instruction before it reaches the register file.
+
+<Recall cards={[
+  { q: "What three parts did Tomasulo's design add?", a: "Reservation stations in front of the units, and tags for results not computed yet. Also a common data bus that broadcasts each result with its tag." },
+  { q: "At issue, what does a station copy for a source register?", a: "The value, if the register holds one. Otherwise the tag of the station that will produce the value." },
+  { q: "How does Tomasulo's design remove WAR hazards?", a: "An older reader copies the value or the tag at issue. A later writer only changes the register's tag, so the reader is not affected." },
+  { q: "When does a register take a value from the common data bus?", a: "Only if it still holds the tag of that result. If a newer instruction has since claimed the register, the old result does not overwrite it." },
+  { q: "Why must wakeup and select finish in one cycle?", a: "Otherwise two dependent one-cycle operations cannot run in back-to-back cycles. This limits the size of the issue queue." },
+  { q: "Why are interrupts imprecise in the original design?", a: "Results go to the registers when they finish, in any order. At an exception, some later results are written and some earlier ones are not." },
+]} />

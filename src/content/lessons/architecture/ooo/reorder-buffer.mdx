@@ -1,0 +1,121 @@
+---
+summary: Execute out of order, commit in order. How a circular buffer makes exceptions precise and mispredicts cheap to undo, and why its size decides how much memory latency a core can hide.
+---
+import { OooRobRingDemo, OooRobSweepDemo, OooPreciseDemo } from "@/demos/arch/ArchOooRobDemos";
+
+[Tomasulo's algorithm](/architecture/ooo/tomasulos-algorithm) lets results finish in any order. That is good for speed and bad for correctness. An exception or a branch mispredict needs a clean point in the program: everything before it done, nothing after it done.
+
+The **reorder buffer** (ROB) gives that point. Instructions enter it in program order, execute in any order, and leave it in program order. Leaving the ROB is called **commit** (or retire). Only commit changes the state that a program or an operating system can see.
+
+James Smith and Andrew Pleszkun described the reorder buffer in "Implementation of Precise Interrupts in Pipelined Processors" (ISCA 1985). The same paper describes two other designs, the history buffer and the future file. Mainstream out-of-order cores keep a structure of this kind, under names such as reorder buffer, active list or retire queue.
+
+## A circular buffer
+
+The ROB is a ring of entries with a **head** and a **tail**. Rename puts each new instruction at the tail. Commit takes instructions from the head, and only when the head instruction is done. An entry holds:
+
+- the instruction's destination register and its new and old physical registers (see [register renaming](/architecture/ooo/register-renaming)),
+- a "done" bit, set when the result is on the result bus,
+- an exception, if the instruction raised one,
+- for a branch, whether it was mispredicted,
+- for a store, a link to its store-queue entry, because a store writes memory only at commit.
+
+<OooRobRingDemo />
+
+Things to try:
+
+1. The demo opens at cycle 8. The head is a load that misses in the cache, and the ROB is full. Rename stops, and the instructions behind the load wait, even the ones that are done.
+2. Step forward. When the miss returns, the head commits, and then the done entries behind it commit quickly, 4 per cycle.
+3. With 16 entries, the ROB is full for 158 of the 188 cycles. Select **64**. The whole loop fits, its misses overlap, and the run takes 96 cycles.
+4. Select **8**. Even one iteration does not fit. Each miss waits alone.
+
+## Commit, step by step
+
+In each cycle, commit looks at the head entry, then the next, up to the commit width:
+
+<Steps>
+<div><b>Not done:</b> stop. Commit is in order, so nothing younger can go first.</div>
+<div><b>Done, with an exception:</b> squash this entry and everything younger. Restore the rename table. Then jump to the trap handler with the exact program counter of this instruction.</div>
+<div><b>Done, a mispredicted branch</b> (in a design that recovers at commit): squash everything younger and fetch from the correct target.</div>
+<div><b>Done, normal:</b> make the result architectural. Point the committed map at the new physical register, and free the old one. A store goes to the store buffer and then to memory.</div>
+</Steps>
+
+## Precise exceptions
+
+An exception is **precise** when the state at the handler is exactly the state between two instructions. Everything before the faulting instruction is complete, and nothing after it has changed any register or memory. Operating systems need this for page faults: the kernel maps the page and runs the instruction again (see [page faults](/architecture/vm/page-faults)).
+
+<OooPreciseDemo />
+
+Things to try:
+
+1. Keep **In order, at commit**. The load to address 0x20000 faults in cycle 7. The divide before it needs 20 cycles. The fault waits in the ROB until the divide commits. Then the core squashes the five younger instructions and traps. The handler sees `t2` = 14 and `s1` to `s4` = 0.
+2. Select **When done**. This is the register state of the original Tomasulo design at cycle 7. The younger instructions have already written `s1` to `s4`, and the older divide has not written `t2`. No point in the program has this state.
+3. Look at the timeline. The younger instructions are done long before the fault commits. In-order commit does not slow them down; it only delays the moment their results become visible.
+
+## Undoing a mispredict
+
+A mispredicted branch has the same problem as an exception: younger instructions must disappear. A core can recover in two ways:
+
+- **At commit.** Wait until the branch reaches the head, then flush everything. This is simple, but the wrong path keeps running until all older instructions commit. A branch behind a cache miss can waste hundreds of cycles.
+- **At execute.** Squash the younger entries as soon as the branch resolves. The rename table must go back to its state at the branch. A core can walk the ROB backward and undo each mapping, or keep a **checkpoint** of the table per branch. The MIPS R10000 kept four checkpoints in a branch stack. When all four were in use, decoding stopped at the next branch.
+
+The model in this module recovers at execute. It walks back, youngest first, in one cycle.
+
+## The window hides latency
+
+A core can work past a stalled instruction only while there is room in the ROB. The **instruction window** is the set of instructions between the head and the tail. A cache miss at the head stops commit. Behind it, the window fills, and then rename stops too.
+
+How big must the window be? A core that runs $W$ instructions per cycle past a stall of $L$ cycles fills about $L \times W$ entries. This is Little's law again:
+
+$$
+\text{entries} \approx L \times W = 100 \times 4 = 400
+$$
+
+A 100-cycle miss on a 4-wide core needs about 400 entries to run at full speed. Few cores have that much. Intel's Golden Cove (2021) has 512 entries, but most cores are smaller. So cores also overlap **several** misses. If the window holds the next miss, its latency overlaps with the first one. This is **memory-level parallelism**.
+
+<Predict
+  id="rob-chase"
+  question="A loop walks a linked list, one node per cache line, with 6 other instructions per node. Each miss takes 100 cycles. The ROB grows from 64 to 256 entries. What happens to the run time?"
+  options={["It drops to about a quarter", "It drops by about half", "It does not change"]}
+  answer={2}
+  explain="The address of the next node comes from the load of this node. The next miss cannot start until this one returns, however big the window is. The run takes 2414 cycles at 16, 64 or 256 entries. Independent misses, by contrast, overlap: that loop drops from 1252 to 179 cycles."
+>
+<OooRobSweepDemo />
+</Predict>
+
+Things to try:
+
+1. Look at the blue line. With 16 entries, the 24 independent misses take 1252 cycles. With 256 entries, they take 179 cycles, 7.0 times faster. Each step up lets the window reach one more miss.
+2. Look at the red line. The linked list takes 2414 cycles at every size. The misses form a chain of true dependences.
+3. Move **Miss latency** to 300. The blue line moves up, and a bigger window helps more. The red line moves up by the full latency for each node.
+
+## Real sizes
+
+| Core | Instructions in flight | Source |
+|---|---|---|
+| MIPS R10000 (1996) | 32 (active list) | Yeager, IEEE Micro, April 1996 |
+| Alpha 21264 (1998) | 80 | Kessler, IEEE Micro, March 1999 |
+| AMD Zen 4 | 320 macro-ops (retire queue) | AMD Software Optimization Guide for Zen 4 |
+
+A larger ROB alone is not enough. The physical registers, the issue queue and the load and store queues must grow with it. Otherwise one of them stops rename first. The sweep above grows them all, so the ROB is the only limit.
+
+## What this means for your code
+
+- **Independent misses overlap; dependent misses add up.** An array of indices is fast to traverse; a linked list is not. When you must chase pointers, walk several lists at the same time.
+- **A long operation at the head blocks commit.** A divide, a miss or a serializing instruction stops commit for its whole latency. Work behind it continues only until the window is full.
+- **Software prefetch helps the chain case.** A prefetch starts a miss early, outside the window (see [prefetching](/architecture/caches/prefetching)).
+- **Exceptions are cheap to make precise, but traps are not free.** A trap flushes the whole window. A page fault or a system call costs the work in flight, plus the handler.
+
+## Connect
+
+- [Multi-level caches](/architecture/caches/multi-level-caches) give the latencies that the window must hide.
+- [Memory consistency models](/architecture/multicore/memory-consistency-models) show what happens to a store after commit, in the store buffer.
+- [Speculative execution](/architecture/ooo/speculative-execution) puts the ROB, the predictor and the squash together.
+
+<Recall cards={[
+  { q: "What does the reorder buffer guarantee, and what does it not restrict?", a: "Results become visible (commit) in program order. Execution can still happen in any order." },
+  { q: "What is a precise exception?", a: "At the handler, every instruction before the faulting one is complete, and no instruction after it has changed registers or memory." },
+  { q: "Why does a cache miss at the head of the ROB stop the whole core after a while?", a: "Commit is in order, so nothing behind the miss can leave. The ROB fills, and then rename stops." },
+  { q: "How many window entries does a 4-wide core need to run through a 100-cycle miss?", a: "About L × W = 100 × 4 = 400. Real cores overlap several misses in a smaller window instead." },
+  { q: "Why does a bigger ROB not help a linked-list walk?", a: "Each load needs the previous load's result as its address. The misses form a chain, and only one can be in flight." },
+  { q: "Name two ways to restore the rename table after a mispredict.", a: "Walk the ROB backward and undo each mapping, or keep a checkpoint of the table for each unresolved branch." },
+]} />

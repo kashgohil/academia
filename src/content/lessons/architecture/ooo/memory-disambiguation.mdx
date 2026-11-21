@@ -1,0 +1,112 @@
+---
+summary: Registers can be renamed, memory cannot. How load and store queues forward data, why a load may run before an older store with an unknown address, how the core catches the mistake, and how it learns which loads to hold back.
+---
+import { OooAliasDemo, OooAliasLoopDemo } from "@/demos/arch/ArchOooMemDemos";
+
+[Register renaming](/architecture/ooo/register-renaming) removes false dependences between registers, because the core sees every register name at decode. Memory is different. The address of a load or a store is a value, and the core knows it only when the instruction executes. So a load can follow a store whose address is still unknown. They may touch the same bytes, or they may not. Deciding this is **memory disambiguation**.
+
+The stakes are high. Loads start most dependence chains, and they have the longest latency. A core that holds every load until all older store addresses are known loses much of its parallelism. A core that lets loads go early must catch the cases where it was wrong.
+
+## Load and store queues
+
+The core keeps two queues in program order, next to the [reorder buffer](/architecture/ooo/reorder-buffer):
+
+- The **store queue** holds every store in flight: its address (when known), its data (when known) and its size. A store writes memory only after it commits.
+- The **load queue** holds every load in flight: its address and where its value came from.
+
+When a load executes, it searches the store queue for older stores, youngest first:
+
+<Steps>
+<div><b>An older store to the same bytes, with its data:</b> take the data from the store queue. This is <b>store-to-load forwarding</b>. The load does not wait for the store to commit.</div>
+<div><b>An older store that covers only part of the load,</b> for example a byte store and a word load: the load waits until the store commits and reaches the cache. Merging bytes from several places is too complex for the fast path.</div>
+<div><b>An older store with the right address but no data yet:</b> the load waits for the data.</div>
+<div><b>An older store with an unknown address:</b> this is the hard case. The policy decides.</div>
+<div><b>No match:</b> read the cache.</div>
+</Steps>
+
+## The hard case
+
+<OooAliasDemo />
+
+The program runs a 20-cycle divide, then a store to `buf[j]`, then a load from `buf[i]`. With **From a divide**, the store address comes out of the divide, so it is late. The load address is known at once.
+
+Things to try:
+
+1. Keep i = 1, j = 2 and **Speculate**. The load runs in cycle 6 and has its value in cycle 10, long before the store address is known.
+2. Select **Wait for all**. The load waits for the store address, and its value is ready only in cycle 31.
+3. Select **Speculate** again and set i = 2. Now the addresses match. The load reads the old value 12 from memory in cycle 6. When the store address arrives, the core sees the conflict: this is a **memory-order violation**. The core squashes the load and everything after it, and fetches them again. The load gets 99 in cycle 36.
+4. Select **Wait for all** with i = 2. The load waits, then takes 99 from the store queue. It is ready in cycle 31.
+5. Select **Known at once**. The store address is known before the load runs, so the load takes 99 from the store queue in cycle 10. The store itself cannot commit before the divide, but its data is already useful.
+
+## Three policies
+
+- **Wait for all** (conservative): a load runs only when every older store address is known. It never violates, but it waits even when nothing aliases, and most of the time nothing does.
+- **Speculate**: a load runs as soon as its own address is known. When a store address becomes known, the core checks the load queue. It looks for a younger load that already ran, overlaps the store, and did not take its data from a younger store. If one exists, the core squashes from that load and fetches again. This is a **machine clear**. It costs a refill of the whole pipeline.
+- **Predict**: speculate by default, but remember the loads that caused violations, and make them wait next time.
+
+## Memory dependence prediction
+
+Real conflicts are rare, and the same few load instructions cause most of them. So a small predictor, indexed by the load's program counter, works well.
+
+- The **Alpha 21264** (Kessler, IEEE Micro, 1999) kept a **load wait table**. A load that caused a violation set its bit. Later instances of that load waited for all older stores. The table was cleared from time to time, so that a load was not held back forever.
+- **Store sets** (Chrysos and Emer, ISCA 1998) are more precise. A Store Set ID Table (SSIT), indexed by instruction address, puts a load and the stores it conflicted with into one set. A Last Fetched Store Table (LFST) remembers the newest store in flight of each set. A load waits only for that store, not for all stores.
+- Intel introduced a memory disambiguation predictor in its Core microarchitecture. Its optimization manual describes a predictor of which loads do not depend on older stores with unknown addresses.
+
+The model on these pages implements a simplified store-set predictor: one SSIT entry per instruction address, and one LFST entry per set.
+
+<Predict
+  id="alias-every"
+  question="A loop does p = out[i]; *p = i; sum += *g. The store address comes from a load. Every out[i] points at g. Which policy is fastest?"
+  options={["Speculate: loads never wait", "Wait for all: it never violates", "Store sets: one violation, then the load waits for the right store"]}
+  answer={2}
+  explain="Speculate violates in all 24 iterations and takes 277 cycles. Wait for all takes 133 cycles. Store sets violate once, then make *g wait only for the store it conflicts with, and forward from it: 74 cycles."
+>
+<OooAliasLoopDemo />
+</Predict>
+
+Things to try:
+
+1. Select **Never**. Speculation wins: 62 cycles against 133. Store sets match it, because no violation ever trains them.
+2. Select **Every 8th**. Speculation violates 3 times (88 cycles). Store sets violate once (74 cycles), then forward the right value from the store queue.
+3. Select **Every time**. Speculation is now the worst policy, with 24 machine clears and 277 cycles.
+
+## A security side
+
+A load that runs before an older store can read a stale value, even if only for a few cycles. In 2018, this became Speculative Store Bypass (CVE-2018-3639). Code on the wrong side of a violation can use the stale value and leave a trace in the cache. Intel's mitigation, Speculative Store Bypass Disable (SSBD), makes loads wait until the addresses of all older stores are known. That is the conservative policy, turned on by a control bit. The [speculative execution](/architecture/ooo/speculative-execution) lesson shows how such a trace is read.
+
+## Loads and other cores
+
+Disambiguation looks only at stores of the same core. Stores from other cores reach this core as cache invalidations. On x86, which promises that loads appear in order, the core also checks the load queue against invalidations. If a line changes between two loads that ran out of order, the core squashes and runs the younger load again. The [memory consistency models](/architecture/multicore/memory-consistency-models) lesson covers this, and the store buffer that sits after commit.
+
+## What this means for your code
+
+- **Aliasing costs in hardware too.** In C, `restrict` (and in Rust, `&mut`) tells the compiler that two pointers do not overlap. The compiler can then keep values in registers, so the load disappears.
+
+```c
+// restrict on g: no store through out[i] can change *g, so the compiler may load *g once.
+// Without it, the compiler must load *g again after every store.
+long sum_g(int **out, const int *restrict g, int n) {
+    long s = 0;
+    for (int i = 0; i < n; i++) { *out[i] = i; s += *g; }
+    return s;
+}
+```
+
+- **Do not read wider than you wrote.** Two 4-byte stores followed by one 8-byte load of the same bytes cannot forward. The load waits for both stores to commit. Packing and unpacking structs through memory is a common source of this stall.
+- **Store and reload is not free, but it is fast when forwarding works.** A spilled register comes back from the store queue in about the time of a cache hit.
+- **Repeated aliasing is cheap after the first time** on a core with a dependence predictor. Random aliasing is not.
+
+## Connect
+
+- [Register renaming](/architecture/ooo/register-renaming) does for registers what these queues cannot fully do for memory.
+- [The reorder buffer](/architecture/ooo/reorder-buffer) holds the stores until commit and makes machine clears precise.
+- [Fences](/concurrency/atomics/fences) order memory across threads. Disambiguation only keeps the order inside one thread.
+
+<Recall cards={[
+  { q: "Why can renaming not remove memory dependences?", a: "A memory address is a value computed at execute time. At rename, the core does not know which bytes a load or store will touch." },
+  { q: "What is store-to-load forwarding?", a: "A load takes its data from an older store in the store queue that writes the same bytes, before the store commits." },
+  { q: "When does a speculating core detect a memory-order violation?", a: "When an older store address becomes known, and a younger load to the same bytes has already run. That load did not take its data from this store or a younger one." },
+  { q: "What does a store-set predictor remember?", a: "Which stores each load has conflicted with (the SSIT, by instruction address), and the newest store in flight of each set (the LFST). The load waits only for that store." },
+  { q: "In the aliasing loop, why is pure speculation the slowest policy when every iteration aliases?", a: "Every iteration violates and causes a machine clear, so the pipeline refills 24 times." },
+  { q: "Why does a wide load after two narrow stores to the same bytes stall?", a: "No single store covers the load, so it cannot forward. The load waits until the stores commit and reach the cache." },
+]} />

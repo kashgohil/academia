@@ -1,0 +1,111 @@
+---
+summary: "The instruction window is renaming, the issue queue, the reorder buffer and the load-store queues together, filled by the branch predictor. Wrong-path work is undone in the registers but not in the caches: the idea behind Spectre, and the end of free speedups."
+---
+import { OooWindowDemo, OooSpectreDemo } from "@/demos/arch/ArchOooSpecDemos";
+
+The four earlier lessons built the parts of an out-of-order core. [Renaming](/architecture/ooo/register-renaming) removes false dependences. [Reservation stations](/architecture/ooo/tomasulos-algorithm) start each instruction when its operands arrive. [The reorder buffer](/architecture/ooo/reorder-buffer) makes the results visible in order. [The load and store queues](/architecture/ooo/memory-disambiguation) let loads go early and catch them when they were wrong. Together they form the **instruction window**: the instructions that the core has fetched but not yet committed.
+
+A window is only useful when it holds instructions the program will really run. In typical integer code, a branch comes every few instructions. So a window of a few hundred instructions holds dozens of branches that have not resolved. The core fetches past all of them on the word of the [branch predictor](/architecture/pipelining/branch-prediction). This is **speculative execution**: the core does work before it knows the work is needed.
+
+## The window and the predictor
+
+Suppose a predictor is right with probability $p$ for each branch, and one instruction in $b$ is a branch. Take $b = 5$ as a model input. A full window of $E$ entries is then all correct with probability
+
+$$
+p^{E/b} = 0.95^{64/5} \approx 0.52
+$$
+
+So with 95% accuracy, a 64-entry window is fully on the correct path only about half the time. With 99% accuracy it is 0.88. A 256-entry window at 95% falls to 0.07. Big windows need very good predictors. This is why branch predictors grew as windows grew.
+
+<OooWindowDemo />
+
+The program counts which of 32 random values are above 50. Each value sits on its own cache line, so each load misses, and the branch on the value waits for the miss. One branch per value is random, so no predictor can learn it.
+
+Things to try:
+
+1. Keep **2-bit** and 64 entries. Red areas are wrong-path instructions. Each red ramp ends at a mispredict, when the branch finally resolves and the core squashes everything after it. The core fetched 686 wrong-path instructions to commit 312.
+2. Select **Perfect**. Every instruction in the window is useful. Move **ROB entries** from 16 to 256: instructions per cycle rise from 0.19 to 1.39, because more misses overlap.
+3. Select **2-bit** and do the same. Instructions per cycle rise only from 0.18 to 0.72. The window fills, but the part beyond the first mispredicted branch is thrown away.
+4. Compare the rows of the table. The gap between a perfect and a real predictor grows with the window.
+5. Notice that the bad predictors still gain a little from a larger window. Wrong-path loads fetch real cache lines, and some of those lines are on the correct path too. Wrong-path work is not always wasted.
+
+## Undone in registers, not in caches
+
+When a branch resolves as mispredicted, the core squashes every younger instruction. Their physical registers return to the free list, their store-queue entries disappear, and the rename table goes back to the branch. No register or memory location that the program can read shows that the wrong path ran. That is the **architectural** promise.
+
+The **microarchitectural** state is different. A wrong-path load that missed has already asked memory for a line, and the line arrives in the cache. Predictor tables, the TLB and the prefetchers may also change. Nothing undoes these changes, because they do not affect the result of any program. They only affect timing.
+
+## Spectre, as a concept
+
+In 2018, Paul Kocher and others showed that this timing is readable ("Spectre Attacks: Exploiting Speculative Execution", IEEE Symposium on Security and Privacy, 2019). Their first variant, bounds check bypass (CVE-2017-5753), uses code of this shape:
+
+```c
+if (x < array1_size)
+    y = array2[array1[x] * 4096];
+```
+
+The attacker first calls the code with valid `x`, so the predictor learns "in bounds". Then the attacker makes sure that `array1_size` is not in the cache. The next call has an `x` that points outside `array1`, at a secret byte. The bounds check waits for a miss.
+
+The predictor says "in bounds", so the core reads the secret and touches one line of `array2` that depends on its value. Then the branch resolves, and the core squashes both loads. But the line stays in the cache.
+
+<Predict
+  id="spectre-lines"
+  question="The victim runs twice with valid x, then once with x pointing at a secret byte 11. Before the calls, no probe line is cached. After the program ends, which probe lines are in the cache?"
+  options={["None: the squash undoes the wrong path", "Line 0 only, from the valid calls", "Lines 0 and 11"]}
+  answer={2}
+  explain="The valid calls read array1[x] = 0 and touch probe line 0. The third call runs the two loads on the wrong path: the secret byte 11 selects probe line 11. The squash removes the loads from the registers, but the cache keeps line 11."
+>
+<OooSpectreDemo />
+</Predict>
+
+Things to try:
+
+1. Move the cycle slider back to the start of the third call. The `lw t1` of `size` misses, and the `bgeu` waits. Step forward: the wrong-path instructions, in red, read `array1[40]` and then the probe line.
+2. Step to the end. The probe line that matches the secret is in the cache. A load of it would take 4 cycles; every other line except 0 would take 100. Change the **Secret byte**: the warm line moves with it.
+3. Select **Barrier after the check**. A barrier stops younger instructions until the branch is resolved, so the wrong path never loads anything. Only line 0 is warm. The run is slower, because the barrier also stops correct work in the valid calls.
+4. Select **Mask the index**. The code clamps `x` to 0 without a branch when it is out of bounds. The index now needs the value of `size`, so the wrong path cannot read the secret before the branch resolves. Even then, the index would be 0.
+
+The demo shows the cache state directly. A real attacker reads it by timing loads, but this page contains no timing code. The model treats RISC-V `fence` as a barrier like x86 `LFENCE`. The RISC-V specification defines `fence` as a memory-ordering instruction, and it does not promise that it stops speculation.
+
+## Mitigations, briefly
+
+- **A barrier after the check.** Intel recommends `LFENCE` between a bounds check and the dependent load. Arm defines the speculation barrier `SB` (optional from Armv8.0, mandatory from Armv8.5). Arm's `CSDB` works with a conditional select that clamps the index, so it belongs with index masking.
+- **Index masking.** Clamp the index with arithmetic, not with a branch, so that speculation cannot use an out-of-bounds value. The Linux kernel provides `array_index_nospec()` for this.
+- **Retpoline** (for variant 2, branch target injection, CVE-2017-5715). Google's construct replaces an indirect jump with a return that the predictor sends into a harmless loop.
+- **Speculative Store Bypass Disable** (for variant 4). It makes loads wait for older store addresses, as the [memory disambiguation](/architecture/ooo/memory-disambiguation) lesson explains.
+- **Kernel page-table isolation** answered a related attack, Meltdown (CVE-2017-5754). See [kernel mode and user mode](/os/processes/kernel-mode-and-user-mode).
+
+Each mitigation gives back some of the speed that speculation bought. That is the trade.
+
+## The end of free speedups
+
+For thirty years, wider and deeper windows made old programs faster with no change to the code. The cost grew faster than the gain:
+
+- **Wakeup and select** compare every result tag with every waiting entry, every cycle. A bigger issue queue makes this slower and hotter.
+- **Ports.** A wider core reads and writes the physical register file from more units at the same time. Register files with many ports grow fast in area and power.
+- **Wasted work.** In the demo, the 2-bit predictor fetched more wrong-path instructions than correct ones. Each of them used fetch, rename and execution energy.
+- **Diminishing returns.** A window helps only up to the next mispredict or the next dependent miss. The gap in the table above is what remains for a better predictor to win.
+
+Designers still grow windows. AMD's Zen 4, for example, retires from a queue of 320 macro-ops. But single-thread speed now grows slowly. The gains moved to more cores, to [SIMD units](/architecture/parallel/simd-and-vector-units) and to accelerators. Those need software that exposes parallelism explicitly.
+
+## What this means for your code
+
+- **Unpredictable branches cost a window refill.** On random data, branchless code (a conditional move or a mask) can win. See [branch prediction and branchless code](/performance/cpu/branch-prediction-and-branchless-code).
+- **A branch that waits for a miss is the worst case.** The core speculates for the whole miss, and a mispredict throws all of it away. Sorting or partitioning data first can make such branches predictable.
+- **Security code must assume speculation.** A bounds check does not stop a speculative load. Mask indexes derived from untrusted input in kernels, interpreters and sandboxes.
+- **Measure.** Hardware counters report mispredicts and machine clears; `perf stat` shows `branch-misses` on Linux.
+
+## Connect
+
+- [Branch prediction](/architecture/pipelining/branch-prediction) covers the predictors that feed the window.
+- [Instruction-level parallelism](/performance/cpu/instruction-level-parallelism) gives the software view of the same window.
+- [Prefetching](/architecture/caches/prefetching) is the honest version of wrong-path loads: it fetches lines on purpose.
+
+<Recall cards={[
+  { q: "What is the instruction window?", a: "The instructions fetched but not yet committed. Rename, the issue queue, the reorder buffer and the load and store queues hold them." },
+  { q: "With 95% prediction accuracy and a branch every 5 instructions, how often is a 64-entry window fully on the correct path?", a: "About 0.95 to the power 64/5, which is about 0.52." },
+  { q: "What does a squash undo, and what does it leave?", a: "It undoes registers, rename mappings and queued stores. It leaves cache lines, TLB entries and predictor state that the wrong path changed." },
+  { q: "How does Spectre variant 1 move a secret into the cache?", a: "A mispredicted bounds check lets a wrong-path load read the secret, and a second load touches a cache line chosen by the secret's value." },
+  { q: "Name two mitigations for bounds check bypass.", a: "A speculation barrier after the check: LFENCE, or SB on Arm. Or mask the index with arithmetic, so it stays in bounds even under speculation. On Arm, use CSEL and CSDB." },
+  { q: "Why did larger windows stop giving free speedups?", a: "Wakeup, select and register ports cost more power and time as the window grows. Wrong-path work wastes energy. Mispredicts and dependent misses limit the gain." },
+]} />

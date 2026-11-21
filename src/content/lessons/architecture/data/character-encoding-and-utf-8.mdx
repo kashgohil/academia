@@ -1,0 +1,132 @@
+---
+summary: "How text becomes bytes: ASCII, Unicode code points, the bit packing of UTF-8 and why it won, invalid sequences and why decoders must reject them, UTF-16 and surrogate pairs, the four different lengths of one string, normalization, and fast SIMD validation."
+---
+import { ArchDataUtf8EncoderDemo, ArchDataLengthsDemo, ArchDataDecoderDemo } from "@/demos/arch/ArchDataUtf8Demos";
+
+A CPU has no instructions for text. Text is a sequence of numbers, and an **encoding** says which numbers mean which characters, and how the numbers become bytes. If the writer and the reader use different encodings, the reader gets wrong characters, or it rejects the input.
+
+**ASCII** (1963) gives 128 characters the numbers 0 to 127: English letters, digits, punctuation and control codes such as newline (10). It needs 7 bits, so it fits in a byte with one bit to spare. For decades, many incompatible "code pages" used the values 128 to 255 for other alphabets. A file did not say which code page it used.
+
+**Unicode** gives one number to every character of every script. This number is a **code point**, written `U+` and at least four hex digits: `U+0041` is A, and `U+20AC` is the euro sign €. The code space is U+0000 to U+10FFFF, which is 1,114,112 code points in 17 planes of 65,536. The first plane, U+0000 to U+FFFF, is the **Basic Multilingual Plane** (BMP). Most emoji and many historic scripts are above it.
+
+Unicode defines numbers, not bytes. An **encoding form** turns each code point into one or more **code units** of a fixed size. UTF-32 uses one 32-bit unit for each code point. UTF-16 uses one or two 16-bit units. UTF-8 uses one to four 8-bit units.
+
+## The bit packing of UTF-8
+
+UTF-8 keeps ASCII as it is: a code point below 128 is one byte. Larger code points use a lead byte and one to three continuation bytes. The lead byte starts with as many 1 bits as the sequence has bytes. Each continuation byte starts with `10` and carries 6 bits of the code point.
+
+| Code points | Bytes | Bit pattern | Payload bits |
+|---|---|---|---|
+| U+0000 to U+007F | 1 | `0xxxxxxx` | 7 |
+| U+0080 to U+07FF | 2 | `110xxxxx 10xxxxxx` | 11 |
+| U+0800 to U+FFFF | 3 | `1110xxxx 10xxxxxx 10xxxxxx` | 16 |
+| U+10000 to U+10FFFF | 4 | `11110xxx 10xxxxxx 10xxxxxx 10xxxxxx` | 21 |
+
+<Predict
+  id="euro"
+  question="How many bytes does the euro sign € (U+20AC) take in UTF-8?"
+  options={["2 bytes, because 0x20AC fits in 16 bits", "3 bytes", "4 bytes, like every character outside ASCII"]}
+  answer={1}
+  explain="0x20AC needs 14 bits. Two bytes carry only 11 payload bits, because the prefixes take 5 bits. Three bytes carry 16 payload bits, so € is E2 82 AC."
+>
+<ArchDataUtf8EncoderDemo />
+</Predict>
+
+Things to try:
+
+1. Keep €. Follow the colors. The top 4 bits go to the lead byte `1110xxxx`, and each continuation byte takes the next 6 bits.
+2. Click **A**. One byte, with the same value as in ASCII.
+3. Click **😀**. It needs 4 bytes in UTF-8, and a surrogate pair in UTF-16.
+4. Click **é**. It is 2 bytes in UTF-8 but 1 unit in UTF-16. For most European text, UTF-8 is smaller.
+5. Move the slider into the range D800 to DFFF. These code points are reserved for UTF-16 surrogates, and no encoding can hold them.
+
+Ken Thompson and Rob Pike designed UTF-8 in September 1992, on a placemat in a New Jersey diner, by Pike's account. Plan 9 used it within a week. The design has four properties that made it win:
+
+- **ASCII compatibility.** Every ASCII file is already valid UTF-8. No byte of a multi-byte sequence is below 0x80. So a search for `/` or for a NUL byte never matches inside a character. C string functions and Unix tools kept working.
+- **Self-synchronization.** A byte shows its role with no context: ASCII, lead or continuation. A reader that starts in the middle skips at most 3 continuation bytes to find the next character.
+- **Sort order.** Byte-by-byte comparison of UTF-8 gives code point order. So `memcmp` sorts UTF-8 strings by code point.
+- **No byte order.** The code unit is a byte, so UTF-8 needs no byte order mark. UTF-16 and UTF-32 come in big-endian and little-endian forms.
+
+The original design allowed up to 6 bytes and 31 bits. RFC 3629 (2003) limited UTF-8 to U+10FFFF, the range that UTF-16 can reach, so 4 bytes is the maximum.
+
+## Invalid sequences
+
+Not every byte sequence is valid UTF-8. A decoder must reject or replace these cases:
+
+- **Overlong forms.** `C0 AF` decodes to the bits of `/` (U+002F), but in 2 bytes when 1 byte is enough. The Unicode standard forbids it, so there is exactly one encoding for each code point. The bytes C0, C1 and F5 to FF never appear in valid UTF-8.
+- **Surrogates.** `ED A0 80` would encode U+D800, which is not a character.
+- **Values above U+10FFFF.** `F4 90 80 80` would be U+110000.
+- **Truncated sequences**, and **stray continuation bytes** with no lead byte.
+
+<Predict
+  id="overlong"
+  question="A web server checks a URL path for the byte 2F (/), and then decodes it from UTF-8. The path contains C0 AF. What should a correct decoder do?"
+  options={["Decode it as /, because the payload bits are 0x2F", "Reject it, or replace it with U+FFFD: it is an overlong form", "Pass both bytes through unchanged"]}
+  answer={1}
+  explain="C0 AF is an overlong encoding of /. A lenient decoder turns it into / after the security check has passed. Microsoft IIS 4.0 and 5.0 had this bug (CVE-2000-0884): attackers used overlong slashes to read files outside the web root."
+>
+<ArchDataDecoderDemo />
+</Predict>
+
+1. Keep **overlong /** and press Step. C0 is rejected at once: it can only start an overlong form. Then AF is a continuation byte with no lead byte. The output has two U+FFFD characters.
+2. Select **surrogate**. The lead byte ED limits the next byte to 80–9F. A0 is outside, so the decoder emits U+FFFD and reads A0 again as a new start.
+3. Select **truncated**. The input breaks after `E2 82`, and the 41 (A) after it still decodes.
+4. Click any byte of **valid: 😀**. The decoder finds the start of the character by skipping back over continuation bytes.
+
+The decoder in the demo follows the WHATWG Encoding Standard, which browsers and the JavaScript `TextDecoder` use. It replaces each **maximal subpart** of an invalid sequence with one U+FFFD (the replacement character �). The Unicode standard describes this practice but does not require it. A strict decoder rejects the whole input: Rust `str::from_utf8` returns an error, and a Rust `&str` is always valid UTF-8. Validate at the boundary where bytes enter the program, and keep a type that says "already valid" after that.
+
+## UTF-16 and surrogate pairs
+
+Unicode began in 1991 as a 16-bit code. Windows NT, Java and JavaScript adopted 16-bit characters at that time. When Unicode grew beyond 65,536 code points, UTF-16 kept the BMP as one unit and added **surrogate pairs** for the rest. A code point above U+FFFF becomes $v = c - \text{0x10000}$, a 20-bit value. The high 10 bits go into a unit from D800 to DBFF, and the low 10 bits into a unit from DC00 to DFFF. That is why these 2,048 code points can never be characters.
+
+UTF-16 lost the sort property: U+FF61 sorts after U+1F600 in UTF-16, because the high surrogate D83D is less than FF61. In UTF-8 and in code point order it sorts before. Java `compareTo` and JavaScript `<` compare UTF-16 units, so they can disagree with a sort in Rust, Go or a database.
+
+## One string, four lengths
+
+"Length" has four meanings for text, and each language picks one by default.
+
+<Predict
+  id="family"
+  question="The family emoji 👨‍👩‍👧 is three people joined by two zero-width joiners (U+200D). What does JavaScript's .length return for it?"
+  options={["1: it is one character", "5: one for each code point", "8: one for each UTF-16 code unit"]}
+  answer={2}
+  explain="Each person is above U+FFFF, so each needs a surrogate pair: 3 × 2 = 6 units. Each joiner is one unit. The total is 8. The UTF-8 form is 18 bytes, there are 5 code points, and a reader sees 1 grapheme cluster."
+>
+<ArchDataLengthsDemo />
+</Predict>
+
+1. Read the default text. It is 25 UTF-8 bytes, 14 UTF-16 units, 11 code points and 7 graphemes.
+2. Click **👍🏽**. A skin tone modifier is a second code point, but the reader sees one emoji.
+3. Click **🇯🇵**. A flag is two regional indicator code points.
+4. Click **naïve** and switch to **NFD**. The ï becomes i plus U+0308, a combining diaeresis. The byte count grows from 6 to 7, and the text looks the same.
+
+A **grapheme cluster** is what a reader sees as one character. Unicode Standard Annex #29 defines the rules, and they change as new emoji appear. Swift counts these by default. Other languages need a library, such as `Intl.Segmenter` in JavaScript or the `unicode-segmentation` crate in Rust. A text editor must move the cursor by grapheme clusters, or it can split an emoji in half.
+
+**Normalization** fixes a related problem. "é" can be one code point (U+00E9) or two (e plus U+0301). The two forms look the same but compare as different. NFC composes characters where it can, and NFD decomposes them.
+
+The old macOS file system HFS+ stored names in a decomposed form. Most other file systems do not normalize, and most text input produces NFC. Normalize before you compare or hash user text.
+
+What this means for code: index a UTF-8 string by byte offsets that you got from a search, never by a character count. In Rust, slicing a `&str` in the middle of a character panics. In Go, `len(s)` counts bytes, and `for range s` decodes runes, which are code points, with U+FFFD for each invalid byte. Python 3 counts code points. It stores each string with 1, 2 or 4 bytes per code point, chosen by the largest code point in the string (PEP 393).
+
+## Validation at memory speed
+
+A byte-at-a-time decoder needs several branches for each byte. Validation is on the hot path of every JSON parser and web server.
+
+John Keiser and Daniel Lemire showed how to validate with SIMD instructions in "Validating UTF-8 In Less Than One Instruction Per Byte" (2021). Their method looks up 3 nibbles of each pair of adjacent bytes in small tables, and ANDs the results to find every error class. It checks 32 or 64 bytes per step with no branches. The paper reports that it is more than 10 times faster than the validators of many common libraries. The simdutf library and simdjson use this method.
+
+## Connect
+
+- [Binary and hexadecimal](/architecture/data/binary-and-hexadecimal) shows UTF-8 bytes in a hex dump.
+- [Endianness](/architecture/data/endianness) explains why UTF-16 and UTF-32 need a byte order and UTF-8 does not.
+- [WebSockets](/networking/apps/websockets) sends text frames that must be valid UTF-8.
+- [Tries and adaptive radix trees](/databases/indexes/tries-and-adaptive-radix-trees) store UTF-8 keys, and byte order gives code point order.
+- [SIMD by hand](/performance/cpu/simd-by-hand) covers the vector instructions that fast validators use.
+
+<Recall cards={[
+  { q: "How does UTF-8 encode a code point that needs 12 to 16 bits?", a: "In 3 bytes: 1110xxxx 10xxxxxx 10xxxxxx. The lead byte carries the top 4 bits, and each continuation byte carries 6." },
+  { q: "Name three properties that made UTF-8 win.", a: "ASCII compatibility: ASCII bytes never occur inside a multi-byte sequence. Self-synchronization: each byte shows its role. Also, byte order equals code point order, and there is no endianness." },
+  { q: "Why must a decoder reject the overlong form C0 AF?", a: "It decodes to /, but a check on the raw bytes does not see a slash. Accepting it lets an attacker pass a security check, as in the IIS path traversal bug CVE-2000-0884." },
+  { q: "How does UTF-16 encode U+1F600?", a: "Subtract 0x10000 to get a 20-bit value. The high 10 bits go into D800 to DBFF and the low 10 bits into DC00 to DFFF: D83D DE00." },
+  { q: "What are the four lengths of a string, and which languages use each?", a: "UTF-8 bytes (Rust len, Go len), UTF-16 units (JS length, Java length), code points (Python len), and grapheme clusters (Swift count)." },
+  { q: "Why should you normalize text before you compare it?", a: "One visible character can have several code point sequences, such as é as U+00E9 or as e plus U+0301. NFC or NFD makes equal text compare equal." },
+]} />

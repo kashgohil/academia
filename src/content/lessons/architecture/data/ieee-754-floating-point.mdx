@@ -1,0 +1,160 @@
+---
+summary: The bits of an IEEE 754 float, field by field; why the gaps between floats double at each power of two; subnormals, zeros, infinities and NaNs; exact rounding and why 0.1 + 0.2 is not 0.3; why sum order matters; FMA; and the narrow formats of machine learning.
+---
+import { ArchDataFloatBitsDemo, ArchDataDensityDemo, ArchDataRoundDemo, ArchDataSumOrderDemo, ArchDataFormatsDemo } from "@/demos/arch/ArchDataFloatDemos";
+
+An integer word has fixed steps of 1. Science, graphics and machine learning need very small and very large values in the same program. **Floating point** solves this like scientific notation, in base 2. It stores a sign, an exponent and a few significant bits:
+
+$$
+x = (-1)^{s} \times 1.f \times 2^{e}
+$$
+
+The **IEEE 754** standard defines the formats and the rules of arithmetic. William Kahan was its main architect, and the first version appeared in 1985. The 2008 revision added the fused multiply-add and the 16-bit format. The current version is IEEE 754-2019. Every mainstream CPU and GPU follows it for binary32 and binary64.
+
+## The three fields
+
+A binary32 value (`float` in C, `f32` in Rust) has 1 sign bit, 8 exponent bits and 23 fraction bits. A binary64 value (`double`, `f64`) has 1, 11 and 52.
+
+- The **sign** bit $s$ is 1 for a negative number.
+- The **exponent field** $E$ is an unsigned number with a **bias**: the real exponent is $E - 127$ for binary32 and $E - 1023$ for binary64. A bias, not two's complement, keeps the order of positive floats the same as the order of their bit patterns.
+- The **fraction** $f$ holds the bits after the binary point. A normal number always starts with a 1 bit, so the format does not store it. This **implicit bit** gives one extra bit of precision. The precision $p$ is 24 bits for binary32 and 53 bits for binary64.
+
+<Predict
+  id="tenth"
+  question="You store 0.1 in a binary32 float. What value does the float hold exactly?"
+  options={["Exactly 0.1", "0.100000001490116119384765625", "0.1, plus a small error that is different each time"]}
+  answer={1}
+  explain="0.1 is 1/10, and 10 has the factor 5, so 0.1 has no finite binary expansion. The float holds the nearest value with a 24-bit significand. Every binary fraction has a finite decimal expansion, so the stored value can be written exactly. The error is the same every time: rounding is deterministic."
+>
+<ArchDataFloatBitsDemo />
+</Predict>
+
+Things to try:
+
+1. Read the fields of 0.1: E = 123, so the scale is $2^{-4}$. The fraction is the repeating pattern `1001 1001 …`, rounded at the last bit.
+2. Drag **Exponent field E**. Each step doubles or halves the value. The fraction stays the same.
+3. Click **min subnormal**, then **min normal**. Below the normal range the exponent field is 0, and the implicit bit becomes 0.
+4. Click **−0**, **+∞** and **NaN**. On the NaN, set a low fraction bit and clear the top fraction bit. The value is now a signaling NaN. If all fraction bits are 0, the value is ∞.
+5. Select **binary64** and type 0.1. The exact value now has 55 decimal digits, and the shortest string that reads back as the same value is still 0.1.
+
+## The special values
+
+The exponent fields of all zeros and all ones are reserved.
+
+| Exponent field | Fraction = 0 | Fraction ≠ 0 |
+|---|---|---|
+| all zeros | ±0 | **subnormal**: $0.f \times 2^{e_{\min}}$ |
+| 1 to max − 1 | normal: $1.f \times 2^{E - \text{bias}}$ | normal |
+| all ones | ±∞ | NaN |
+
+**Signed zero** keeps the sign of a result that underflows. So $1 / {-0}$ gives $-\infty$, but $-0 = +0$ compares true. **Infinity** is the result of an overflow or of $1/0$. **NaN** (not a number) is the result of an invalid operation, such as $0/0$ or $\infty - \infty$. A NaN is not equal to anything, not even to itself. So `x != x` is true exactly when `x` is a NaN.
+
+A NaN has a **quiet** form and a **signaling** form. IEEE 754 recommends a top fraction bit of 1 for quiet NaNs. A signaling NaN raises the invalid-operation exception when an operation uses it. The other fraction bits are the **payload**.
+
+The x86 SSE unit passes the payload of the first NaN operand to the result. RISC-V does not: an operation that produces a NaN produces the **canonical NaN**, 0x7fc00000 in binary32. JavaScript engines such as SpiderMonkey use NaN payloads to store pointers and tags inside one 64-bit value. This is called NaN-boxing.
+
+## Where the values are
+
+<Predict
+  id="density"
+  question="binary32 has $2^{23}$ = 8,388,608 values from 1 up to 2. How many does it have from 1024 up to 2048?"
+  options={["8,388,608, the same", "8,192, fewer", "Much more: about $2^{33}$"]}
+  answer={0}
+  explain="Each interval from one power of two to the next is a binade. A binade is one exponent field value with all $2^{23}$ fractions. The gap between neighbours doubles at each power of two, so 1024 to 2048 has the same count, 1024 times further apart."
+>
+<ArchDataDensityDemo />
+</Predict>
+
+1. Keep 3 exponent bits and 2 fraction bits. Each binade holds 4 values, and the gap doubles from one binade to the next. The largest value is 14.
+2. Select the **log** axis. Now every binade has the same width, and the values look evenly spread.
+3. Turn on **Flush subnormals to zero**. A hole opens between 0 and the smallest normal value. In that hole, `x - y == 0` can be true when `x != y`.
+4. Add a fraction bit. Each binade gets twice as many values. Add an exponent bit. The range grows, and the count per binade stays the same.
+
+The gap between a value and its next neighbour is one **ULP** (unit in the last place). Its relative size is about the same everywhere: from $2^{-p}$ to $2^{1-p}$. For binary32 that is a relative error of at most $2^{-24}$ after one rounding, about 7 decimal digits. For binary64 it is $2^{-53}$, about 16 digits. The value $2^{1-p}$ is called **machine epsilon**: the gap above 1.
+
+Above $2^{53}$, binary64 cannot hold every integer. So `9007199254740993.0` in source code becomes 9007199254740992, and `1e16 + 1 == 1e16` is true. JavaScript has only binary64 numbers, so `Number.MAX_SAFE_INTEGER` is $2^{53} - 1$. Use `BigInt` or a 64-bit integer type for IDs and counters beyond that.
+
+**Subnormals** fill the gap near zero with the smallest step. They give **gradual underflow**: the difference of two different floats is never zero. Some hardware handles them slowly.
+
+In its Sandy Bridge section, Intel's optimization manual says that denormal inputs to x87 instructions need an assist that can cost hundreds of cycles. SSE has two MXCSR bits that trade accuracy for speed. **FTZ** (flush to zero, bit 15) replaces subnormal results with zero. **DAZ** (denormals are zero, bit 6) reads subnormal inputs as zero. With `-ffast-math`, GCC links startup code that sets them. This changes the results of every library that the process loads.
+
+## Rounding, exactly
+
+Every operation in IEEE 754 is **correctly rounded**. The hardware computes the exact result, as if with infinite precision, and then rounds it once. The default rule is **round to nearest, ties to even**. If the exact result is halfway between two neighbours, it picks the one whose last bit is 0. This avoids a bias toward up or down in long computations.
+
+<ArchDataRoundDemo />
+
+1. Keep **0.1 + 0.2**. Each literal is rounded when it is stored. The exact sum of the two stored values is then exactly halfway between two binary64 values: a tie.
+2. Read the last bits. The neighbour above has last bit 0, so ties to even picks it: 0.30000000000000004. The literal 0.3 is stored as the neighbour below. So `0.1 + 0.2 == 0.3` is false.
+3. Select **toward zero**. The result changes to the neighbour below, and the comparison is now true. This is luck, not a fix.
+4. Click **1e16 + 1**. The exact result is between two neighbours that are 2 apart, and it is a tie. Ties to even gives back 1e16.
+5. Click **fma vs. mul then add**. A separate multiply rounds away the low bits of the product, and the sum is 0. The fused multiply-add keeps them, and gives $2^{-60}$.
+
+IEEE 754 has five rounding modes: ties to even, ties away from zero, toward zero, toward $+\infty$ and toward $-\infty$. RISC-V encodes the mode in the `rm` field of each floating-point instruction: RNE = 000, RTZ = 001, RDN = 010, RUP = 011 and RMM = 100. The value DYN = 111 reads the mode from the `fcsr` register. On x86, SSE keeps one mode in MXCSR bits 13 and 14. Interval arithmetic uses the two directed modes to get a lower and an upper bound.
+
+The **fused multiply-add** (FMA) computes $a \times b + c$ with one rounding. It is faster than two instructions, and more accurate. RISC-V has `fmadd.d`, x86 has `vfmadd231sd` and its variants, and AArch64 has `fmadd`. A compiler can contract `a*b + c` into an FMA. This makes results differ between targets and compiler flags, so GCC and Clang have `-ffp-contract` to control it.
+
+Before SSE2, x86 code used the **x87** unit. It computes with an 80-bit format: 1 sign bit, 15 exponent bits and a 64-bit significand with an explicit integer bit. A value in an x87 register had more precision than the same value after a store to memory. So the result of a 32-bit program could change when the compiler spilled a register. The x86-64 ABIs use SSE2 for `float` and `double`, and this source of surprises is gone.
+
+## Order matters
+
+Correct rounding of each operation does not make a whole computation exact. Floating-point addition is not associative: $(a + b) + c$ can differ from $a + (b + c)$, because each step rounds.
+
+<ArchDataSumOrderDemo />
+
+1. Keep **1 then many 1e−8**. Left to right, each 1e−8 is less than half an ULP of 1, so each addition gives back 1. The result is off by 839 ULP.
+2. Read **smallest first**. The small values add up to $10^{-4}$ first, and that is large enough to change the sum. The result is correct.
+3. Select **mixed signs and sizes**. Left to right is off by 822 ULP. Pairwise summation is off by 2, because each value goes through only about $\log_2 n$ additions.
+4. Select **1 + 1/2 + 1/3 + …**. Kahan summation gets the correct result. It keeps a second variable for the rounding error of each step and adds it back.
+
+In binary32, the harmonic series stops growing. At term 2,097,152 the sum is 15.403683, and $1/n$ is less than half an ULP of the sum, so it adds nothing. The true sum grows without limit. The Math track covers error analysis and compensated summation in depth.
+
+What this means for code: a parallel reduction, a SIMD loop or a new thread count changes the order of the additions. So it changes the result. `-ffast-math` lets the compiler reorder for speed for this reason. Compare floats with a tolerance that fits the computation, not with `==`. If two runs must give identical bits, fix the order.
+
+## Narrow formats for machine learning
+
+Neural networks need range more than precision. Their weights and gradients span many powers of ten, but each value needs only a few significant bits. Narrow formats halve or quarter the memory traffic, and tensor hardware runs them much faster.
+
+<Predict
+  id="narrow"
+  question="You store 70,000 in two 16-bit formats: binary16 (5 exponent bits, 10 fraction bits) and bfloat16 (8 exponent bits, 7 fraction bits). What happens?"
+  options={["Both store it with a small error", "binary16 overflows to ∞, and bfloat16 stores 70,144", "bfloat16 overflows, and binary16 stores it exactly"]}
+  answer={1}
+  explain="The largest binary16 value is 65,504, so 70,000 overflows. The bfloat16 format has the exponent range of binary32, so it holds the value. But it has only 8 significant bits: it stores 70,144, an error of 0.21%."
+>
+<ArchDataFormatsDemo />
+</Predict>
+
+1. Keep 70,000. binary16 overflows, and bfloat16 stores 70,144.
+2. Move the value down to 0.1. Now binary16 has the smaller error (0.024%), because it has 3 more fraction bits than bfloat16.
+3. Move the value above 464. It rounds to a value above 448, and FP8 E4M3 has no infinity, so the conversion gives NaN. Turn on **saturate** to clamp to 448, as many ML libraries do.
+4. Compare the two FP8 formats. E5M2 has more range, and E4M3 has more precision.
+
+| Format | Sign/exponent/fraction bits | Largest value | Machine epsilon | Use |
+|---|---|---|---|---|
+| binary64 | 1/11/52 | about $1.8 \times 10^{308}$ | $2^{-52}$ | scientific code, JavaScript numbers |
+| binary32 | 1/8/23 | about $3.4 \times 10^{38}$ | $2^{-23}$ | graphics, most ML training state |
+| binary16 | 1/5/10 | 65,504 | $2^{-10}$ | GPU graphics, ML inference |
+| bfloat16 | 1/8/7 | about $3.39 \times 10^{38}$ | $2^{-7}$ | ML training (Google TPU, then most accelerators) |
+| FP8 E4M3 | 1/4/3 | 448 | $2^{-3}$ | weights and activations |
+| FP8 E5M2 | 1/5/2 | 57,344 | $2^{-2}$ | gradients |
+
+The **bfloat16** format came from Google Brain for TPUs. It is the top half of a binary32 value. A conversion rounds away the low 16 bits, usually to nearest even.
+
+The two FP8 formats come from Micikevicius and others, "FP8 Formats for Deep Learning" (2022). The Open Compute Project published them as the OFP8 specification in 2023. E4M3 gives up infinities and keeps only one NaN pattern per sign, S.1111.111. That frees 7 more values, and the largest value grows from 240 to 448. NVIDIA Hopper (H100) tensor cores take both FP8 formats as inputs.
+
+## Connect
+
+- [Two's complement](/architecture/data/twos-complement) covers integers, which have exact steps but a fixed range.
+- [SIMD by hand](/performance/cpu/simd-by-hand) adds floats in vector registers, which changes the order of the additions.
+- [Tries and adaptive radix trees](/databases/indexes/tries-and-adaptive-radix-trees) flip the bits of a float so that byte order sorts it.
+- [Endianness](/architecture/data/endianness) shows a float in the bytes of a struct.
+
+<Recall cards={[
+  { q: "What are the three fields of a binary32 value, and what is the bias?", a: "1 sign bit, 8 exponent bits, 23 fraction bits. The real exponent is E − 127. Normal numbers have an implicit leading 1, so the precision is 24 bits." },
+  { q: "Why does the gap between neighbouring floats double at each power of two?", a: "Each binade has the same number of fraction values, $2^{m}$, spread over an interval that is twice as wide as the one below." },
+  { q: "Why is 0.1 + 0.2 == 0.3 false in binary64?", a: "Each literal is rounded when stored. The exact sum of the stored values is a tie between two doubles, and ties to even picks the upper one, 0.30000000000000004. The literal 0.3 rounds to the lower one." },
+  { q: "What do subnormals give you, and what do FTZ and DAZ do?", a: "Gradual underflow: x − y is 0 only if x equals y. FTZ flushes subnormal results to zero, and DAZ reads subnormal inputs as zero. Both avoid slow paths on some hardware, at a cost in accuracy." },
+  { q: "What does an FMA do differently from a multiply and an add?", a: "It computes a × b + c exactly and rounds once. The separate multiply rounds the product first, so it loses its low bits." },
+  { q: "Why did ML hardware choose bfloat16 over binary16 for training?", a: "bfloat16 keeps the 8 exponent bits of binary32, so gradients and weights do not overflow or underflow. It gives up precision: only 8 significant bits." },
+]} />

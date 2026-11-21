@@ -1,0 +1,134 @@
+---
+summary: How a multi-byte value is laid out at increasing addresses, why byte order matters only when bytes cross a boundary, how to write code that never needs to know the host order, the byte-swap instructions, bit order, and what an unaligned access costs on x86, Arm and RISC-V.
+---
+import { ArchDataStructDumpDemo, ArchDataBoundaryDemo, ArchDataSwapDemo, ArchDataUnalignedDemo } from "@/demos/arch/ArchDataEndianDemos";
+
+Memory gives an address to each byte, not to each word. A 32-bit value takes four addresses. The machine must decide which byte of the value goes at the lowest address. This decision is the **byte order**, or **endianness**.
+
+- **Little-endian**: the least significant byte is at the lowest address. x86 uses this order, and so do Arm and RISC-V in every common operating system.
+- **Big-endian**: the most significant byte is at the lowest address. This is the order of network protocols, of IBM z mainframes and of SPARC.
+
+Danny Cohen took the two names from *Gulliver's Travels* in his 1980 note "On Holy Wars and a Plea for Peace" (IEN 137). In the book, two nations go to war over which end of an egg to break first. Neither order is better in general. Little-endian lets a load of a narrower type at the same address read the low part of the value. Big-endian matches the way that people write numbers, so dumps are easier to read.
+
+<Predict
+  id="lowbyte"
+  question="An x86 program stores the uint32_t value 0x0A000001 at address 0x100. Which byte is at address 0x100?"
+  options={["0x0A, the first byte as you read the number", "0x01, the least significant byte", "0x00"]}
+  answer={1}
+  explain="x86 is little-endian. The least significant byte, 0x01, goes to the lowest address, and 0x0A goes to 0x103. A big-endian machine puts 0x0A at 0x100."
+>
+<ArchDataStructDumpDemo />
+</Predict>
+
+Things to try:
+
+1. Click address +0 in the little-endian row. It holds byte 0 of `magic`, the value 0x01. The big-endian row holds 0x0A there.
+2. Look at `flags` and `kind`. One-byte fields are the same in both rows: a single byte has no order.
+3. Move **delta** to −2. Its four bytes are `FE FF FF FF` in little-endian and `FF FF FF FE` in big-endian.
+4. Look at `ratio`. The float 1.5 is 0x3FC00000, and its bytes follow the same order as an integer.
+5. Look at `id`. In big-endian order you can read 0x1122334455667788 from left to right. In little-endian order you read it backwards.
+
+The struct has the same field offsets in both rows. The compiler places fields by their size and alignment, and byte order changes only the bytes inside each field. The Systems track covers padding and alignment rules.
+
+## The boundary rule
+
+Inside one machine, byte order is invisible. A store and a later load of the same type use the same order, so the program gets its value back. Shifts and masks work on values in registers, which have no byte order. `x >> 24` gives the most significant byte on every machine.
+
+Byte order matters only when bytes cross a **boundary**. A boundary is a file, a network packet, memory shared with another machine, or a pointer cast to another type.
+
+<Predict
+  id="boundary"
+  question="A little-endian machine writes a uint32_t to a file with fwrite(&x, 4, 1, f). A big-endian machine reads it with fread into a uint32_t. The value was 0x0A000001. What does the reader get?"
+  options={["0x0A000001, the same value", "0x0100000A, the bytes in reverse order", "It depends on the compiler"]}
+  answer={1}
+  explain="fwrite copies the bytes of memory: 01 00 00 0A. The big-endian reader puts the first byte in the most significant place, so it gets 0x0100000A, which is 16,777,226."
+>
+<ArchDataBoundaryDemo />
+</Predict>
+
+1. Keep a little-endian writer and a big-endian reader, both copying memory. The reader gets 16,777,226.
+2. Make the reader little-endian. The value is correct, but only because the two machines agree.
+3. Set both sides to **shifts (big-endian)**. Now every combination of CPUs gives the correct value.
+4. Mix the methods: write with shifts, and read with a memory copy. It works only on a big-endian reader.
+
+The robust method is to say the byte order of the data in the code, and never ask about the order of the host. Rob Pike called this "the byte order fallacy" (2012): if your code checks the host byte order, it probably has a bug. Decode a big-endian field like this:
+
+```c
+uint32_t read_be32(const uint8_t *p) {
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+```
+
+This code is correct on every machine, and it costs nothing. GCC and Clang recognize the pattern. On x86-64 they emit one load and one `bswap`, or one `movbe`. On a big-endian target they emit one plain load. Each language has the same functions in its library:
+
+| Language | Read big-endian | Write little-endian |
+|---|---|---|
+| C (POSIX) | `ntohl(x)`, `be32toh(x)` | `htole32(x)` |
+| Rust | `u32::from_be_bytes(b)` | `x.to_le_bytes()` |
+| Go | `binary.BigEndian.Uint32(b)` | `binary.LittleEndian.PutUint32(b, x)` |
+| Zig | `std.mem.readInt(u32, b, .big)` | `std.mem.writeInt(u32, b, x, .little)` |
+
+**Network byte order** is big-endian. RFC 791, the IPv4 specification, says that the most significant octet of a multi-octet quantity is sent first. The C functions `htonl` and `ntohl` convert host order to network order and back. On a big-endian host they do nothing. The [layers and encapsulation](/networking/foundations/layers-and-encapsulation) lesson parses real headers with these rules.
+
+File formats choose their own order. ELF stores it in byte 5 of the file. PNG is big-endian. Protocol Buffers and SQLite use variable-length integers with a defined byte layout. A database page format that stores keys in big-endian order can compare them with `memcmp`.
+
+## Byte-swap instructions
+
+When the order of the data and the order of the host differ, the CPU swaps the bytes. Each ISA has an instruction for this. The 80486 added `bswap` to x86. The `movbe` instruction loads or stores with a swap in one step.
+
+<ArchDataSwapDemo />
+
+1. Keep **reverse bytes** at 32 bits. 0x89ABCDEF becomes 0xEFCDAB89. The lines show where each byte goes.
+2. Select **bytes in each 16 bits**. Arm `REV16` swaps the two bytes of each halfword. This converts an array of 16-bit values.
+3. Select **bits in each byte**. The bytes stay in place, but the bits inside each byte reverse. RISC-V `brev8` serves cryptography and CRC code.
+4. Select **reverse all bits**. Arm `RBIT` is a full mirror image. With `CLZ` it counts trailing zeros.
+
+| ISA | Reverse bytes | Other |
+|---|---|---|
+| x86-64 | `bswap`, `movbe` (load or store) | |
+| RISC-V | `rev8` (Zbb and Zbkb extensions) | `brev8` reverses the bits in each byte (Zbkb) |
+| AArch64 | `REV`, and `REV16`, `REV32` on smaller units | `RBIT` reverses all bits |
+
+**Bit order** is a different matter. Memory gives addresses to bytes, so the bits inside a byte have no order that a program can see. Bit order exists on serial links. Ethernet sends each octet least significant bit first, except the frame check sequence. Some checksums, such as the CRC-32 of Ethernet, gzip and PNG, work on reflected bits for this reason. Bit fields in C structs have an implementation-defined layout, so do not use them for a wire format.
+
+Byte order can also be a setting. AArch64 can be **bi-endian**. Support is optional, and `ID_AA64MMFR0_EL1` says if a core has it. Where it is supported, the `SCTLR_ELx.EE` bit selects the data byte order, and `SCTLR_EL1.E0E` selects it for user code. Instruction fetches are always little-endian.
+
+The RISC-V privileged spec added the `MBE`, `SBE` and `UBE` bits in version 1.12, with the same rule for instruction fetches. Linux on these machines runs little-endian, but a big-endian network appliance can use the other mode.
+
+Some old machines used neither order. The PDP-11 stored a 32-bit value as two 16-bit words, the high word first, but each word little-endian. So 0x0A0B0C0D was stored as `0B 0A 0D 0C`. This is the "NUXI problem": the string UNIX could come back as NUXI after a transfer between machines.
+
+## Alignment
+
+An access is **naturally aligned** when its address is a multiple of its size. A 4-byte load at address 0x1004 is aligned, and the same load at 0x1006 is not. Byte order and alignment are separate topics, but both appear when you read structured data from a byte buffer.
+
+<ArchDataUnalignedDemo />
+
+1. Keep the 8-byte access at address 60. Bytes 60 to 67 cross the line boundary at 64, so the core reads two cache lines.
+2. Move the address to 56. The access is aligned, and stays in one line.
+3. Read the table. An 8-byte access at a random byte address crosses a 64-byte line in 10.9% of cases. A 64-byte vector load crosses in 98.4% of cases.
+4. Select 64 bytes. Only the aligned address 0 or 64 stays in one line. This is why AVX-512 code aligns its arrays to 64 bytes.
+
+The rules differ by ISA.
+
+- **x86-64**: ordinary loads and stores can be unaligned. Instructions such as `movaps` require 16-byte alignment and raise a general-protection fault otherwise. A locked instruction that spans two cache lines is a **split lock**. It can lock the whole memory bus, and Linux can detect and penalize it since version 5.7.
+- **AArch64**: ordinary accesses to normal memory can be unaligned, unless the `SCTLR_ELx.A` bit enables alignment checks. Exclusive loads and stores and acquire/release accesses need alignment, and newer cores with FEAT_LSE2 relax this inside a 16-byte block. Accesses to device memory must be aligned.
+- **RISC-V**: the spec leaves misaligned loads and stores to the execution environment. Hardware can handle them, or a trap can emulate them invisibly at a high cost, or they can raise an exception. LR/SC and atomic instructions need natural alignment.
+
+What this means for code: do not cast a byte pointer to a wider type to read a field. In C this is undefined behavior if the address is not aligned, and it is wrong on the other byte order. Use `memcpy` into a local variable, or the shift pattern above. Compilers turn both into one load where the target allows it.
+
+## Connect
+
+- [Binary and hexadecimal](/architecture/data/binary-and-hexadecimal) shows how to read a little-endian value in a hex dump.
+- [Layers and encapsulation](/networking/foundations/layers-and-encapsulation) parses big-endian headers field by field.
+- [Pages and slotted records](/databases/storage/pages-and-slotted-records) lays out records with alignment and padding.
+- [Tries and adaptive radix trees](/databases/indexes/tries-and-adaptive-radix-trees) store keys big-endian so that byte comparison gives numeric order.
+- [Cache organization](/architecture/caches/cache-organization-and-access-patterns) explains the 64-byte line that a split access crosses.
+
+<Recall cards={[
+  { q: "On a little-endian machine, which byte of 0x0A000001 is at the lowest address?", a: "0x01, the least significant byte." },
+  { q: "When does byte order matter, and when is it invisible?", a: "It matters when bytes cross a boundary: a file, a socket, shared memory with another machine, or a pointer cast to another type. Inside one machine, loads and stores of the same type use the same order, and shifts work on values." },
+  { q: "How do you read a big-endian uint32 from a byte buffer with no check of the host order?", a: "Shift and OR the bytes: p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]. Compilers turn it into one load plus a byte swap where needed." },
+  { q: "Name the byte-swap instruction on x86-64, RISC-V and AArch64.", a: "bswap (or movbe for a load or store with a swap), rev8 (Zbb), and REV." },
+  { q: "What fraction of random byte addresses makes an 8-byte access cross a 64-byte cache line?", a: "7 out of 64, which is 10.9%. In general it is (size − 1) / 64." },
+  { q: "How did the PDP-11 store 0x0A0B0C0D?", a: "0B 0A 0D 0C: the high 16-bit word first, but each word little-endian." },
+]} />

@@ -1,0 +1,136 @@
+---
+summary: How a machine word holds a number, why programmers write it in hexadecimal, the bit operations that every systems programmer uses, how fast counters wrap, and how to read a hex dump by eye.
+---
+import { ArchDataBitFlipperDemo, ArchDataBitOpsDemo, ArchDataGrowthDemo, ArchDataHexDumpDemo } from "@/demos/arch/ArchDataBinaryDemos";
+
+A register, a memory word and a file all hold the same thing: a fixed number of bits. A **bit** is one binary digit, 0 or 1. A **word** is a group of bits that the machine moves and computes as one unit. Current CPUs use words of 8, 16, 32 and 64 bits.
+
+The bits have no meaning of their own. The instruction that reads them gives them a meaning: an unsigned integer, a signed integer, a float, a character or an address. This module shows each meaning at the bit level. This first lesson covers the plain unsigned integer, and the notation that we use to read and write bits.
+
+## Positional notation
+
+In **positional notation**, each digit has a weight. The weight is a power of the base. The decimal number 4096 is $4 \cdot 10^3 + 0 \cdot 10^2 + 9 \cdot 10^1 + 6 \cdot 10^0$. Binary works the same way with base 2, so each bit has the weight $2^i$, where $i$ is the bit index.
+
+$$
+x = \sum_{i=0}^{w-1} b_i \cdot 2^i
+$$
+
+Bit 0 is the **least significant bit** (LSB). Bit $w - 1$ is the **most significant bit** (MSB). A word of $w$ bits holds the values 0 to $2^w - 1$. We write the MSB on the left, as with decimal digits.
+
+<Predict
+  id="hexdigits"
+  question="A 32-bit word holds 1. You set bit 31. How many hexadecimal digits change, and how many decimal digits change?"
+  options={["One hex digit and one decimal digit", "One hex digit, but the decimal value gets 9 new digits", "All 8 hex digits and all decimal digits"]}
+  answer={1}
+  explain="0x00000001 becomes 0x80000001: only the top hex digit changes, because each hex digit is exactly 4 bits. In decimal, 1 becomes 2,147,483,649. A decimal digit does not map to a fixed group of bits, so one bit can change every decimal digit."
+>
+<ArchDataBitFlipperDemo />
+</Predict>
+
+Things to try:
+
+1. Click bit 15 of the 16-bit word. Only the leftmost hex digit changes. The decimal value jumps by 32,768.
+2. Click **All ones**, then **+1**. The value wraps to 0, because the carry leaves the top of the word.
+3. Click **× 2** a few times. Each click shifts every bit one place to the left.
+4. Select 64 bits and click **All ones**. The largest value needs 20 decimal digits but only 16 hex digits.
+5. Type `0b101010` or `0o52` in the text field. All four notations name the same bits.
+
+## Why hexadecimal
+
+One hex digit holds exactly 4 bits, because $16 = 2^4$. So a byte is always two hex digits, and a 64-bit word is always 16. You can convert between hex and binary one digit at a time, with no arithmetic. Decimal has no such property, because 10 is not a power of 2. A decimal digit holds $\log_2 10 \approx 3.32$ bits.
+
+Octal holds 3 bits per digit. It was popular on machines with word sizes that are multiples of 3, such as the 36-bit PDP-10. Today it survives mostly in Unix file modes such as `0o755`. A leading `0` in C means octal, so `010` is 8 in C. Rust, Zig and Python 3 use `0o` to avoid this trap.
+
+The table gives the sizes that you meet every day.
+
+| Width | Hex digits | Largest unsigned value | Decimal digits |
+|---|---|---|---|
+| 8 | 2 | 255 | 3 |
+| 16 | 4 | 65,535 | 5 |
+| 32 | 8 | 4,294,967,295 | 10 |
+| 64 | 16 | 18,446,744,073,709,551,615 | 20 |
+
+## The bit toolkit
+
+Most bit tricks combine four operations: AND, OR, XOR and shift. A **mask** is a word with 1 bits in the places that you want to select. `x & mask` keeps the selected bits. `x | mask` sets them, and `x ^ mask` flips them.
+
+<Predict
+  id="clearlowest"
+  question="What does x & (x - 1) compute?"
+  options={["x rounded down to a power of two", "x with its lowest 1 bit cleared", "x − 1, with no change"]}
+  answer={1}
+  explain="Subtracting 1 turns the lowest 1 bit into 0, and every 0 bit below it into 1. The AND then clears all of those bits. The bits above stay the same. So the result is 0 exactly when x has at most one 1 bit."
+>
+<ArchDataBitOpsDemo />
+</Predict>
+
+1. Keep **x & (x−1)** with x = 104 (binary `0110 1000`). The row for x − 1 shows the borrow: bit 3 becomes 0, and bits 0 to 2 become 1. The result is 96.
+2. Click **x = power of 2**. The result is 0. This is the standard test for a power of two.
+3. Select **x & −x**. Only the lowest 1 bit stays. A Fenwick tree uses this step to move between nodes.
+4. Select **Extract field** and move the sliders. A shift and a mask take an $n$-bit field out of a word. Instruction decoders and packet parsers do this all the time.
+5. Select **Next power of 2**. The top 1 bit is copied into every lower bit, and then 1 is added. Hash tables use this to size their arrays.
+
+Count operations have their own instructions:
+
+| Operation | x86-64 | RISC-V (Zbb extension) | AArch64 | Rust |
+|---|---|---|---|---|
+| count 1 bits | `popcnt` | `cpop` | `cnt` (on a vector register; scalar with FEAT_CSSC) | `x.count_ones()` |
+| count leading zeros | `lzcnt` | `clz` | `clz` | `x.leading_zeros()` |
+| count trailing zeros | `tzcnt` | `ctz` | `rbit`, then `clz` (`ctz` with FEAT_CSSC) | `x.trailing_zeros()` |
+
+Use the language intrinsic, not a loop. C++20 has `std::popcount` and `std::countl_zero` in `<bit>`. C23 has `stdc_count_ones` in `<stdbit.h>`. Zig has `@popCount` and `@clz`, and Go has `bits.OnesCount` in `math/bits`. The compiler emits the instruction if the target has it, and a short bit-trick sequence if not.
+
+## How wide numbers grow
+
+Each extra bit doubles the number of values. So $2^{10} = 1024$ is about a thousand, $2^{20}$ is about a million, and $2^{30}$ is about a billion. With this rule you can estimate any power of two: $2^{32}$ is $4 \cdot 2^{30}$, about 4 billion.
+
+<Predict
+  id="wrap"
+  question="A 32-bit unsigned counter counts milliseconds from 0. When does it wrap to 0?"
+  options={["After about 4 seconds", "After about 50 days", "After about 136 years"]}
+  answer={1}
+  explain="$2^{32}$ is 4,294,967,296. At 1000 counts per second, that is 4,294,967 seconds, or 49.7 days. A machine that stays up longer than that sees time go backwards, unless the code handles the wrap."
+>
+<ArchDataGrowthDemo />
+</Predict>
+
+1. Keep 32 bits and milliseconds. The counter wraps after 49.7 days.
+2. Select nanoseconds. A 32-bit counter wraps after 4.29 s, and a 64-bit counter after 585 years.
+3. Select seconds and set 31 bits. This is a signed 32-bit Unix time, the `time_t` of many older systems. It ends at 2038-01-19 03:14:07 UTC.
+4. Select the 3 GHz cycle counter, which is a model input. At 64 bits, it wraps after 195 years.
+
+What this means for code: a counter that can wrap needs a comparison that survives the wrap. Compare the difference, not the values. If `a` and `b` are 32-bit unsigned counters, `(int32_t)(a - b) > 0` means that `a` is later than `b`. This works if the two values are less than $2^{31}$ counts apart. The Linux `time_after` macro uses this method for `jiffies`, the kernel tick counter.
+
+The kernel also starts `jiffies` so that its low 32 bits wrap five minutes after boot. Wrap bugs then show up soon.
+
+## Reading a hex dump
+
+A **hex dump** prints bytes as hex digits, with the offset of each line on the left. `xxd file` and `hexdump -C file` give the classic format. A right column shows each printable byte as an ASCII character, and a dot for any other byte.
+
+<ArchDataHexDumpDemo />
+
+1. Keep **int32 array**. Click byte 8. It is part of `a[2]`, which is 256. Its bytes are `00 01 00 00`: the low byte comes first.
+2. Click the bytes of `a[3]`. The value −1 is `ff ff ff ff`. The next lesson explains why.
+3. Look at the last line. The value `0x44434241` shows as `ABCD` in the ASCII column, because 0x41 is the ASCII code of A.
+4. Select **Your text** and type some text. Each ASCII letter is one byte. Each non-ASCII character takes 2 to 4 bytes, and none of these bytes is printable.
+5. Select **ELF header**. The first four bytes are always `7f 45 4c 46`. Byte 18 is the machine type: 0x3E (62) means x86-64.
+
+Some patterns are worth learning by sight. A run of `00` is padding or an empty field. `ff ff ff ff` is −1 or a mask of all ones. Bytes from 0x20 to 0x7E are probably text.
+
+A small number followed by zeros is a little-endian integer. A file usually starts with a **magic number**: fixed bytes that identify the format. ELF files start with `7f 45 4c 46`, and PNG files start with `89 50 4e 47`.
+
+## Connect
+
+- The [two's complement](/architecture/data/twos-complement) lesson gives the same bits a sign.
+- The [endianness](/architecture/data/endianness) lesson explains why the low byte comes first in the dump.
+- [Loading a program](/os/processes/loading-a-program-elf-and-the-dynamic-linker) reads every field of the ELF header.
+- [Column-store compression](/databases/olap/compression) uses bit-packing: each value takes only the bits that it needs.
+- [Tries and adaptive radix trees](/databases/indexes/tries-and-adaptive-radix-trees) use bit fields of a key as an index.
+
+<Recall cards={[
+  { q: "Why does one hex digit map to exactly 4 bits, and one decimal digit not?", a: "16 is $2^4$, so each hex digit is one group of 4 bits. 10 is not a power of 2, so a decimal digit holds about 3.32 bits and does not line up with any bit group." },
+  { q: "What does x & (x − 1) do, and how do you use it?", a: "It clears the lowest 1 bit. The result is 0 exactly when x is 0 or a power of two, so it is a power-of-two test. A loop of it counts the 1 bits." },
+  { q: "How do you take an n-bit field that starts at bit k out of a word?", a: "Shift right by k, then AND with a mask of n ones: (x >> k) & ((1 << n) − 1)." },
+  { q: "How long does a 32-bit millisecond counter last, and how do you compare two values that can wrap?", a: "49.7 days. Subtract them with wrapping and read the difference as signed: (int32_t)(a − b) > 0 means a is later, if they are less than $2^{31}$ apart." },
+  { q: "In a hex dump of an int32_t array on x86, how does 256 look?", a: "00 01 00 00. The least significant byte is at the lowest address." },
+]} />

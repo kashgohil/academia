@@ -96,7 +96,7 @@ export function ArchDataLengthsDemo() {
           );
         })}
       </div>
-      <Note>Chip colors show the UTF-8 length of each code point: 1, 2, 3 or 4 bytes. With NFD, é becomes e plus U+0301 (combining acute accent): one more code point, one more byte, the same grapheme.</Note>
+      <Note>Chip colors show the UTF-8 length of each code point: 1, 2, 3 or 4 bytes. With NFD, ï becomes i plus U+0308 (combining diaeresis): one more code point, one more byte, the same grapheme.</Note>
     </Demo>
   );
 }

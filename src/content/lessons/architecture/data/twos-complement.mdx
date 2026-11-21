@@ -1,0 +1,145 @@
+---
+summary: How two's complement lets one adder serve signed and unsigned numbers, what the carry and overflow flags mean, sign and zero extension, why a right shift rounds down, the MIN / −1 trap, and what C, Rust, Go, Zig and the ISAs do at the edges.
+---
+import { ArchDataWheelDemo, ArchDataExtendDemo, ArchDataShiftDemo, ArchDataOverflowDemo } from "@/demos/arch/ArchDataTwosDemos";
+
+The [previous lesson](/architecture/data/binary-and-hexadecimal) read a word as an unsigned number. A machine also needs negative numbers. Early computers tried two other methods. **Sign-magnitude** uses the top bit as a sign. **Ones' complement** negates a number by inverting every bit. Both have two zeros (+0 and −0), and both need extra adder logic for mixed signs.
+
+**Two's complement** gives the top bit a negative weight. In a $w$-bit word, bit $w - 1$ counts $-2^{w-1}$, not $+2^{w-1}$:
+
+$$
+x = -b_{w-1} \cdot 2^{w-1} + \sum_{i=0}^{w-2} b_i \cdot 2^i
+$$
+
+So an 8-bit word holds −128 to 127, and the pattern `1111 1111` is −1. There is one zero. Every current CPU uses two's complement. C23 and C++20 require it, after decades in which the standards also allowed the two older methods.
+
+## One adder for both
+
+Put the $2^w$ bit patterns around a circle. Adding 1 moves one step clockwise. The unsigned reading and the signed reading are two sets of labels on the same circle. They differ only on the lower half, where the signed labels are the unsigned labels minus $2^w$.
+
+<Predict
+  id="flags"
+  question="A 4-bit adder adds 0110 (6) and 0011 (3). Which flags does x86 set for this addition?"
+  options={["CF only: the result does not fit", "OF and SF, but not CF", "No flags: 9 fits in 4 bits"]}
+  answer={1}
+  explain="The bits are 1001. As unsigned values, 6 + 3 = 9 is correct, so there is no carry out (CF = 0). As signed values, 6 + 3 should be 9, but 1001 means −7. Two positive inputs gave a negative result, so OF = 1. The top bit is 1, so SF = 1."
+>
+<ArchDataWheelDemo />
+</Predict>
+
+Things to try:
+
+1. Keep a = 6 and b = 3. The solid arc crosses the overflow seam, between 7 and −8. The unsigned reading is right, and the signed reading is wrong.
+2. Set b to −3. The adder still walks clockwise, by 13 steps, the unsigned value of `1101`. It crosses the carry seam, so CF = 1. The signed reading, 6 − 3 = 3, is right.
+3. Set a = 8 (−8 as signed) and b = −1. The dashed arc crosses the overflow seam backwards: −8 − 1 gives 7.
+4. Select 8 bits. The same seams sit between 255 and 0, and between 127 and −128.
+
+The adder does not know if its inputs are signed. It computes the sum modulo $2^w$, and the bits are right for both readings when the true result fits. The flags report the two ways that it can fail.
+
+- **CF** (carry flag) is the carry out of the top bit. It is set when the unsigned result is wrong.
+- **OF** (overflow flag) is set when both inputs have the same sign and the result has the other sign. It is set when the signed result is wrong.
+- **SF** copies the top bit, and **ZF** is set when the result is 0.
+
+The x86 `ADD` instruction sets all of them, plus AF and PF. The code that follows chooses the flag. Unsigned branches (`jb`, `ja`) read CF, and `ja` also reads ZF. Signed branches (`jl`, `jg`) compare SF with OF, and `jg` also reads ZF. In C, the type of the variable decides which branch the compiler emits.
+
+## Negation and its one failure
+
+To negate in two's complement, invert every bit and add 1. The sum of $x$ and its inverse is all ones, which is −1, so $\lnot x + 1 = -x$.
+
+One value has no negative. In 8 bits, −128 is `1000 0000`. Its inverse is `0111 1111`, and adding 1 gives `1000 0000` again. The range is not symmetric: there is one more negative value than positive values.
+
+So `abs(INT_MIN)` and `-INT_MIN` overflow. In C they are undefined behavior. In Rust, `i32::MIN.abs()` panics in a debug build and returns `i32::MIN` in an optimized build.
+
+## Sign extension and zero extension
+
+A load of one byte into a 32-bit or 64-bit register must fill the upper bits. **Zero extension** fills them with 0 and keeps the unsigned value. **Sign extension** copies the top bit of the byte and keeps the signed value. Each ISA has both kinds of load.
+
+<ArchDataExtendDemo />
+
+1. Keep the byte 0xF6. Sign extension gives 0xFFFFFFF6, which is −10. Zero extension gives 0x000000F6, which is 246.
+2. Move the slider below 0x80. Bit 7 is 0, and both loads give the same register.
+
+| Load | RISC-V | x86-64 | AArch64 |
+|---|---|---|---|
+| byte, sign-extend | `lb` | `movsx` | `ldrsb` |
+| byte, zero-extend | `lbu` | `movzx` | `ldrb` |
+
+RV64 adds a twist. The 32-bit operations such as `addw` sign-extend their 32-bit result into the 64-bit register. On x86-64, a write to a 32-bit register such as `eax` zero-extends into `rax`. A wrong choice here is a classic bug. C code that reads a `char` from a buffer can get a negative number for a byte above 0x7F. This occurs where `char` is signed, as on x86-64 Linux.
+
+## Right shifts round toward minus infinity
+
+A **logical right shift** fills the top with zeros. An **arithmetic right shift** fills it with copies of the sign bit, so a negative number stays negative. RISC-V names them `srl` and `sra`, and x86 names them `shr` and `sar`.
+
+<Predict
+  id="sra"
+  question="x is −7 in a signed 8-bit register. What does an arithmetic right shift by 1 give, and what does the C expression x / 2 give?"
+  options={["Both give −3", "The shift gives −4, and x / 2 gives −3", "The shift gives −3, and x / 2 gives −4"]}
+  answer={1}
+  explain="An arithmetic shift computes floor(x / 2), which rounds toward minus infinity: −3.5 becomes −4. C, Rust, Go and every hardware divider truncate toward zero: −3.5 becomes −3."
+>
+<ArchDataShiftDemo />
+</Predict>
+
+1. Keep x = −7 and k = 1. The shift gives −4, and the division gives −3.
+2. Set x = −8. Now both give −4, because nothing is rounded.
+3. Set x to a positive value. The two always agree for $x \geq 0$.
+4. Read the last value. The compiler adds $2^k - 1$ to a negative x before the shift, and gets the division result.
+
+The Intel SDM entry for `SAR` says the same. The quotient of `IDIV` is rounded toward zero, and the "quotient" of `SAR` is rounded toward negative infinity. This is why `x / 2` on a signed `int` costs two or three instructions more than on an `unsigned`. If you know that x is not negative, use an unsigned type or a shift. In C11, a right shift of a negative signed value is implementation-defined. GCC and Clang define it as an arithmetic shift.
+
+## Overflow in the ISA and in the language
+
+RISC-V has no flags at all. Its base ISA has no carry flag and no overflow flag, and no integer instruction traps on overflow. The spec shows how to check in software. For unsigned addition, one branch after the add is enough:
+
+```riscv
+    add  t0, t1, t2
+    bltu t0, t1, overflow   # the sum is smaller than an input: it wrapped
+```
+
+For general signed addition, three instructions follow the add. The sum is less than `t1` exactly when `t2` is negative, unless the add overflowed:
+
+```riscv
+    add  t0, t1, t2
+    slti t3, t2, 0          # t3 = (t2 < 0)
+    slt  t4, t0, t1         # t4 = (sum < t1)
+    bne  t3, t4, overflow
+```
+
+The tests for this lesson check this sequence against the x86 OF rule for all 65,536 pairs of 8-bit inputs. They agree on every pair.
+
+Division has two edge cases: division by zero, and MIN / −1, where the true quotient $2^{w-1}$ does not fit. The ISAs and the languages disagree on both.
+
+<ArchDataOverflowDemo />
+
+1. Click **MAX + 1**. The bits wrap to MIN everywhere. Only the languages differ in what they call it: undefined behavior, a panic, `None` or a defined wrap.
+2. Select **a / b** and click **MIN / −1**. x86 raises a divide error, so the process gets SIGFPE on Linux. RISC-V and AArch64 return MIN with no trap.
+3. Click **7 / 0**. RISC-V returns all ones as the quotient, and AArch64 returns 0. Both continue.
+4. Change the width to 8. The edge values change, but the behavior does not.
+
+| | Signed `+` overflow | MIN / −1 |
+|---|---|---|
+| C, C++ | undefined behavior | undefined behavior |
+| Rust | panic in debug builds, wraps in release builds by default | panic in every build |
+| Go | wraps, defined by the spec | the result is MIN, defined by the spec |
+| Zig | illegal behavior: a panic in Debug and ReleaseSafe | `a / b` does not compile for signed values; `@divTrunc(MIN, -1)` is illegal behavior |
+| Java | wraps, defined by the JLS | the result is MIN |
+
+C undefined behavior is not "wraps". The optimizer assumes that signed overflow never happens. So it can delete a check such as `if (x + 1 < x)`, because that condition is always false without overflow. Write the check before the operation, or use `__builtin_add_overflow`, or C23 `ckd_add`.
+
+In Rust, say what you mean: `wrapping_add`, `checked_add` (returns an `Option`), `overflowing_add` (returns the value and a flag) or `saturating_add`. In Zig, use `+%` to wrap, `+|` to saturate, and `@addWithOverflow` to get the result and an overflow bit. The Systems track covers the C rules in depth.
+
+## Connect
+
+- [Binary and hexadecimal](/architecture/data/binary-and-hexadecimal) covers the unsigned reading and the bit operations.
+- [Tries and adaptive radix trees](/databases/indexes/tries-and-adaptive-radix-trees) flip the sign bit, so that byte order sorts signed keys correctly.
+- [RISC-V basics](/architecture/isa/risc-v-basics) lists the full set of integer instructions with no flags.
+- [Branch prediction and branchless code](/performance/cpu/branch-prediction-and-branchless-code) uses the sign bit as a mask.
+
+<Recall cards={[
+  { q: "Which weight does the top bit of a w-bit two's complement word have?", a: "$-2^{w-1}$. All other bits keep their positive weights, so the range is $-2^{w-1}$ to $2^{w-1} - 1$." },
+  { q: "What do CF and OF mean after an x86 add?", a: "CF: the unsigned result is wrong, because a carry left the top bit. OF: the signed result is wrong, because two inputs of the same sign gave a result of the other sign." },
+  { q: "Why does negating INT_MIN fail, and what does Rust's i32::MIN.abs() do?", a: "Invert plus 1 gives INT_MIN back, because $+2^{w-1}$ does not fit. Rust panics in a debug build and returns i32::MIN in an optimized build." },
+  { q: "Why can a compiler not compile signed x / 4 as one arithmetic shift?", a: "The shift rounds toward minus infinity, and division truncates toward zero. For negative x the compiler adds 3 before the shift." },
+  { q: "What do x86, RISC-V and AArch64 do for INT_MIN / −1?", a: "x86 idiv raises a divide error (#DE, SIGFPE on Linux). RISC-V div returns INT_MIN with remainder 0. AArch64 sdiv returns INT_MIN. Neither of the last two traps." },
+  { q: "How does RISC-V check an unsigned add for overflow with no flags?", a: "add t0, t1, t2, then bltu t0, t1, overflow. If the wrapped sum is less than an input, the add carried out." },
+]} />

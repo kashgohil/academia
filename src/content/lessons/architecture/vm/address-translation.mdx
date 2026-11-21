@@ -1,0 +1,129 @@
+---
+summary: "Translation as a circuit on every access: where the TLB sits next to the L1 cache, PIPT, VIPT and VIVT caches, the rule that L1 size must not exceed ways × page size, synonyms and page colors, and what satp, CR3 and TTBR hold."
+---
+import { ArchVmViptDemo, ArchVmSynonymDemo, ArchVmHitTimingDemo } from "@/demos/arch/ArchVmTranslateDemos";
+
+The OS track explains [address spaces](/os/vm/address-spaces): why each process has its own, how Linux lays one out, and what base-and-bound and segmentation were. This lesson looks at the same idea from the other side. Translation is a function that the core must compute for every instruction fetch, every load and every store. It must also be fast enough that the L1 cache does not wait for it.
+
+The function has four inputs: the virtual address, the type of access, the privilege mode and the current address space. Its output is a physical address, or an exception. A 5-stage pipeline computes it twice per instruction. The fetch stage translates the program counter with the **instruction TLB (iTLB)**. The memory stage translates the load or store address with the **data TLB (dTLB)**. A **TLB** (translation lookaside buffer) is a small cache of recent translations.
+
+<Predict
+  id="vipt-limit"
+  question="An L1 data cache is 8-way with 64-byte lines. The core reads the set while the TLB translates the address, and pages are 4 KiB. How large can the cache be with no aliases?"
+  options={["32 KiB", "64 KiB: the line size does not matter", "Any size: the tags are physical, so aliases cannot happen"]}
+  answer={0}
+  explain="The set index and the line offset must both come from the 12 untranslated bits. So one way can hold at most one page: 4 KiB. Eight ways give 32 KiB. A larger cache needs more ways or larger pages."
+>
+<ArchVmViptDemo />
+</Predict>
+
+Things to try:
+
+1. Keep the default. The 6 index bits and the 6 offset bits fill the 12 bits of the page offset exactly. This is the AMD Zen 3 L1 data cache.
+2. Press **Intel Sunny Cove**. The cache grows to 48 KiB, but the index does not grow. Intel added ways, not sets.
+3. Press **128 KiB, 4 KiB pages**. Two index bits now come from the page number, so the cache has 4 page colors. Move **Ways** to 32 and the problem goes away, at the cost of 32 tag compares.
+4. Press **128 KiB, 16 KiB pages**. The same 128 KiB needs only 8 ways, because the page offset now has 14 bits.
+
+## Three places for the TLB
+
+A cache lookup has two parts. The **index** selects a set, and the **tag compare** checks which way, if any, holds the line. Each part can use the virtual address or the physical address. This gives three designs that real cores use:
+
+| Design | Index from | Tag from | Hit path | Main problem |
+|---|---|---|---|---|
+| PIPT (physically indexed, physically tagged) | physical | physical | TLB, then set read | Slower hit |
+| VIPT (virtually indexed, physically tagged) | virtual | physical | TLB and set read in parallel | Aliases if a way is larger than a page |
+| VIVT (virtually indexed, virtually tagged) | virtual | virtual | No TLB on a hit | Synonyms and homonyms |
+
+<ArchVmHitTimingDemo />
+
+1. Keep the defaults. PIPT takes 4 cycles, and VIPT and VIVT take 3. The TLB lookup is hidden under the set read.
+2. Set the TLB to 3 cycles. Now VIPT waits for the TLB, and only VIVT stays at 3 cycles.
+3. Set the set read to 4 cycles. A larger, slower array hides even a slow TLB.
+
+These cycle counts are model inputs, not data for a real core. The shape is real. Many L1 data caches are VIPT, because it hides the TLB and still compares physical tags. L2 and L3 caches are usually PIPT. Their access starts after the L1 miss, so the physical address is ready by then.
+
+## The size rule
+
+The VIPT rule follows from the bit widths. Let the line have $2^{b}$ bytes, the cache have $2^{s}$ sets, and the page have $2^{p}$ bytes.
+
+<Steps>
+<div>The set index uses address bits $b$ to $b+s-1$. The TLB does not change bits 0 to $p-1$.</div>
+<div>The index is safe to use before translation only if $b + s \le p$. In bytes, one way (sets times line size) must be at most one page.</div>
+<div>The cache size is ways times the size of one way. So a VIPT cache with no aliases has size $\le$ ways $\times$ page size.</div>
+<div>For 4 KiB pages: 8 ways allow 32 KiB, and 12 ways allow 48 KiB. More capacity at the same page size needs more ways.</div>
+</Steps>
+
+Real cores follow this rule closely. The AMD Zen 3 L1 data cache is 32 KiB and 8-way (AMD Software Optimization Guide 56665, section 2.6.2). Intel's Sunny Cove core moved from 32 KiB 8-way to 48 KiB 12-way. Each extra way costs another tag compare and more energy on each access.
+
+Native macOS processes on Apple cores use 16 KiB pages. On an Apple M4 Pro, `sysctl hw.perflevel0.l1dcachesize` reports 131072 bytes for a performance core, and `hw.pagesize` reports 16384. With 16 KiB pages, a 128 KiB cache needs only 8 ways to stay alias-free. With 4 KiB pages it would need 32. Rosetta 2 processes use 4 KiB pages, so the core must also handle aliases. Apple does not publish how it does this.
+
+## Synonyms
+
+A **synonym** is two virtual addresses that map to one physical address. Shared memory, `mmap` of one file twice, and the kernel's own direct map all create them. A **homonym** is one virtual address that maps to different physical addresses in different address spaces. Physical tags remove the homonym problem. Only the synonym problem is left for a VIPT cache.
+
+<Predict
+  id="synonym"
+  question="Pages A and B map to one frame, and they have different colors. The cache is VIPT with 2 colors. The program stores 1 through A, then loads through B. What does the load return?"
+  options={["1: the tags are physical, so the cache finds the line", "0: the old value from memory", "A machine check: the hardware detects the conflict"]}
+  answer={1}
+  explain="The load indexes a different set, which does not hold the line. It misses and reads memory, where the dirty value has not arrived yet. The physical tags would match, but the lookup never looks in the other set."
+>
+<ArchVmSynonymDemo />
+</Predict>
+
+1. Press **Next** twice. The store went to set 1, and the load through B looked in set 65. It returns 0, a stale value.
+2. Press **Next** twice more. Now two copies of one physical line hold two different values.
+3. Select **Same color**. Both names now index set 1, and every load is correct. This is **page coloring**: the OS maps synonyms only at addresses with equal color bits.
+4. Select **VIPT + alias probe**. On a miss, the cache searches the sets of the other colors for the physical tag and moves the line. It is correct, but every alias costs a slower miss.
+5. Select **PIPT**. The index uses the physical address, so the problem cannot happen.
+
+Operating systems on cores with aliasing caches had to color pages. The Linux document `cachetlb.rst` states the condition. A D-cache has this problem if it is virtually indexed, larger than a page, and allows two copies of one line. Such ports set `SHMLBA` to the cache size, so that System V shared memory maps only at aligned addresses. The kernel also maps every page a second time in its direct map, so the problem appears as soon as one user maps a page.
+
+Hardware can also detect aliases. AMD Zen 3 tags each L1 line with a hash of the linear (virtual) address, the **utag**, and uses it to predict the way. A load through a different alias misses in L1 and goes to L2, according to section 2.6.2.2 of AMD document 56665. The result is correct, but it is slow.
+
+## What the ISA defines
+
+The ISA does not say how a core builds its caches. It only says where the root of translation is, and when translation applies:
+
+| ISA | Register | Holds |
+|---|---|---|
+| RISC-V RV64 | `satp` | MODE (bits 63 to 60), ASID (59 to 44), root table PPN (43 to 0) |
+| x86-64 | CR3 | Root table address, and a PCID in bits 11 to 0 if CR4.PCIDE = 1 |
+| AArch64 | `TTBR0_EL1`, `TTBR1_EL1` | Two roots, one for each half of the address space; `TCR_EL1.A1` selects which register supplies the ASID |
+
+On RISC-V, the MODE values are 0 for Bare (no translation), 8 for Sv39, 9 for Sv48 and 10 for Sv57. Translation applies only when the effective privilege mode is S or U. M-mode addresses are physical. The spec puts the ASID and the root in one register so that a context switch can change both with one write.
+
+**Segmentation** survives in x86-64 as one adder. The address unit adds the FS or GS base to the address of an instruction that uses that prefix. Linux on x86-64 uses FS for thread-local storage. GCC's stack protector reads its canary with `mov rax, qword ptr fs:0x28`. The add happens before translation, so it costs no TLB work.
+
+## What this means for your code
+
+- Ask for the page size. A macOS arm64 process sees 16384, and a Linux x86-64 process usually sees 4096. In C, use `sysconf(_SC_PAGESIZE)`.
+- A "magic ring buffer" maps one buffer twice, side by side, so that reads can run past the end. This is correct on every current CPU. On Zen 3, a hot loop that uses both names for one line can pay L2 latency for each switch.
+- An alias-free VIPT L1 larger than 48 KiB with 4 KiB pages needs more than 12 ways. This is one reason why x86 L1 caches grow slowly, while L2 caches grow fast.
+
+```c
+// The mirrored ring buffer: two virtual names for the same frames.
+int fd = memfd_create("ring", 0);
+ftruncate(fd, size);                       // size is a multiple of the page size
+char *base = mmap(NULL, 2 * size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+mmap(base,        size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+mmap(base + size, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+// base[i] and base[i + size] are synonyms.
+```
+
+## Connect
+
+- [Address spaces](/os/vm/address-spaces) covers the layout, canonical addresses and the history of segmentation.
+- [Cache organization](/architecture/caches/cache-organization-and-access-patterns) explains sets, ways and tags.
+- [Multi-level caches](/architecture/caches/multi-level-caches) shows why L2 and L3 can be physically indexed.
+- [Page tables](/architecture/vm/page-tables) shows what the hardware does when the TLB has no entry.
+- [TLBs](/architecture/vm/tlbs) looks inside the TLB arrays.
+
+<Recall cards={[
+  { q: "Why can a VIPT cache read the set before the TLB finishes?", a: "Its index and line offset bits come from the page offset, which translation does not change. Only the tag compare needs the physical address." },
+  { q: "Derive the largest alias-free VIPT cache for 12 ways and 4 KiB pages.", a: "One way may hold at most one page, 4 KiB. Twelve ways give 48 KiB." },
+  { q: "How many ways does a 128 KiB alias-free VIPT cache need with 4 KiB pages, and with 16 KiB pages?", a: "32 with 4 KiB pages, and 8 with 16 KiB pages: size divided by page size." },
+  { q: "What is a synonym, and why does it break a VIPT cache whose way is larger than a page?", a: "Two virtual addresses for one physical address. Their index bits above the page offset can differ, so the line can live in two sets with two different values." },
+  { q: "What does page coloring require of the OS?", a: "Synonyms of one frame must have equal values in the index bits above the page offset, so they all index the same set." },
+  { q: "What three fields does the RISC-V satp register hold on RV64?", a: "MODE (Bare, Sv39, Sv48, Sv57), the ASID, and the physical page number of the root table." },
+]} />

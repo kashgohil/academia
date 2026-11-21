@@ -1,0 +1,138 @@
+---
+summary: "The page walker as a hardware state machine: the RISC-V Sv39 algorithm step by step, PTE encodings and the superpage alignment rule, hardware and software A/D updates, page-walk caches that skip levels, and the designs that lost: hashed tables and software-refilled TLBs."
+---
+import { ArchVmSv39WalkDemo, ArchVmWalkCacheDemo } from "@/demos/arch/ArchVmWalkDemos";
+
+The OS track explains [paging and page tables](/os/vm/paging-and-page-tables). It shows why a flat table is too large, how the x86-64 tree splits an address, and what the tables cost. This lesson looks at the unit that reads those tables.
+
+The **page walker** is a small state machine in the core. When the TLB misses, the walker reads one entry per level, checks it, and either fills the TLB or raises a page fault. The ISA defines every check that it makes. The microarchitecture decides how fast it makes them.
+
+We use RISC-V **Sv39** as the example, because its specification writes the algorithm out as numbered steps. Sv39 is the 39-bit scheme of RV64. An address has a 12-bit page offset and three 9-bit fields, VPN[2], VPN[1] and VPN[0]. Bits 63 to 39 must all equal bit 38, or the access raises a page fault. A table is one 4 KiB page that holds 512 entries of 8 bytes.
+
+<Predict
+  id="sv39-dirty"
+  question="A store goes to a writable 4 KiB page whose PTE has D = 0. The hart implements Svadu, so the walker manages the A and D bits. What happens?"
+  options={["A store page fault, so that the kernel can set D", "The walker sets D with one atomic update of the PTE, and the store completes", "Nothing: D is only a hint, and the store completes"]}
+  answer={1}
+  explain="With Svadu the walker compares the PTE in memory with the value that it read and, if they match, writes it back with D = 1. Under Svade the same store raises a store page fault instead. D can never be skipped: the kernel uses it to decide whether a page must be written back."
+>
+<ArchVmSv39WalkDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **code** and press **Step** from the start. The walker reads three PTEs: two pointers and a leaf. The state chips light up in order.
+2. Select **heap**, then **Store**. Its PTE has A = 0 and D = 0. With Svadu, the walk ends with one atomic write. Select **Svade**, and the same store raises scause 15.
+3. Select **2 MiB megapage**. The walk stops after 2 reads, because the level-1 entry is a leaf. Select **misaligned megapage**: its frame number has low bits set, so the walker raises a page fault.
+4. Select **kernel**. From U-mode it faults on the U bit. Select **S-mode** and it works. With **Fetch**, S-mode still cannot execute from a page with U = 1, whatever SUM says.
+5. With **code** selected, click **R** to clear it in the leaf. Now W and X tell the story: click **W** to set it, and the walker reports the reserved encoding W = 1 with R = 0.
+6. Select **not sign-extended**. The walker faults before it reads any PTE.
+
+## The algorithm
+
+An Sv39 PTE has these fields:
+
+| Bits | Field | Meaning |
+|---|---|---|
+| 63 | N | Svnapot: part of a 64 KiB contiguous range. Reserved without Svnapot. |
+| 62 to 61 | PBMT | Svpbmt: memory type. Reserved without Svpbmt. |
+| 60 to 54 | reserved | Must be 0, or the walk faults |
+| 53 to 10 | PPN[2], PPN[1], PPN[0] | Physical page number, 44 bits |
+| 9 to 8 | RSW | For supervisor software. The hardware ignores it. |
+| 7 to 0 | D A G U X W R V | Dirty, accessed, global, user, execute, write, read, valid |
+
+The R, W and X bits also decide what kind of entry it is. If all three are 0, the entry is a **pointer** to the next table. Any other value makes it a **leaf**, which maps a page. W = 1 with R = 0 is reserved, in both the write-only and the write-execute form. A leaf can appear at any level, so Sv39 has 4 KiB pages, 2 MiB megapages and 1 GiB gigapages.
+
+The privileged specification gives the walk as numbered steps. In order, the walker does this:
+
+<Steps>
+<div>Start with the root table address, `satp.PPN` × 4096, at level i = 2.</div>
+<div>Read the PTE at table + VPN[i] × 8. This is one 8-byte memory read, done as one access.</div>
+<div>If V = 0, or W = 1 with R = 0, or a reserved bit is set: page fault.</div>
+<div>If R = 0 and X = 0, this is a pointer. Go down one level and read again. If no level is left, page fault.</div>
+<div>A leaf at level i greater than 0 must have zeros in its low PPN fields. If not, it is a misaligned superpage: page fault.</div>
+<div>Check U against the privilege mode, `sstatus.SUM` and `sstatus.MXR`, then check R, W or X against the access. A failure is a page fault.</div>
+<div>If A = 0, or the access is a store and D = 0: under Svade, page fault. Otherwise set them with an atomic compare-and-swap of the whole PTE. If the compare fails, go back to the read.</div>
+<div>Build the physical address from the PPN and the untranslated low bits.</div>
+</Steps>
+
+A page fault has three codes in `scause`: 12 for an instruction fetch, 13 for a load and 15 for a store or AMO. The fault type follows the original access, not the step that failed.
+
+In hardware, this is a state machine with a few registers: the current table address, the level counter, and the PTE that it read. Each read goes through the normal data cache hierarchy, so a PTE can hit in L1 or L2. The spec allows **speculative walks** at any time, for any address. Such a walk may fill the address-translation caches, but it must not set D and must not raise an exception. A core can also run several walks at once: AMD Zen 3 has six hardware walkers (AMD 56665, section 2.7.3).
+
+## A and D bits
+
+The A bit says that a page was used, and the D bit says that it was written. The kernel needs both: A for page replacement, and D to know which pages to write back. RISC-V offers two schemes, and all harts in a system must use the same one.
+
+- **Svade** raises a page fault when A must be set, or when a store finds D = 0. The kernel sets the bit and returns. The hardware stays simple, but the first store to each clean page costs a trap.
+- **Svadu** makes the walker set the bits itself. The update must be atomic with the checks. A may be set by a speculative walk, but D must be exact and in program order. D decides whether data is saved, so a wrong D loses data.
+
+x86 has always set these bits in hardware. The Intel SDM (vol. 3A, "Automatic Locking") says that the processor uses locked cycles to set the accessed and dirty flags. x86 also sets A in the non-leaf entries, which RISC-V reserves. A store to a clean page therefore costs an atomic read-modify-write in the walker, but no trap.
+
+If the kernel does not use the bits, it should set A and D to 1 when it creates the PTE. The RISC-V spec recommends this, because it removes the update or the trap.
+
+## Page-walk caches
+
+<ArchVmWalkCacheDemo />
+
+1. Keep **Random pages** and drag **Working set** to 64 MiB. Without walk caches, every TLB miss costs 4 PTE reads. With 32 entries per level it costs 1.00, because every walk finds the level above the leaf in a walk cache.
+2. Move the working set to 1 GiB. The walk caches now hold only part of the 512 leaf tables, so a walk costs 1.94 reads.
+3. Select **1 page per 2 MiB**. Each page has its own leaf table, and the cost rises to 2.94 reads at 1 GiB.
+4. Change **Levels** from 4 to 5. At 1 GiB the cost does not change: 1.94 reads. The walk caches hide the extra level.
+5. Drag **Walk cache entries per level** down to 1, then up again. A few entries already remove most of the cost.
+
+A walk-cache entry keeps a non-leaf entry, tagged with the virtual address bits above it. On a TLB miss, the walker looks for the deepest hit and starts there. Intel calls these **paging-structure caches**. The SDM describes a PML4 cache, a PDPTE cache and a PDE cache, which hold only entries that point to other tables. AMD Zen 3 keeps PDEs in its L2 TLB, so a walk can skip three levels. It also has a 64-entry page directory cache for the upper levels.
+
+This is one reason why 5-level paging costs little in practice. A deeper tree adds reads only when the upper levels miss in the walk cache, and upper levels cover huge ranges. The remaining cost is the leaf PTE read. One 64-byte line holds 8 PTEs, which map 32 KiB. Dense data keeps those lines hot in the cache, and scattered data does not.
+
+The cycle figures in the demo use a model input of 20 cycles for each PTE read, as if each read hits in L2. A read that misses to DRAM costs ten times more. Then a TLB miss costs as much as a cache miss, or more.
+
+## The designs that lost
+
+**Hashed page tables.** Older POWER cores use a hashed page table: the hardware hashes the virtual page number to a group of entries and searches that group. The table size follows the amount of physical memory, not the size of the address space. But the table has no tree structure for the walk cache to reuse, and sparse or shared mappings are hard to manage. POWER9 added a radix tree, and Linux uses it by default.
+
+**Software-refilled TLBs.** Classic MIPS has no hardware walker. Later revisions add an optional one. A TLB miss raises a TLB Refill exception, at offset `0x000` from the exception base (MIPS32 Privileged Resource Architecture, MD00090). The hardware puts the failing address in `BadVAddr`, and its page number in `Context` and `EntryHi`. A short handler loads two PTEs, writes `EntryLo0` and `EntryLo1`, and executes `TLBWR`, which writes a random TLB entry. 
+
+The OS can use any table format it likes. But each miss costs a trap and a pipeline flush, which deep out-of-order cores cannot afford.
+
+Nested walks in virtual machines multiply the reads of each level. The OS lesson on [the TLB](/os/vm/the-tlb) counts them.
+
+## What this means for your code
+
+- A TLB miss costs a few cycles when the PTE line is in L1 or L2. It costs a DRAM access when the program jumps across gigabytes. Pointer chasing over a large heap pays both costs.
+- Huge pages remove the last level, so a walk needs one read fewer and its leaf covers 2 MiB. See [huge pages](/os/vm/huge-pages).
+- On Linux x86, `perf stat -e dtlb_load_misses.walk_completed,dtlb_load_misses.walk_active` shows how often walks happen and how long they take. Event names differ between CPU models.
+
+```rust
+// The Sv39 walk without the permission and A/D steps: one read per level.
+fn walk(mem: &impl Fn(u64) -> u64, satp_ppn: u64, va: u64) -> Option<(u64, u32)> {
+    let mut a = satp_ppn << 12;
+    for i in (0..3).rev() {
+        let pte = mem(a + ((va >> (12 + 9 * i)) & 0x1ff) * 8);
+        if pte & 1 == 0 || (pte & 0b110) == 0b100 { return None; } // V = 0, or W without R
+        let ppn = (pte >> 10) & ((1 << 44) - 1);
+        if pte & 0b1010 == 0 { a = ppn << 12; continue; }          // R = X = 0: a pointer
+        if ppn & ((1 << (9 * i)) - 1) != 0 { return None; }        // misaligned superpage
+        let mask = (1u64 << (12 + 9 * i)) - 1;
+        return Some((((ppn << 12) & !mask) | (va & mask), i));
+    }
+    None
+}
+```
+
+## Connect
+
+- [Paging and page tables](/os/vm/paging-and-page-tables) covers the tree, its memory cost and the x86 PTE bits.
+- [Address translation](/architecture/vm/address-translation) shows what the TLB must deliver on a hit.
+- [TLBs](/architecture/vm/tlbs) covers the arrays that the walker fills, and how software empties them.
+- [Page faults](/architecture/vm/page-faults) follows a failed walk into the pipeline.
+- [Atomic operations](/concurrency/atomics/atomic-operations) explains the compare-and-swap that Svadu uses.
+
+<Recall cards={[
+  { q: "How does an Sv39 walker decide whether a PTE is a pointer or a leaf?", a: "R = W = X = 0 means a pointer to the next table. Any other valid encoding is a leaf. W = 1 with R = 0 is reserved and faults." },
+  { q: "What is a misaligned superpage, and what does the walker do with one?", a: "A leaf above level 0 whose low PPN fields are not zero. The walker raises a page fault of the original access type." },
+  { q: "What do Svade and Svadu do when a store finds D = 0?", a: "Svade raises a store page fault, so software sets D. Svadu makes the walker set D with an atomic compare-and-swap of the PTE." },
+  { q: "Why may A be set speculatively, but not D?", a: "A is a replacement hint. D decides whether a page is written back, so a wrong D can lose data or waste writes." },
+  { q: "What does a page-walk cache hold, and what does a hit save?", a: "Non-leaf entries tagged with the upper address bits. The walk starts at the deepest hit and skips the reads above it." },
+  { q: "What does a MIPS TLB refill handler do?", a: "It reads the missing page number from Context or BadVAddr, loads the PTEs, writes EntryLo0 and EntryLo1, and executes TLBWR to fill a random entry." },
+]} />

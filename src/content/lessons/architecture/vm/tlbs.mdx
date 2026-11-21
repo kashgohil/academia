@@ -1,0 +1,115 @@
+---
+summary: "TLBs as hardware arrays: CAM and set-associative designs, several page sizes in one lookup, replacement policy, coalescing of contiguous pages (AMD Zen, Svnapot), and what sfence.vma, invlpg, INVPCID and TLBI must remove. Why the hardware may use any translation that was valid since the last fence."
+---
+import { ArchVmTlbSweepDemo, ArchVmFenceDemo, ArchVmStaleDemo } from "@/demos/arch/ArchVmTlbDemos";
+
+The OS track explains [the TLB](/os/vm/the-tlb) from the kernel's side: TLB reach, the Skylake TLB sizes, PCIDs, and shootdowns by inter-processor interrupt. This lesson opens the arrays. A TLB is a cache, so every choice from the [cache lessons](/architecture/caches/cache-organization-and-access-patterns) appears again: entries, ways and a replacement policy. Two problems are new. One lookup must handle several page sizes. And the TLB is not coherent, so the ISA must give software a way to empty it.
+
+An L1 TLB must answer within the L1 cache hit time, as the [first lesson of this module](/architecture/vm/address-translation) shows. So L1 TLBs are small, and often **fully associative**. Each entry has its own comparator, in a structure called a **CAM** (content-addressable memory). All entries compare the page number at once. A CAM costs area and energy for each entry, so L2 TLBs, with thousands of entries, are set-associative SRAM arrays.
+
+<Predict
+  id="random-wins"
+  question="A 64-entry fully associative TLB serves a loop over 65 pages. With LRU replacement, every access misses. What miss rate does random replacement give?"
+  options={["About 100%, the same as LRU", "About 50%", "About 3%"]}
+  answer={2}
+  explain="LRU always evicts the page that the loop needs next. Random replacement evicts a page that the loop needs soon only by chance, so most pages survive one round. The model gives 3.2% for random and 100% for LRU."
+>
+<ArchVmTlbSweepDemo />
+</Predict>
+
+Things to try:
+
+1. Keep the defaults: 64 entries, fully associative, LRU, a loop over 65 pages. The miss rate is 100%. Move **Working set** to 64 pages, and it is 0%.
+2. Select **Random**. At 65 pages it falls to 3.2%. At 96 pages it is 58.4%, while LRU stays at 100%. Select **Tree PLRU**: 93.1% at 65 pages. It approximates LRU, so it inherits most of its worst case.
+3. Back to LRU, select **4** ways at 65 pages: 7.7%. Only one of the 16 sets overflows, so only its pages miss.
+4. Select **Random** accesses. Now all policies give about the same curve: about 50% at 128 pages, and 93.7% at 1,024 pages. Replacement cannot help when there is no reuse pattern.
+5. With random accesses, select **4 pages (Zen)** and a working set of 256 pages. With all groups contiguous, the miss rate is 0%. Move **Groups that are contiguous** to 50%: it rises to 47.6%. Select **16 pages (Svnapot)** at 1,024 pages and 50%: 57.2%.
+
+## Several page sizes in one lookup
+
+A set-associative array needs the set index before it can read. The index comes from the page number, and the page number depends on the page size. But the TLB does not know the page size until it finds the entry. Designs solve this in three ways:
+
+| Design | How it works | Cost |
+|---|---|---|
+| One array per page size | Index each array with its own bits, probe all in parallel | More arrays, and entries of one size cannot be used by another |
+| Fully associative with a mask | Each entry stores its size and masks the low bits before it compares | CAM cost, so only for small TLBs |
+| Probe one size, then the next | Try 4 KiB, then 2 MiB | Extra cycles on some hits |
+
+For example, a 4 KiB array with 16 sets takes its index from address bits 12 to 15. A 2 MiB array with 8 sets takes it from bits 21 to 23. Both read at once, and at most one hits.
+
+AMD Zen 3 shows how a real core mixes these (AMD 56665, section 2.7). The L1 data TLB has 64 entries, is fully associative, and holds 4 KiB, 2 MiB and 1 GiB pages. The L2 data TLB has 2,048 entries, is 16-way, and holds 4 KiB and 2 MiB pages and page-directory entries. The L2 instruction TLB does not hold 1 GiB pages at all. It "smashes" them into 2 MiB entries: one 1 GiB page then uses several entries.
+
+## Coalescing
+
+Reach is entries times the bytes each entry maps. Huge pages raise it by a factor of 512, but they need 2 MiB of contiguous, aligned physical memory. **Coalescing** asks for less. If a few neighbouring virtual pages also have neighbouring frames, one entry can map all of them.
+
+- AMD Zen 3 stores four 4 KiB pages in one entry if they are 16 KiB-aligned and contiguous in both address spaces, with identical attributes. It does this on its own, in long mode, so software needs no change.
+- RISC-V **Svnapot** lets software mark the range. A PTE with N = 1 is part of a naturally aligned 64 KiB range. Software writes all 16 PTEs of the range with N = 1, and the hardware may then use one TLB entry for it.
+
+The demo shows the limit of both: coalescing helps only as much as the allocator gives contiguous frames. A fragmented system, with half of the groups contiguous, loses much of the gain.
+
+## Invalidation: what the ISA promises
+
+A TLB entry is a copy of a PTE. If software changes the PTE, the copy can stay. The ISA defines instructions that remove copies. The RISC-V privileged spec describes `sfence.vma` as a fence, not only a flush. It orders the earlier stores to the page tables before the later implicit reads that the walker makes.
+
+<ArchVmFenceDemo />
+
+1. With RISC-V, press **Execute on core 0** for each of the four forms. `sfence.vma x0, x0` removes everything. Only the forms with `x0` in rs2 remove the global kernel entry.
+2. Select `sfence.vma a0, a1` with ASID 2. One entry goes. Core 1 still holds its copies, in every RISC-V form.
+3. Select **x86-64** and compare `invlpg` with `invpcid type 0`. `invlpg` acts on the current PCID and also removes the global entry for the page.
+4. Compare the two `mov cr3` forms. With bit 63 set, the switch keeps the entries of the new PCID.
+5. Select **AArch64** and `tlbi vae1is`. Entries go on both cores. The IS suffix means Inner Shareable: the hardware sends the invalidation to every core in that domain.
+
+The four RISC-V forms come from the spec. With `rs1 = x0` and `rs2 = x0`, the fence covers all levels and all address spaces. With only `rs2` set, it covers one ASID and keeps global mappings. With only `rs1` set, it covers the leaf entries for one address in every address space. With both set, it covers one address in one ASID.
+
+The spec also says that it is "always legal to over-fence". A simple core can treat every form as the first one.
+
+`sfence.vma` acts only on the hart that executes it. To change a mapping that other harts may hold, the kernel sends them an interrupt, and each one runs its own fence. The `invlpg` instruction of x86 is local in the same way. Arm, and AMD with `INVLPGB` from Zen 3, also have broadcast forms. Linux on arm64 uses one template for every invalidation:
+
+```asm
+dsb  ishst          // complete the page-table stores
+tlbi vae1is, x0     // invalidate by VA and ASID, on every core in the domain
+dsb  ish            // wait until every core has done it
+isb                 // only after kernel mappings: drop instructions fetched with the old one
+```
+
+RISC-V **Svinval** splits `sfence.vma` into three instructions: `sfence.w.inval`, `sinval.vma` and `sfence.inval.ir`. A kernel can then batch many `sinval.vma` instructions between one pair of barriers.
+
+## Any translation since the last fence
+
+<ArchVmStaleDemo />
+
+1. Press **Next** to the end with the fence off. The second load hits the old TLB entry and reads a frame that now belongs to another process.
+2. Turn on the fence and step again. The walker reads V = 0 and raises a page fault.
+
+The RISC-V spec states the rule exactly. An implicit read "may return any translation for an address that was valid at any time since the most recent SFENCE.VMA that subsumes that address".
+
+The hardware may also walk speculatively at any time, for any address. So a translation can enter the TLB even if the program never touched that page. Without a fence, software cannot know which entries a core holds.
+
+Two consequences follow for kernels:
+
+- Removing or reducing a permission always needs a fence, and on other harts an interrupt. The old permission can stay in use until then.
+- Adding a permission, or making an invalid PTE valid, may use a lazy fence. The old entry can only cause an extra page fault, and the handler then executes the fence. The spec also allows a core to cache invalid PTEs. The **Svvptc** extension promises that a new valid PTE becomes visible within a bounded time, so no fence is needed for that case.
+
+## What this means for your code
+
+- `munmap` and `mprotect` that remove access are expensive on a multi-threaded process, because each one needs fences on every core that ran it. Batch them.
+- A JIT that flips pages between writable and executable pays the same cost on each flip. Two mappings of the same frames, one writable and one executable, avoid the flips.
+- TLB reach, not cache size, can limit a large hash table. Huge pages or coalescing-friendly allocation help more than a better hash function.
+
+## Connect
+
+- [The TLB](/os/vm/the-tlb) covers reach, PCIDs and the cost of shootdowns.
+- [Huge pages](/os/vm/huge-pages) shows how the kernel gets the large pages that a TLB rewards.
+- [Page tables](/architecture/vm/page-tables) shows the walker that refills the TLB.
+- [Cache coherence](/architecture/multicore/cache-coherence-mesi) explains why data caches need no fence, while TLBs do.
+- [Memory consistency models](/architecture/multicore/memory-consistency-models) explains the ordering that `dsb` and `sfence.vma` give.
+
+<Recall cards={[
+  { q: "Why are L1 TLBs often fully associative, and L2 TLBs set-associative?", a: "An L1 TLB is small and must be fast, and a CAM compares every entry at once. A CAM costs area and energy per entry, which is too much for thousands of entries." },
+  { q: "Why is a loop over one page more than the capacity the worst case for LRU, and what does random replacement do there?", a: "LRU always evicts the page that the loop needs next, so every access misses. Random evicts a soon-needed page only by chance, so most accesses hit." },
+  { q: "Why is a set-associative TLB with several page sizes hard to index, and name one solution.", a: "The index bits depend on the page size, which is unknown before the lookup. One solution is a separate array per page size, probed in parallel." },
+  { q: "What does sfence.vma with rs1 = x0 and rs2 = a1 remove?", a: "Every cached translation of the ASID in a1, at all levels, except global mappings. Only on the executing hart." },
+  { q: "What does the IS suffix of an Arm TLBI instruction do?", a: "It broadcasts the invalidation to every core in the Inner Shareable domain, so the kernel needs no IPI for it." },
+  { q: "Why may a RISC-V kernel fence lazily after it makes an invalid PTE valid, but not after it removes a permission?", a: "A stale invalid entry can only cause an extra page fault, after which the handler fences. A stale permission lets a forbidden access succeed." },
+]} />

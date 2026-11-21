@@ -1,0 +1,105 @@
+---
+summary: "Page faults as precise exceptions: how a pipeline stops at the faulting instruction, records scause, stval and sepc (or the x86 error code and CR2), discards younger work and runs the instruction again. Two faults at once, faults in the middle of rep movsb and of a misaligned store, and what a trap costs."
+---
+import { ArchVmPreciseTrapDemo, ArchVmMultiPageDemo, ArchVmTrapCostDemo } from "@/demos/arch/ArchVmFaultDemos";
+
+The OS track explains [page faults and demand paging](/os/vm/page-faults-and-demand-paging) from the kernel's side: the VMA lookup, minor and major faults, the zero page and overcommit. This lesson stays in the core. A page fault is useful only because the hardware makes it **restartable**. The kernel fixes the page table, returns, and the same instruction runs again as if nothing had happened. That requires a **precise exception**.
+
+An exception is precise when the saved state matches a sequential machine that stopped just before the faulting instruction. Every older instruction has completed. The faulting instruction and every younger one have changed nothing: no register, no memory, no CSR. A pipeline has several instructions in flight, so this does not happen by itself. The hardware must work for it.
+
+On RISC-V, a trap into S-mode records three facts. `sepc` holds the address of the faulting instruction. `scause` holds the cause: 12 for an instruction page fault, 13 for a load page fault, 15 for a store or AMO page fault. `stval` can hold the faulting virtual address, and the Sstvala extension makes this mandatory. On x86-64, CR2 holds the faulting address, and the CPU pushes an error code that says why. The OS lesson lists its bits.
+
+<Predict
+  id="drain"
+  question="A load faults in the MEM stage. Instead of discarding the younger instructions, a design lets them finish, then traps and returns to the load. The next instruction is addi a0, a0, 1. What happens to a0?"
+  options={["Nothing goes wrong: the addi is independent of the load", "a0 is incremented twice: once before the trap and once after the return", "a0 is never incremented"]}
+  answer={1}
+  explain="The addi completed before the trap. The handler returns to the load, so the addi runs a second time. With a0 = 5 at the start, the result is 7 instead of 6. The add that uses the load result also reads the old a1 the first time."
+>
+<ArchVmPreciseTrapDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **Precise** and press **Play**. The load is marked in MEM at cycle 4. At cycle 5 it reaches WB, the commit point, and the trap is taken. The three younger instructions turn into dashed, flushed cells.
+2. Step to the end. The handler reads `scause` and `stval`, maps page `0x4000`, and executes `sret`. The load runs again, and the result is correct: a0 = 6, a2 = 43. The run takes 22 cycles, against 8 with every page mapped.
+3. Select **Let younger instructions finish**. The `addi`, the `add` and the `sw` commit before the handler runs, and again after it. The result is a0 = 7 and a2 = 44, and the wrong value 6 was stored to memory for a while.
+4. Select **Data page and code page missing**, with **Precise**. The page of the `add` is missing too. The fetch of the `add` faults at cycle 3, before the load faults at cycle 4. But the first trap reports the load: scause = 13. The fetch fault is flushed, and it happens again later, after the return.
+5. Keep two faults and select **Let younger instructions finish**. The fetch fault traps first, and the load fault traps one cycle later. The second trap overwrites `sepc` before the handler has read it.
+
+## How a pipeline makes faults precise
+
+The demo uses the standard design from Hennessy and Patterson. The rules are short:
+
+<Steps>
+<div><b>Detect early, act late.</b> The TLB check happens in IF for fetches and in MEM for data. A failed check does not trap. It marks the instruction with a cause and the faulting address.</div>
+<div><b>Carry the mark to the commit point.</b> The marked instruction flows to WB like any other. Its own result is discarded.</div>
+<div><b>Commit in order.</b> Registers and memory change only at the commit point, in program order. A younger store must not write memory before the older load has committed.</div>
+<div><b>At the commit point, trap.</b> Write `sepc`, `scause` and `stval`, flush every younger instruction, and redirect fetch to `stvec`.</div>
+</Steps>
+
+Two faults at once show why acting late matters. A younger instruction can detect its fault first, because fetch comes before memory access in the pipeline. If the hardware acted at once, it would report a fault that a sequential machine never sees first. Acting at the commit point reports the oldest fault. The younger one is flushed, and if it is real, it comes back after the return.
+
+An out-of-order core uses the same idea with a larger buffer. The [reorder buffer](/architecture/ooo/reorder-buffer) is the commit point. A load can execute far ahead of older instructions, and its fault waits in the buffer until the load is the oldest instruction. Then the core flushes everything younger. This is also why a fault on a wrong-path load never reaches the kernel: a branch mispredict flushes that load before it reaches the head.
+
+The x86 SDM states the same contract for paging. A page fault restarts the instruction, and the processor invalidates the TLB entries and paging-structure-cache entries for the faulting address in the current PCID. So the retry walks the tables again and sees the kernel's change.
+
+## One instruction, two pages
+
+<ArchVmMultiPageDemo />
+
+1. Keep **x86 rep movsb** and press **Step** three times. Eight bytes are copied, and the store to `0x6000` faults. RCX = 8, RSI and RDI point to the next bytes, and RIP still points to `rep movsb`.
+2. Step on. The handler maps the page, and the instruction resumes with the 8 bytes that remain. No byte is copied twice.
+3. Select **RISC-V misaligned sd**. This core splits the 8-byte store into two 4-byte parts. The first part is written, and the second faults with stval = `0x2000`.
+4. Step to the end. The `sd` runs again in full. The first 4 bytes are written twice, with the same value.
+
+A **string instruction** such as `rep movsb` is one instruction that does many stores. If it had to be precise as a whole, a fault after a megabyte would discard all the work. The Intel SDM defines a finer contract instead.
+
+A fault suspends the operation and keeps the registers. RSI and RDI point to the next elements, and RCX holds the count after the last completed iteration. RIP still points to the instruction, so the return resumes it. The state is precise at the level of one iteration.
+
+A **misaligned access** that crosses a page boundary needs two translations. The RISC-V privileged spec allows an implementation to split it. A part that passed its check may become visible even though another part faults. In that case `stval` holds the address of the part that faulted, and `sepc` points to the instruction. The retry writes the first part again, which is safe for an ordinary store. The same retry would not be safe for an AMO, whose read and write must happen as one atomic step.
+
+Instruction fetch has the same problem on x86, where an instruction can be up to 15 bytes long. Its first bytes can be on a mapped page and its last bytes on a missing page. After the handler, the restart fetches the whole instruction again. RISC-V with compressed instructions has the same case: a 4-byte instruction can start 2 bytes before a page boundary. The spec says that `stval` then holds the address of the faulting part, while `sepc` points to the start of the instruction.
+
+## What a trap costs
+
+<ArchVmTrapCostDemo />
+
+1. Keep the defaults. One minor fault costs 1,600 cycles. The hardware part is 100 cycles, or 6.3%.
+2. Drag **Handler instructions** to 100. The hardware part is now half of the total.
+3. Set **Pipeline refill** to 40 and **Trap entry** to 400. Even then, a normal handler dominates.
+
+All of these values are model inputs. A deep out-of-order core loses about its pipeline depth in cycles at the trap, and again at the return. The privilege switch, the register saves and the mitigations for side channels add more. The kernel's fault path then runs a few hundred to a few thousand instructions. So the hardware makes a fault cheap enough to use for demand paging, but not cheap enough to take on every access. A program that touches a fresh page every few microseconds spends a large part of its time here.
+
+## What this means for your code
+
+- Restartable faults are what make lazy allocation, copy-on-write and memory-mapped files possible. Each one costs a trap on first touch. Pre-fault memory that a latency-critical path will use, with `MAP_POPULATE` or a touch loop.
+- Do not split an atomic variable across a cache line or a page. A misaligned atomic can trap, or take a bus lock on x86, which stalls other cores.
+- Some garbage collectors use `SIGSEGV` and `mprotect` as a write barrier. Such a user-space handler pays the hardware cost plus a signal delivery. Use it for rare events only.
+
+```c
+// Count faults around a region of code (Linux and macOS).
+#include <sys/resource.h>
+struct rusage a, b;
+getrusage(RUSAGE_SELF, &a);
+touch_every_page(buf, len);
+getrusage(RUSAGE_SELF, &b);
+printf("minor faults: %ld\n", b.ru_minflt - a.ru_minflt);
+```
+
+## Connect
+
+- [Page faults and demand paging](/os/vm/page-faults-and-demand-paging) follows the trap into the kernel: VMAs, minor and major faults.
+- [Interrupt handling](/os/kernel/interrupt-handling) shows the entry code that runs after the redirect to the trap vector.
+- [Page tables](/architecture/vm/page-tables) lists every check that can raise the fault.
+- [The reorder buffer](/architecture/ooo/reorder-buffer) is the commit point in an out-of-order core.
+- [Copy-on-write](/os/memory/copy-on-write) is the most common use of a restartable store fault.
+
+<Recall cards={[
+  { q: "When is an exception precise?", a: "The saved state equals a sequential machine stopped just before the faulting instruction: all older instructions complete, and the faulting and younger ones changed nothing." },
+  { q: "Why does a pipeline mark a faulting instruction and wait for the commit point, instead of trapping at once?", a: "A younger instruction can detect a fault first. Waiting reports the oldest fault and lets the younger work be flushed." },
+  { q: "Which RISC-V CSRs does a page fault into S-mode write, and with what?", a: "sepc: the address of the instruction. scause: 12, 13 or 15. stval: the faulting virtual address, if the hart writes it." },
+  { q: "What state does rep movsb leave when its store faults halfway?", a: "RSI and RDI point to the next bytes, RCX holds the bytes that remain, and RIP points to the instruction, so it resumes." },
+  { q: "A misaligned RISC-V store crosses into a missing page. What can memory and stval show?", a: "The first part may already be visible. stval holds the address of the part that faulted, and sepc points to the store." },
+  { q: "What dominates the cost of a minor page fault: the hardware trap or the kernel handler?", a: "Usually the handler: hundreds to thousands of instructions, against about a hundred cycles for the flush, refill and privilege switch." },
+]} />

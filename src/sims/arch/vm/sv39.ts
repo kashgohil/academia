@@ -175,6 +175,7 @@ export function walkSv39(mem: PhysMem, rootPpn: bigint, va: bigint, access: Acce
         steps.push({ kind: "pointer", level: i, addr, pte, ok: false, text: "R = W = X = 0 at the last level: a pointer with no level below it." });
         return fault(i, "The walk ran out of levels.");
       }
+      if (has(pte, "D") || has(pte, "A") || has(pte, "U")) return fault(i, "D, A and U are reserved in a pointer entry, and one of them is set.");
       a = ptePpn(pte) << 12n;
       steps.push({ kind: "pointer", level: i, addr, pte, ok: true, text: `R = W = X = 0: a pointer to the next table at ${hex(a)}.` });
       i--;

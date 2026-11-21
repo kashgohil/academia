@@ -91,6 +91,16 @@ describe("page tables: Sv39", () => {
     expect(r.ok).toBe(false);
     expect(r.steps.at(-1)!.text).toContain("reserved");
   });
+  test("D, A and U are reserved in a pointer PTE", () => {
+    const s = new Sv39Space();
+    s.map(0x1000n, 0x900n, { w: true });
+    expect(walkSv39(s.mem, s.rootPpn, 0x1000n, "load").ok).toBe(true);
+    const at = s.pteAddr(0x1000n, 1)!;
+    s.mem.write(at, s.mem.peek(at) | PTE.A);
+    const r = walkSv39(s.mem, s.rootPpn, 0x1000n, "load");
+    expect(r).toMatchObject({ ok: false, cause: 13, reads: 2 });
+    expect(r.steps.at(-1)!.text).toContain("reserved in a pointer entry");
+  });
   test("Svade faults on A = 0 and D = 0; Svadu sets them with one write", () => {
     expect(run("heap", "store", { ad: "svade" }).r).toMatchObject({ ok: false, cause: 15 });
     expect(run("heap", "load", { ad: "svade" }).r).toMatchObject({ ok: false, cause: 13 });

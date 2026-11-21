@@ -32,6 +32,9 @@ export const LEVELS: Record<Level, string> = {
 
 /** Lessons with a written MDX page. Paths must match `src/content/lessons/<path>.mdx`. */
 export const LIVE = new Set<string>([
+  "architecture/datapath/control-unit",
+  "architecture/datapath/multi-cycle-execution",
+  "architecture/datapath/single-cycle-datapath",
   "architecture/pipelining/branch-prediction",
   "architecture/pipelining/control-hazards",
   "architecture/pipelining/data-hazards-and-forwarding",

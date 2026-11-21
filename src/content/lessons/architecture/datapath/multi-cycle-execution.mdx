@@ -1,0 +1,141 @@
+---
+summary: "Reuse one memory and one ALU over several short clock cycles, under a finite state machine. Count cycles per instruction from a real trace, apply the iron law, and see when the multi-cycle machine wins and when it loses."
+---
+import { ArchPathFsmDemo, ArchPathIronLawDemo, ArchPathMicrocodeDemo } from "@/demos/arch/ArchPathMultiDemos";
+
+The [single-cycle machine](/architecture/datapath/single-cycle-datapath) has two problems. Every instruction takes as long as a load. It also needs separate hardware for each use in the same cycle: two memories, an ALU and two more adders.
+
+A **multi-cycle** machine cuts each instruction into steps of about equal length. Each step takes one short clock cycle. An instruction uses only the steps that it needs, so a branch takes fewer cycles than a load. Because the steps happen in different cycles, one memory and one ALU can do all the work.
+
+The machine needs new registers to keep values from one step to the next. They are not part of the ISA, so a program cannot see them:
+
+- **IR** (instruction register) and **OldPC**: the instruction and its address, written in the first step.
+- **A** and **B**: the two register values that the register file read.
+- **ALUOut**: the last ALU result. **Data**: the last value read from memory.
+
+A **finite state machine** (FSM) is the control. Its state is a small register, and each state sets the control signals for one cycle. The design here follows the multi-cycle RISC-V processor of Harris and Harris, extended to all of RV32IM.
+
+<Predict
+  id="decode-target"
+  question="In the Decode state, the FSM does not know the instruction type yet. But the ALU already computes OldPC + immediate. Why?"
+  options={["It is a mistake that costs nothing", "It is the branch target: the ALU is free in Decode, so a branch can finish one cycle earlier", "It checks that the PC is aligned"]}
+  answer={1}
+  explain="The ALU has no other work in Decode. If the instruction is a branch, the target is then ready in ALUOut, and the Branch state only compares A and B. For any other instruction, the next state overwrites ALUOut."
+>
+<ArchPathFsmDemo />
+</Predict>
+
+Things to try:
+
+1. Step through the first instruction of **Sum of an array**. Fetch reads the instruction into IR, and the ALU adds 4 to the PC in the same cycle. The memory and the ALU work in parallel.
+2. Find the first `lw t2, 0(t0)`. It walks Fetch, Decode, MemAdr, MemRead and MemWB: 5 cycles. Watch the address go from ALUOut to the memory.
+3. Find a `bnez`. It takes 3 cycles: Fetch, Decode and Branch. In the Branch state, the target is already in ALUOut.
+4. Select **Dot product** and find a `mul`. The FSM stays in ExecuteM for 3 cycles. The multiplier is slower than one cycle, so it gets more cycles. Only `mul` pays for that.
+5. Read **CPI so far** at the end of a run. Sum of an array needs 183 cycles for 46 instructions.
+
+## The states
+
+| State | Work in this cycle | Used by |
+|---|---|---|
+| Fetch | IR ← memory[PC]; OldPC ← PC; PC ← PC + 4 | all |
+| Decode | A, B ← registers; ALUOut ← OldPC + imm | all |
+| MemAdr | ALUOut ← A + imm | loads, stores |
+| MemRead, MemWB | Data ← memory[ALUOut]; rd ← Data | loads |
+| MemWrite | memory[ALUOut] ← B | stores |
+| ExecuteR, ExecuteI | ALUOut ← A op B, or A op imm | R-type, I-type |
+| ALUWB | rd ← ALUOut | ALU instructions, jumps |
+| Branch | compare A - B; if true, PC ← ALUOut | branches |
+| JAL | PC ← ALUOut; ALUOut ← OldPC + 4 | `jal`, `jalr` |
+| JALR, LUI, AUIPC | ALUOut ← A + imm, 0 + imm, or OldPC + imm | those instructions |
+
+The counts per instruction follow from the paths through the FSM. Harris and Harris give the same counts for their subset, in Digital Design and Computer Architecture, RISC-V Edition (2021), section 7.4. A `beq` takes 3 cycles. R-type, `addi`, `sw` and `jal` take 4 cycles, and `lw` takes 5. The extended FSM here gives `jalr` 5 cycles, `lui` and `auipc` 4, and `ecall` 3.
+
+## The iron law
+
+The time of a program on any processor is a product of three numbers:
+
+$$
+T = N \times \mathrm{CPI} \times t_c
+$$
+
+$N$ is the number of instructions that run, CPI is the mean number of cycles for each instruction, and $t_c$ is the clock period. The single-cycle machine has CPI = 1 and a long $t_c$. The multi-cycle machine has a short $t_c$ and a CPI of about 4.
+
+The multi-cycle clock period is the time of the slowest step. Each step starts at a register and ends at a register. So each step pays the clock-to-output delay of one register and the setup time of the next. That cost is the **sequencing overhead**.
+
+<Predict
+  id="who-wins"
+  question="With the model delays, the multi-cycle clock is 300 ps and the single-cycle clock is 760 ps. Which machine runs Sum of an array faster?"
+  options={["Multi-cycle: its clock is 2.5 times shorter", "Single-cycle", "They take the same time"]}
+  answer={1}
+  explain="The multi-cycle machine needs 3.98 cycles per instruction. The clock is 2.53 times shorter, but each instruction takes 3.98 cycles. The single-cycle machine is 1.57 times faster."
+>
+<ArchPathIronLawDemo />
+</Predict>
+
+1. Read the two bars. Single-cycle: 46 × 1 × 760 ps = 34.96 ns. Multi-cycle: 46 × 3.98 × 300 ps = 54.9 ns.
+2. Read the step times. MemRead is the slowest at 300 ps, and the ALU steps need 230 ps. The write-back steps need only 85 ps, but they get a full 300 ps cycle too.
+3. Move **Register overhead** to 200 ps. Each step pays it again, so the multi-cycle machine falls further behind. Move it to 0, and the gap gets smaller.
+4. Select **RV32IM (with divider)**. The single-cycle clock must now fit a combinational divider: 4410 ps for every instruction. The multi-cycle machine gives `div` 19 cycles and `mul` 3, and it runs Sum of an array 3.69 times faster.
+5. Select **Factorial, recursive** with **RV32I + multiplier**. The program needs `mul`. Compare which machine wins now, and why.
+
+Harris and Harris reach the same verdict. In their slides, the SPECINT2000 mix of 25% loads, 10% stores, 13% branches and 52% R-type gives a CPI of 4.12. With their delays, the multi-cycle clock is 375 ps against 750 ps. A program of 100 billion instructions takes 155 s against 75 s.
+
+The model in this lesson gives the same CPI from the same mix:
+
+$$
+0.13 \times 3 + (0.52 + 0.10) \times 4 + 0.25 \times 5 = 4.12
+$$
+
+So a multi-cycle machine wins only under two conditions. The steps must be well balanced, so that no cycle is mostly idle. Also, the slowest instruction must be much slower than the common ones. A divider meets the second condition. A load does not, because a load is only about one third slower than an add.
+
+<Callout kind="note" title="Model inputs">
+The delays are round numbers for teaching: 200 ps for a memory access, 150 ps for the ALU, 30 ps clock-to-output and 20 ps setup, and so on. They are not measurements of any chip. The tests of this lesson pin the results, so the text and the demos agree.
+</Callout>
+
+## The FSM as a microprogram
+
+The FSM can be gates, or it can be a table in a ROM. In the table, each state is one row: the control word, plus a field that says how to pick the next row. Most rows go to a fixed next row. Decode jumps through a **dispatch ROM** that maps the opcode to the first state of that instruction.
+
+<ArchPathMicrocodeDemo />
+
+1. Step through **lw**. The rows go 0000, 0001, 0010, 0011, 0100. Decode uses dispatch ROM 1, and MemAdr uses dispatch ROM 2 to pick MemRead.
+2. Select **jalr**. It goes through JALR and then the JAL row. Two instructions share microcode, as a subroutine would.
+3. Select **mul**. The ExecuteM row has a **wait** field. The sequencer stays on the row until the multiplier is done.
+4. Read the sizes. A microinstruction is 22 bits wide: 15 bits of control, 3 bits of sequencing kind and 4 bits of next address. The control store is 16 × 22 = 352 bits, and the dispatch ROMs add 264 bits.
+
+To add an instruction, you add rows and dispatch entries, and you do not change any gates. This is what Wilkes wanted in 1951, as the [control unit](/architecture/datapath/control-unit) lesson explains.
+
+## From multi-cycle to pipelining
+
+Look at the states again. Fetch uses the memory and the adder. Decode uses the register file. Execute uses the ALU. In a multi-cycle machine, most of the hardware does nothing in most cycles.
+
+A **pipeline** uses that idle hardware. It starts a new instruction in every cycle, so the steps of five instructions overlap. To do that, it needs its own hardware for each step again: separate instruction and data paths, and an adder for PC + 4. The clock stays short, and the ideal CPI goes back to 1. The new problem is dependences between instructions in flight. The [five-stage pipeline](/architecture/pipelining/five-stage-pipeline) starts there.
+
+## What this means for your code
+
+Real cores keep one idea from this lesson: an operation can take a different number of cycles from another. A multiply takes a few cycles, and an integer divide takes many more. The pipeline does not stretch the clock for them. It gives them more cycles, as ExecuteM does here.
+
+For code, this means a divide costs much more than an add. Compilers replace a divide by a constant with a multiply and a shift, after Granlund and Montgomery, "Division by Invariant Integers using Multiplication" (1994). For an unsigned 32-bit divide by 10, the multiplier is the constant `0xcccccccd`, which is about $2^{35} / 10$:
+
+```c
+unsigned div10(unsigned x) { return x / 10; }   // the compiler emits no divide instruction
+```
+
+```riscv
+div10:                     # a0 = x / 10 for every 32-bit unsigned x (RV32IM)
+        li    t0, 0xcccccccd
+        mulhu a0, a0, t0   # high 32 bits of x * 0xcccccccd
+        srli  a0, a0, 3    # total shift: 32 + 3 = 35
+        ret
+```
+
+The test of this lesson runs this sequence on the hart of the track and compares it with `x / 10`. Compilers emit sequences of this kind; the exact instructions depend on the compiler and the target. The idea stays: the compiler trades one slow operation for a few fast ones.
+
+<Recall cards={[
+  { q: "Why does the multi-cycle machine need IR, A, B, ALUOut and Data?", a: "A value made in one cycle is used in a later cycle, but the units that made it do other work in between. These registers keep the values across the clock edges." },
+  { q: "How many cycles do lw, sw, an R-type instruction and beq take in the Harris and Harris multi-cycle machine?", a: "lw 5, sw 4, R-type 4, beq 3." },
+  { q: "State the iron law of processor performance.", a: "Time = instructions × cycles per instruction × clock period." },
+  { q: "Why can a multi-cycle machine be slower than a single-cycle machine, although its clock is shorter?", a: "The steps are not equal, and every step pays the register overhead. The CPI of about 4 grows more than the clock period shrinks." },
+  { q: "When does the multi-cycle design win clearly?", a: "When one rare instruction, such as a divide, is much slower than the common ones. The single-cycle clock must fit it; the multi-cycle machine only gives that instruction more cycles." },
+  { q: "What does a dispatch ROM do in a microcoded control unit?", a: "It maps the opcode to the first microinstruction of that instruction type, so the sequencer can branch after Decode." },
+]} />

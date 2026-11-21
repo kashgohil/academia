@@ -1,0 +1,116 @@
+---
+summary: "The control unit as truth tables: the main decoder, the ALU decoder and their size as ROMs. Break one control bit and see which programs fail. Then hardwired against microcoded control, from Wilkes in 1951 to x86 microcode updates today."
+---
+import { ArchPathMainDecoderDemo, ArchPathAluDecoderDemo } from "@/demos/arch/ArchPathControlDemos";
+
+The [single-cycle datapath](/architecture/datapath/single-cycle-datapath) has muxes, write enables and an ALU with 18 operations. Something must set all of them for each instruction. That is the **control unit**. In a single-cycle machine, it is pure combinational logic. Its input is the instruction word, and its output is a set of **control signals**.
+
+The control in this lesson has two levels, as in the textbooks of Patterson and Hennessy and of Harris and Harris:
+
+- The **main decoder** reads the 7-bit opcode. It gives 12 signals, 17 bits in total: RegWrite, ImmSrc, ALUSrcA, ALUSrcB, MemRead, MemWrite, ResultSrc, Branch, Jump, TargetSrc, ALUOp and Sys.
+- The **ALU decoder** reads ALUOp from the main decoder, plus funct3 and three single bits of the instruction. It gives the ALU operation.
+
+<Predict
+  id="jal-regwrite"
+  question="You set RegWrite = 0 in the JAL row of the main decoder. How many of the 10 sample programs now give a wrong result?"
+  options={["All 10: every program jumps", "3: the programs that call a function", "None of them"]}
+  answer={2}
+  explain="The samples use jal only as j, which is jal x0, and x0 ignores writes. A call is auipc + jalr, not jal. So no sample program exercises the broken cell. The bug is real, but these tests cannot see it."
+>
+<ArchPathMainDecoderDemo />
+</Predict>
+
+Things to try:
+
+1. Click **JAL: RegWrite = 0**. All chips stay green. Then click the JAL cell under RegW back to 1, and look for another cell that no program uses.
+2. Click **Load: ResultSrc = ALU**. Every program with a load fails at its first load: rd gets the address, not the data.
+3. Click **Store: ImmSrc = I** and select **Factorial, recursive**. The immediate generator reads the I-type bits of `sw ra, 12(sp)`, and the offset becomes 1. The store traps as misaligned.
+4. Click **Branch: ALUOp = add**. The ALU adds, so the zero flag now means "rs1 = -rs2". Only 3 programs fail. A branch against x0 still works, because rs1 + 0 equals rs1 - 0.
+5. Click **AUIPC: ALUSrcA = 0**. Now `auipc` computes 0 + imm in place of PC + imm. Five programs survive. Their only `auipc` is at address 0, where the two values are equal.
+
+## The main decoder
+
+The table in the demo is the whole main decoder. Each row is one opcode, and each column is one control signal.
+
+| Signal | Width | Meaning |
+|---|---|---|
+| RegWrite | 1 | write the result into rd at the clock edge |
+| ImmSrc | 3 | which format the immediate generator decodes: I, S, B, U or J |
+| ALUSrcA, ALUSrcB | 2, 1 | ALU inputs: rs1, PC or 0; rs2 or the immediate |
+| MemRead, MemWrite | 1, 1 | read or write the data memory |
+| ResultSrc | 2 | value for rd: ALU, memory or PC + 4 |
+| Branch, Jump | 1, 1 | take the target if the condition holds, or always |
+| TargetSrc | 1 | jump target: the PC + imm adder, or the ALU (`jalr`) |
+| ALUOp | 2 | add, subtract, or let the ALU decoder read funct3 and funct7 |
+| Sys | 1 | `ecall` or `ebreak`: hand over to the kernel |
+
+An **x** in the table is a **do-not-care entry**, which logic books call `don't care`. No state element uses that signal for this opcode, so either value is correct. For example, a store writes no register, so ResultSrc does not matter. Logic designers use these entries to make the logic smaller.
+
+A do-not-care entry is also a risk. If a later change makes the signal matter, nobody checks the old entry. The JAL case in the demo is a smaller form of the same problem: the cell matters, but no test reaches it.
+
+## The ALU decoder and the op5 trick
+
+ALUOp = 10 tells the ALU decoder to read the function fields. R-type and I-type ALU instructions share funct3 codes, so `add` and `addi` both have funct3 = 000. But `sub` is `add` with funct7 bit 5 set, and an I-type instruction has no funct7 field. In `addi`, instruction bit 30 is bit 10 of the immediate.
+
+So the ALU decoder must also check **op5**, bit 5 of the opcode. It is 1 for R-type (0110011) and 0 for I-type (0010011). Subtract needs op5 AND funct7 bit 5. Harris and Harris use the same check.
+
+<ArchPathAluDecoderDemo />
+
+1. Keep the example `addi t1, t1, -1`. The immediate -1 sets bits 31 to 20, so funct7 bit 5 and funct7 bit 0 are both 1. The op5 bit is 0, so the decoder still picks add.
+2. Turn on **Mistake 1**. Now this `addi` subtracts. In **Sum of an array**, the first `addi t1, t1, -1` gives 9 in place of 7: it computes 8 - (-1). 8 of the 10 programs fail.
+3. Turn off Mistake 1 and turn on **Mistake 2**. The same `addi` now multiplies, and it gives -8. The same 8 programs fail.
+4. Find the 2 programs that survive both mistakes: strlen and the linked-list walk. They have no `addi` with a negative immediate or with immediate bit 5 set.
+5. Turn on **Mistake 3**. No program fails, because none of them uses `sra` or `srai`. A test suite needs at least one instruction for each row of the table.
+
+## Control as a table: ROM or PLA
+
+Any combinational function can be a lookup table. A **ROM** (read-only memory) has one row for each input pattern. A **PLA** (programmable logic array) stores only the product terms that the function needs. So a PLA is small when most input patterns give the same output.
+
+| Design | Address bits | Rows | Width | Bits |
+|---|---|---|---|---|
+| One flat ROM: opcode, funct3 and funct7 | 17 | 131,072 | 22 | 2,883,584 |
+| Main decoder ROM (opcode) | 7 | 128 | 17 | 2,176 |
+| ALU decoder ROM | 8 | 256 | 5 | 1,280 |
+| Main decoder on bits 6:2 only | 5 | 32 | 17 | 544 |
+
+Two levels need 3,456 bits in place of 2,883,584. The last row uses a fact of the ISA: all 32-bit base instructions have their lowest two bits set to 11. So the main decoder needs only opcode bits 6:2, and the two levels need 1,824 bits. A PLA of the main decoder needs one product term for each of the 11 opcodes.
+
+## Hardwired and microcoded control
+
+A **hardwired** control unit is logic gates, as above. A **microcoded** control unit keeps the control signals as words in a memory, the **control store**. A small sequencer steps through the words, one per cycle. Each word is a **microinstruction**, and a sequence of them is a **microprogram**.
+
+Maurice Wilkes proposed microprogramming in 1951, in a talk at the inaugural conference of the Manchester University computer. Its title was "The Best Way to Design an Automatic Calculating Machine". His aim was to make the control systematic. A table is easier to design, to check and to change than ad hoc logic.
+
+IBM used this idea in the System/360, launched on April 7, 1964. The Models 30, 40, 50 and 65 used a microprogram in read-only storage. The Models 44, 75 and 91 were hardwired. Microcode let IBM sell one instruction set on machines of very different cost and speed.
+
+x86-64 cores today use both methods. The decoders turn most instructions into a few micro-operations (µops) with hardwired logic. Complex instructions, such as CPUID, use long µop flows from a microcode ROM, which Intel calls the MSROM. Intel's optimization manual tells compilers to avoid instructions such as `enter`, `leave` and `loop` that have more than four µops.
+
+The microcode can also change after the chip ships. The Intel SDM (Volume 3A, section 12.11 "Microcode Update Facilities" in revision 093) describes how the BIOS or the operating system loads a **microcode update**. Linux can load one very early in boot, from the initrd. The kernel documentation says that this can fix CPU problems before the kernel boot sees them. Vendors use updates to fix bugs and security problems in the control.
+
+```sh
+# Linux on x86-64: the microcode revision that each core runs now
+grep -m1 microcode /proc/cpuinfo
+```
+
+<Callout kind="warn" title="A table is only as good as its tests">
+In 1994, Intel found that the Pentium FDIV instruction gave wrong quotients for a few operands. The divider used the SRT algorithm with a lookup table, and five entries of that table were missing. They return 0 where they must return 2. Intel took a pretax charge of $475 million to replace the chips.
+</Callout>
+
+## What this means for your code
+
+The control of a modern core is not a single table, but the same ideas apply. A few points matter to a programmer:
+
+- An instruction from the microcode ROM costs many µops, and it can take several cycles to decode. Compilers emit simple instructions for this reason.
+- A microcode update can change the speed of an instruction. Some microcode fixes for security problems made certain instructions slower, so measure again after a system update.
+- When you design a table-driven system yourself, such as a decoder, a state machine or a parser, test every row. The demo shows that real programs reach only a part of the table.
+
+The [multi-cycle](/architecture/datapath/multi-cycle-execution) lesson turns the control into a state machine and shows the same machine as a microprogram.
+
+<Recall cards={[
+  { q: "Why does the control use a main decoder and a separate ALU decoder?", a: "The main decoder needs only the opcode, and the ALU decoder needs only ALUOp and a few function bits. Two small tables are much smaller than one table over all of these bits: 3,456 bits against about 2.9 million in the model." },
+  { q: "Why must the ALU decoder check op5 before it selects subtract?", a: "In an I-type instruction, the bit where funct7 bit 5 would be is immediate bit 10. Without op5, an addi with that bit set, such as addi t1, t1, -1, would subtract." },
+  { q: "What is a do-not-care entry in a decoder table?", a: "An entry whose value no state element uses for that instruction, so either value is correct. Designers use it to make the logic smaller." },
+  { q: "What is the difference between hardwired and microcoded control?", a: "Hardwired control computes the signals with gates. Microcoded control reads them from a control store, one microinstruction per cycle, under a sequencer." },
+  { q: "Who proposed microprogramming, and when?", a: "Maurice Wilkes, in 1951, at the inaugural conference of the Manchester University computer." },
+  { q: "What does a microcode update do on an x86 CPU?", a: "It replaces or patches the microcode that the core runs. Firmware or the operating system loads it at boot, to fix bugs or security problems." },
+]} />

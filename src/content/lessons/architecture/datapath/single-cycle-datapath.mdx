@@ -1,0 +1,141 @@
+---
+summary: "Build an RV32I processor from units and wires: PC, memories, register file, immediate generator, ALU and multiplexers. Then find its critical path, and see why every instruction pays for the slowest one."
+---
+import { ArchPathStepDemo, ArchPathImmDemo, ArchPathTimingDemo } from "@/demos/arch/ArchPathSingleDemos";
+
+A processor has two parts. The **datapath** is the set of units that hold and change data, and the wires between them. The **control** tells each unit what to do for the current instruction. This lesson builds a datapath for RV32I, the RISC-V base integer instruction set. The next lesson builds its control.
+
+The simplest design is **single-cycle**: each instruction starts and finishes in one clock cycle. It is slow, and no fast core works this way. But it shows every wire that an instruction needs. The faster designs in the next modules are this datapath cut into pieces.
+
+You need two kinds of hardware parts:
+
+- **Combinational logic**: its output depends only on its inputs now. An adder, the ALU (arithmetic logic unit) and a **multiplexer** (mux) are examples. A mux has a select input, and it passes one of its data inputs to its output.
+- **State elements**: they keep a value from one clock cycle to the next. A **register** is a set of flip-flops that load together on the clock edge. The PC, the register file and the memories are state elements.
+
+On each rising clock edge, the state elements load new values. Between two edges, the new values travel through the combinational logic. The clock must wait until the slowest signal arrives.
+
+<Predict
+  id="beq-compare"
+  question="beq a0, a1, loop must compare two registers. In this datapath, which unit makes the comparison?"
+  options={["A separate equality comparator next to the register file", "The ALU: it subtracts rs2 from rs1, and branch logic reads the flags", "The data memory, which compares the address"]}
+  answer={1}
+  explain="The ALU subtracts and sets flags: zero, negative, overflow and carry. Branch logic picks the condition from funct3. beq tests the zero flag, blt tests negative XOR overflow, and bltu tests that there is no carry. One subtractor serves all six branches."
+>
+<ArchPathStepDemo />
+</Predict>
+
+Things to try:
+
+1. Step through the first cycles of **Sum of an array**. The `la` pseudo-instruction is an `auipc` and an `addi`. For `auipc`, ALU input A is the PC, not a register.
+2. Click **Load** in the row of chips. The address comes from the ALU, and the value goes from the data memory through the result mux to the register file. Count the units on that path. It is the longest path of all.
+3. Click **Branch**. The ALU subtracts, and the branch logic decides. Find a taken branch and a not-taken branch. Only the PC mux setting changes.
+4. Select **Factorial, recursive** and click **JAL** or **JALR**. A jump writes PC + 4 into rd, so the result mux has a third input.
+5. Look at the control word under the drawing. Each x is a value that no state element uses for this instruction.
+
+## The units
+
+| Unit | Inputs | Output | Notes |
+|---|---|---|---|
+| PC | next PC | address of this instruction | a 32-bit register |
+| Instruction memory | address | 32-bit instruction | read only in this design |
+| Register file | rs1, rs2, rd, write data, RegWrite | two read values | 2 read ports, 1 write port; `x0` reads 0 |
+| Immediate generator | instruction, ImmSrc | 32-bit signed immediate | one wiring per format: I, S, B, U, J |
+| ALU | A, B, operation | result and four flags | add, sub, shifts, compares, logic |
+| Data memory | address, write data, MemRead, MemWrite | read value | size and sign from funct3 |
+| PC + 4 adder, PC + imm adder | PC, immediate | next address, target | two adders, not the ALU |
+
+The register fields of RISC-V make the register file easy to connect. The ISA manual says that it keeps rs1, rs2 and rd "at the same position in all formats to simplify decoding". So bits 19:15 always go to read port 1, and bits 24:20 always go to read port 2. The hardware reads both registers for every instruction, before it knows the format. A read that nobody needs adds no time to the cycle. It only costs some energy.
+
+The datapath has two memories because one cycle can do two accesses: one fetch and one load or store. In the model, both are ports on one byte array, and the hart in this track uses the same layout. Most real cores also split the two paths at the first level, into an instruction cache and a data cache. See [multi-level caches](/architecture/caches/multi-level-caches).
+
+## Five instructions, five paths
+
+Each instruction class uses a different subset of the wires. The muxes pick the subset.
+
+| Instruction | ALU input A | ALU input B | ALU does | rd gets | Next PC |
+|---|---|---|---|---|---|
+| `add a0, a1, a2` | rs1 | rs2 | funct3 and funct7 | ALU result | PC + 4 |
+| `addi t1, t1, -1` | rs1 | immediate (I) | funct3 | ALU result | PC + 4 |
+| `lw t2, 0(t0)` | rs1 | immediate (I) | add | memory | PC + 4 |
+| `sw t3, 0(t0)` | rs1 | immediate (S) | add | (no write) | PC + 4 |
+| `beq a0, a1, L` | rs1 | rs2 | subtract | (no write) | PC + imm if taken |
+| `jal ra, f` | (not used) | (not used) | (not used) | PC + 4 | PC + imm |
+| `jalr ra, 0(a0)` | rs1 | immediate (I) | add | PC + 4 | ALU result, bit 0 cleared |
+| `lui a0, 0x12345` | 0 | immediate (U) | add | ALU result | PC + 4 |
+| `auipc t0, 0x1` | PC | immediate (U) | add | ALU result | PC + 4 |
+
+The `jalr` row follows the ISA manual: the target is rs1 plus the immediate, "then setting the least-significant bit of the result to zero".
+
+The same structure in Verilog is short. This sketch shows the muxes and the clock edge. A real design also needs the decoders, which are the subject of the [control unit](/architecture/datapath/control-unit) lesson.
+
+```verilog
+// one cycle of the single-cycle datapath (decoders and ALU not shown)
+wire [31:0] srcA   = (ALUSrcA == 2'd0) ? rd1 : (ALUSrcA == 2'd1) ? pc : 32'd0;
+wire [31:0] srcB   = ALUSrcB ? imm : rd2;
+wire [31:0] pc4    = pc + 32'd4;
+wire [31:0] target = TargetSrc ? (aluY & ~32'd1) : (pc + imm);
+wire [31:0] result = (ResultSrc == 2'd1) ? memOut : (ResultSrc == 2'd2) ? pc4 : aluY;
+wire        pcSrc  = Jump | (Branch & cond);
+
+always @(posedge clk) begin
+  pc <= pcSrc ? target : pc4;
+  if (RegWrite && rd != 5'd0) regs[rd] <= result;
+  if (MemWrite) dmem[aluY[31:2]] <= rd2;   // word stores only, for brevity
+end
+```
+
+The model in this lesson runs every sample program of the track. After each instruction, a test compares its registers, stores and output with the hart, the functional model of the track. They agree on all ten programs.
+
+## Why the immediate bits look scrambled
+
+The B-type and J-type formats store their immediates in an odd order. For example, bit 7 of a branch holds bit 11 of the offset. The reason is the immediate generator. It is a set of muxes, one for each output bit, and fewer inputs mean less hardware.
+
+<ArchPathImmDemo />
+
+1. Read the last column of the grid, imm bit 31. All five formats take it from instruction bit 31, so it has 1 source. The ISA manual says that the sign bit is always bit 31 "to speed sign-extension circuitry".
+2. Read the **sources** row. With the RISC-V layout, no bit has more than 4 sources, and the muxes need 69 inputs in total.
+3. Select **Unscrambled**. Now B and J keep their offset bits in order. Bits 1 to 4 need 5 sources, and the total is 97 inputs.
+4. Select the **B** example and read the value row. Bit 11 of the offset comes from instruction bit 7, where S-type keeps bit 0.
+
+The manual explains the trick. The S and B formats differ only in the meaning of the immediate field. The middle bits and the sign stay in place, and instruction bit 7 holds a high bit in B. The U and J formats share bits in the same way. The manual estimates that this cuts the immediate mux cost and the fanout "by around a factor of 2". The simple count in this model gives 97 against 69 inputs.
+
+## Timing: the critical path
+
+Every unit has a delay. A gate output is a wire with capacitance, and a transistor charges it through a resistance. So the output changes along an [RC charging curve](/electronics/transients/rc-charging-and-discharging), not at once. Add the delays along a chain of units, and you get the time that the signal needs. The longest chain is the **critical path**.
+
+The model uses round numbers for the unit delays. They are model inputs for teaching, not measurements of a chip. Memory read is 200 ps, the ALU 150 ps, a register-file read 100 ps, an adder 100 ps, and a mux 25 ps.
+
+<Predict
+  id="add-time"
+  question="With these delays, an add needs 560 ps and a lw needs 760 ps. How long does each add take in the single-cycle machine?"
+  options={["560 ps: it finishes early", "760 ps: every cycle has the same length", "660 ps: the average of the two"]}
+  answer={1}
+  explain="The clock period is one fixed number. It must fit the slowest instruction that the hardware can run, so every add also takes 760 ps."
+>
+<ArchPathTimingDemo />
+</Predict>
+
+1. Read the bars. lw is the slowest at 760 ps: instruction memory, register file, ALU, data memory, result mux, and the register setup time. So the clock period is 760 ps, which is 1.32 GHz.
+2. add and addi need 560 ps. They wait 200 ps in every cycle. On **Sum of an array**, the machine wastes 22.2% of its time this way.
+3. Select **RV32I + multiplier**. A combinational multiplier (600 ps, a model input) puts mul on the critical path. The clock grows to 1010 ps for every instruction, and also for programs with no mul.
+4. Select **RV32IM (with divider)**. A combinational divider is a chain of 32 subtract-and-select stages. The clock grows to 4410 ps.
+5. Move each slider to its ends. The load stays the slowest in all settings, because its path holds the full path of add, plus the data memory.
+
+The waste has a simple cause. The clock period is a property of the hardware, not of the instruction. In a single-cycle machine, the common case pays for the rare case.
+
+## What this means for real machines and your code
+
+No high-performance core is single-cycle. Real cores keep this datapath, but they cut it into stages with registers between them. The [multi-cycle](/architecture/datapath/multi-cycle-execution) machine reuses the units over several short cycles, and a [pipeline](/architecture/pipelining/five-stage-pipeline) overlaps the stages of different instructions.
+
+Memory is also not one fast unit. A load that hits in the L1 data cache takes a few cycles on a fast core, and a miss takes much longer. See [multi-level caches](/architecture/caches/multi-level-caches). The single-cycle model hides this, because its clock is so long.
+
+The idea that remains true is the critical path. In every design, the clock period is the delay of the slowest path between two registers. Hardware designers add registers to cut long paths. This is why a load has a latency of several cycles on real cores, while an add has one.
+
+<Recall cards={[
+  { q: "What is the difference between combinational logic and a state element?", a: "The output of combinational logic depends only on its inputs now. A state element, such as a register, keeps a value and changes only on the clock edge." },
+  { q: "Which instruction class sets the clock period of the single-cycle machine in this model, and why?", a: "Loads. A load uses the instruction memory, the register file, the ALU, the data memory, the result mux and the register setup, one after the other." },
+  { q: "How does the single-cycle datapath compute the condition of blt?", a: "The ALU subtracts rs2 from rs1. Branch logic takes N XOR V from the flags: the sign of the result, corrected for signed overflow." },
+  { q: "What does the result mux choose between, and for which instructions?", a: "The ALU result (R-type, I-type, lui, auipc), the memory value (loads) and PC + 4 (jal and jalr)." },
+  { q: "Why does RISC-V keep the sign bit of every immediate in instruction bit 31?", a: "The sign of every immediate is then known before the decoder finishes, so sign extension can start in parallel with decoding. Only imm bit 31 needs no mux." },
+  { q: "Why does a combinational divider slow down every instruction of a single-cycle machine?", a: "The clock period must fit the slowest path that the hardware has. If div is that path, an add waits for the divider delay too." },
+]} />

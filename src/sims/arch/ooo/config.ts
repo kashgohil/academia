@@ -61,7 +61,7 @@ export interface OooConfig {
   sqSize: number;
   /** Physical registers (at least 33). Unused when `rename` is false. */
   physRegs: number;
-  /** false: no renaming. Write-after-read and write-after-write hazards then stall issue, as in a scoreboard. */
+  /** false: no renaming. Write-after-read and write-after-write hazards then stall the instruction, as in a scoreboard. */
   rename: boolean;
   /** Functional units of each class (each pipelined, except the divider). */
   units: Record<Unit, number>;

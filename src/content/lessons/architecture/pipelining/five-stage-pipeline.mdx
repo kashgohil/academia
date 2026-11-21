@@ -1,0 +1,134 @@
+---
+summary: "The classic RISC pipeline: five stages, four pipeline registers, one instruction finished per cycle in the best case, and why deeper pipes do not give the speedup that their stage count promises."
+---
+import { ArchPipeStepDemo, ArchPipeDepthDemo } from "@/demos/arch/ArchPipeStageDemos";
+
+A single-cycle processor does all the work of one instruction in one long clock cycle (see [the single-cycle datapath](/architecture/datapath/single-cycle-datapath)). Most of its logic is idle most of the time. When the ALU computes, the instruction memory has nothing to do. **Pipelining** puts that idle logic to work. It cuts the work into **stages** and lets each stage work on a different instruction in the same cycle. This is the laundry trick: wash load 2 while load 1 dries.
+
+The classic RISC pipeline has five stages. RISC-V cores in textbooks use the same five as the MIPS R2000:
+
+| Stage | Name | Work for `lw a0, 8(sp)` |
+|---|---|---|
+| IF | instruction fetch | read the word at pc from instruction memory, compute pc + 4 |
+| ID | instruction decode | decode the fields, read `sp` from the register file, sign-extend the immediate 8 |
+| EX | execute | the ALU adds `sp` + 8 to make the address |
+| MEM | memory access | read the data memory at that address |
+| WB | write-back | write the loaded value into `a0` |
+
+Between two stages is a **pipeline register**: a row of flip-flops that holds everything the next stage needs. The four registers are named after the stages they join: IF/ID, ID/EX, EX/MEM and MEM/WB. At each clock edge, every instruction moves one stage to the right.
+
+<Predict
+  id="fill"
+  question="A five-stage pipeline runs 8 instructions that do not depend on each other. Each stage takes one cycle. How many cycles from the first fetch to the last write-back?"
+  options={["40: 8 instructions × 5 stages", "12", "8: one per cycle"]}
+  answer={1}
+  explain="The first instruction needs 5 cycles to go through the pipe. After that, one instruction finishes in every cycle, so the other 7 need 7 more cycles: 5 + 7 = 12. Each instruction still takes 5 cycles, but they overlap."
+>
+<ArchPipeStepDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **8 independent instructions** and move the cycle slider from 1 to 5. The pipe fills one stage per cycle. In cycle 5, all five stages are busy, and the first instruction writes back.
+2. Move to cycle 12. Eight instructions finished in 12 cycles, so the CPI is 1.50. The 4 extra cycles are the fill at the start and the drain at the end.
+3. Read the text under each stage. The ID box shows the register values that go into ID/EX. The EX box shows the ALU result that goes into EX/MEM.
+4. Select **Sum of an array**. The 46 instructions take 72 cycles, a CPI of 1.57. The bar under the diagram shows where the 26 extra cycles go: 4 for the fill, 8 load-use stalls and 14 cycles lost at branches.
+
+## Latency and throughput
+
+Pipelining does not make one instruction faster. It makes the processor finish more instructions per second. These are two different numbers:
+
+- **Latency**: the time from fetch to write-back of one instruction. In the pipeline it is 5 cycles, and it gets slightly longer than in the single-cycle design.
+- **Throughput**: instructions finished per unit of time. In the ideal pipeline it is one instruction per cycle, and each cycle is about 5 times shorter.
+
+For $n$ instructions in a $k$-stage pipeline with no stalls, the time in cycles is
+
+$$
+T = k + (n - 1)
+$$
+
+The $k$ term is the fill. For a long program it does not matter, and the average **CPI** (cycles per instruction) goes to 1. Real code adds **stalls**: cycles in which a stage must wait. So the useful formula is
+
+$$
+\text{CPI} = 1 + \frac{\text{stall cycles}}{\text{instructions}}
+$$
+
+The rest of this module is about these stall cycles. A **hazard** is a reason for a stall. There are three kinds:
+
+- **Structural hazard**: two instructions need the same hardware in the same cycle. The classic five-stage pipe avoids most of them by design. It has separate instruction and data memories. Its register file writes in the first half of a cycle and reads in the second half.
+- **Data hazard**: an instruction needs a value that an older instruction has not written yet. See [Data hazards and forwarding](/architecture/pipelining/data-hazards-and-forwarding).
+- **Control hazard**: the pipe does not know which instruction comes after a branch. See [Control hazards](/architecture/pipelining/control-hazards).
+
+## What a pipeline register holds
+
+A pipeline register carries the instruction's state, not only its result. For `lw a0, 8(sp)`, ID/EX holds the value of `sp`, the immediate 8 and the destination register number (10, for `a0`). It also holds the control signals that later stages need. The control unit decodes the instruction once, in ID. Its outputs then travel down the pipe with the instruction. A sketch in Verilog:
+
+```verilog
+// ID/EX: everything that EX, MEM and WB need, latched at the clock edge.
+always @(posedge clk) begin
+  if (flush) begin
+    idex_regwrite <= 1'b0;   // a bubble: an instruction that changes nothing
+    idex_memread  <= 1'b0;
+    idex_memwrite <= 1'b0;
+  end else begin
+    idex_rs1_val  <= rf_rs1;          // values read in ID
+    idex_rs2_val  <= rf_rs2;
+    idex_imm      <= imm_ext;
+    idex_rd       <= ifid_inst[11:7]; // the rd field of the instruction
+    idex_regwrite <= ctl_regwrite;    // control travels with the instruction
+    idex_memread  <= ctl_memread;
+    idex_memwrite <= ctl_memwrite;
+    idex_alu_op   <= ctl_alu_op;
+  end
+end
+```
+
+A **bubble** is a pipeline register whose control bits are all zero. It moves down the pipe like an instruction, but it writes nothing. This is how the hardware makes a stall: it holds the older stages and inserts a bubble into the next one.
+
+## How many stages?
+
+If the logic of one instruction takes $t$ and you cut it into $k$ equal stages, each stage takes $t/k$. The clock could be $k$ times faster. Two effects stop this:
+
+- **Unbalanced stages.** The clock must fit the slowest stage. Patterson and Hennessy's textbook example has stage times of 200, 100, 200, 200 and 100 ps. The single-cycle clock is 800 ps, and the pipelined clock is 200 ps, not 160 ps. The speedup is 4, not 5.
+- **Register overhead.** Each pipeline register adds its setup time, its clock-to-output delay and some clock skew. This overhead does not shrink when the stages get shorter.
+
+<ArchPipeDepthDemo />
+
+1. Keep 5 stages and 40 ps of overhead. The clock is 160 + 40 = 200 ps, and the speedup is 4.2, not 5.
+2. Move to 20 stages. The clock is 80 ps, half of which is register overhead. The speedup is 10.5.
+3. Move to 30 stages. The curve is almost flat. With 40 ps of overhead, no depth can give more than $840 / 40 = 21$ times.
+4. Set the overhead to 0 and the imbalance to 1.25. Now the slowest stage sets the clock, and every other stage waits for it.
+5. Watch the latency of one instruction. It goes from 840 ps with 1 stage to 1600 ps with 20 stages. Deep pipes finish more instructions but take longer for each one.
+
+In the model, the speedup with $k$ stages, logic time $t$ and register overhead $o$ is
+
+$$
+S(k) = \frac{t + o}{t/k + o}
+$$
+
+It approaches $(t + o)/o$ and never reaches it. These numbers are model inputs. Real stages are not cut from one block of logic: a cache access or a register-file read cannot be split at any point you like.
+
+## Real pipeline depths
+
+| Core | Integer pipeline | Source |
+|---|---|---|
+| MIPS R2000 | 5 stages: IF, RD, ALU, MEM, WB | IDT R30xx Family Software Reference Manual, chapter 1 |
+| Intel Pentium (P5, 1993) | 5 stages: PF, D1, D2, E, WB, in two pipes | Intel Architecture Optimization Manual (1997), section 2.1 |
+| Intel Pentium 4 (Willamette, 2000) | a 20-stage branch misprediction pipeline, against 10 for the P6 | Hinton et al., Intel Technology Journal, Q1 2001 |
+| Arm Cortex-A53 | 8 stages, in order, dual issue | Arm |
+| SiFive U74 (RISC-V) | 8 stages: F0, F1, F2, ID, AG, M1, M2, WB | SiFive U74 Core Complex Manual |
+
+The Pentium 4 went deep to reach high clock rates. Its 90 nm version went even deeper. The Core designs that replaced it were much shorter. The reason is the subject of [Control hazards](/architecture/pipelining/control-hazards): each stage before the branch is resolved adds to the cost of every mispredict. Deep pipes also use more power, because each pipeline register is clocked every cycle.
+
+## What this means for your code
+
+The pipeline gives you one instruction per cycle only if the stream is free of stalls. A chain of dependent instructions, a load whose value is needed at once, and an unpredictable branch each cost cycles. Modern out-of-order cores hide many of these stalls, but they use the same pipeline underneath. The in-order cores in phones, microcontrollers and many RISC-V boards hide almost none.
+
+<Recall cards={[
+  { q: "Name the five stages of the classic RISC pipeline and what each one does.", a: "IF fetches the instruction, ID decodes it and reads registers, EX uses the ALU, MEM reads or writes data memory, WB writes the register file." },
+  { q: "How many cycles do n independent instructions take in a k-stage pipeline?", a: "k + n − 1: k cycles for the first one, then one more for each of the others." },
+  { q: "What does a pipeline register such as ID/EX hold?", a: "Everything that the later stages need for one instruction: operand values, the immediate, the destination register number and the control signals." },
+  { q: "Why is the speedup of P&H's five-stage example 4 and not 5?", a: "The stages are unbalanced. The clock must fit the slowest stage (200 ps), so 800 ps of logic gives a 200 ps clock, not 160 ps." },
+  { q: "Why does adding stages give less and less speedup?", a: "Each pipeline register adds a fixed overhead, which does not shrink with the stage. The speedup approaches (logic + overhead) ÷ overhead." },
+  { q: "What is a bubble?", a: "A pipeline slot whose control signals are all zero. It moves down the pipe like an instruction but writes nothing, so it fills a stall." },
+]} />

@@ -1,0 +1,130 @@
+---
+summary: "The predictor hardware in the front end: the branch target buffer, the return-address stack, and direction predictors from 2-bit counters through two-level, gshare, tournament and perceptron to TAGE, tested on RISC-V programs at a fixed storage budget."
+---
+import { ArchPipePredictorStepper, ArchPipeShootoutDemo, ArchPipeRasDemo } from "@/demos/arch/ArchPipePredictDemos";
+
+[Control hazards](/architecture/pipelining/control-hazards) showed that a deep pipe loses many cycles on each wrong guess. So the front end of a core must answer three questions in every cycle, before it has even decoded the instructions it fetched:
+
+1. Is there a branch in this fetch block?
+2. If so, which way does it go: the **direction**?
+3. If it is taken, where does it go: the **target**?
+
+The lesson [Branch prediction and branchless code](/performance/cpu/branch-prediction-and-branchless-code) covers 2-bit counters and gshare from the software side. This lesson opens the hardware. It builds each predictor as a table of a given size, and runs it on branch traces from RISC-V programs on the hart.
+
+## The branch target buffer
+
+A **branch target buffer (BTB)** is a cache indexed by the fetch address. Each entry holds a tag (part of the pc of a branch) and the target that the branch went to the last time. A hit in the BTB during IF tells the front end two things: there is a branch here, and this is its likely target. With a taken direction prediction, it fetches from the target in the next cycle. On a miss, the front end assumes that there is no branch and fetches pc + 4.
+
+A direct branch such as `bnez t1, loop` always has the same target, so the BTB is right once it has seen the branch. Its only error is the cold miss. A BTB is a real cache, with sets, ways and replacement. Large programs have more branches than the BTB has entries, and then the front end loses cycles even on branches that it would predict correctly.
+
+## Direction: counters and history
+
+James Smith's "A Study of Branch Prediction Strategies" (ISCA 1981) gave each branch a small saturating counter. It found that 2 bits are often better than 1, and that more than 2 bits do not reliably help. A table of 2-bit counters indexed by the low bits of the pc is the **bimodal** predictor. It learns the usual direction of each branch, but not a pattern.
+
+<Predict
+  id="loop4"
+  question="A branch repeats the pattern T T T N, the back-edge of a loop that runs 4 times. After warm-up, how often does a bimodal predictor miss, and how often does a predictor that uses the branch's own last 4 outcomes miss?"
+  options={["Both about 0%", "Bimodal 25%, local history 0%", "Both 25%"]}
+  answer={1}
+  explain="One 2-bit counter sees mostly taken, so it stays in the taken states and misses every exit: 1 in 4. With the last 4 outcomes as the index, the history T T T is followed by N, and every other history by T. Each history gets its own counter, so each one learns its own answer."
+>
+<ArchPipePredictorStepper />
+</Predict>
+
+Things to try:
+
+1. Keep **Loop of 4** and **Bimodal**, and step to the end. Only counter 0 is used. It misses 4 of the last 16 branches: every exit.
+2. Select **Local history**. The history picks a different counter for each position in the pattern. After a short warm-up, it misses 0 of the last 16.
+3. Select **Alternating: T N** with bimodal. The counter swings between the two weak states and misses half the time. Local history and gshare learn it after 2 misses.
+4. Select **gshare**. Here the only branch is this one, so the global history equals the local history, and gshare learns the same patterns. The index is history XOR pc, so the counter numbers differ.
+
+## Two levels: history, then counters
+
+Yeh and Patt's "Two-Level Adaptive Training Branch Prediction" (MICRO-24, 1991) added a first level: a **branch history register** of the last $h$ outcomes. Their 1991 paper used one history per branch. Global history and correlation followed in 1992, from Yeh and Patt and from Pan, So and Rahmeh. The history selects a counter in the second level, the **pattern table**. There are two kinds of history:
+
+- **Local history**: one history register per branch, in a table indexed by pc. It learns loops and other patterns of one branch.
+- **Global history**: one shift register with the outcomes of all recent branches. It learns **correlation**: `if (x < 50) a++; ... if (x < 50) b++;` The second branch does exactly what the first did.
+
+McFarling's "Combining Branch Predictors" (DEC WRL TN-36, 1993) named **gshare**: the index is the global history XOR the pc. The XOR spreads the history patterns of different branches over the whole table. McFarling also proposed the **combining** predictor: two predictors and a **chooser** table of 2-bit counters that learns, for each branch, which one to trust.
+
+The Alpha 21264 built such a **tournament** predictor (Kessler, IEEE Micro, 1999):
+
+| Part | Size |
+|---|---|
+| Local history table | 1,024 entries × 10 bits |
+| Local prediction | 1,024 3-bit counters |
+| Global prediction | 4,096 2-bit counters, indexed by 12 bits of global history |
+| Choice prediction | 4,096 2-bit counters, indexed by the same history |
+
+That is 29,696 bits. In the demo below, the tournament predictor at a budget of $2^{15}$ bits has exactly these tables.
+
+## Perceptrons and TAGE
+
+A table of counters needs an entry for each history pattern. So it needs $2^h$ entries for $h$ bits of history, and long histories become too expensive. Two later designs avoid this.
+
+**Perceptron** (Jiménez and Lin, "Dynamic Branch Prediction with Perceptrons", HPCA 2001). Each branch has a vector of small signed weights, one for each history bit, plus a bias. With history bits $x_i = \pm 1$, the output is
+
+$$
+y = w_0 + \sum_{i=1}^{h} w_i x_i
+$$
+
+The prediction is taken if $y \ge 0$. Training happens after a mispredict, or when $|y| \le \theta$. Each weight then moves by +1 if its history bit agreed with the outcome, else by −1.
+
+The paper found the best threshold to be $\theta = \lfloor 1.93h + 14 \rfloor$. Its weights are 7 bits at $h = 12$ and 9 bits at $h = 62$. Storage grows linearly with the history length, not exponentially. The cost: a perceptron can only learn **linearly separable** functions of the history. It cannot learn, for example, "taken when exactly one of two old branches was taken".
+
+**TAGE** (Seznec and Michaud, "A case for (partially) TAgged GEometric history length branch prediction", JILP 2006). A base bimodal table gives a default. Several **tagged** tables are indexed by the pc hashed with global histories of geometric lengths, for example 3, 6, 12, 24 and 48 branches. Each entry has a partial tag, a counter and a "useful" counter.
+
+The table with the longest history whose tag matches makes the prediction. After a mispredict, TAGE allocates an entry in a longer table. So a branch uses a long history only where a short one fails. Most branches need only a few entries.
+
+## A shoot-out at a fixed budget
+
+<ArchPipeShootoutDemo />
+
+1. Keep **400 small loops** at $2^{13}$ bits (1 KiB). Bimodal misses 24.4%: every loop exit. Local history misses 1.1%, because each loop's own history is enough and the 400 histories fit.
+2. At the same budget, gshare misses 10.7% and TAGE 23.8%. The global designs need an entry for each pair of branch and history, and 400 loops do not fit in 1 KiB. TAGE falls back on its small base table almost every time.
+3. Move the budget to $2^{17}$ bits (16 KiB). Now gshare misses 3.5%, the tournament 1.4% and TAGE 3.6%. The global predictors were short of storage, not of ideas.
+4. Select **Two branches that test the same value** at $2^{13}$ bits. Bimodal misses 32.9% and local history 20.5%. TAGE misses 17.2%, and gshare 18.6%. The first test is a coin flip: half of its outcomes, one sixth of all branches, are lost to every predictor. Only global history can predict the second test.
+5. Select **Random data**. Every predictor misses about a quarter of the branches: the data branch half the time, the loop branch almost never. No hardware can predict a coin.
+
+This is a model, not a benchmark. The table sizes for each budget are model inputs, and the TAGE is a simplified version. Real predictors also use path history, larger tables and many tuned details. But the lesson holds for real cores too. The best design depends on the code, and the storage budget decides how much of the code it can learn.
+
+## Returns and indirect jumps
+
+A return is a `jalr` whose target changes with the caller. The BTB remembers only the last target, so a function with two callers often gets the wrong one. A **return-address stack (RAS)** fixes this: a call pushes its return address, and a return pops the prediction.
+
+RISC-V tells the hardware which `jalr` is a call or a return through the registers it uses. The manual's table of return-address-stack hints treats `x1` (`ra`) and `x5` (`t0`) as link registers:
+
+| `rd` is a link register | `rs1` is a link register | `rd` = `rs1` | RAS action |
+|---|---|---|---|
+| no | no | – | none |
+| no | yes | – | pop |
+| yes | no | – | push |
+| yes | yes | no | pop, then push |
+| yes | yes | yes | push |
+
+So `call f` (`auipc ra` and `jalr ra`) pushes, and `ret` (`jalr x0, 0(ra)`) pops. A `jal` pushes only when `rd` is `x1` or `x5`. A computed jump through `t1` is neither, so the RAS leaves it alone.
+
+<ArchPipeRasDemo />
+
+1. Keep fib(8) and 4 entries. The BTB alone mispredicts 43 of 67 returns, because each return goes to call site A or call site B. The stack mispredicts 7.
+2. Step through the calls. Each call pushes. When the chain is deeper than 4, the oldest entry falls off the bottom, and the matching return later finds the wrong address.
+3. Move the stack to 8 entries. The deepest call chain is 8, so every return is predicted correctly.
+4. Move the stack to 0. The stack column now misses every return, because it has nothing to pop.
+
+Other **indirect jumps** have the same problem as a return without a RAS. Examples are a `switch` jump table, a virtual call and the dispatch in a bytecode interpreter. A BTB that holds the last target is right only when the jump keeps going to the same place. High-end cores add indirect predictors that index the target by the global history, in the TAGE style.
+
+## What this means for your code
+
+- A branch with a pattern is cheap if the pattern fits in the history. Examples are loops with a fixed short trip count, alternating cases and branches that repeat an earlier test.
+- Code with very many branch sites competes for the predictor tables and the BTB. A hot loop with a few branches is easier to predict than a large hot function with hundreds of them.
+- Deep recursion overflows the return-address stack. Each return beyond its depth is a mispredict, as fib showed. An explicit stack in a loop avoids this.
+- A virtual call or a `match` on an enum is cheap when one target dominates. An interpreter's dispatch jump is hard. Interpreters that copy the dispatch into each handler give each handler its own jump, with its own history.
+
+<Recall cards={[
+  { q: "What does a BTB hit in IF tell the front end?", a: "That there is a branch at this pc, and the target it went to last time, so fetch can go there in the next cycle." },
+  { q: "Why can a bimodal predictor not learn the pattern T T T N, but a local two-level predictor can?", a: "Bimodal has one counter per branch, which learns only the usual direction. A local history selects a different counter for each recent pattern, and each counter learns what follows its pattern." },
+  { q: "What is gshare's index, and why the XOR?", a: "The global history XOR the pc. The XOR spreads the history patterns of different branches over the whole table, so they collide less." },
+  { q: "What were the four tables of the Alpha 21264 tournament predictor?", a: "A 1,024 × 10-bit local history table and 1,024 3-bit local counters. Also 4,096 2-bit global counters and 4,096 2-bit choice counters, both indexed by 12 bits of global history." },
+  { q: "What can a perceptron predictor not learn, and why does it scale to long histories?", a: "Functions of the history that are not linearly separable, such as an XOR of two outcomes. Its storage grows linearly with the history length." },
+  { q: "Which entry makes a TAGE prediction?", a: "The entry in the tagged table with the longest history whose tag matches; with no match, the base bimodal table." },
+]} />

@@ -1,0 +1,97 @@
+---
+summary: "What the pipe fetches after a branch: stall, predict not taken and flush, resolve early, or fill a delay slot; and why every extra stage before the branch is resolved makes each mispredict cost more."
+---
+import { ArchPipeBranchDemo, ArchPipeDepthCostDemo } from "@/demos/arch/ArchPipeControlDemos";
+
+The fetch stage must choose the next pc in every cycle. For most instructions the choice is easy: pc + 4, but not for a branch. In the [five-stage pipeline](/architecture/pipelining/five-stage-pipeline), `bnez t1, loop` compares its register in EX, the third stage. By then, the fetch stage has already fetched two more instructions. If the branch is taken, those two are the wrong ones. This is a **control hazard**.
+
+The pipe has a few choices:
+
+- **Stall**: stop fetching after each branch until EX knows the outcome. Every branch then costs 2 cycles, taken or not.
+- **Predict not taken**: keep fetching at pc + 4. If the branch is not taken, nothing is lost. If it is taken, the two wrong instructions are **squashed**: their pipeline slots become bubbles, and fetch restarts at the target. This is a **flush**.
+- **Predict taken**: go to the target as soon as it is known. In this pipe the target is computed in ID, so one cycle is still lost on each taken branch.
+- **Predict dynamically**: remember what each branch did before. A **branch target buffer (BTB)** also remembers where it went, so fetch can go to the target in the next cycle. See [Branch prediction](/architecture/pipelining/branch-prediction).
+
+A squashed instruction has not written anything yet. It is in IF or ID, and the first stage that changes state is MEM (for a store) or WB. So a flush only clears the control bits in IF/ID and ID/EX. Nothing has to be undone.
+
+<Predict
+  id="loop4"
+  question="A loop runs 4 times. Its back-edge branch is resolved in EX, and the pipe predicts not taken. How many cycles do the branches lose in all?"
+  options={["0: the prediction is right most of the time", "6", "8"]}
+  answer={1}
+  explain="The branch is taken 3 times and not taken once. Each taken branch squashes 2 instructions, so 3 × 2 = 6 cycles are lost. The last branch falls through correctly and costs nothing. Stalling on every branch would lose 4 × 2 = 8."
+>
+<ArchPipeBranchDemo />
+</Predict>
+
+Things to try:
+
+1. Keep 4 iterations and **Predict not taken**. The struck-through rows are `addi a1, a0, 1` and `ebreak`: the fall-through path, fetched and then squashed. 6 cycles are lost, and the loop takes 26 cycles.
+2. Select **Stall**. Nothing is squashed, but fetch waits after every branch. 8 cycles are lost, 28 in all.
+3. Select **Predict taken**: 25 cycles. Each taken branch loses only 1 cycle, because ID computes the target. The last branch goes the wrong way and loses 2.
+4. Select **2-bit + BTB**: 23 cycles. The first time, the BTB does not know the branch. After that, fetch goes to the target with no loss. Only the first iteration and the exit cost cycles.
+5. Select **ID (stage 2)** with **Predict not taken**. The control loss drops from 6 to 3. But the compare now needs `t1` one cycle earlier, and the `addi` just before it adds 4 data stalls. The total is 27 cycles, worse than 26.
+
+## Resolve the branch earlier
+
+Each stage between fetch and the resolve point adds a cycle to every flush. So a classic optimization moves the compare into ID. RISC-V branches compare two registers for equality or order, which needs a comparator but no full ALU. The hardware then needs:
+
+- a comparator in ID, in parallel with the register read;
+- forwarding paths into ID, because the operands must now be ready one stage earlier;
+- an adder in ID to compute pc + offset.
+
+The last try above shows the catch. A branch that tests a value computed just before it now waits for that value. The win depends on the code, and on whether the comparator fits into the ID cycle at all. Patterson and Hennessy's RISC-V pipeline makes this move. Many real cores do not, because the register read already fills the ID cycle.
+
+## Branch delay slots
+
+The MIPS R2000 took another path: it changed the ISA. The instruction after a branch, in the **branch delay slot**, always executes, taken or not. The compiler fills the slot with useful work from before the branch, or with a `nop`:
+
+```asm
+# MIPS: the addiu in the delay slot runs before the jump takes effect
+loop:   lw     t0, 0(a0)
+        addiu  a1, a1, -1       # also fills the R2000's load delay slot
+        addu   v0, v0, t0
+        bne    a1, zero, loop
+        addiu  a0, a0, 4        # delay slot: executed on every iteration
+```
+
+On a pipe that resolves branches in ID, one slot hides the whole loss. SPARC has delay slots too. The idea did not age well. A slot fits one particular pipeline. A deeper or wider pipe loses more than one slot per branch, but the ISA still promises exactly one. Later cores must still implement the slot, and it complicates exceptions and dual issue.
+
+RISC-V does not have them. Its manual states that control transfer instructions in RV32I do not have architecturally visible delay slots. Its introduction describes the base ISA as similar to the early RISC processors, except with no branch delay slots. AArch64 and x86-64 have no delay slots either.
+
+The RISC-V manual gives software a static prediction rule instead. Software should assume that backward branches are predicted taken and forward branches not taken, at least the first time. A loop back-edge points backward, so it is predicted taken. An error check jumps forward, so it is predicted not taken. This is called **BTFN** (backward taken, forward not taken).
+
+## Deeper pipes pay more for each mispredict
+
+A modern core resolves a branch many stages after fetch. The cost of a mispredict is about the number of stages between them. The Pentium 4 had a 20-stage branch misprediction pipeline, against 10 stages for the P6 before it (Hinton et al., 2001). So a deeper pipe has a faster clock but a larger penalty for each wrong guess.
+
+<ArchPipeDepthCostDemo />
+
+1. Keep the defaults: 5% of branches mispredicted. At 5 stages, a mispredict costs 2 cycles, the CPI is 1.12, and each instruction takes 224 ps.
+2. Move the stages to 20. A mispredict now costs 11 cycles, but the clock is 80 ps. The time per instruction drops.
+3. Find the best depth: 25 stages with these inputs. Beyond it, the extra stalls cost more than the faster clock gives.
+4. Move the mispredict rate to 0%, then to 20%. The best depth moves from 28 stages to 20 stages. Better prediction makes deeper pipes worthwhile.
+5. Look at the curve near its minimum. It is very flat, so a design a few stages away from the best loses little. Power, which this model ignores, pushes real designs to the shallow side.
+
+The model follows the form of Hartstein and Puzak, "The Optimum Pipeline Depth for a Microprocessor" (ISCA 2002). Each hazard drains a fixed share of the pipe, so its cost grows in proportion to the depth:
+
+$$
+\frac{T}{\text{instruction}} = \left(\frac{t}{k} + o\right)\left(1 + f_{b}\, m\, (0.6k - 1) + f_{\ell}\,\frac{k - 1}{4}\right)
+$$
+
+Here $t$ is the logic time and $o$ the register overhead. The shares $f_b$ of branches and $f_\ell$ of load-use pairs and the mispredict rate $m$ complete it. All of them are model inputs. Sprangle and Carmean's paper at the same conference argued the case for deeper pipes, with the Pentium 4 as the example.
+
+## What this means for your code
+
+- A predictable branch is almost free. The cost comes from mispredicts, so ask how predictable the data makes a branch, not how many branches there are. See [Branch prediction and branchless code](/performance/cpu/branch-prediction-and-branchless-code).
+- Put the common case on the fall-through path. Compilers do this with profile data (`-fprofile-use`) or with hints such as C++20's `[[likely]]`, GCC's `__builtin_expect` and Rust's `#[cold]` on error paths.
+- On a simple in-order core, a taken branch can cost cycles even when it is predicted. Loop unrolling reduces the number of taken back-edges.
+
+<Recall cards={[
+  { q: "In the five-stage pipe with branches resolved in EX and predict not taken, how many cycles does a taken branch cost, and why?", a: "2 cycles. IF and ID have already fetched the two instructions after the branch, and both are squashed." },
+  { q: "Why does a flush not need to undo any state in the classic pipe?", a: "The squashed instructions are only in IF and ID. No instruction changes memory or registers before MEM or WB." },
+  { q: "What does moving the branch compare into ID cost?", a: "A comparator and a target adder in ID, plus forwarding into ID. A branch that uses a value computed just before it now stalls more." },
+  { q: "What is a branch delay slot, and why did RISC-V leave it out?", a: "The instruction after a branch always executes. It fits one pipeline depth, so deeper or wider pipes cannot use it well, but must still implement it." },
+  { q: "What static prediction rule does the RISC-V manual tell software to assume?", a: "Backward branches are taken and forward branches are not taken, at least the first time they are seen." },
+  { q: "Why does a deeper pipeline make each mispredict more expensive?", a: "The branch resolves more stages after fetch, and every stage in between holds a wrong-path instruction that must be squashed." },
+]} />

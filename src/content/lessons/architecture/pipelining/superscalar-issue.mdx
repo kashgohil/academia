@@ -1,0 +1,96 @@
+---
+summary: "Issue more than one instruction per cycle in order: pairing rules, the limits that dependences and ports set, why a wide in-order core stops on every cache miss, and the static alternative of VLIW."
+---
+import { ArchPipeDualIssueDemo, ArchPipePairingDemo, ArchPipeWidthDemo } from "@/demos/arch/ArchPipeIssueDemos";
+
+A [five-stage pipeline](/architecture/pipelining/five-stage-pipeline) finishes at most one instruction per cycle, so its CPI is at least 1. To go below 1, a core must start more than one instruction in a cycle. A **superscalar** core fetches, decodes and issues several instructions per cycle, through several copies of the pipeline. We then count **IPC**, instructions per cycle, the inverse of CPI. A core that issues up to $w$ instructions per cycle is **$w$-wide**.
+
+The simplest form is **in-order dual issue**. The core fetches two consecutive instructions. If they can run together, both enter EX in the same cycle. If not, the older one goes alone, and the younger one waits for the next cycle. The order of the program never changes.
+
+Real in-order dual-issue cores are common:
+
+- The Intel Pentium (P5) had two integer pipes, U and V. The V pipe took only simple instructions, and Intel gave the pairing rules in section 3.6 of its optimization manual.
+- The Arm Cortex-A53 is an in-order core with symmetric dual issue of most instructions (Cortex-A53 MPCore TRM).
+- The SiFive U74, a 64-bit RISC-V core, has a dual-issue, in-order pipeline with a peak of two instructions per cycle (U74 Core Complex Manual).
+
+## Pairing rules
+
+Two instructions can issue together only if the hardware has room for both, and the second does not need the first. The shared model in these demos uses these rules:
+
+- **Dependence**: the younger instruction must not read a register that the older one writes. Forwarding cannot help: in the same cycle, the value does not exist yet.
+- **Ports**: one data memory port, so two loads or stores cannot pair. One multiplier, so two `mul` cannot pair.
+- **Control**: a branch or jump ends the pair. The instruction after it may be on the wrong path.
+- **Fetch**: both instructions come from the same fetch, so a taken branch also splits the stream.
+
+The register file now needs 4 read ports and 2 write ports, and the forwarding network must feed both ALUs from both pipes.
+
+<Predict
+  id="dual"
+  question="The dot-product loop runs on the five-stage pipe with a 2-bit predictor and a BTB. Its IPC is 0.83 at width 1. About what is its IPC at width 2?"
+  options={["About 1.66: twice the width, twice the work", "About 1.06", "About 0.83: nothing pairs"]}
+  answer={1}
+  explain="Only some neighbours can pair. The two loads cannot (one memory port). The mul needs both loads, and the add needs the mul. The loop-counter adds pair well. The program runs at 1.06 instructions per cycle, about 28% more, not 100% more."
+>
+<ArchPipeDualIssueDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **Dot product**, width 2 and **2-bit + BTB**. Read the table under the diagram. `lw t4` cannot pair with `lw t3` (one memory port), and `mul` cannot pair with the load it needs.
+2. Count the pairs: 38 of the 72 instructions issued in a pair, and the IPC is 1.06.
+3. Select **Predict not taken**. The IPC drops to 0.91 at width 2, against 0.73 at width 1. A taken branch costs more at width 2: each lost cycle could have issued two instructions.
+4. Select **Linked-list walk**. The loads chain through each other, and the dual-issue pipe stalls as often as the single one.
+
+## Be the compiler, again
+
+A compiler for an in-order dual-issue core schedules for pairs. It puts an independent ALU instruction next to each load, and it keeps a user away from its producer.
+
+<ArchPipePairingDemo />
+
+1. Read the original order: load, load, mul, add, twice. Each step uses the result of the step before. At width 2, the block takes 19 cycles.
+2. Click **Show a good order**: 17 cycles. The loads are mixed with the multiplies and the pointer increments, and fewer instructions wait.
+3. Try to move `addi a0, a0, 8` above `lw t3, 4(a0)`. The hart reports a wrong result, because the load now reads the wrong address. You must also change its offset, which this demo does not let you do. A compiler can.
+4. Select width 1. The same good order takes 23 cycles in place of 25. A good schedule for dual issue helps the single pipe too, because it also removes load-use stalls.
+
+## The limits of in-order width
+
+Why not issue 4 or 8 instructions per cycle in order? Three limits get in the way:
+
+- **Dependences**: real code has short chains. An in-order core can only pair neighbours, and neighbours often depend on each other.
+- **Ports and fetch**: every extra slot needs register-file ports, bypass paths and decoders, and fetch must deliver a group of $w$ useful instructions. A taken branch ends the group.
+- **Latency**: an in-order core can let a load miss and go on until an instruction needs the loaded value. It must then stop the whole pipe. Every younger instruction waits, even the independent ones.
+
+The last limit is the important one. The model below runs RISC-V programs from the hart through an issue model that ignores pipeline stages. It compares an in-order core with an idealised out-of-order **window**: a core that can issue any instruction among the next $N$ whose operands are ready.
+
+<ArchPipeWidthDemo />
+
+1. Keep **y[i] = 3·x[i] + y[i]**, a 40-cycle miss and a window of 64. At width 4, the in-order core reaches an IPC of 0.96. The window reaches 1.92.
+2. Move the miss latency down to 2 cycles: no real misses. The in-order core reaches 1.29 at width 4, and the window 2.98. Even without misses, in-order issue cannot find enough independent neighbours.
+3. Move the miss latency to 200 cycles. The in-order IPC collapses. The window still overlaps the misses of several iterations, until the window itself is full.
+4. Select **Linked list of 256 nodes**. Both cores sit at an IPC of about 0.1. Each load needs the address from the previous load, so no core can overlap the misses. Only a different data structure helps.
+5. Make the window smaller, 16 instructions. It holds fewer iterations, so it overlaps fewer misses.
+
+This is why fast general-purpose cores are out of order: they find independent work far beyond the next instruction. The [out-of-order module](/architecture/ooo/register-renaming) shows how. Renaming removes WAR and WAW hazards, and a reorder buffer keeps the program order for exceptions. A scheduler issues ready instructions from a large window. In-order cores stay where power and area matter more than single-thread speed: small cores in phones, microcontrollers and many RISC-V chips.
+
+## VLIW: let the compiler issue
+
+A third approach removes the pairing logic from the hardware. In a **VLIW** (very long instruction word) machine, the compiler packs independent operations into one wide instruction, one operation for each unit. The hardware issues the whole word without checks. Fisher's "Very Long Instruction Word Architectures and the ELI-512" (ISCA 1983) described the idea and the trace scheduling that feeds it.
+
+Intel's Itanium (IA-64) used a related design called EPIC. Its instructions come in 128-bit **bundles** of three 41-bit slots and a 5-bit template (Itanium Architecture Software Developer's Manual, volume 1, section 3.3). The template tells the hardware which units the slots use, and where the groups of independent instructions end.
+
+VLIW works well when the compiler knows the latencies, as in signal processing and many accelerators. It works badly for general code. The compiler cannot know which load will miss in the cache, so a static schedule stops on a miss, just like an in-order core. The binary also encodes one machine's latencies and widths. Itanium did not replace out-of-order x86 cores. VLIW lives on in DSPs and in parts of accelerators.
+
+## What this means for your code
+
+- On an in-order dual-issue core (Cortex-A53, SiFive U74), the instruction order the compiler picks matters. Build with the right `-mtune` or `-mcpu`.
+- Independent work is the fuel for width. Several accumulators, unrolled loops and structure-of-arrays layouts give the core neighbours that can pair (see [Instruction-level parallelism](/performance/cpu/instruction-level-parallelism)).
+- On any in-order core, a cache miss stops everything at the first use of the value. Prefetching (see [Prefetching](/architecture/caches/prefetching)) and data layouts that avoid pointer chasing matter more there than on an out-of-order core.
+
+<Recall cards={[
+  { q: "Name three reasons why two adjacent instructions cannot issue together on an in-order dual-issue core.", a: "The second reads a register that the first writes. Both need one single unit, such as the memory port or the multiplier. The first is a branch or jump." },
+  { q: "Why does doubling the width of an in-order core not double its IPC?", a: "Neighbouring instructions often depend on each other or compete for one unit, and taken branches and stalls waste both slots." },
+  { q: "Why does an in-order core stop on a cache miss, and how does an out-of-order core avoid it?", a: "In order, the first instruction that needs the missing value stops all younger ones. An out-of-order core keeps issuing independent instructions from its window." },
+  { q: "Why does no core overlap the misses of a linked-list walk?", a: "Each load needs the address that the previous load returns, so the misses form one dependence chain." },
+  { q: "What is in an IA-64 bundle?", a: "128 bits: three 41-bit instruction slots and a 5-bit template that says which units the slots use and where groups end." },
+  { q: "Why did VLIW not win for general-purpose code?", a: "The compiler cannot know which loads will miss, so a static schedule stalls on misses. The binary also encodes one machine's latencies and width." },
+]} />

@@ -1,0 +1,116 @@
+---
+summary: "Read-after-write hazards in the five-stage pipe, the forwarding paths that remove most of them, the load-use stall that no path can remove, and how a compiler schedules around it."
+---
+import { ArchPipeHazardLab, ArchPipeForwardProgramsDemo, ArchPipeCompilerDemo } from "@/demos/arch/ArchPipeForwardDemos";
+
+In the [five-stage pipeline](/architecture/pipelining/five-stage-pipeline), an instruction reads its registers in ID and writes its result in WB, three stages later. The next instruction is already in ID when the first one is in EX. So if it needs that result, the value is not in the register file yet. This is a **data hazard**.
+
+```riscv
+add  t0, a0, a1     # writes t0 in WB, cycle 5
+sub  t1, t0, a2     # reads t0 in ID, cycle 3: too early
+```
+
+The hazard here is a **read after write (RAW)**: the younger instruction reads what the older one writes. It is a **true dependence**, because the value really flows from one instruction to the other. Two other orders exist in principle:
+
+- **Write after read (WAR)**: a younger instruction writes a register before an older one has read it.
+- **Write after write (WAW)**: two writes to one register finish in the wrong order.
+
+Neither can happen in this pipe. Every instruction reads in ID and writes in WB, and instructions go through the stages strictly in order. So an older read always comes before a younger write, and writes happen in program order. WAW appears when instructions can finish out of order, for example behind a long divide. An in-order core then stalls the younger write.
+
+WAR and WAW both appear when instructions issue out of order. Then the core uses register renaming (see [Register renaming](/architecture/ooo/register-renaming)).
+
+## Stall, or forward
+
+The simple fix is to **stall**: hold the younger instruction in ID until the older one has written back. The register file writes in the first half of a cycle and reads in the second half. So the user can read the value in the same cycle as the producer's WB. A distance of 1 instruction costs 2 stalls, a distance of 2 costs 1 stall, and a distance of 3 costs nothing.
+
+But the value exists much earlier. An ALU result is ready at the end of EX, and it sits in the EX/MEM pipeline register for the next cycle. **Forwarding** (also called **bypassing**) adds multiplexers in front of the ALU. They take an operand from EX/MEM or MEM/WB in place of the stale value from ID/EX.
+
+<Predict
+  id="load-use"
+  question="The pipeline has full forwarding into EX. A load writes t0, and the very next instruction adds t0 to itself. How many stall cycles?"
+  options={["0: forwarding removes all data stalls", "1", "2"]}
+  answer={1}
+  explain="A load has its value only at the end of MEM. The add needs it at the start of its EX, which is the same cycle as the load's MEM. Data cannot go back in time, so the add waits 1 cycle and then takes the value from MEM/WB."
+>
+<ArchPipeHazardLab />
+</Predict>
+
+Things to try:
+
+1. Keep **Load** and distance 1. One bubble, and an arrow from the load's MEM/WB into the add's EX.
+2. Select **ALU** as the producer. No stall at any distance: EX/MEM feeds EX at distance 1, and MEM/WB feeds EX at distance 2.
+3. Select **None** for forwarding. The table shows 2, 1 and 0 stalls at distances 1, 2 and 3, for an ALU producer and a load alike.
+4. Select **Load**, **Store data** and full forwarding: 1 stall. Now select **Also MEM/WB → MEM**. The store needs its data only in MEM, so the stall goes away.
+5. Select **Load address**: a load whose address comes from a load. This is pointer chasing. The extra path does not help, because the address is needed in EX.
+
+## The forwarding unit
+
+The forwarding unit compares register numbers. It needs no values. For the first ALU operand, the conditions from Patterson and Hennessy are:
+
+```verilog
+// EX hazard: the instruction one ahead writes the register that we read.
+wire fwd_a_exmem = exmem_regwrite && exmem_rd != 5'd0 && exmem_rd == idex_rs1;
+// MEM hazard: the instruction two ahead writes it, and the one ahead does not.
+wire fwd_a_memwb = memwb_regwrite && memwb_rd != 5'd0 && memwb_rd == idex_rs1 && !fwd_a_exmem;
+
+always @(*) begin
+  case ({fwd_a_exmem, fwd_a_memwb})
+    2'b10:   alu_a = exmem_alu_result;   // the newest value wins
+    2'b01:   alu_a = memwb_value;
+    default: alu_a = idex_rs1_val;
+  endcase
+end
+```
+
+Three details matter:
+
+- The test for `rd != 0` exists because `x0` is always 0. An instruction that writes `x0` must not forward its result.
+- The newest value wins. In `add t0, ...; add t0, ...; sub t1, t0, ...`, the second add is the correct producer.
+- The same logic repeats for the second operand. A real core also forwards into the store data path and into the branch comparator.
+
+The **hazard detection unit** sits in ID and handles the case that forwarding cannot fix:
+
+```verilog
+// Load-use: the instruction in EX is a load, and we read its destination.
+wire stall = idex_memread && idex_rd != 5'd0 && (idex_rd == ifid_rs1 || idex_rd == ifid_rs2);
+// On stall: keep pc and IF/ID, and send a bubble into ID/EX.
+```
+
+## Forwarding on real programs
+
+<ArchPipeForwardProgramsDemo />
+
+1. Keep **Linked-list walk**. With no forwarding, the 37 instructions take 90 cycles. Full forwarding cuts this to 71. The 16 stalls that remain are all load-use stalls: each loaded value is needed by the next instruction.
+2. Select **memcpy, byte by byte**. Full forwarding gives 168 cycles in place of 222. The store `sb t1, 0(t0)` needs the byte that `lbu` loaded just before it. Select **Also MEM/WB → MEM**: 152 cycles, with no load-use stall at all.
+3. Select **Dot product** and look at the arrows in the diagram. Most of the forwarding happens in a long chain: load, load, mul, add.
+4. Compare the programs. The extra path to MEM helps only code where a store writes a value that was just loaded.
+
+The cost of forwarding is in the wires and the multiplexers. Every ALU input needs a multiplexer with one input for each forwarding source. A wide superscalar core has many ALUs, and each one can be a source for every other one. So the bypass network grows much faster than the width. In fast cores, this network is often on the critical path, and some designs forward only between nearby units.
+
+## When the load-use stall is the ISA's problem
+
+The MIPS R2000 did not have a load-use interlock. Its manual says that the data from a load cannot be used in the following instruction. This is the **load delay slot**: the compiler had to put an independent instruction, or a `nop`, after each load. Later MIPS cores added the interlock, and RISC-V has always required the hardware to handle it. The cycle is still lost if nothing useful fills it. Only the responsibility moved.
+
+<ArchPipeCompilerDemo />
+
+1. Read the original order. It loads `b` and `e` and adds them at once: 1 stall. It loads `f` and adds it at once: 1 more stall. Total 16 cycles.
+2. Select the line `lw t3, 16(a0)` and move it up, above `add t2, t0, t1`. Both stalls go away, and the block takes 14 cycles. This is the example from Patterson and Hennessy, chapter 4.
+3. Now move `add t2, t0, t1` above `lw t1, 12(a0)`. The banner turns red: `t2` gets the wrong value, because `t1` is not loaded yet. The hart catches it.
+4. Move a `sw` above the `add` that computes its value. The memory check fails, and the banner names the word that differs.
+
+A compiler does this as **instruction scheduling**. It reorders instructions inside a block and never moves a user above its producer. GCC and LLVM use a model of the target pipeline for this. For example, `-mtune=sifive-7-series` gives GCC the latencies of SiFive's in-order cores. On an out-of-order core, the hardware reorders by itself, so the scheduling matters less. On an in-order core, it can matter a lot.
+
+## What this means for your code
+
+- On an in-order core, keep a loaded value away from its first use. Unrolling a loop gives the scheduler independent loads to put in the gap.
+- Pointer chasing (`p = p->next`) is a chain of load-use hazards, and no compiler can break it. On any core, each step costs at least the full load latency, and much more on a cache miss.
+- Forwarding makes a dependent ALU chain run at one instruction per cycle on a simple pipe. On a wide core, the same chain still runs at one per cycle, while the other units sit idle (see [Instruction-level parallelism](/performance/cpu/instruction-level-parallelism)).
+
+<Recall cards={[
+  { q: "Why can WAR and WAW hazards not happen in the classic five-stage pipeline?", a: "All instructions read registers in ID and write in WB, and they pass the stages strictly in order. So reads and writes to a register keep program order." },
+  { q: "Without forwarding, how many stall cycles does a dependent instruction at distance 1, 2 and 3 cost?", a: "2, 1 and 0. The register file is written in the first half of WB's cycle and read in the second half of ID's cycle." },
+  { q: "Which forwarding paths does the classic pipe have, and which distance does each serve?", a: "EX/MEM → EX for the instruction just before (distance 1), and MEM/WB → EX for the one two before (distance 2)." },
+  { q: "Why does a load followed at once by a user still stall 1 cycle with full forwarding?", a: "The loaded value exists only at the end of MEM, but the user needs it at the start of its EX, in the same cycle." },
+  { q: "What does the hazard detection unit compare, and what does it do on a load-use hazard?", a: "It checks if the instruction in EX is a load whose rd matches rs1 or rs2 of the instruction in ID. Then it holds pc and IF/ID and puts a bubble into ID/EX." },
+  { q: "What did the MIPS R2000 load delay slot mean for the compiler?", a: "The instruction after a load could not use the loaded value, so the compiler had to put an independent instruction or a nop there." },
+]} />

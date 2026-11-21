@@ -1,0 +1,113 @@
+---
+summary: "The same C functions compiled for x86-64 and AArch64, next to RISC-V: variable-length against fixed-length encoding and what it does to decoders, condition flags against compare-and-branch, two-operand against three-operand forms, memory operands against load/store, and the memory model."
+---
+import { IsaCompareDemo, IsaFlagsDemo, IsaDecodeDemo } from "@/demos/arch/ArchIsaCompareDemos";
+
+Most code that you run executes on one of two ISAs. x86-64 runs PCs and most servers. AArch64 runs phones, Apple Macs and a growing share of servers. They came from opposite traditions. x86-64 extends the 1978 Intel 8086, through the 32-bit 80386 and AMD's 64-bit extension. AArch64 is the 64-bit ISA that Arm introduced with Armv8-A as a clean design. RISC-V is the third column in this lesson, because its choices are the simplest to read.
+
+This lesson compares the encodings, the way to branch, the operand forms, memory access and the memory model. Each section uses real compiler output.
+
+<Predict
+  id="size"
+  question="clang -O2 compiles a loop that sums an int array. Which ISA gives the smallest machine code: x86-64 with variable-length instructions, AArch64 with 4-byte instructions, or RISC-V RV32 with 4-byte instructions?"
+  options={["AArch64: it needs the fewest instructions", "x86-64: its common instructions are 2 or 3 bytes", "They are all within a few bytes of each other"]}
+  answer={1}
+  explain="x86-64 needs 11 instructions in 24 bytes, plus a 7-byte nop that clang adds to align the loop. AArch64 needs 12 instructions in 48 bytes, and the hand-written RV32 code needs 10 in 40 bytes. Most x86 instructions here are 2 or 3 bytes long. The RISC-V C extension would close much of this gap."
+>
+<IsaCompareDemo />
+</Predict>
+
+Things to try:
+
+1. Read **sum of an array**. Count the byte lengths of the x86-64 rows: 1, 2 and 3 bytes. Every AArch64 and RISC-V row is 4 bytes.
+2. Select **p->c += v**. x86-64 needs 1 instruction plus `ret`, because `add dword ptr [rdi + 0x8], esi` reads memory, adds and writes back. AArch64 and RISC-V need a load, an add and a store.
+3. Select **max(a, b)**. x86-64 uses `cmovg` and AArch64 uses `csel`, so neither branches. The RISC-V base ISA has no conditional move, so it branches.
+4. Select **strlen: a byte loop**. Each loop body has 3 instructions on every ISA. AArch64 uses `cbnz`, which tests a register and branches with no flags.
+5. Read the colors of the x86 bytes. A REX prefix (`48`) marks a 64-bit operation. A ModRM byte follows most opcodes and names the operands.
+
+## Encoding: 1 to 15 bytes against 4
+
+An x86-64 instruction starts with optional legacy prefixes and an optional REX prefix. Then comes an opcode of 1 to 3 bytes and an optional ModRM and SIB byte. Last come a displacement of 0, 1 or 4 bytes and an immediate of 0 to 8 bytes. The Intel SDM limits an instruction to 15 bytes. In the four functions of the demos, x86 instructions are 1 to 7 bytes long.
+
+AArch64 instructions are always 32 bits, aligned to 4 bytes. RISC-V base instructions are also 32 bits. The C extension adds 16-bit forms, but bits 1 and 0 of the first parcel still give the length at once.
+
+The cost of variable length is in decode. A wide core wants to decode several instructions per cycle. With fixed length, instruction n starts at byte 4n, and every decoder slot can start at once. With x86, the start of an instruction is known only when the lengths of all earlier instructions are known.
+
+<Predict
+  id="sync"
+  question="A decoder starts on the x86-64 bytes of sum one byte too late, in the middle of the first instruction. What happens?"
+  options={["It raises an invalid-opcode exception at once", "It decodes different, valid instructions for a few bytes, and then falls back into step", "It decodes the same instructions, because x86 marks each instruction start"]}
+  answer={1}
+  explain="Byte 1 is 85, the opcode of test. With the next byte, it forms test esi, esi: a valid 2-byte instruction that the compiler never wrote. After it, the decoder is at byte 3, which is a true start. Nothing in the bytes marks where an instruction begins."
+>
+<IsaDecodeDemo />
+</Predict>
+
+1. Keep start byte 1. The decoder reads `test` with a length of 2, and is back in step at byte 3.
+2. Move the start to 14. The decoder reads one 4-byte instruction that the compiler never wrote, a valid `ror`, and is back in step at byte 18.
+3. Move the start to 4. The byte `17` is not a valid opcode in 64-bit mode, so here the wrong start is detected. From byte 8, the decoder first reads one valid instruction, and only then an invalid byte.
+4. Select **AArch64**. Every true start is a multiple of 4. A start at byte 5 cannot happen silently. The pc must be 4-byte aligned, and a fetch from byte 5 raises a PC alignment fault.
+
+The length decoder in this demo implements the one-byte opcode map and the common two-byte and three-byte maps of the Intel SDM, Vol. 2. The test file compares its lengths with the LLVM disassembler on compiled code, from several start bytes.
+
+Real x86 cores attack this problem with hardware. They find the instruction boundaries in a separate predecode step, and some designs store these marks with the cache lines. They also keep a cache of already decoded micro-ops, so hot loops skip the length decode. Both cost area and power. A fixed-length ISA does not need them for this reason.
+
+## Flags against compare-and-branch
+
+x86-64 and AArch64 use **condition flags**. An ALU instruction or a compare sets the flags, and a later conditional jump reads them. RISC-V has no flags: `blt`, `bge`, `bltu` and `bgeu` compare two registers inside the branch.
+
+<IsaFlagsDemo />
+
+1. Keep a = 100 and b = -100. The true difference is 200, which does not fit in 8 signed bits. So OF (overflow) is 1, and SF (sign) alone would give the wrong answer. This is why `jl` tests SF ≠ OF.
+2. Set a = 5 and b = 10. As unsigned numbers, a is smaller, so x86 sets CF = 1. AArch64 sets C = 0 for the same compare. Its carry flag after a subtraction is the opposite of a borrow, so `b.lo` tests C = 0.
+3. Read the RISC-V column. There is no `bgt` instruction: the assembler writes `blt b, a`, with the operands swapped.
+
+Each design has a cost. Flags are extra architectural state that many instructions write. An out-of-order core must rename them like registers. Flags also link instructions: a compare and its branch must stay in order with nothing that writes flags between them. RISC-V avoids this state, but some operations need more instructions.
+
+The RISC-V manual shows that an overflow check for signed addition needs three extra instructions after the `add`. An unsigned check needs one extra branch, for example `add t0, t1, t2` then `bltu t0, t1, overflow`.
+
+AArch64 reduces the coupling. Most ALU instructions do not set flags. Only compares and the forms with an `s` suffix, such as `adds` and `subs`, write them. It also has `cbz`, `cbnz`, `tbz` and `tbnz`, which test a register and branch without flags.
+
+## Operand forms
+
+| | x86-64 | AArch64 | RISC-V |
+|---|---|---|---|
+| ALU form | two-operand: `add eax, ebx` overwrites `eax` | three-operand: `add w0, w1, w2` | three-operand: `add a0, a1, a2` |
+| Memory in ALU ops | yes: `add [rdi + 8], esi` | no: load/store | no: load/store |
+| General registers | 16 (APX adds 16 more) | 31, plus a zero register or `sp` in register 31 | 31, plus `x0` = 0 |
+| Conditional select | `cmovcc` | `csel`, `csinc`, `csneg` | none in the base ISA (Zicond adds `czero.eqz`, `czero.nez`) |
+| Load pairs | no | `ldp`, `stp` | no (RV32 Zilsd loads an even–odd register pair) |
+
+A two-operand form destroys one source. When the compiler needs both inputs later, it adds a `mov` first, as in the `max2` code: `mov eax, esi` before `cmovg`. Large x86 cores can often execute such a `mov` at rename, with no execution unit. This is **move elimination**. The AVX encodings (VEX and EVEX) brought three-operand forms to the vector instructions of x86.
+
+## Memory model
+
+The ISA also defines the order in which other cores see loads and stores. x86-64 uses a strong model close to **TSO** (total store order). A core can see its own store before other cores do, but stores become visible in program order. AArch64 and RISC-V (RVWMO) use weak models. The hardware can reorder independent loads and stores unless the code uses acquire, release or fence instructions.
+
+The [memory consistency models](/architecture/multicore/memory-consistency-models) lesson covers this in depth. Here only one consequence matters: code that is correct only because of TSO can fail on AArch64. Emulators that run x86 code on Arm must insert fences, or use hardware help.
+
+RISC-V defines an optional Ztso extension for this. The manual says that Ztso "is meant to facilitate the porting of code originally written for the x86 or SPARC architectures". Reverse-engineering reports say that Apple M-series cores have a TSO mode for Rosetta 2. Apple does not document it, so do not rely on it.
+
+## What this means for your code
+
+- **Compare code size on the binary, not on instruction counts.** x86-64 often needs more instructions but fewer bytes than AArch64. RISC-V with the C extension is usually close to both.
+- **Branchless code is portable.** `cmov`, `csel` and Zicond all turn a simple `?:` into a select. The compiler picks it when the branch is unpredictable (see [branch prediction and branchless code](/performance/cpu/branch-prediction-and-branchless-code)).
+- **Do not depend on x86 ordering** in lock-free code. Use the atomics and orderings of your language. An acquire load and a release store compile to plain moves on x86-64, and to `ldar` and `stlr` on AArch64.
+- **Read the length of x86 instructions** when you align hot loops or patch code. A jump into the middle of an instruction decodes as something else, with no error.
+
+## Connect
+
+- [What an ISA is](/architecture/isa/what-an-isa-is) explains why x86 keeps every old encoding.
+- [Addressing modes](/architecture/isa/addressing-modes) compares the memory operands in detail.
+- [Memory consistency models](/architecture/multicore/memory-consistency-models) covers x86-TSO and the weak models of Arm and RISC-V.
+- [Atomic operations](/concurrency/atomics/atomic-operations) shows `lock`-prefixed instructions against LL/SC and the Armv8.1 atomics.
+- [Instruction-level parallelism](/performance/cpu/instruction-level-parallelism) shows what a wide core does with the decoded instructions.
+
+<Recall cards={[
+  { q: "How long can an x86-64 instruction be, and how long is an AArch64 instruction?", a: "x86-64: 1 to 15 bytes, with prefixes, opcode, ModRM, SIB, displacement and immediate. AArch64: always 4 bytes, 4-byte aligned." },
+  { q: "Why is wide decode harder on x86-64 than on AArch64?", a: "The start of an x86 instruction depends on the lengths of all earlier ones. On AArch64, instruction n starts at byte 4n, so all decoder slots can start at once." },
+  { q: "Why does x86 jl test SF ≠ OF and not only SF?", a: "When a − b overflows, the sign of the stored result is wrong. OF records the overflow, so SF ≠ OF gives the true signed comparison." },
+  { q: "What is different about the AArch64 carry flag after cmp?", a: "C = 1 means no borrow: a ≥ b unsigned. x86 CF = 1 means a borrow: a < b unsigned. So b.lo tests C = 0, and jb tests CF = 1." },
+  { q: "How does RISC-V branch without flags?", a: "blt, bge, bltu and bgeu compare two registers inside the branch. bgt and ble swap the operands." },
+  { q: "What does a two-operand ALU form cost, and how do cores reduce it?", a: "It overwrites a source, so the compiler adds mov instructions to keep values. Many x86 cores remove such moves at register rename." },
+]} />

@@ -1,0 +1,94 @@
+---
+summary: "RISC-V has one addressing mode: base plus a 12-bit offset. x86-64 has base + index × scale + displacement and RIP-relative; AArch64 has register offsets and pre- and post-index. Compile the same C accesses for all three and count what each mode saves."
+---
+import { IsaPatternDemo, IsaLowerDemo } from "@/demos/arch/ArchIsaModesDemos";
+
+An **addressing mode** is a rule that a load or store uses to compute its memory address, the **effective address**. A C expression such as `a[i].f` needs a base, an index times a size, and a field offset. The ISA decides how much of that arithmetic one memory instruction can do.
+
+RISC-V gives one mode to loads and stores: a base register plus a sign-extended 12-bit offset. In the words of the manual, the effective address is register rs1 plus the sign-extended 12-bit offset. Every other address must be computed first with normal ALU instructions. x86-64 and AArch64 do more of the work inside the memory instruction.
+
+<Predict
+  id="sidx"
+  question="struct S has three ints, 12 bytes. How many instructions, not counting ret, does int sidx(struct S *a, long i) { return a[i].f; } take on RV32 without extensions?"
+  options={["1: lw can scale the index", "2: one multiply, then lw", "5: shifts and adds build i × 12, then lw adds the field offset"]}
+  answer={2}
+  explain="RISC-V loads add only a 12-bit constant to one register. So 12i is 2i + i, then a shift by 2, then an add to the base: four ALU instructions. The lw adds the field offset 4. x86-64 needs 2 instructions, because its address can hold base + index × 4 + 4."
+>
+<IsaPatternDemo />
+</Predict>
+
+Things to try:
+
+1. Read **a[i]: array element**. x86-64 and AArch64 scale the index inside the load: 1 instruction each. RISC-V needs `slli`, `add` and `lw`: 3 instructions.
+2. Select **p->c: struct field**. All three need 1 instruction. A constant offset from a pointer is the one mode that every ISA has.
+3. Select **a[i] += 1**. x86-64 does it in one `inc` instruction with a memory operand. AArch64 needs 3 and RISC-V needs 5, because only loads and stores touch memory there.
+4. Select **sum of an array: a loop**. Each loop body has 4 instructions on all three ISAs. Each ISA saves work in a different place.
+5. Read the Zba lines under **a[i].f**. With the Zba extension, RISC-V needs 3 instructions in place of 5.
+
+## The modes of each ISA
+
+| Mode | x86-64 | AArch64 | RISC-V |
+|---|---|---|---|
+| Base + constant | `[rdi + 8]`, 8- or 32-bit displacement | `[x0, #8]`: 0 to 16380 for a word load, scaled; `ldur`: -256 to 255 | `8(a0)`: -2048 to 2047 |
+| Base + index | `[rdi + 4*rsi]`, scale 1, 2, 4 or 8 | `[x0, x1, lsl #2]`, shift 0 or the access size | no |
+| Base + index + constant | `[rdi + 4*rax + 4]` | no | no |
+| pc-relative | `[rip + disp32]` | `adr`, `adrp` + offset; literal loads | `auipc` + offset |
+| Base update | no (`push`, `pop` and string ops only) | pre-index `[x0, #8]!`, post-index `[x0], #8` | no |
+| Memory operand on ALU ops | yes: `add [rdi + 8], esi` | no | no |
+
+**x86-64.** An address is base + index × scale + displacement. The scale is 1, 2, 4 or 8, and the displacement has 8 or 32 bits. The **ModRM** byte names the base register or says that a **SIB** (scale-index-base) byte follows. In 64-bit mode, one ModRM form means RIP-relative: the address is the next instruction's address plus a 32-bit displacement. This is how x86-64 code reaches globals in position-independent code.
+
+**AArch64.** A load can add a scaled 12-bit unsigned offset, or a signed 9-bit offset (`ldur`), or a register shifted by the access size. Pre-index and post-index forms also write the new address back to the base register. The `sum` loop uses `ldr w9, [x0], #4`: load, then add 4 to `x0`. Globals use `adrp`, which gives the 4 KiB page of the symbol relative to the pc, plus a low 12-bit offset in the load.
+
+**RISC-V.** Base plus 12 bits, nothing else. Globals use `auipc` plus the load offset, with the `%pcrel_hi` and `%pcrel_lo` relocations. The stack uses `sp` as the base. Arrays need a shift and an add, or one `sh1add`, `sh2add` or `sh3add` with Zba.
+
+## Lower one address yourself
+
+The next demo takes one x86-style address and writes the sequence for each ISA by the rules above. The x86-64 byte counts follow the ModRM and SIB rules. They match clang for all 192 combinations of the controls. The RISC-V sequence runs on the hart, which checks the address of its `lw`.
+
+<IsaLowerDemo />
+
+1. Start with index × 4 + 8. x86-64 needs 1 instruction of 4 bytes, AArch64 needs 2, and RISC-V needs 3.
+2. Move the displacement from 2047 to 2048. RISC-V jumps from 3 instructions to 5: the offset no longer fits in 12 bits, so `lui` and `add` build it.
+3. Move the displacement from 127 to 128. x86-64 stays at 1 instruction, but its displacement grows from 1 byte to 4. The instruction grows from 4 bytes to 7.
+4. Turn off the index and step through 16380 and 16384. AArch64 uses one `ldr` up to 16380, the largest scaled offset for a word load. At 16384 it needs a second instruction.
+5. Select scale × 8 with displacement 0. A word load on AArch64 can shift the index only by 0 or 2, so it needs an `add` first.
+
+## The trade-off
+
+<Steps>
+<div><b>More modes save instructions.</b> One x86-64 instruction does the work of up to five RISC-V instructions here. That saves fetch bandwidth, instruction cache space and decode slots.</div>
+<div><b>More modes cost decode and pipeline complexity.</b> An address with three inputs needs a three-input adder, or two cycles in the address unit. A memory operand on an ALU instruction turns one instruction into a load, an operation and a store. Large x86 cores split it into micro-ops for this reason.</div>
+<div><b>More modes cost encoding space.</b> x86 needs ModRM, SIB and displacement bytes, so an instruction is 1 to 15 bytes long. AArch64 fits its modes into fixed 32-bit words, at the cost of small offset ranges.</div>
+<div><b>Compilers hide much of the difference.</b> In a loop, the compiler turns <code>a[i]</code> into a pointer that moves by 4 bytes per iteration. This is strength reduction. Then every ISA needs only base + constant, and the loop bodies of the demo have the same length.</div>
+<div><b>Hardware can fuse common pairs.</b> A core can combine an <code>add</code> and the load that uses its result into one internal operation. This is <b>macro-op fusion</b>. Celio and others proposed it for RISC-V in 2016, so that the ISA stays simple and the core still does an indexed load.</div>
+</Steps>
+
+## Edge cases that you meet in disassembly
+
+- **`[rsp + 8]` on x86-64 has a SIB byte.** The ModRM code for "base = rsp" means "a SIB byte follows". So stack accesses are one byte longer than accesses through `rdi`.
+- **`[rbp]` has a zero displacement byte.** The code for "base = rbp, no displacement" means RIP-relative in 64-bit mode, so the assembler writes `[rbp + 0]` with an 8-bit 0.
+- **A large offset on RISC-V needs `lui`.** Frames larger than 2 KiB, and structs with fields beyond 2047 bytes, cost extra instructions on every access. Compilers then keep a second base register.
+- **AArch64 has two encodings for small offsets.** `ldr` takes positive offsets that are multiples of the size. `ldur` takes small negative or unaligned offsets. The disassembler shows which one the compiler picked.
+
+## What this means for your code
+
+- **Put the hot fields of a struct first.** On RISC-V, field offsets above 2047 need extra instructions. On x86-64, offsets above 127 make each access 3 bytes longer.
+- **Use element sizes of 1, 2, 4 or 8 bytes for hot arrays** where you can. x86-64, AArch64 and Zba scale these in one instruction. Other sizes, such as the 12-byte struct here, need extra multiplies or shifts.
+- **Do not hand-write pointer arithmetic for speed.** Compilers do strength reduction already. Write the clear indexed loop and read the disassembly.
+
+## Connect
+
+- [RISC-V basics](/architecture/isa/risc-v-basics) shows the I and S formats that hold the 12-bit offset.
+- [x86-64 and Arm compared](/architecture/isa/x86-64-and-arm-compared) shows what variable-length encoding costs the decoder.
+- [Locality](/architecture/caches/locality) explains why the order of the addresses matters more than the instructions that compute them.
+- [Instruction-level parallelism](/performance/cpu/instruction-level-parallelism) shows why extra address instructions often cost less than their count suggests.
+
+<Recall cards={[
+  { q: "What is the only load and store addressing mode of RISC-V?", a: "A base register plus a sign-extended 12-bit offset, -2048 to 2047." },
+  { q: "Write the x86-64 general memory address form.", a: "base + index × scale + displacement, with scale 1, 2, 4 or 8 and an 8- or 32-bit displacement. In 64-bit mode there is also RIP + 32-bit displacement." },
+  { q: "What do AArch64 pre-index and post-index addressing do?", a: "They also write the new address back to the base register: before the access ([x0, #8]!) or after it ([x0], #8). Loops use post-index to walk arrays." },
+  { q: "Why do the sum loops have the same length on x86-64, AArch64 and RISC-V?", a: "Strength reduction turns a[i] into a moving pointer. x86 saves the load with a memory operand, Arm with post-index, and RISC-V with compare-and-branch." },
+  { q: "Why does [rsp + 8] need one byte more than [rdi + 8] on x86-64?", a: "The ModRM code for rsp as a base means that a SIB byte follows, so a stack access always has a SIB byte." },
+  { q: "What does a RISC-V load need when the offset is 2048?", a: "It does not fit in 12 signed bits, so lui and add build the upper part first. In the demo, the sequence grows from 3 to 5 instructions." },
+]} />

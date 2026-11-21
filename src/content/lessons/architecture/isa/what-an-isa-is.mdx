@@ -1,0 +1,105 @@
+---
+summary: The instruction set architecture is the contract between software and hardware. It fixes the architectural state and what each instruction does to it, and it leaves out time. Run one binary on three cores and then break the contract.
+---
+import { IsaCoresDemo, IsaContractDemo } from "@/demos/arch/ArchIsaContractDemos";
+import { ArchRvPlayground } from "@/demos/arch/ArchRvDemos";
+
+A compiler writes machine code once. Many different chips then run it: a small microcontroller, a phone core, a server core with hundreds of instructions in flight. They can all run the same bytes because they all obey one document. This document is the **instruction set architecture** (ISA).
+
+The ISA is a contract. It defines the **architectural state**, which is everything that a program can see: the registers, the program counter (pc) and memory. It also defines what each instruction does to that state. The hardware that implements the contract is the **microarchitecture**: pipelines, caches, predictors and execution units. The program cannot see these parts, except through time.
+
+This lesson uses RISC-V, because its manual is open and short. The same ideas apply to x86-64 and AArch64. The demos use the shared RV32IM model of this track. A **hart** (hardware thread) executes the instructions, and a timing model gives the cycles.
+
+<Predict
+  id="state"
+  question="A tiny in-order core needs 100 cycles for the sum program. A dual-issue core needs 50. At the moment when each core has retired 20 instructions, do their registers hold the same values?"
+  options={["No: the dual-issue core has done more work per instruction", "Yes: after the same number of instructions, the architectural state is the same", "Only if both cores use the same branch predictor"]}
+  answer={1}
+  explain="The ISA defines the state after each instruction, not the time at which it happens. A core can only be further along the same sequence of states. A faster core gets to state 20 earlier, but state 20 is the same on every core."
+>
+<IsaCoresDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **Sum of an array** and move the cycle to 40. The three cores are at states 18, 24 and 38. Each dot is on the same track.
+2. Select **Show the registers of** for each core. You see the registers of three different states, but each is a state that the other cores also pass through.
+3. Move the cycle to the end. All three cores show exit code 31 after 46 instructions. They need 100, 72 and 50 cycles.
+4. Select **Factorial, recursive**. The tiny core needs 564 cycles, because the model gives its multiplier 32 cycles. The dual-issue core needs 138. The result is the same.
+
+## What the contract covers
+
+The three cores in the demo are timing models with different inputs. They are not real products. The hart computes every value once, and the timing model only says when each instruction retires. Real verification works the same way. A functional reference model, such as the RISC-V Sail model, gives the correct state, and the core must match it.
+
+| The ISA defines | Examples in RISC-V |
+|---|---|
+| Registers and their width | 32 integer registers `x0` to `x31`, of XLEN bits. `x0` always reads 0. |
+| Instructions and their encodings | Every bit of `add a0, a1, a2` (`0x00c58533`) |
+| Memory and its order | Byte addresses, little-endian instructions, the RVWMO memory model. The execution environment sets the byte order of data, and RVA23 makes it little-endian. |
+| Exceptions | Illegal instruction, misaligned address, `ecall` and `ebreak` |
+| Privilege | Machine, supervisor and user modes, and the control and status registers (CSRs) |
+
+The contract also leaves some choices to the implementation, on purpose. A misaligned load can work in hardware, or it can trap so that software emulates it. Both choices conform. Portable code must not depend on either.
+
+The contract does not cover time. It says nothing about how many cycles a `mul` takes, how large a cache is, or how a branch is predicted. So timing is the one thing that you cannot learn from the ISA manual. You must measure it, or read the optimization guide of each core.
+
+## Change the core, or change the contract
+
+The demo below runs one binary in two ways. First it changes the microarchitecture. Then it keeps the bits the same and changes the contract that reads them.
+
+<IsaContractDemo />
+
+1. Keep **Factorial, recursive**. All three cores give 3,628,800, with 564, 215 and 138 cycles.
+2. Read the row **No M extension**. A core without multiply sees one illegal word, so it traps after 95 instructions.
+3. Read the row **16 registers (RV32E)**. RV32E has only `x0` to `x15`, and encodings that name `x16` to `x31` are reserved. The binary uses `a7` (`x17`) for the system call number. This model traps on it, as many cores do.
+4. Select **Sum of an array**. It has no `mul`, so it runs without the M extension. Then read the row **add and sub swap encodings**. The result is -31, and nothing reports an error.
+
+The last row is the most dangerous failure. A trap is loud: the program stops. A changed meaning is silent: the program gives a wrong answer. So ISA designers try hard not to change the meaning of an encoding after release. New features go into new encodings where possible. There are exceptions: x86-64 reused the bytes `40` to `4F` as REX prefixes, and on cores with BMI1 the bytes `F3 0F BC` mean `tzcnt`, not `bsf`.
+
+## How ISAs grow without breaking binaries
+
+RISC-V is modular. The manual defines a **base integer ISA**, which must be present in any implementation, plus optional **extensions**. RV32I and RV64I are the main bases. Letters name the larger extensions: M (multiply and divide), A (atomics), F and D (floating point), C (compressed instructions) and V (vectors). Names that start with Z name smaller ones, such as Zba for address generation.
+
+Freedom to choose extensions makes a problem for software. A Linux distribution needs to know which extensions it can assume. **Profiles** answer this. A profile is a named list of mandatory extensions. RISC-V International announced the ratification of RVA23 in October 2024, and RVA23 makes the vector extension mandatory.
+
+x86 grew another way. Each new feature, such as SSE2, AVX2 or AVX-512, got new encodings, and the `cpuid` instruction tells software what is present. Old instructions stay, so an x86-64 core still runs 1980s 8086 code in the correct mode. This compatibility is a large reason why x86 is still in use. It is also why x86 decoders are complex: they must handle every encoding ever released.
+
+## RISC and CISC, briefly
+
+In the 1970s, many ISAs had complex instructions, such as string copies or polynomial evaluation in one instruction. The IBM 801 project, Berkeley RISC and Stanford MIPS took the opposite approach. They used simple instructions of fixed length, many registers, and loads and stores as the only memory access. This is **RISC** (reduced instruction set computer). The RISC-V manual names Berkeley's RISC-I and RISC-II as two of its four predecessors.
+
+The difference is now smaller than the names suggest. Large x86 cores split complex instructions into simple internal operations, called micro-ops, and then schedule these like a RISC core. Large RISC cores fuse pairs of simple instructions. The ISA still matters for the front end of the core, for code size and for the memory model. Lesson 5 of this module compares x86-64 and AArch64 in these areas.
+
+## Step the architectural state yourself
+
+The playground shows only architectural state: the pc, the 32 registers and memory. There is no cycle count, because the hart is a pure model of the contract.
+
+<ArchRvPlayground />
+
+1. Select **Sum of an array** and press **Next** several times. Each step changes at most one register and the pc. This is the granularity of the contract.
+2. Select **Hello**. The `ecall` instructions leave the ISA. The Linux system call convention gives the meaning of `a7`, `a0`, `a1` and `a2`.
+3. Edit a line to read `addi zero, zero, 5`, then step it. Register `x0` stays 0, because the ISA defines writes to `x0` as discarded.
+
+## What this means for your code
+
+- **Correctness comes from the ISA, speed comes from the core.** Never conclude from one machine that an operation is fast. Measure on the target.
+- **Do not depend on behavior that the ISA leaves open.** Misaligned access, the result of undefined C operations, and the order of memory operations between threads are all choices that change between cores.
+- **Target a profile, not a chip.** For RISC-V, compile for a profile such as RVA23. For x86-64, the microarchitecture levels x86-64-v2, v3 and v4 group the extensions in the same way.
+- **Check features at run time** before you use an optional extension. Use `cpuid` on x86, `getauxval(AT_HWCAP)` on Linux, or `riscv_hwprobe` on RISC-V Linux.
+
+## Connect
+
+- [RISC-V basics](/architecture/isa/risc-v-basics) reads the encodings bit by bit.
+- [x86-64 and Arm compared](/architecture/isa/x86-64-and-arm-compared) shows what a different contract costs.
+- [Memory consistency models](/architecture/multicore/memory-consistency-models) covers the part of the contract that orders memory between cores.
+- [Kernel mode and user mode](/os/processes/kernel-mode-and-user-mode) covers the privileged part of the contract.
+- [System calls](/os/processes/system-calls) shows how `ecall` and `syscall` cross into the kernel.
+- [eBPF](/os/observability/ebpf) is a second, small ISA that runs inside the Linux kernel.
+
+<Recall cards={[
+  { q: "What is the difference between an ISA and a microarchitecture?", a: "The ISA is the contract: the architectural state and what each instruction does to it. The microarchitecture is one implementation of it: pipeline, caches, predictors. It is invisible to the program, except through time." },
+  { q: "What is architectural state? Name its parts in RISC-V.", a: "Everything that a program can see: the 32 integer registers (x0 is always 0), the pc, memory and the CSRs. Most CSRs are visible only in privileged modes." },
+  { q: "Why is a changed encoding worse than a removed instruction?", a: "A removed instruction traps, so the failure is visible. A changed meaning gives a wrong result with no error." },
+  { q: "What is a RISC-V profile, and why does it exist?", a: "A named list of mandatory extensions, such as RVA23. It tells software which extensions it can assume, because the modular ISA allows many combinations." },
+  { q: "Name two things that the ISA does not specify.", a: "The time that an instruction takes, and the sizes and policies of caches and predictors. It also leaves some choices open, for example whether a misaligned load traps." },
+]} />

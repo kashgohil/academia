@@ -1,0 +1,135 @@
+---
+summary: The 32 registers and x0, the six instruction formats bit by bit, why the immediate bits look scrambled, how lui, auipc and addi build any constant or address, the extensions, and what the C extension does for code size.
+---
+import { IsaEncoderDemo, IsaImmediateDemo, IsaCompressDemo } from "@/demos/arch/ArchIsaRvDemos";
+
+RISC-V is a small, open ISA. Its base integer set, RV32I, has about 40 instructions. This lesson reads them at the level of bits, because the encoding explains many design decisions.
+
+## Registers
+
+RV32I has 32 integer registers of 32 bits: `x0` to `x31`. Register `x0` always reads 0, and the hardware discards every write to it. This one register replaces many special instructions. A move is `addi rd, rs, 0`, a negation is `sub rd, x0, rs`, and a jump that discards its return address writes `x0`.
+
+The hardware treats `x1` to `x31` the same. Their roles come from the calling convention, the **psABI** (processor-specific application binary interface). The assembler accepts both names.
+
+| Registers | ABI names | Role |
+|---|---|---|
+| `x0` | `zero` | Always 0 |
+| `x1`, `x2` | `ra`, `sp` | Return address, stack pointer |
+| `x3`, `x4` | `gp`, `tp` | Global pointer, thread pointer |
+| `x5`–`x7`, `x28`–`x31` | `t0`–`t6` | Temporaries |
+| `x8`, `x9`, `x18`–`x27` | `s0`–`s11` | Saved registers (`s0` is also the frame pointer `fp`) |
+| `x10`–`x17` | `a0`–`a7` | Arguments and return values |
+
+## Six formats
+
+Every RV32I instruction is 32 bits. Bits 1 and 0 are always `11`. Other values of these two bits mark 16-bit compressed instructions. Bits 6 to 0 are the **opcode**. The manual defines four core formats, R, I, S and U, and two variants of them, B and J.
+
+| Format | Used by | Fields from bit 31 to bit 0 |
+|---|---|---|
+| R | register-register ALU ops | funct7, rs2, rs1, funct3, rd, opcode |
+| I | ALU immediates, loads, `jalr` | imm[11:0], rs1, funct3, rd, opcode |
+| S | stores | imm[11:5], rs2, rs1, funct3, imm[4:0], opcode |
+| B | conditional branches | imm[12\|10:5], rs2, rs1, funct3, imm[4:1\|11], opcode |
+| U | `lui`, `auipc` | imm[31:12], rd, opcode |
+| J | `jal` | imm[20\|10:1\|11\|19:12], rd, opcode |
+
+The register fields never move. The field `rd` is always bits 11 to 7, `rs1` is always bits 19 to 15, and `rs2` is always bits 24 to 20. So a decoder can read the register file before it knows the format.
+
+<Predict
+  id="flip"
+  question="The word of add a0, a1, a2 is 0x00c58533. You flip bit 30 (the second bit of funct7). What does the new word decode to?"
+  options={["add with a different destination register", "sub a0, a1, a2", "An illegal instruction"]}
+  answer={1}
+  explain="add and sub have the same opcode, funct3 and registers. Only funct7 differs: 0000000 for add and 0100000 for sub. Bit 30 also turns srl into sra. The new word is 0x40c58533."
+>
+<IsaEncoderDemo />
+</Predict>
+
+Things to try:
+
+1. Flip bit 30 of `add`. The word becomes `0x40c58533`, which is `sub a0, a1, a2`.
+2. Flip bit 25 of `add`. It becomes `mul`: the M extension uses funct7 = `0000001` in the same opcode.
+3. Select **lw** and flip bits in the register fields. The register names change, and the format stays the same.
+4. Flip bit 0. The word no longer ends in `11`, so it is not a 32-bit instruction. Without the C extension, the core raises an illegal instruction exception.
+
+## Why the immediate bits look scrambled
+
+In S, B and J, the immediate is not in one piece. The bits seem to be in a random order. They are not random. The manual gives two reasons, and the demo below makes both visible.
+
+First, the sign of every immediate is always instruction bit 31. So sign extension can start in parallel with decoding, before the format is known. Second, each immediate bit comes from as few different instruction bits as possible. A hardware **multiplexer** (mux) selects one of its inputs. Fewer different sources for an immediate bit means a smaller mux in front of that bit.
+
+<IsaImmediateDemo />
+
+1. Select **B** and **RISC-V**. Immediate bits 10 to 5 come from instruction bits 30 to 25, the same bits as in I and S.
+2. Select **Naive (contiguous)**. Now B stores the offset divided by 2 in the S positions. Immediate bits 1 to 10 each get two more possible sources, one from B and one from J. Bits 12 to 19 get one more.
+3. Read the totals. In this simple count, the RISC-V layout needs 69 mux inputs and the naive layout needs 97. Bit 31 needs no mux. The largest mux shrinks from 5 inputs to 4.
+4. Select **U** and move the slider. Bits 31 to 12 come straight down, and the low 12 bits are 0.
+
+The manual estimates that the rotated B and J layouts cut instruction signal fanout and immediate mux costs "by around a factor of 2". Its measure is not the one in this demo, so the numbers differ. The direction is the same. The cost of the scrambling falls on assemblers and JIT compilers, which must place the bits. The test file of this module checks that the shared encoder and decoder agree on every field.
+
+## Constants and addresses
+
+An I-type immediate holds 12 signed bits: -2048 to 2047. For larger constants, `lui` (load upper immediate) writes a 20-bit value into bits 31 to 12 and clears the low 12 bits. Then `addi` adds the low part. The `addi` immediate is sign-extended, so the upper part must be rounded:
+
+$$
+\text{hi} = (v + 2048) \gg 12, \qquad \text{lo} = v - \text{hi} \cdot 4096
+$$
+
+For example, `li a0, 0x12345fff` becomes `lui a0, 0x12346` and `addi a0, a0, -1`. A constant that fits in 12 bits needs only `addi`. So `li a0, 2047` is one instruction, and `li a0, 2048` is two.
+
+The **`auipc`** instruction (add upper immediate to pc) is the same idea relative to the pc. It gives position-independent addresses. The `la` pseudo-instruction expands to `auipc` and `addi`. A `call` expands to `auipc ra` and `jalr ra`, which reach any address within about ±2 GiB of the pc.
+
+```riscv
+        lui   a0, %hi(table)          # absolute address: lui + addi
+        addi  a0, a0, %lo(table)
+here:   auipc a1, %pcrel_hi(table)    # pc-relative: auipc + addi
+        addi  a1, a1, %pcrel_lo(here)
+```
+
+## Extensions
+
+The base set has no multiply. Everything else is an extension, named by a letter or by a name that starts with Z:
+
+- **M**: multiply and divide (`mul`, `mulh`, `div`, `rem`). Division by zero does not trap. The quotient is all ones, and the remainder equals the dividend.
+- **A**: atomics: load-reserved and store-conditional, and atomic memory operations such as `amoadd`.
+- **F**, **D**: single and double precision floating point, with 32 more registers `f0` to `f31`.
+- **C**: 16-bit compressed forms of common instructions.
+- **V**: vectors, with a vector length that the hardware chooses.
+- **Zba**, **Zbb**, **Zbs**: bit manipulation. Zba adds `sh1add`, `sh2add` and `sh3add`, which compute a shifted index plus a base in one instruction.
+
+The common Linux target RV64GC means RV64I plus M, A, F, D, C and two small extensions for CSRs and instruction fences.
+
+## The C extension and code density
+
+Fixed 32-bit instructions are simple to decode, but they make code large. The C extension adds 16-bit forms. Each 16-bit instruction expands to exactly one 32-bit instruction, so the core needs only an expander in front of its normal decoder. The 16-bit forms exist only for common cases. Typical cases are a small immediate, `x0`, `ra` or `sp` as an operand, or a destination equal to the first source. Many forms also need registers from `x8` to `x15`, the eight most common.
+
+<IsaCompressDemo />
+
+1. Read **Factorial, recursive**. 13 of its 21 instructions have a 16-bit form, so the code shrinks from 84 to 58 bytes, 31% smaller.
+2. Read the reasons. The `mul` and `ecall` instructions have no 16-bit form. The two-word `call` sequences do not compress either, because `auipc` has no 16-bit form.
+3. Select **Sum of an array**. The `lw t2, 0(t0)` line uses `t0` (`x5`), which is outside `x8` to `x15`. Rename `t0` to `a5` in the source and `t2` to `a2`, and the load becomes `c.lw`.
+4. Over all ten sample programs, 77 of 148 instructions (52%) compress, and the code is 26% smaller.
+
+The C extension also changes the instruction alignment from 4 bytes to 2 bytes. A 32-bit instruction can then start at any even address. This makes fetch a bit harder: an instruction can cross a cache line. The manual reports that the earlier compressed RISC ISAs, such as ARM Thumb and MIPS16, reduced code size by about 25 to 30%. The 26% of this small sample is in that range.
+
+## What this means for your code
+
+- **Read your disassembly with the formats in mind.** `objdump -d` shows the word, and you can now decode it by hand.
+- **Small constants are cheap.** Constants from -2048 to 2047 cost no extra instruction. Most other 32-bit constants cost one more `lui`. Large 64-bit constants on RV64 need a longer sequence of shifts and adds, or a load from memory.
+- **Compilers favor `a0` to `a5` and `s0`, `s1`** where they can. These registers are `x8` to `x15`, so more instructions compress.
+
+## Connect
+
+- [What an ISA is](/architecture/isa/what-an-isa-is) explains the contract that these encodings implement.
+- [Addressing modes](/architecture/isa/addressing-modes) builds every kind of address from base plus 12-bit offset.
+- [Calling conventions](/architecture/isa/calling-conventions) gives the registers their roles.
+- [Binary and hexadecimal](/architecture/data/binary-and-hexadecimal) and [Two's complement](/architecture/data/twos-complement) cover the number formats of the immediates.
+
+<Recall cards={[
+  { q: "Where are rd, rs1 and rs2 in a RISC-V instruction, and why do they never move?", a: "rd is bits 11 to 7, rs1 is bits 19 to 15, rs2 is bits 24 to 20, in every format that has them. The decoder can then read registers before it knows the format." },
+  { q: "Why is the sign of every RISC-V immediate in bit 31?", a: "So sign extension can start in parallel with decoding, before the format is known." },
+  { q: "How does li a0, 0x12345fff become two instructions?", a: "lui a0, 0x12346 then addi a0, a0, -1. The upper part is rounded up because addi sign-extends its 12-bit immediate." },
+  { q: "Which two bits mark a 32-bit RISC-V instruction?", a: "Bits 1 and 0 are 11. Other values mark 16-bit compressed instructions." },
+  { q: "Why can lw t2, 0(t0) not use the C extension, while lw a2, 0(a5) can?", a: "c.lw has 3-bit register fields that reach only x8 to x15. t0 is x5; a2 and a5 are x12 and x15." },
+  { q: "What does the C extension change about instruction alignment?", a: "Instructions can start on any 2-byte boundary, so a 32-bit instruction can cross a cache line." },
+]} />

@@ -1,0 +1,156 @@
+---
+summary: "The machine-level contract between functions: argument and return registers, caller-saved and callee-saved registers, the stack frame, prologue and epilogue, and 16-byte alignment. RISC-V psABI against System V AMD64, Microsoft x64 and AAPCS64, with a recursive call stepped on the hart."
+---
+import { IsaFrameDemo, IsaSplitDemo } from "@/demos/arch/ArchIsaCallDemos";
+
+The ISA has no idea of a function. It has a jump that saves a return address (`jal`), an indirect jump (`jalr`), and registers. Functions that were compiled separately can still call each other, because they all follow one more contract: the **calling convention**. For RISC-V, the RISC-V **psABI** document defines it. On x86-64 Linux it is the System V AMD64 ABI, and on Windows it is the Microsoft x64 convention. On 64-bit Arm it is the AAPCS64.
+
+A calling convention answers four questions. Where are the arguments and the return value? Which registers must a function keep for its caller? How is the stack laid out and aligned? Who removes what from the stack?
+
+## RISC-V roles
+
+| Registers | Role | Kept across a call? |
+|---|---|---|
+| `a0`–`a7` | Arguments; `a0` and `a1` also return values | No |
+| `ra` | Return address, written by `jal` and `jalr` | No |
+| `sp` | Stack pointer, 16-byte aligned | Yes |
+| `s0`–`s11` | Saved registers; `s0` can be the frame pointer | Yes |
+| `t0`–`t6` | Temporaries | No |
+| `gp`, `tp` | Global pointer and thread pointer | Not allocated |
+
+A **caller-saved** register (also called volatile) can change in any call. If the caller needs its value after the call, the caller must save it first. A **callee-saved** register (nonvolatile) must have the same value after the call. If the callee wants to use it, the callee saves it on entry and restores it before it returns.
+
+The psABI requires that `sp` is aligned to 128 bits, 16 bytes, at every procedure entry, and that it stays aligned in the standard ABI. Data below `sp` is not safe: the psABI says that procedures must not rely on it.
+
+## A stack frame, step by step
+
+The recursive factorial below has the classic shape. The **prologue** makes a 16-byte frame, saves `ra` and `s0`, and keeps `n` in `s0` across the recursive call. The **epilogue** restores both and frees the frame.
+
+<Predict
+  id="depth"
+  question="fact(10) calls itself until n = 1. Each call makes a 16-byte frame. How far below its starting value does sp go?"
+  options={["8 bytes: only ra and s0 are saved, and only in the deepest call", "80 bytes: 10 frames of the 8 bytes that hold data", "160 bytes: 10 frames of 16 bytes, padding included"]}
+  answer={2}
+  explain="fact(10), fact(9), ... fact(1) are all live at the same time: 10 frames. Each frame is 16 bytes, because sp must stay 16-byte aligned. 8 of the 16 bytes are padding. Set n to 10 in the demo and read the deepest point."
+>
+<IsaFrameDemo />
+</Predict>
+
+Things to try:
+
+1. Step from the start. The `addi sp, sp, -16` opens frame 1. The next two stores fill the slots at offsets 12 and 8 with `ra` and `s0`.
+2. Keep stepping into the recursion. Each frame holds a return address and the `n` of its caller. The two low words of each frame are padding.
+3. Run to the deepest point with n = 4. There are 4 frames and 64 bytes. Then run to the end: the frames are popped, but their old values are still in memory, below `sp`.
+4. Set n to 12. The result is 479,001,600. Set n to 13: the true result does not fit in 32 bits, so the program returns 1,932,053,504, the value mod $2^{32}$.
+
+The demo shows why calls in a debugger form a **call stack**. A debugger walks the saved return addresses to show it. With frame pointers, each frame also stores the caller's `s0`, so the walk is a linked list. Without them, the debugger needs unwind tables (DWARF CFI) that describe each prologue.
+
+## Leaf functions
+
+A **leaf function** calls nothing. It does not need to save `ra`, and it can often use only `a` and `t` registers. Then it needs no frame at all. Most small functions compile to leaves after inlining.
+
+On x86-64 System V, a leaf can also use the **red zone**. This is 128 bytes below `rsp` that "shall not be modified by signal or interrupt handlers". The function can use this space without moving `rsp`.
+
+The Linux kernel builds x86-64 code with `-mno-red-zone`. In kernel mode, an interrupt arrives on the current kernel stack. The CPU pushes its interrupt frame right below `rsp`, so it would overwrite any data in a red zone. The RISC-V psABI defines no red zone.
+
+## Why both kinds of register
+
+If every register were caller-saved, a function that keeps values across many calls would save them around every call. If every register were callee-saved, every small leaf function would save the registers that it uses as scratch. Real programs have both kinds of function, so conventions split the registers.
+
+The demo generates a real RISC-V program for a hypothetical split. Function f keeps some values alive across calls to a leaf g, and g needs some scratch registers. The hart runs the program and counts every load and store. In this program, every load and store is a save or a restore.
+
+<IsaSplitDemo />
+
+1. Start with 4 live values, 6 scratch registers in g and 8 calls. At 12 callee-saved registers, the RISC-V split, the program needs 10 loads and stores.
+2. Move the split to 0. Now f saves its 4 values around each of the 8 calls: 66 loads and stores.
+3. Move it to 25. Now g has no free scratch register, so it saves 6 registers on each call: 106.
+4. Set f to 10 live values and g to 12 scratch registers. The best splits are 10 to 13 callee-saved registers, at 22 loads and stores, and 12 is one of them.
+5. Watch the result. It stays the same for every split. Only the cost changes.
+
+## The conventions side by side
+
+| | RISC-V psABI | System V AMD64 | Microsoft x64 | AAPCS64 |
+|---|---|---|---|---|
+| Integer arguments | `a0`–`a7` | `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` | `rcx`, `rdx`, `r8`, `r9` | `x0`–`x7` |
+| Return | `a0`, `a1` | `rax`, `rdx` | `rax` | `x0`, `x1` |
+| Return address | `ra` register | on the stack (`call`) | on the stack (`call`) | `x30` (LR) |
+| Callee-saved | `sp`, `s0`–`s11`; `fs0`–`fs11` in the hard-float ABI | `rbx`, `rbp`, `r12`–`r15`, `rsp` | `rbx`, `rbp`, `rdi`, `rsi`, `r12`–`r15`, `rsp`, `xmm6`–`xmm15` | `x19`–`x29`, `sp`; the low 64 bits of `v8`–`v15` |
+| Stack alignment | 16 B | 16 B at the `call` | 16 B | 16 B |
+| Special | | 128-byte red zone | 32-byte shadow space | `x8` indirect result, `x16`, `x17` linker scratch, `x18` platform |
+
+The Microsoft convention requires the caller to reserve stack space for the four register arguments, even when the callee takes fewer. This is the 32-byte **shadow space** (home space). The callee can store its register arguments there, which helps varargs and debuggers.
+
+Here is one small function in each convention. The x86-64 and AArch64 code is clang -O2 output. The RISC-V code is hand-written in the same style.
+
+```c
+int h(int);
+int keep(int x) { return h(x) + x; }   // x must survive the call
+```
+
+```asm
+; x86-64 System V                     ; x86-64 Microsoft
+push rbx          ; save callee-saved   push rsi           ; rsi is callee-saved here
+mov  ebx, edi     ; x lives in rbx      sub  rsp, 0x20     ; 32-byte shadow space
+call h                                  mov  esi, ecx      ; x arrives in ecx
+add  eax, ebx                           call h
+pop  rbx                                add  eax, esi
+ret                                     add  rsp, 0x20
+                                        pop  rsi
+                                        ret
+```
+
+```asm
+// AArch64 (AAPCS64)
+stp  x29, x30, [sp, #-0x20]!   // save fp and lr, open a 32-byte frame
+str  x19, [sp, #0x10]          // save callee-saved x19
+mov  x29, sp
+mov  w19, w0                   // x lives in x19
+bl   h
+add  w0, w0, w19
+ldr  x19, [sp, #0x10]
+ldp  x29, x30, [sp], #0x20
+ret
+```
+
+```riscv
+keep:   addi sp, sp, -16    # open a 16-byte frame
+        sw   ra, 12(sp)     # call overwrites ra
+        sw   s0, 8(sp)      # save callee-saved s0
+        mv   s0, a0         # x lives in s0
+        call h
+        add  a0, a0, s0
+        lw   s0, 8(sp)
+        lw   ra, 12(sp)
+        addi sp, sp, 16
+        ret
+```
+
+On System V, `call` pushes 8 bytes, so `rsp` is 8 bytes off 16 at entry. The `push rbx` aligns it again before the next `call`. The Microsoft version also pushes one register, and the 32-byte shadow space keeps the alignment.
+
+## Structs and varargs, briefly
+
+The RISC-V psABI passes an aggregate of up to XLEN bits in one register, and of up to 2×XLEN bits in a pair. A larger aggregate is passed by reference: the caller makes a copy and passes its address. Variadic arguments use the integer registers in the same way as named arguments, with one exception for aligned register pairs. On System V AMD64, a variadic call also sets `al` to the number of vector registers that hold arguments.
+
+## What this means for your code
+
+- **Small functions that call nothing are almost free.** They need no frame and no saves. Keep hot helpers small enough to be leaves, or to be inlined.
+- **A value that lives across a call costs a callee-saved register,** and that costs a save and a restore in the function. Long chains of calls in hot loops pay this many times.
+- **Pass small structs by value.** Up to two machine words, they travel in registers on RISC-V, System V and AAPCS64. Larger structs go through memory anyway.
+- **Keep frame pointers on** (`-fno-omit-frame-pointer`) if you profile in production. The stack walk is then a cheap list walk.
+- **Hand-written assembly must follow the convention exactly**: save what you use from the callee-saved set, and keep `sp` 16-byte aligned at every call.
+
+## Connect
+
+- [RISC-V basics](/architecture/isa/risc-v-basics) introduces the ABI register names.
+- [System calls](/os/processes/system-calls) shows the different convention for calls into the kernel.
+- [Loading a program: ELF and the dynamic linker](/os/processes/loading-a-program-elf-and-the-dynamic-linker) shows the stack at program start and the PLT that sits between calls.
+- [Context switching](/os/processes/context-switching) saves all registers, not only the callee-saved ones.
+
+<Recall cards={[
+  { q: "What is the difference between caller-saved and callee-saved registers?", a: "A caller-saved register can change in any call, so the caller saves it if it needs the value later. A callee-saved register must have the same value after the call, so a callee that uses it saves and restores it." },
+  { q: "Which RISC-V registers pass arguments and return values, and which are callee-saved?", a: "a0 to a7 pass arguments; a0 and a1 return values. s0 to s11 and sp are callee-saved." },
+  { q: "Why is the fact frame 16 bytes when it stores only 8 bytes?", a: "The psABI keeps sp 16-byte aligned, so every frame size is a multiple of 16. The other 8 bytes are padding." },
+  { q: "What is the red zone, and why does the Linux kernel turn it off?", a: "On System V x86-64, 128 bytes below rsp that signal and interrupt handlers do not modify, so leaf functions can use them without moving rsp. In the kernel, an interrupt pushes its frame onto the current stack and would overwrite that area, so the kernel uses -mno-red-zone." },
+  { q: "What is the shadow space in the Microsoft x64 convention?", a: "32 bytes that the caller reserves on the stack for the four register arguments, even if the callee takes fewer. The callee can store its arguments there." },
+  { q: "Why do conventions have both caller-saved and callee-saved registers?", a: "Values that live across many calls are cheapest in callee-saved registers, and scratch values of leaf functions are cheapest in caller-saved ones. A split serves both kinds of function." },
+]} />

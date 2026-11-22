@@ -32,6 +32,10 @@ export const LEVELS: Record<Level, string> = {
 
 /** Lessons with a written MDX page. Paths must match `src/content/lessons/<path>.mdx`. */
 export const LIVE = new Set<string>([
+  "systems/explicit/allocators-as-parameters-in-zig",
+  "systems/explicit/defer-and-errdefer",
+  "systems/explicit/odins-context-allocator",
+  "systems/explicit/temporary-allocators",
   "systems/ub/aliasing-rules",
   "systems/ub/integer-overflow",
   "systems/ub/sanitizers",

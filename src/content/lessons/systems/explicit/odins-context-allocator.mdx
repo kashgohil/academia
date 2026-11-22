@@ -1,0 +1,141 @@
+---
+summary: "Odin passes the allocator implicitly: every call carries a pointer to a context struct, a scope can override context.allocator for everything it calls, and the temp and tracking allocators build on that. The trade-off against Zig's explicit parameter."
+---
+import { OdinContextDemo, SignatureRippleDemo } from "@/demos/sys/SysExpOdinDemos";
+
+[Zig](/systems/explicit/allocators-as-parameters-in-zig) makes the allocator a visible parameter. Odin keeps the same goal, an allocator that the caller chooses, but it removes the parameter. Each procedure call carries a hidden pointer to a struct called the **context**, and the context holds the current allocator.
+
+Odin is not installed on the machine that checked this lesson. So the Odin code here is unchecked, and it stays close to the examples in the Odin overview and the core library source.
+
+## The implicit context
+
+The Odin overview says that the default `"odin"` calling convention "includes a pointer to the current context as an implicit additional argument". The struct is `runtime.Context`, defined in `base/runtime/core.odin`:
+
+```odin
+// base/runtime/core.odin, field names and types (unchecked)
+Context :: struct {
+    allocator:              Allocator,
+    temp_allocator:         Allocator,
+    assertion_failure_proc: Assertion_Failure_Proc,
+    logger:                 Logger,
+    random_generator:       Random_Generator,
+    user_ptr:               rawptr,
+    user_index:             int,
+    _internal:              rawptr,
+}
+```
+
+An `Allocator` is two words: `procedure` and `data`. This is the same fat pointer as Zig's `Allocator`, with one difference. Zig has four functions in a vtable. Odin has one procedure with a mode argument: `Alloc`, `Free`, `Free_All`, `Resize`, `Query_Features`, `Query_Info`, `Alloc_Non_Zeroed` and `Resize_Non_Zeroed`. Because `Free_All` is in the interface, any code can clear an arena through a plain `Allocator`.
+
+Procedures such as `make`, `new` and `strings.join` take an allocator parameter whose default value is `context.allocator`. So a call that names no allocator still allocates from the one in the context. A dynamic array remembers the allocator that made it, so a later `append` or `delete` uses that same allocator.
+
+## A scope can change it
+
+The overview gives the rule: "context is local to each scope". An assignment changes the context for the rest of that scope and for every procedure called from it. The caller's context does not change, and it is current again when the scope ends.
+
+```odin
+main :: proc() {
+    context.user_index = 456
+    {
+        context.allocator = my_custom_allocator()
+        context.user_index = 123
+        supertramp() // sees 123 and the custom allocator
+    }
+    assert(context.user_index == 456)
+}
+```
+
+The demo shows one way to get these rules. A scope that assigns to the context gets its own copy of the struct in its frame. Its callees get a pointer to that copy. This is the model of the demo, not a claim about how the Odin compiler lays out frames.
+
+<Predict
+  id="scope"
+  question="serve sets context.allocator = context.temp_allocator and then calls render. render never names an allocator. Where does strings.join in render put its result?"
+  options={[
+    "On the heap: render has its own default context",
+    "In the temp arena: render receives a pointer to serve's context",
+    "Nowhere: render must take an allocator parameter to allocate",
+  ]}
+  answer={1}
+  explain="render gets a hidden pointer to the context of its caller, so it sees serve's override. Its signature does not change, and it cannot tell which allocator it got."
+>
+<OdinContextDemo />
+</Predict>
+
+Things to try:
+
+1. With **serve: temp**, step to line 14. The table shows that render uses serve's context, and the allocator is `temp`. No heap block appears: the 64 and 9 bytes go into the temp arena's block.
+2. Step to the end. `free_all` sets the arena back to 0 bytes, so `page` now points at bytes that the arena will reuse. The code is correct only because `send` finished with `page` first.
+3. Select **nowhere**. The same code now allocates `page` on the heap and never frees it. At exit a leak checker reports 9 bytes.
+4. Select **main: tracking**. The tracking allocator wraps the heap, and at the end it lists the 9 bytes with the source line.
+5. Select **both**. Three frames have their own context copy, and each one points at a different allocator.
+
+## The temp allocator
+
+Every context also has `context.temp_allocator`. By default it is a growing arena. Its first block is `DEFAULT_TEMP_ALLOCATOR_BACKING_SIZE` bytes: 4 MiB, and a build can change it with `-define`. The overview says that `free_all(context.temp_allocator)` "must be called to clear the contents". The arena then keeps its first block and resets it, so a loop that clears it once per frame reuses the same memory.
+
+```odin
+for !should_quit {
+    defer free_all(context.temp_allocator)
+    lines := strings.split(input, "\n", context.temp_allocator)
+    // ... the frame uses lines; nobody frees them one by one
+}
+```
+
+For a smaller scope, `runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()` saves the arena position, and its deferred companion puts the position back at the end of the scope. This is the mark and restore of the [bump allocator lesson](/systems/allocators/bump-allocators), as a library call.
+
+## The tracking allocator
+
+`core:mem` has `Tracking_Allocator`. It wraps another allocator and records every live allocation in `allocation_map`. The overview shows this pattern for debug builds:
+
+```odin
+track: mem.Tracking_Allocator
+mem.tracking_allocator_init(&track, context.allocator)
+context.allocator = mem.tracking_allocator(&track)
+defer {
+    for _, entry in track.allocation_map {
+        fmt.eprintf("- %v bytes @ %v\n", entry.size, entry.location)
+    }
+    mem.tracking_allocator_destroy(&track)
+}
+```
+
+By default it panics on a bad free. With `bad_free_callback` set to `mem.tracking_allocator_bad_free_callback_add_to_array`, it collects bad frees in `bad_free_array` instead. Three lines at the top of `main` make the whole program checked, with no change to any other procedure. In Zig you get the same effect by passing a checking allocator from the top. But each function on the way must already take the parameter.
+
+<SignatureRippleDemo />
+
+Things to try:
+
+1. With **Zig** and only `query` marked, three signatures change: `handle`, `route` and `query`. The parameter must travel down every path to the function that allocates.
+2. Mark all four leaves. Seven signatures change. Allocation has spread through the whole call graph.
+3. Select **Odin**. No signature changes, but now every function can allocate, and the dashed boxes show which ones really do. A reader learns that only from the bodies.
+4. Select **C**. No signature changes either, but no caller can choose an allocator for one call.
+
+## The trade-off
+
+| | Zig parameter | Odin context | C global `malloc` |
+|---|---|---|---|
+| Caller chooses per call | yes | yes, per scope | no |
+| Visible at the call site | yes | no | no |
+| Signatures change when a leaf starts to allocate | yes, up the call graph | no | no |
+| Cost per call | an argument when needed | one pointer argument on every call | none |
+| Typical bug | the wrong allocator passed to a free | a temp pointer kept after `free_all` | a leak or a double free |
+
+The context bug deserves the warning. A library procedure can store a pointer in a long-lived structure. If the caller had set `context.allocator` to the temp allocator, that pointer dies at the next `free_all`. As the [arena lesson](/systems/allocators/arena-allocators) shows, it does not crash. It reads data of a later frame. A function that keeps memory for longer than the call should take an explicit allocator, or use `context.allocator` only at a known, long-lived point.
+
+Code that C calls has no context at all. The overview says that procedures without the `"odin"` convention "must explicitly assign the context" if they need one. A `"c"` callback usually starts with `context = runtime.default_context()`.
+
+## Connect
+
+- [Allocators as parameters in Zig](/systems/explicit/allocators-as-parameters-in-zig) is the explicit version of the same idea.
+- [Temporary allocators](/systems/explicit/temporary-allocators) covers scratch arenas and the conflict that `free_all` can cause.
+- [defer and errdefer](/systems/explicit/defer-and-errdefer) compares Odin's block-scoped `defer` with Zig and Go.
+- [Calling conventions](/architecture/isa/calling-conventions) shows where a hidden argument such as the context pointer travels.
+
+<Recall cards={[
+  { q: "How does an Odin procedure get its context?", a: "The default \"odin\" calling convention passes a pointer to the current context as an implicit extra argument." },
+  { q: "A scope sets context.allocator and calls f. What does f see, and what does the caller see after the scope?", a: "f and everything it calls see the new allocator. After the scope, the caller's old context is current again." },
+  { q: "What is the default temp allocator, and how do you clear it?", a: "A growing arena whose first block is 4 MiB by default. free_all(context.temp_allocator) clears it and keeps the first block." },
+  { q: "How is Odin's Allocator interface different from Zig's VTable?", a: "Odin has one procedure with a mode argument (Alloc, Free, Free_All, Resize and others). Zig has four separate functions: alloc, resize, remap and free." },
+  { q: "Name one bug that the implicit context makes easy.", a: "A procedure keeps a pointer that it allocated from context.allocator, while the caller had set it to the temp allocator. The pointer dies at the next free_all." },
+  { q: "Why do more signatures change in Zig than in Odin when a leaf function starts to allocate?", a: "In Zig the allocator is a parameter. Each function on a path from the caller to the leaf must take it and pass it on." },
+]} />

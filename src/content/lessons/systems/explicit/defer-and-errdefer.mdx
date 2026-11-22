@@ -1,0 +1,196 @@
+---
+summary: "Cleanup written next to the acquisition: Zig's block-scoped defer and errdefer, Go's function-scoped defer and its rules, Odin's defer, C's goto chains, the cleanup attribute and the WG14 defer TS, and how each one handles the error path."
+---
+import { CleanupPathDemo, DeferLoopDemo } from "@/demos/sys/SysExpDeferDemos";
+
+A function that acquires three resources has four ways to fail and one way to succeed. Each path must release exactly what exists at that point: no more, no less. C++ and Rust solve this with destructors. A guard object releases its resource when it goes out of scope, as [RAII in C++](/systems/ownership/raii-in-c) and [ownership in Rust](/systems/ownership/ownership-in-rust) explain.
+
+Languages without destructors use a statement instead. A **defer** statement schedules a call for the moment that control leaves a scope. You write the cleanup on the line after the acquisition, and the compiler copies it to every exit. This lesson is about where that "exit" is in each language, and what runs on an error path.
+
+## Zig: defer and errdefer
+
+Zig has two statements. `defer` runs when control leaves the enclosing **block**, by any path. `errdefer` runs only when the function returns an error while the errdefer is in scope. Both run in reverse order of registration, newest first. This program was run with Zig 0.17.1:
+
+```zig
+fn step(fail_at: u32) !void {
+    print("acquire A\n", .{});
+    defer print("defer A\n", .{});
+    errdefer print("errdefer A\n", .{});
+    if (fail_at == 1) return error.Fail;
+    {
+        print("acquire B (block)\n", .{});
+        defer print("defer B (end of block)\n", .{});
+    }
+    print("acquire C\n", .{});
+    errdefer print("errdefer C\n", .{});
+    if (fail_at == 2) return error.Fail;
+}
+```
+
+Its output for two runs, side by side:
+
+```text
+--- fail_at 0          --- fail_at 2
+acquire A              acquire A
+acquire B (block)      acquire B (block)
+defer B (end of block) defer B (end of block)
+acquire C              acquire C
+defer A                errdefer C
+                       errdefer A
+                       defer A
+```
+
+The block's defer runs at the closing brace of the block, not at the end of the function. On success, no errdefer runs. On the error at `fail_at == 2`, the cleanups run newest first.
+
+The split matters for ownership. A function that returns a buffer must free it if a later step fails. It must not free it on success, because the caller owns it then. That is exactly `errdefer gpa.free(buf)`.
+
+Zig 0.17.0 removed the capture form `errdefer |err| ...`. The release notes say "The capture (`|err|`) is no longer allowed". Zig 0.17.1 rejects it with `error: expected block or expression, found '|'`.
+
+<Predict
+  id="order"
+  question="load acquires a, then f, then c, with errdefer free(a), defer f.close() and errdefer free(c). Then validate fails. In which order do the cleanups run?"
+  options={[
+    "free(a), f.close(), free(c): the order of the source lines",
+    "free(c), f.close(), free(a): newest first",
+    "Only f.close(): errdefer runs only when an allocation fails",
+  ]}
+  answer={1}
+  explain="All three are in scope, and the function returns an error, so all three run. They run in reverse order of registration, so a resource is released before the resources that it may depend on."
+>
+<CleanupPathDemo />
+</Predict>
+
+Things to try:
+
+1. Step through **validate fails** in Zig. The stack of pending cleanups grows with each acquisition, and the error empties it from the top.
+2. Select **nothing fails**. Only `f.close()` runs. The two errdefers are dropped, and the caller later frees `a` and `c`.
+3. Select the version **defer, not errdefer, for c**. On success `load` frees `c`, and then the caller writes to it. The memory model reports a heap use after free, and then a double free.
+4. Select **C goto** and the version where the `c` failure jumps to `free_a`. With **alloc c fails**, the jump skips `close_f`, and the FILE leaks.
+5. Select **C cleanup attr** and **forget c = NULL**. The cleanup frees `c` although the caller now owns it.
+
+## C: goto chains and the cleanup attribute
+
+C has no defer in C23. The common pattern is a chain of labels at the end of the function, in reverse order of acquisition. The Linux kernel uses it widely. Each failure jumps to the label that releases what exists so far, and the labels fall through to each other. It is correct when every jump goes to the right label. Nothing checks that.
+
+GCC and Clang have `__attribute__((cleanup(fn)))` on a local variable. The GCC manual says that it "runs a function when the variable goes out of scope". The function gets "a pointer to a type compatible with the variable". Several cleanups run "in reverse order of definition". With `-fexceptions`, the function also runs during stack unwinding. This program was run with Apple clang 21:
+
+```c
+static void free_ptr(char **p) { printf("cleanup %p\n", (void *)*p); free(*p); }
+int main(void) {
+    for (int i = 0; i < 2; i++) {
+        __attribute__((cleanup(free_ptr))) char *a = malloc(8);
+        __attribute__((cleanup(free_ptr))) char *b = malloc(8);
+        printf("iteration %d: a=%p b=%p\n", i, (void *)a, (void *)b);
+    }
+}
+```
+
+```text
+iteration 0: a=0x102e55c50 b=0x102e55c60
+cleanup 0x102e55c60
+cleanup 0x102e55c50
+iteration 1: a=0x102e55c50 b=0x102e55c60
+...
+```
+
+The cleanup is block-scoped, like Zig's defer. It has no error-only form, so code that returns a resource sets the variable to NULL first, and the cleanup then frees NULL. WG14 works on a `defer` statement for C as a Technical Specification. The most recent draft is N4001, "defer Technical Specification (Approved Committee Draft), r7", dated November 2026.
+
+## Go: defer belongs to the function
+
+Go's rules are different in three ways. The Go specification ("Defer statements") gives them. First, a deferred call runs when the surrounding **function** returns, not at the end of a block. Second, the function value and its arguments are evaluated when the defer statement runs, not at exit. Third, deferred calls also run while the goroutine panics. This program was run with Go 1.25:
+
+```go
+func args() {
+	x := 1
+	defer fmt.Println("defer arg x =", x)                // x is evaluated now
+	defer func() { fmt.Println("defer closure x =", x) }() // x is read at exit
+	x = 2
+}
+```
+
+```text
+defer closure x = 2
+defer arg x = 1
+```
+
+Go has no errdefer. The usual replacement is a named error result and a deferred closure that checks it:
+
+```go
+func open2(failSecond bool) (_, _ *conn, err error) {
+	a, err := dial("a", false)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() {
+		if err != nil {
+			a.Close() // errdefer by hand
+		}
+	}()
+	b, err := dial("b", failSecond)
+	if err != nil {
+		return nil, nil, err
+	}
+	return a, b, nil
+}
+```
+
+Note the blank names of the two results. In a first version, they were named `a` and `b`. Then `return nil, nil, err` set `a` to nil before the deferred closure ran, and `a.Close()` panicked with a nil pointer dereference. A return statement assigns the results first, and the deferred calls run after that.
+
+Function scope causes the classic loop bug. A `defer f.Close()` inside a loop does not close anything until the whole function returns.
+
+<DeferLoopDemo />
+
+Things to try:
+
+1. Keep **macOS**, 2000 files and a limit of 1024 (soft and hard). The Go loop fails at file 1022. Stdin, stdout and stderr hold 3 descriptors, and 1021 deferred `Close` calls wait.
+2. Select **Go: func literal**. Each iteration calls a function literal, and its defer runs when the literal returns. One file is open at a time.
+3. Select **Zig: block defer**. The defer runs at the end of each iteration, so the peak is 4 descriptors.
+4. Select **Linux**. The first `os.Open` also starts Go's network poller, which takes 2 descriptors (an epoll instance and an eventfd). Now the loop fails at file 1020.
+5. Select the limit 65536. The Go loop now finishes, but it holds all 2000 files until it returns.
+
+The demo sets the soft and the hard limit to the same value. The Go 1.25 runtime raises the soft open-file limit (`RLIMIT_NOFILE`) to one below the hard limit when it starts (`syscall/rlimit.go`). Many Linux systems have a hard limit far above 1024. There the Go loop does not fail at 1024, but it still holds every file until the function returns.
+
+**Cost.** A defer in Go used to cost a runtime call. Go 1.13 made most defers about 30% faster. Go 1.14 added open-coded defers, which "incur almost zero overhead compared to calling the deferred function directly". The compiler inlines the deferred calls at each exit, with one bit per defer.
+
+The Go 1.25 compiler open-codes the defers of a function only if three conditions are true. The function has at most 8 defers, and none is in a loop. The number of returns times the number of defers is at most 15. These conditions are necessary, not sufficient: `-N`, race instrumentation and heap-allocated results also turn it off. The source is in `cmd/compile`, in `walk/stmt.go` and `ssagen/ssa.go`. Otherwise each defer becomes a record on the goroutine's defer chain.
+
+## Odin: defer at the end of the scope
+
+Odin's overview says that "a defer statement defers the execution of a statement until the end of the scope it is in". Defers run "in the reverse order that they were declared". So Odin behaves like Zig's `defer`, at block scope. Odin has no `errdefer`. Code that must clean up only on failure checks a named error result in a deferred `if`. This Odin sketch is unchecked:
+
+```odin
+load :: proc(path: string) -> (buf: []byte, err: mem.Allocator_Error) {
+    buf = make([]byte, 64) or_return
+    defer if err != nil { delete(buf) }
+    // ... later steps that can set err ...
+    return
+}
+```
+
+## Comparison
+
+| | scope | error-only form | arguments evaluated | runs on panic or unwind |
+|---|---|---|---|---|
+| Zig `defer` / `errdefer` | block | `errdefer` | at exit | no exceptions in Zig |
+| Go `defer` | function | none: a named result and a closure | at the defer statement | yes, while panicking |
+| Odin `defer` | block | none: `defer if err != nil` | at exit | no exceptions in Odin |
+| C `cleanup` attribute | block | none: set the variable to NULL | at exit | with `-fexceptions` |
+| C++ destructor, Rust `Drop` | the object's lifetime | moved-from objects do nothing | at exit | yes, during unwinding |
+
+A destructor ties the cleanup to the type, so you cannot forget it. A defer ties it to the place, so you can see it. The demo shows the price of seeing it: one wrong keyword, `defer` for `errdefer`, frees memory that the caller owns.
+
+## Connect
+
+- [Mutexes](/concurrency/locks/mutexes) shows `defer mu.Unlock()` and the RAII guard for locks.
+- [RAII in C++](/systems/ownership/raii-in-c) and [ownership in Rust](/systems/ownership/ownership-in-rust) tie cleanup to an object instead.
+- [Allocators as parameters in Zig](/systems/explicit/allocators-as-parameters-in-zig) uses `checkAllAllocationFailures` to test every errdefer path.
+- [Temporary allocators](/systems/explicit/temporary-allocators) use a deferred restore to free a whole scope at once.
+
+<Recall cards={[
+  { q: "When does a Zig errdefer run, and in what order relative to defers?", a: "Only when the function returns an error while the errdefer is in scope. All pending defers and errdefers run newest first." },
+  { q: "Why is errdefer, not defer, the right cleanup for a buffer that the function returns?", a: "On success the caller owns the buffer, so it must not be freed. It must be freed only if a later step fails." },
+  { q: "Name two ways Go's defer differs from Zig's defer.", a: "It runs when the function returns, not at the end of the block. Its function value and arguments are evaluated at the defer statement." },
+  { q: "Why does defer f.Close() inside a Go loop hold every file open?", a: "Go runs deferred calls when the surrounding function returns. The fix is a function literal for each iteration, or an explicit Close." },
+  { q: "How does C code with __attribute__((cleanup)) hand a resource to its caller?", a: "It copies the pointer to the caller and sets the variable to NULL, so the cleanup frees NULL and does nothing." },
+  { q: "When does the Go 1.25 compiler open-code defers?", a: "Only when a function has at most 8 defers, none in a loop, and returns times defers is at most 15. Other rules, such as -N, can also turn it off." },
+]} />

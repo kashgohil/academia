@@ -1,0 +1,131 @@
+---
+summary: "Zig's std.mem.Allocator: a two-word fat pointer with a four-function vtable, why containers take it as an argument, what each standard allocator does with the same calls, and how a test makes every allocation fail."
+---
+import { ZigSwapDemo, ZigFailDemo } from "@/demos/sys/SysExpZigDemos";
+
+In C, `malloc` is a global function. In C++, Rust and Go, a `std::vector`, a `Vec` or a slice gets memory from a global heap. The call site does not show it. Zig takes the other path. A function that allocates takes an **allocator** as a normal parameter, so the caller chooses where the memory comes from.
+
+This lesson uses Zig 0.17.1, and every Zig snippet was run with it. The allocator lessons explain how a [bump allocator](/systems/allocators/bump-allocators), an [arena](/systems/allocators/arena-allocators) and a [general-purpose allocator](/systems/allocators/general-purpose-allocators) work inside. This lesson is about the interface between them and your code.
+
+## The interface is two words
+
+`std.mem.Allocator` is a struct with two fields. The field `ptr` is a type-erased pointer to the state of the allocator. The field `vtable` points to a table of four functions. So an `Allocator` value is 16 bytes on a 64-bit target, and you pass it by value.
+
+```zig
+// lib/std/mem/Allocator.zig (0.17.1), shortened
+ptr: *anyopaque,
+vtable: *const VTable,
+
+pub const VTable = struct {
+    alloc: *const fn (*anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u8,
+    resize: *const fn (*anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool,
+    remap: *const fn (*anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8,
+    free: *const fn (*anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void,
+};
+```
+
+The helpers that you call, such as `create`, `destroy`, `alloc`, `free`, `realloc` and `dupe`, are ordinary functions on top of these four. `resize` must keep the address. `remap` can move the memory, or it can return null to say "copy it yourself". Zig 0.14.0 added `remap`. Note that `free` takes the length: the caller remembers the size, so the allocator does not need a header for it.
+
+This is the same design as C++17's `std::pmr::memory_resource`, which has the private virtual functions `do_allocate`, `do_deallocate` and `do_is_equal`. The cost is one indirect call per allocation. A function that takes `anytype` instead can make the compiler build one copy for each allocator type, with direct calls. The standard library uses the interface, because one compiled `ArrayList` then works with every allocator.
+
+## Containers take it on each call
+
+Since Zig 0.15, `std.ArrayList(T)` stores no allocator. The release notes call this "make unmanaged the default". You pass the allocator to each method that can allocate or free:
+
+```zig
+var list: std.ArrayList(u64) = .empty;
+defer list.deinit(gpa);
+try list.append(gpa, 42);
+```
+
+The old form, with an allocator field, is now `std.array_list.Managed`, and Zig 0.17.1 marks it deprecated. In a ReleaseFast build on a 64-bit target, the list is 24 bytes instead of 40. Debug and ReleaseSafe builds add a safety lock of 8 bytes. The call site also shows which calls can allocate. The cost is that you must pass the same allocator every time. Nothing checks this at compile time.
+
+<Predict
+  id="leak"
+  question="The function in the demo allocates `report`, and you delete its `defer gpa.free(report)` line. You run it once on each allocator. Which ones tell you about the leak?"
+  options={[
+    "All of them: Zig tracks allocations",
+    "Only std.testing.allocator; the arena frees everything at deinit, and the others stay silent",
+    "None of them: leaks are only found by external tools",
+  ]}
+  answer={1}
+  explain="Only a checking allocator keeps a table of live allocations. The arena frees all its nodes in deinit, so the lost free does not matter there. The page allocator and the C allocator keep the memory and say nothing."
+>
+<ZigSwapDemo />
+</Predict>
+
+Things to try:
+
+1. Keep 40 items and **page_allocator**. Step through the calls. Each `alloc` is one `mmap` of whole 4 KiB pages, so the run maps 8 KiB to hold 444 bytes.
+2. Select **FixedBuffer** with 4 KiB and turn on **Two lists grow at the same time**. Set 100 items. Each growth finds the other list in the way, so `remap` returns null 6 times. The old buffers stay as hatched holes, and the run ends in `error.OutOfMemory`.
+3. Select **Arena** and turn on **Forget defer gpa.free(report)**. The banner stays green: `arena.deinit` gives back the whole node.
+4. Select **testing** with the same setting. The test now fails with a leak report for 100 bytes.
+5. Select **Failing** and move **Fail allocation number**. The `try` returns `error.OutOfMemory`, and the two `defer` lines free what exists.
+
+## What each standard allocator does
+
+| Allocator | alloc | remap to grow | free |
+|---|---|---|---|
+| `page_allocator` | one `mmap`, rounded up to pages | same page count: in place; else `mremap` on Linux | `munmap` |
+| `c_allocator` | `malloc` | in place if `malloc_usable_size` allows, else `realloc` | `free` |
+| `FixedBufferAllocator` | bump `end_index` in your buffer | only the newest allocation, only if room is left | only the newest allocation |
+| `ArenaAllocator` | bump in a node; grow the node, or add a node | only the newest allocation in the current node | only the newest; `deinit` frees all nodes |
+| `std.testing.allocator` | a `SafeAllocator` in 0.17.1 | its own buckets | checked; `deinit` reports leaks |
+
+The table explains the demo. A bump allocator can grow only the allocation at its top. Two growing lists take turns at the top, so each growth copies, and each old buffer becomes a hole. The arena of 0.17.1 shows one more detail. Its lock-free `alloc` adds to `end_index` before it checks the bounds. So a request that does not fit still uses up the rest of the node.
+
+The arena's own memory comes from its **child allocator**, here `page_allocator`. The demo models Linux x86-64, with 4 KiB pages. The unit tests replay the same program on the real 0.17.1 allocators, on an Apple M-series Mac with 16 KiB pages. The call sequences of `FixedBufferAllocator` and `ArenaAllocator` match the real traces call for call.
+
+## The checking allocators
+
+`DebugAllocator` was called `GeneralPurposeAllocator` before Zig 0.14.0. It records a stack trace for each allocation, finds double frees, and reports leaks in `deinit`. Zig 0.17.0 deprecates it.
+
+Its replacement, `std.heap.SafeAllocator`, is thread-safe. It panics on a free of memory that it did not allocate. It can tell two `SafeAllocator` instances apart only when you give them different `canary` values. In 0.17.1, `std.testing.allocator` is a `SafeAllocator`, and the test runner fails any test that leaks.
+
+```text
+1/1 t4.test.bad email...OK
+[SafeAllocator] (err): leaked [addr: 102f24130, len: 144 (0x90) align: 8] allocated at:
+...
+1 tests leaked memory.
+```
+
+## Make every allocation fail
+
+Out-of-memory paths are hard to test, because they almost never run. `std.testing.checkAllAllocationFailures` runs your function once to count its allocations. Then it runs it again for each allocation, with a `FailingAllocator` that makes allocation number k, and every later one, return null.
+
+After each run it compares the bytes allocated with the bytes freed. A difference stops the test with `error.MemoryLeakDetected`. A run that succeeds although an allocation failed stops it with `error.SwallowedOutOfMemoryError`.
+
+<ZigFailDemo />
+
+Things to try:
+
+1. With the defaults, look at the row that stops the checker. Allocation 2 (`tags`) fails, and nothing frees `email`. The checker prints fail index 2/3, 18 bytes allocated and 3 bytes freed.
+2. Turn on `errdefer gpa.free(email)`. The checker now passes.
+3. Leave `errdefer tags.deinit(gpa)` off and look at the last row. The invalid email returns `error.InvalidEmail` after `tags` exists, so `tags` leaks. The checker cannot see this path: it only makes allocations fail.
+4. Turn on **catch on append**. The function now hides an allocation failure, and the checker reports `error.SwallowedOutOfMemoryError`.
+
+## What this means for your code
+
+- **Take an allocator when the function allocates.** A library that calls a global heap makes the choice for every user. A parameter lets a caller use an arena for a request, a fixed buffer in an interrupt handler, and the testing allocator in tests.
+- **Store it where the lifetime is.** A long-lived struct can keep the allocator in a field, which shortens the signatures. Then a reader cannot see from a call site that it allocates.
+- **Free with the allocator that allocated.** The interface does not check this. `SafeAllocator` catches a free of memory that no `SafeAllocator` made. Two instances look the same to it unless their canaries differ.
+- **Expect remap to fail.** Under a bump allocator, two growing buffers copy at each growth. Reserve the capacity first with `ensureTotalCapacity`, or build one buffer at a time.
+
+Other languages can do this too, with more friction. In Rust 1.96, `Vec::new_in` needs the unstable `allocator_api` feature (rustc 1.96 rejects it with error E0658). C++ has `std::pmr` containers since C++17. In C, the convention is a struct of function pointers that each library defines for itself.
+
+## Connect
+
+- [Odin's context allocator](/systems/explicit/odins-context-allocator) passes the allocator implicitly, and the trade-off is the reverse of Zig's.
+- [Temporary allocators](/systems/explicit/temporary-allocators) are the main reason to choose an allocator per call.
+- [defer and errdefer](/systems/explicit/defer-and-errdefer) shows the cleanup rules that the failure checker tests.
+- [RAII in C++](/systems/ownership/raii-in-c) ties the free to a destructor instead.
+- [mmap](/os/memory/mmap) explains the system call under `page_allocator`.
+
+<Recall cards={[
+  { q: "What are the two fields of std.mem.Allocator, and what are the four vtable functions in Zig 0.17.1?", a: "ptr (the allocator state, type-erased) and vtable. The vtable has alloc, resize, remap and free." },
+  { q: "What is the difference between resize and remap?", a: "resize must keep the address and returns true or false. remap may move the memory, or it returns null so that the caller copies." },
+  { q: "Why does a FixedBufferAllocator run out of memory when two ArrayLists grow at the same time?", a: "It can grow or free only its newest allocation. Each growth of the other list copies to a new place, and the old buffer stays as a hole." },
+  { q: "Why is a forgotten free not a leak under ArenaAllocator?", a: "deinit gives back every node of the arena at once, whatever the program freed or forgot." },
+  { q: "What does checkAllAllocationFailures do, and which error path can it not test?", a: "It counts the allocations, then reruns the function with allocation k failing, for each k, and checks allocated bytes against freed bytes. It cannot test errors that are not allocation failures." },
+  { q: "What is std.testing.allocator in Zig 0.17.1?", a: "A SafeAllocator. Its deinit reports leaks, and the test runner fails the leaking test." },
+]} />

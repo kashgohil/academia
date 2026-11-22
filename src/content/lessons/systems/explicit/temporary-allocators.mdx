@@ -1,0 +1,156 @@
+---
+summary: "Scratch arenas for data that dies before the function returns: save and restore marks, the conflict when a result lands in its own scratch arena, the two-arena fix, per-request arenas in Zig, sync.Pool in Go, bumpalo and the borrow checker in Rust, and a cost model."
+---
+import { ScratchConflictDemo, TempCostDemo } from "@/demos/sys/SysExpTempDemos";
+
+Most allocations in a busy program are **temporary**: a string built to compare, a list built to sort, a buffer for one parse. They die before the function that made them returns, or at the end of one request. A general-purpose heap pays the full price of `malloc` and `free` for each of them. A **temporary allocator** groups them, so one cheap step frees them all.
+
+The [arena lesson](/systems/allocators/arena-allocators) explains how arenas work and which lifetimes suit them: a frame, a request, a compiler pass. This lesson is about the API: how a function gets temporary memory without a parameter for it, and the one bug that this design invites.
+
+## Scratch arenas and marks
+
+A **scratch arena** is a per-thread arena that any function can use for temporary data. The function saves the arena position (a **mark**) when it starts, and it restores the position before it returns. Everything that it allocated in between is free again, in one store to `pos`.
+
+```c
+String join_path(Arena *out, String dir, String file) {
+    Scratch s = scratch_begin(out);       // save a mark in a scratch arena
+    String up = str_upper(s.arena, file); // temporary
+    String r = str_cat(out, dir, up);     // the result goes to the caller's arena
+    scratch_end(s);                       // pos = mark: "up" is gone
+    return r;
+}
+```
+
+The caller decides where the result lives, through `out`. The function decides nothing about the caller's memory. This is the same split as in [Zig](/systems/explicit/allocators-as-parameters-in-zig): a parameter for memory that outlives the call, and a scratch arena for memory that does not.
+
+## The conflict
+
+The caller often uses its own scratch arena as `out`. Then the result and the callee's temporary data want the same arena. If `scratch_begin` returns that arena, the callee saves its mark, writes the result after the mark, and restores the mark. The result is now free memory, but the caller still holds a pointer to it.
+
+<Predict
+  id="conflict"
+  question="The thread has one scratch arena. caller passes it as out to join_path, which also takes it as its scratch. What does print(p) show?"
+  options={[
+    "\"/tmp/LOG\": the result was written before scratch_end",
+    "Other bytes: scratch_end freed the result, and the caller's next allocation wrote over it",
+    "The program crashes at print(p)",
+  ]}
+  answer={1}
+  explain="The result lies after the callee's mark, so scratch_end frees it. The bytes stay mapped, so nothing crashes. The next allocation in the arena uses the same bytes."
+>
+<ScratchConflictDemo />
+</Predict>
+
+Things to try:
+
+1. Step through with **one** arena. At line 5 the result lies past `pos`. At line 11, `"OVERWRITE"` lands on the same bytes, and `p` reads `"RWRITEOG"`. No tool reports it, because the bytes are inside a live heap block.
+2. Turn on **Poison bytes on scratch_end** and step to line 12. The read now stops with `use-after-poison`, as AddressSanitizer reports it for memory that the program poisoned with `ASAN_POISON_MEMORY_REGION`.
+3. Select **two** arenas. `scratch_begin(out)` returns the arena that is not `out`, so the temporary data goes to B and the result in A is safe.
+
+Two arenas per thread are enough for this pattern. A function has one `out` arena from its caller, so one other arena is always free for scratch. In the next level down, that scratch arena becomes `out`, and the first one is free again. A function that takes two output arenas needs a third scratch arena.
+
+Debug builds should poison on restore. An arena that fills restored bytes with a pattern such as `0xAA` makes the bug visible in output. ASan poisoning makes it stop at the first bad read.
+
+## Per-request arenas in Zig
+
+Zig has no thread-local scratch arena in the standard library. The usual pattern is an `ArenaAllocator` that a loop resets after each request. `reset` takes a mode: `.free_all`, `.retain_capacity`, or `.{ .retain_with_limit = n }`, which keeps at most n bytes for the next round. This program was run with Zig 0.17.1:
+
+```zig
+fn handle(scratch: std.mem.Allocator, request: []const u8) !usize {
+    const upper = try std.ascii.allocUpperString(scratch, request);
+    var words: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.tokenizeScalar(u8, upper, ' ');
+    while (it.next()) |w| try words.append(scratch, w);
+    return words.items.len; // no frees: the arena reset does it
+}
+
+pub fn main() !void {
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const requests = [_][]const u8{ "get the index", "post a form", "get a page" };
+    for (requests) |r| {
+        defer _ = arena.reset(.{ .retain_with_limit = 64 * 1024 });
+        const n = try handle(arena.allocator(), r);
+        std.debug.print("{s}: {d} words, arena holds {d} bytes\n", .{ r, n, arena.queryCapacity() });
+    }
+}
+```
+
+```text
+get the index: 3 words, arena holds 304 bytes
+post a form: 3 words, arena holds 304 bytes
+get a page: 3 words, arena holds 304 bytes
+```
+
+The capacity stays the same after the first request. The arena makes no new calls to `page_allocator`. In Odin, `context.temp_allocator` with `free_all` gives the same loop, as the [context lesson](/systems/explicit/odins-context-allocator) shows.
+
+## Go and Rust
+
+**Go.** The garbage collector frees temporary objects, so Go has no free to save. It pays in collector work instead. `sync.Pool` lets a program reuse objects across requests. The documentation says that its purpose is "to cache allocated but unused items for later reuse, relieving pressure on the garbage collector". It also warns that "any item stored in the Pool may be removed automatically at any time without notification".
+
+Since Go 1.13, a pool keeps some objects across a collection. Go also has an experimental `arena` package. In Go 1.25 it is still there, behind `GOEXPERIMENT=arenas`. Its proposal, issue 51317, is "on hold indefinitely due to serious API concerns" since January 2023.
+
+**Rust.** The `bumpalo` crate gives a bump arena. `Bump::reset` "performs mass deallocation", and bumpalo never runs `Drop` for values in the arena. The borrow checker solves the conflict at compile time. `alloc` borrows the arena shared, and `reset` borrows it mutably, so a live reference blocks the reset. A toy arena with the same signatures shows the error (rustc 1.96):
+
+```rust
+let mut arena = Arena::new(64);
+let p = arena.alloc_str("/tmp/LOG");
+arena.reset();
+println!("{p}");
+```
+
+```text
+error[E0502]: cannot borrow `arena` as mutable because it is also borrowed as immutable
+21 |     let p = arena.alloc_str("/tmp/LOG");
+   |             ----- immutable borrow occurs here
+22 |     arena.reset();
+   |     ^^^^^^^^^^^^^ mutable borrow occurs here
+23 |     println!("{p}");
+   |                - immutable borrow later used here
+```
+
+[Borrowing and the borrow checker](/systems/ownership/borrowing-and-the-borrow-checker) explains this rule in full.
+
+## What it costs
+
+An arena wins because a bump is much cheaper than `malloc` plus `free`. It loses when the data must live longer than the arena. Then each survivor must be copied out to longer-lived memory. The model below has five model inputs. They are typical sizes, not measurements: `malloc` 20 ns, `free` 15 ns, bump 2 ns, reset 50 ns, copy 0.1 ns per byte.
+
+<TempCostDemo />
+
+Things to try:
+
+1. Keep 100 objects of 64 bytes, with 10% that outlive the request. `malloc` costs 3500 ns per request and the arena costs 664 ns: the arena is 5.3 times faster.
+2. Move **Objects that outlive the request** to the right. The two lines cross at 78.5%. Past that point, the copies cost more than the arena saves.
+3. Make the objects 4 KiB. The copy cost grows with the size, so the break-even point moves to the left.
+4. Set 2 objects per request. The fixed reset cost now matters, and the arena gains less.
+
+For each request of $n$ objects of size $s$, with a fraction $f$ that survives:
+
+$$
+T_\text{malloc} = n\,(c_m + c_f), \qquad T_\text{arena} = n\,c_b + c_r + f\,n\,(c_m + c_f + c_c\,s)
+$$
+
+The break-even fraction is where the two are equal. The real numbers on your machine differ, and only a profile can tell. The shape of the result does not: an arena pays off when almost everything dies together.
+
+## What this means for your code
+
+- Give a function a scratch arena for its temporary data and an explicit allocator for its result. Never write the result into your own scratch arena.
+- Keep two scratch arenas per thread, and pass the output arena to `scratch_begin` as the conflict.
+- Poison restored bytes in debug builds. Without it, a use after restore reads other data and does not crash.
+- Copy out what must survive, and keep it small. When most objects survive, use a general-purpose allocator for them.
+
+## Connect
+
+- [Arena allocators](/systems/allocators/arena-allocators) covers chunks, waste and lifetimes.
+- [Odin's context allocator](/systems/explicit/odins-context-allocator) has a temp allocator in every context.
+- [defer and errdefer](/systems/explicit/defer-and-errdefer) shows how the restore at scope end is written in each language.
+- [Fragmentation](/systems/allocators/fragmentation) shows the cost that arenas avoid for short-lived objects.
+
+<Recall cards={[
+  { q: "What does a scratch mark do?", a: "It saves the arena position at the start of a function. Restoring it frees everything allocated after it in one step." },
+  { q: "What goes wrong when a function writes its result into the same arena that it uses as scratch?", a: "The result lies after the function's mark, so restoring the mark frees it. The caller's next allocation writes over the bytes." },
+  { q: "Why are two scratch arenas per thread enough for the usual pattern?", a: "A function has one output arena from its caller. scratch_begin returns the other arena, and one level down the roles swap." },
+  { q: "Why does a use after restore not crash, and how can a debug build catch it?", a: "The bytes stay inside a live mapping. Poisoning restored bytes, with a fill pattern or ASan's manual poisoning, makes the bad read visible." },
+  { q: "How does Rust stop a reference into an arena from outliving reset?", a: "alloc borrows the arena shared and reset borrows it mutably. A live reference keeps the shared borrow, so the reset does not compile (E0502)." },
+  { q: "When does an arena lose against malloc and free?", a: "When a large fraction of the objects must outlive the arena. Then each survivor costs a malloc, a free and a copy on top of the bump." },
+]} />

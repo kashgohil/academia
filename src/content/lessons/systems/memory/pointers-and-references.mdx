@@ -1,0 +1,158 @@
+---
+summary: "A pointer is an address plus a type plus provenance. Pointer arithmetic and one-past-the-end, array decay, C++ and Rust references, fat pointers (slices, strings, trait objects, interfaces), and what happens to a pointer when a Go slice, a C++ vector or a Rust Vec grows."
+---
+import { SysMemoryArithDemo, SysMemoryFatPtrDemo, SysMemoryHoldDemo, SysMemoryGrowthDemo } from "@/demos/sys/SysMemoryPointerDemos";
+
+A **pointer** is a value that holds the address of other data. The address alone is a number. The **type** of the pointer adds two facts: how many bytes to read at that address, and how to interpret them. A third fact is invisible at run time but real to the compiler: **provenance**, the allocation that the pointer came from.
+
+This lesson takes the language view. It shows what a pointer is in C, C++, Rust, Zig and Go, and why some pointers carry more than one word. It ends with the most common pointer bug in growable arrays.
+
+<Predict
+  id="one-past"
+  question="int a[8]; Which of these is undefined behavior in C, if the program never dereferences the result?"
+  options={[
+    "Neither: forming a pointer is always fine, only a dereference can fail",
+    "Forming a + 9, but not a + 8",
+    "Both a + 8 and a + 9",
+  ]}
+  answer={1}
+  explain="C allows a pointer to each element and one past the last element (C11 6.5.6p8). The pointer a + 8 is that one-past pointer: you can compare and subtract it, but not read through it. The pointer a + 9 is undefined even to compute, and the optimizer may assume that it never happens."
+>
+<SysMemoryArithDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **int** and move **i** from 0 to 7. The address moves by 4 bytes each step, because `p + i` counts elements, not bytes.
+2. Select **double** and then **struct point**. The same `p + 3` now moves 24 bytes and then 36 bytes.
+3. Move **i** to 8. The pointer is one past the end. The machine reports a heap-buffer-overflow for the read, but forming the pointer is legal.
+4. Move **i** to 9 or to -1. Now even forming the pointer is undefined in C.
+
+## Arithmetic, arrays and decay
+
+In C, `p + i` adds `i * sizeof *p` to the address. `a[i]` is defined as `*(a + i)`. Subtraction of two pointers into one array gives a count of elements. The standard allows these operations only inside one array object, plus the one-past-the-end position (N1570 6.5.6p8).
+
+An array is not a pointer, but it turns into one in most expressions. This is **array decay** (N1570 6.3.2.1p3). The exceptions are `sizeof`, `_Alignof`, unary `&`, and a string literal that initializes an array. So `sizeof a` is 32 for `int a[8]`, but a function parameter declared as `int a[8]` is really `int *a`, and `sizeof a` there is 8 on a 64-bit target. The length is lost at the call.
+
+The other languages limit arithmetic more:
+
+- **Rust.** References have no arithmetic. Raw pointers have `add` and `offset`, which are `unsafe`. The standard library says that `add` is "immediate Undefined Behavior when crossing object boundaries". `wrapping_add` is safe to call, but a read out of bounds is still undefined. Safe code uses slices, which check every index.
+- **Zig.** The type says what you may do. `*T` points to one item and has no arithmetic. `[*]T` points to many items of unknown count and allows `ptr + i`. A slice `[]T` knows its length, and indexing checks it in Debug and ReleaseSafe builds.
+- **Go.** No pointer arithmetic in safe code. Package `unsafe` allows it through a round trip to `uintptr` under its documented rules, and `unsafe.Add` (Go 1.17) is a helper for that. Slices and strings carry their length.
+
+## Null and provenance
+
+**Null** is the pointer that points to nothing. In C a null pointer can appear anywhere that a pointer can. Rust references can never be null, so `Option<&T>` uses the null value for `None` and is still 8 bytes. Zig writes the same idea as `?*T`. Go has `nil`, and a nil dereference panics.
+
+**Provenance** is the allocation that a pointer was derived from. Two pointers can hold the same address and still differ. One is derived from array `a`. The other is one past the end of array `b`, which happens to lie next to `a`. The compiler may assume that a pointer derived from `b` never touches `a`.
+
+Rust's standard library describes this model, and its strict provenance APIs such as `addr` and `with_addr` became stable in Rust 1.84. The [aliasing rules lesson](/systems/ub/aliasing-rules) shows what the optimizer does with it. The memory machine in these demos tracks provenance in the same way.
+
+## References
+
+A **reference** is a pointer with rules that the compiler enforces. The machine code is the same: a reference is an address in a register or in memory.
+
+- **C++ references** must be bound when they are made, and they cannot be made to refer to another object later. A valid program has no null references. Nothing checks that a reference still refers to a live object.
+- **Rust references** come in two kinds. Many `&T` can exist at once, or exactly one `&mut T`, never both. A reference is always non-null, aligned and valid for its whole lifetime. The borrow checker proves these rules at compile time.
+
+## Fat pointers
+
+A **fat pointer** is a pointer with extra words. A pointer to a slice carries its length. A pointer to a value of unknown type carries a pointer to a table of functions, a **vtable**.
+
+<SysMemoryFatPtrDemo />
+
+Things to try:
+
+1. Keep **Go: []int32** and move the slice start and end. `ptr` moves by 4 bytes per element, `len` is the count, and `cap` runs to the end of the backing array.
+2. Select **Rust: &[u32]** or **Zig: []u32**. They have the same two words, with no capacity.
+3. Select **Rust: &dyn Shape**. The second word points to a vtable, not to more data.
+4. Select **Go: interface**. The words are in the other order: type information first, then the data pointer.
+
+| Type | Words | Size on 64-bit |
+|---|---|---|
+| C `int *`, Rust `&u32`, Zig `*u32` | address | 8 |
+| Rust `&[T]`, `&str`; Zig `[]T`; C++ `std::span`, `std::string_view` | address, length | 16 |
+| Rust `&dyn Trait`, `Box<dyn Trait>` | data address, vtable address (order not guaranteed) | 16 |
+| Go `string` | address, length | 16 |
+| Go interface | type or itab, data address | 16 |
+| Go slice | address, length, capacity | 24 |
+| Rust `Vec<T>`, `String` | address, capacity, length (order not specified) | 24 |
+
+We checked each size with rustc 1.96 (`size_of`), go 1.25 (`unsafe.Sizeof`), zig 0.17.1 (`@sizeOf`) and Apple clang 21 with libc++ (`sizeof`). A two-word fat pointer usually travels in two registers on x86-64 and AArch64, so the extra word is almost free. The win is large: the length travels with the address, so every index can be checked.
+
+## Grow while you hold a pointer
+
+A growable array, such as a Go slice, a C++ `std::vector` or a Rust `Vec`, keeps its elements in one heap block. When the block is full, a push allocates a larger block, copies the elements and frees the old block. Any pointer into the old block is now stale.
+
+<Predict
+  id="go-append-hold"
+  question="Go: s := []int{1, 2, 3}; p := &s[0]; s = append(s, 4); *p = 99; fmt.Println(s[0], *p). What does it print?"
+  options={[
+    "99 99: p and s share one array",
+    "1 99: append moved s to a new array, and p still points to the old one",
+    "It crashes or prints garbage: p dangles",
+  ]}
+  answer={1}
+  explain="The slice has capacity 3, so append allocates a new array with capacity 6 and copies 1, 2, 3. The pointer p still points into the old array, and the garbage collector keeps that array alive. The write is safe but lost for s. Go 1.25 prints 1 99."
+>
+<SysMemoryHoldDemo />
+</Predict>
+
+Things to try:
+
+1. Step through **Go**. After `append`, `s` points to array B, and `p` still points to array A. A stays alive, because `p` refers to it.
+2. Select **C++**. `push_back` frees the old block, so the write through `first` is a heap-use-after-free. AddressSanitizer reported the same error for this program with Apple clang 21.
+3. Select **Rust**. The program does not compile: `push` needs `&mut v` while `first` still borrows `v`. The fix keeps an index, which stays valid when the buffer moves.
+
+The three results show three designs. C++ trusts the programmer, and the bug is undefined behavior. Go keeps the old memory alive, so the bug is a silent logic error, never memory corruption. Rust makes the bug impossible to compile.
+
+The Go version has a second trap. When a slice still has spare capacity, `append` writes into the shared array:
+
+```go
+a := make([]int, 3, 4)
+x := append(a, 4)
+y := append(a, 5)       // writes the same slot as x[3]
+fmt.Println(x[3], y[3]) // 5 5 (go 1.25)
+```
+
+Both appends see `len 3, cap 4`, so both store into slot 3 of the same array. To force a copy, use a full slice expression, `a[:3:3]`, which sets the capacity to the length.
+
+## How fast they grow
+
+<SysMemoryGrowthDemo />
+
+Things to try:
+
+1. Keep 1,000 elements of 8 bytes, with a Go slice that escapes to the heap. Go reallocates 12 times and copies 1,871 elements. Rust reallocates 9 times, libc++ 11 times, and both copy about 1,020.
+2. Move the count to 20,000. The Go line bends at 256 elements. Above that size, Go grows by less than 2× per step.
+3. Select **1 byte**. Go's first capacity jumps to 8, and Rust's starts at 8 too, for different reasons.
+4. Clear **Go slice escapes**. Since Go 1.25 a slice that does not escape starts in a 32-byte stack buffer: capacity 4 for 8-byte elements, 32 for bytes. Go then makes 10 allocations and copies 1,868 elements.
+
+Go's rule is in `runtime/slice.go` (Go 1.25). `nextslicecap` doubles the capacity below 256 elements. Above that, it adds `(newcap + 768) / 4` until the new length fits, which tends to 1.25× growth. Then `growslice` rounds the new array up to an allocator **size class**. For example, growing a `[]int` from 512 gives 832 elements, which is 6,656 bytes, and the next size class is 6,784 bytes. So the capacity becomes 848.
+
+Rust's `Vec` doubles, with a minimum of 4 elements for most element sizes and 8 for 1-byte elements (`grow_amortized` in rustc 1.96). The libc++ vector doubles too: capacity 3 grows to 6. Doubling copies fewer than two elements per push on average. Go's slower growth for large slices wastes less memory but copies more: about 4 elements per push at a million elements of 8 bytes.
+
+## What this means for your code
+
+- **Do not keep a pointer or reference into a growable array across a push.** Keep an index, or reserve the full capacity first (`reserve`, `make` with a capacity, `Vec::with_capacity`).
+- **Pass a pointer and a length together.** In C, pass a struct or two parameters. In C++, pass `std::span`. Rust, Zig and Go slices do this for you.
+- **In Go, never assume that append copies.** Two slices of one array share writes until one of them grows. Use `a[:len(a):len(a)]` to force a copy on the next append.
+- **Prefer indices over pointers for links between elements.** An index survives reallocation and is often 4 bytes instead of 8.
+- **Treat one-past-the-end as a bound, never as an element.** Loop with `p != end`, and never read `*end`.
+
+## Connect
+
+- [Stack and heap](/systems/memory/stack-and-heap) shows what a dangling pointer to a local does.
+- [Borrowing and the borrow checker](/systems/ownership/borrowing-and-the-borrow-checker) explains the rule that rejected the Rust program.
+- [Aliasing rules](/systems/ub/aliasing-rules) shows how compilers use provenance and types.
+- [Struct layout](/systems/memory/struct-layout-alignment-and-padding) shows how the bytes behind a pointer are arranged.
+- [General-purpose allocators](/systems/allocators/general-purpose-allocators) explains size classes, such as the ones that Go rounds to.
+
+<Recall cards={[
+  { q: "Which pointers into int a[8] may C code form, and which may it dereference?", a: "It may form a + 0 to a + 8. It may dereference a + 0 to a + 7. a + 8 is one past the end: valid for comparison and subtraction only." },
+  { q: "Why does sizeof give a different answer for an array inside a function that received it?", a: "The array decayed to a pointer at the call. The parameter int a[8] is really int *a, so sizeof gives the pointer size." },
+  { q: "What are the words of a Rust &dyn Trait, and of a Go interface?", a: "Rust: a data pointer and a vtable pointer, in that order in current rustc (the order is not guaranteed). Go: type or itab pointer, then data pointer. Both are 16 bytes on 64-bit." },
+  { q: "A Go slice has len 3 and cap 4. Two appends of different values happen on it. Why do the results share a slot?", a: "Both appends fit in the capacity, so both write slot 3 of the same backing array. The second write wins for both slices." },
+  { q: "What does each language do with a pointer into an array that a push then reallocates?", a: "C++: the pointer dangles, and a use is undefined behavior. Go: the old array stays alive, and the write is lost for the slice. Rust: the program does not compile." },
+  { q: "How does Go grow a slice above 256 elements?", a: "nextslicecap adds (newcap + 768) / 4 until the length fits, close to 1.25x. Then growslice rounds the bytes up to an allocator size class." },
+]} />

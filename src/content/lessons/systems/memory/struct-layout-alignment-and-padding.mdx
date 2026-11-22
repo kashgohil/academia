@@ -1,0 +1,113 @@
+---
+summary: "How compilers place struct fields: alignment, padding and tail padding by the psABI rules, field reordering in Rust and Zig but never in C, Go's declaration order and 32-bit atomics, Option niches, packed structs and misaligned references, over-alignment, and data-model traps."
+---
+import { SysMemoryReorderDemo, SysMemoryPackedDemo } from "@/demos/sys/SysMemoryStructDemos";
+
+A struct is a list of fields, but memory is a line of bytes. The compiler must give each field an **offset**: its distance in bytes from the start of the struct. Each field also has an **alignment**: its address must be a multiple of that number. The bytes that the rules leave unused are **padding**. The rules come from the platform ABI. So two compilers on one platform agree, and C code can share structs with Rust, Zig and Go code.
+
+<Predict
+  id="struct-m"
+  question="struct M { uint8_t a; uint64_t b; uint8_t c; uint32_t d; uint16_t e; }; holds 16 bytes of data. What is sizeof(struct M) on x86-64 Linux?"
+  options={["16", "24", "32"]}
+  answer={2}
+  explain="Field b needs an 8-byte boundary, so 7 bytes of padding follow a. Fields c, d and e then end at byte 26, and the size rounds up to 32, a multiple of 8. Half the struct is padding. In the order b, d, e, a, c the same fields fit in 16 bytes, which is what rustc does."
+>
+<SysMemoryReorderDemo />
+</Predict>
+
+Things to try:
+
+1. Keep the struct **u8, u64, u8, u32, u16**. Find the hatched padding: 7 bytes after `a`, 3 after `c`, and 6 at the end. Then press **Sort by alignment**: 16 bytes, no padding.
+2. Press **Reset** and select **repr(Rust) model**. The memory order changes, but the declaration does not. This is what rustc does when you do not write `#[repr(C)]`.
+3. Select the target **i386 Linux**. A `uint64_t` needs only 4-byte alignment there, so the C order takes 24 bytes, not 32.
+4. Select **struct epoll_event** on x86-64 Linux, then on AArch64 Linux. The same header gives 12 bytes and 16 bytes.
+5. Select **long, int** and switch between Linux and Windows. The struct is 16 bytes or 8 bytes, because `long` changes size.
+
+## The C rules
+
+The System V psABIs, the Arm AAPCS64 and the Microsoft x64 conventions all use the same algorithm. The Rust Reference gives the same algorithm for `#[repr(C)]`. **Tail padding** is the gap that the last step adds.
+
+<Steps>
+<div>Start at offset 0.</div>
+<div>For each field in declaration order, round the offset up to a multiple of the field's alignment. The gap is padding. Place the field, and add its size.</div>
+<div>The alignment of the struct is the largest alignment of its fields.</div>
+<div>Round the size up to a multiple of the struct's alignment. This gap is tail padding.</div>
+</Steps>
+
+Tail padding exists for arrays. In `struct M m[2]`, element 1 starts at `sizeof(struct M)`. That address must be a multiple of 8 for `m[1].b` to be aligned. So the size of a type is always a multiple of its alignment.
+
+The alignment of each scalar comes from the psABI of the target, and the targets disagree:
+
+| Type | x86-64 Linux, AArch64 Linux, RV64 | x86-64 Windows | i386 Linux |
+|---|---|---|---|
+| `long` | 8 bytes, align 8 | 4, align 4 | 4, align 4 |
+| `long long`, `double` in a struct | align 8 | align 8 | align 4 |
+| `long double` | 16, align 16 | 8, align 8 | 12, align 4 |
+| pointer | 8 | 8 | 4 |
+
+Linux and macOS use **LP64**: `long` and pointers are 64 bits. Windows uses **LLP64**: `long` stays 32 bits. So a struct with a `long` changes size between the two, and so does any file format or wire format that uses `long`. Use `int64_t` and `uint32_t` in shared structs.
+
+Good C APIs design their structs with no padding at all. `Elf64_Sym` puts a 4-byte name, two 1-byte fields and a 2-byte index in its first 8 bytes, then two 8-byte fields: 24 bytes on every target. `struct sockaddr_in` is 16 bytes everywhere. `struct epoll_event` is the exception that proves the rule. The Linux header packs it on x86-64, with the comment "On x86-64 make the 64bit structure have the same alignment as the 32bit structure. This makes 32bit emulation easier." So it is 12 bytes on x86 and 16 bytes on AArch64.
+
+## Who may reorder fields
+
+**C and C++.** C never reorders. N1570 6.7.2.1p15 says that members "have addresses that increase in the order in which they are declared". Before C++23, C++ left the order of members with different access control unspecified. P1847R4 made declaration order mandatory in C++23, and compilers kept that order in practice before. So the order that you write is the order in memory, and you must sort the fields yourself.
+
+**Rust.** The default representation guarantees only alignment and no overlap: "There are no other guarantees of data layout made by this representation" (Rust Reference, "Type layout"). rustc 1.96 reorders fields to reduce padding. For `struct S { c: u8, i: u32, s: u16 }`, `offset_of!` gives `i` at 0, `s` at 4 and `c` at 6: 8 bytes, where `repr(C)` gives 12. Write `#[repr(C)]` for every struct that crosses an FFI boundary or a file format.
+
+Rust also uses invalid bit patterns, called **niches**. A reference or a `Box` is never null, so `Option<Box<u8>>` uses null for `None` and stays 8 bytes. `Option<char>` is 4 bytes and `Option<bool>` is 1 byte. `Option<u32>` has no niche, so it needs a tag: 8 bytes. We checked all four with rustc 1.96.
+
+**Zig.** A plain `struct` has no guaranteed layout: "Zig gives no guarantees about the order of fields and the size of the struct" (language reference, 0.17.1). Zig 0.17.1 puts `struct { c: u8, i: u32, s: u16 }` in 8 bytes with `i` first. An `extern struct` uses the C rules. A `packed struct` is different from C's packed: it stores the fields bit by bit in one backing integer. Our 7-byte example becomes a `u56`, and `@sizeOf` gives 8.
+
+**Go.** The gc compiler keeps declaration order. `struct { C byte; I int32; S int16 }` is 12 bytes, as in C. On 386, an `int64` field has 4-byte alignment, so `struct { Flag bool; N int64 }` puts `N` at offset 4. The `sync/atomic` documentation warns that 64-bit atomic functions need 64-bit alignment on 386, ARM and 32-bit MIPS. The types `atomic.Int64` and `atomic.Uint64`, added in Go 1.19, align themselves.
+
+**Odin.** The struct directives `#packed`, `#align(N)` and `#raw_union` change the layout (Odin overview; not checked locally, because Odin is not installed here).
+
+## Packed structs
+
+A **packed** struct has no padding: every field has alignment 1. GCC and Clang write `__attribute__((packed))`, MSVC writes `#pragma pack(1)`, and Rust writes `#[repr(C, packed)]`. Packing saves space and matches byte-exact formats. It costs speed and safety.
+
+<SysMemoryPackedDemo />
+
+Things to try:
+
+1. Keep **`*(&h[i].len)`** at i = 0. The field is at byte 1 of a 16-byte aligned array. The load through a `uint32_t *` is a misaligned access.
+2. Move **i**. Only i = 3 and i = 7 put `len` on a 4-byte boundary.
+3. Select **h[i].len** or **memcpy**. Both are fine for every i, because the compiler knows that the bytes may be unaligned.
+4. Select **Rust** with the pointer form. rustc rejects the reference with E0793 before the program runs.
+
+The difference is in the code that the compiler emits. When you read `h[i].len`, the compiler knows that the field is packed. On a target that may not support misaligned loads, it emits byte loads and shifts. With zig cc 0.17.1 for riscv64 at `-O2`, `h[i].len` became four byte loads and three shifts. The same read through `uint32_t *p = &h[i].len` became one `lw`, which may trap or be emulated slowly.
+
+C says that a pointer to `uint32_t` must be aligned, so the second form is undefined when it is not. Clang warns with `-Waddress-of-packed-member`. Rust goes further: creating a misaligned reference is undefined, "even if that reference is never dereferenced" (rustc 1.96, E0793). Copy the field, as in `let n = h.len;`, or use `std::ptr::read_unaligned` on a raw pointer.
+
+## Over-alignment
+
+`alignas(64)` in C and C++, `#[repr(align(64))]` in Rust and `align(64)` on a Zig field raise the alignment. When the alignment is on a type, the size grows with it, because the size must be a multiple of the alignment. A struct that holds one 8-byte counter with `alignas(64)` on the member becomes 64 bytes, so 8 counters take 512 bytes instead of 64. On a plain variable, `alignas(64)` moves the address but does not change `sizeof`. Programs use this to keep data that different threads write on different cache lines. The [false sharing lesson](/concurrency/patterns/false-sharing) measures the effect and lists the line sizes that each library assumes.
+
+Bit-fields are the opposite case: fields smaller than a byte. C leaves their order inside a unit to the implementation (N1570 6.7.2.1p11), and each psABI fixes it for its platform. Do not use C bit-fields to match a wire format. Shift and mask explicitly, or use a Zig `packed struct`, whose bit order the language defines.
+
+## What this means for your code
+
+- **Sort C, C++ and Go fields by alignment, largest first.** It often removes all padding. Rust and Zig do this for you unless you ask for C layout.
+- **Use fixed-width types in any struct that leaves the process.** `long` is 8 bytes on Linux and 4 on Windows.
+- **Write `#[repr(C)]` or `extern struct` at every FFI boundary.** The default layouts of Rust and Zig can change between compiler versions.
+- **Never take a plain pointer to a packed field.** Copy the field, or use `memcpy` or `read_unaligned`.
+- **Check sizes in the build.** `_Static_assert(sizeof(struct M) == 32, "")` in C, `const _: () = assert!(size_of::<M>() == 16);` in Rust and `comptime` asserts in Zig catch a layout change before it ships.
+- **Use Go's `atomic.Int64` instead of a plain `int64` with atomic functions** when the code may run on 32-bit targets.
+
+## Connect
+
+- [Endianness](/architecture/data/endianness) covers byte order and what unaligned access costs on each ISA.
+- [Struct of arrays vs array of structs](/performance/memory/struct-of-arrays-vs-array-of-structs) and [data-oriented design](/performance/memory/data-oriented-design) decide which fields belong in one struct.
+- [False sharing](/concurrency/patterns/false-sharing) shows why to over-align data that threads write.
+- [C ABI as lingua franca](/systems/abi/c-abi-as-lingua-franca) shows how these layout rules let languages share data.
+- [Pointers and references](/systems/memory/pointers-and-references) shows how a pointer's type decides how many bytes it reads.
+
+<Recall cards={[
+  { q: "What are the four steps of the C struct layout algorithm?", a: "Place each field in declaration order at the next multiple of its alignment. The struct alignment is the largest field alignment. Round the size up to a multiple of it (tail padding)." },
+  { q: "Why does a struct need tail padding?", a: "In an array, element i starts at i times the size. The size must be a multiple of the alignment, so that every element's fields stay aligned." },
+  { q: "Which of C, Rust, Zig and Go may reorder struct fields by default?", a: "Rust (repr(Rust)) and Zig (plain struct) may and do. C, C++ and Go keep declaration order. repr(C) and extern struct give C layout." },
+  { q: "Why is struct epoll_event 12 bytes on x86-64 but 16 on AArch64?", a: "The Linux and glibc headers mark it packed on x86, so its 64-bit layout matches the 32-bit one. Other architectures keep the natural 8-byte alignment of the data field." },
+  { q: "Why does rustc reject a reference to a field of a packed struct?", a: "A reference must be aligned. Creating a misaligned reference is undefined behavior even if it is never used (E0793). Copy the field or use read_unaligned." },
+  { q: "How large is Option of Box, of char and of u32 in Rust, and why?", a: "8, 4 and 8 bytes. Box and char have invalid values that can mean None (a niche). u32 uses every bit pattern, so it needs a tag and padding." },
+]} />

@@ -1,0 +1,131 @@
+---
+summary: "What goes where in a program image and why: .text, .rodata, .data and .bss, why zeros cost no file space, read-only string literals, the order in which globals are initialized in C++, Go, Rust and Zig, and thread-locals."
+---
+import { SysMemorySectionsDemo, SysMemoryLifetimeDemo, SysMemoryInitOrderDemo } from "@/demos/sys/SysMemoryStaticDemos";
+
+A global variable exists before `main` starts and until the process exits. This is **static storage duration**. The compiler decides where each global goes, and the program file stores what the loader needs to set it up. The choice depends on two questions: can the bytes change, and are they all zero?
+
+The compiler puts each kind of data in its own **section**, a named range of bytes in an object file. The linker joins equal sections from all object files. The loader then maps them into memory with the right access rights. This lesson stays at the level of "what goes where and why". The [linking module](/systems/linking/object-files-and-elf) shows the ELF records themselves.
+
+<Predict
+  id="bss-file-cost"
+  question="One C file defines static char buf[1 << 20]; with no initializer. You change it to static char buf[1 << 20] = {1};. How much larger does the object file get?"
+  options={[
+    "1 byte: only the first element is nonzero",
+    "About 1 MiB: the whole array must now be stored in the file",
+    "Nothing: the compiler stores the initializer as a list of nonzero bytes",
+  ]}
+  answer={1}
+  explain="An array with any nonzero byte goes to .data, and .data stores every byte of its contents. We measured it with zig cc 0.17.1: the object file grew from 1,336 to 1,049,912 bytes, which is 1,048,576 bytes more. Without the initializer, buf goes to .bss, which stores only its size."
+>
+<SysMemorySectionsDemo />
+</Predict>
+
+Things to try:
+
+1. Guess the section of each C global, then read the answer. Move **Array length N** to the right. The memory bar grows for every array, but the file bar grows only for `.data` and `.rodata`.
+2. Compare `int cleared[N] = {0};` with `int table[N] = {1};`. One nonzero element moves the whole array into the file.
+3. Select **Rust**. An immutable `static` of zeros goes to `.rodata`, not `.bss`, so its zeros take file space.
+4. Select **Zig**. The same `undefined` array goes to `.data` in a Debug build and to `.bss` in ReleaseSmall.
+5. Select **Go**. Its sections split by one more question: does the data hold pointers?
+
+## The four sections
+
+| Section | Holds | Rights at run time | In the file |
+|---|---|---|---|
+| `.text` | machine code | read, execute | yes |
+| `.rodata` | constants, string literals, jump tables | read | yes |
+| `.data` | writable globals with a nonzero initializer | read, write | yes |
+| `.bss` | writable globals that start as zero | read, write | no: only the size |
+
+The linker puts sections with the same rights into one **segment**, a `PT_LOAD` entry in the program header. A segment has two sizes: `p_filesz`, the bytes in the file, and `p_memsz`, the bytes in memory. For the writable segment, `p_memsz` is larger. The loader maps the file bytes and fills the rest with zero pages. The kernel provides those pages only when the program first touches them, as [demand paging](/os/vm/page-faults-and-demand-paging) explains.
+
+So `.bss` is free in the file and cheap at startup. A 1 MiB zero buffer costs 1 MiB of address space, but physical memory only for the pages that the program writes. The C standard requires zero for a static object without an initializer (N1570 6.7.9p10). So the compiler can use `.bss` for both an omitted initializer and an explicit `= 0`. GCC has `-fno-zero-initialized-in-bss` to turn this off.
+
+Two old C details still matter. A file-scope `int x;` without `extern` is a **tentative definition**. Old compilers put it in a COMMON block, and the linker merged equal names from different files. GCC 10 made `-fno-common` the default, and Clang 11 followed. Now two files that both define `int x;` fail to link, which is correct.
+
+Each language adds its own rules:
+
+- **Rust.** An immutable `static` cannot change, so rustc 1.96 puts it in `.rodata`, even when it is all zero. A `static mut`, or a type with interior mutability such as `AtomicU32`, goes to `.data` or `.bss`. A `static NAME: &str` goes to `.data.rel.ro`: the dynamic loader writes the address once, and then the page becomes read-only.
+- **Zig.** A container-level `var` with `undefined` has no value. In Debug mode Zig fills undefined memory with 0xAA bytes, so the array is stored in `.data`. In the release modes that we tried with zig 0.17.1, it went to `.bss`.
+- **Go.** The linker uses `.noptrdata` and `.noptrbss` for globals without pointers, and `.data` and `.bss` for globals with pointers. The garbage collector scans only the second pair as roots. A `string` holds a pointer, so a string global lands in `.data`.
+
+## String literals and static locals
+
+A string literal such as `"hello"` is an array with static storage duration. The C standard says that a program that modifies it has undefined behavior (N1570 6.4.5p7). The compiler puts it in a read-only section, `.rodata.str1.1` in an object file from clang. The linker can merge equal strings across files, because no program may write them.
+
+`char *s = "hello";` makes a pointer to that read-only array. `char a[] = "hello";` makes a new array and copies 6 bytes into it. Only the second one is yours to change.
+
+<SysMemoryLifetimeDemo />
+
+Things to try:
+
+1. Step 1 loads the globals before `main` runs. `greet` is in `.data` and holds the address of `"hello"` in `.rodata`. `total` and `calls` are in `.bss` and read 0.
+2. Step through the first call to `count`. `local` lives in the frame. `calls` lives in `.bss`, although it is declared inside the function.
+3. Step through the second call. `local` starts again from 0. `calls` goes from 1 to 2, because its storage outlives every call.
+4. Step to line 15. The write to the stack copy works.
+5. Step to line 16. The write through `greet` goes to a read-only page. The machine reports a segv; on Linux the process gets SIGSEGV.
+
+A `static` local is a global with a hidden name. Its symbol is `count.calls` in the clang object file. It keeps its value between calls, and it is shared by all threads. A function with a static local is therefore not reentrant, unless the variable is thread-local or protected.
+
+## Initialization order
+
+Some globals need code to compute their first value. C forbids this: every initializer of a static object must be a constant expression (N1570 6.7.9p4). So a C program never runs code before `main` for its own globals. The other languages differ.
+
+<SysMemoryInitOrderDemo />
+
+Things to try:
+
+1. Keep **C++** with both boxes checked. The order works, and `cache` gets 6,144 bytes.
+2. Clear **Link logger.o before app.o**. `config` runs before the constructor of `logger` and reads 0. We saw this with Apple clang 21: the program printed 0 with one link order and 6 with the other.
+3. Turn the link order back on and clear **declare config before cache**. Now the error is inside one file.
+4. Select **Go** and change the declaration order. Go sorts by dependency, so the result is always 6,144.
+5. Select **Rust LazyLock** and **Zig**. Rust runs nothing before `main`. Zig computes the values at compile time.
+
+**C++.** Dynamic initialization in one file follows declaration order. Across files, the order is not specified: the standard calls it "indeterminately sequenced" ([basic.start.dynamic]). In practice the link order decides. A global that reads a global from another file can see it before its constructor runs. This is the **static initialization order fiasco**.
+
+There are two standard fixes. A function-local static is built on first use, and C++11 makes that thread-safe. C++20 `constinit` forces a compile-time initializer, or the code does not compile.
+
+```cpp
+Logger& logger() {
+    static Logger instance; // built on the first call, once
+    return instance;
+}
+```
+
+**Go.** The language specification defines the order. Package-level variables initialize "stepwise, with each step selecting the variable earliest in declaration order which has no dependencies on uninitialized variables". Then the `init` functions run, then `main`. A dependency cycle is a compile error, for example `initialization cycle for a` with Go 1.25.
+
+**Rust.** A `static` initializer must be a constant expression. With rustc 1.96, `static PREFIX: String = String::from("[app] ");` fails with E0015, and the error suggests `std::sync::LazyLock`. `LazyLock` (stable since Rust 1.80) runs its closure on the first access and blocks other threads until it is done. `OnceLock` (since 1.70) does the same with an explicit `get_or_init`. Rust has no life before `main` for statics.
+
+**Zig.** The initializer of a container-level variable must be comptime-known. With zig 0.17.1, a run-time value fails with "initializer of container-level variable must be comptime-known". The compiler runs the code and stores the result as bytes in the file.
+
+## Thread-local storage
+
+A **thread-local** variable has one copy per thread: C11 `_Thread_local`, C++ `thread_local`, Rust `thread_local!`, Zig `threadlocal var`, and Odin's `@(thread_local)` attribute. The compiler puts initialized thread-locals in `.tdata` and zero ones in `.tbss`. These two sections form a template. When the runtime creates a thread, it copies the template into a new block for that thread.
+
+Code finds the block of the current thread through a register. On x86-64 Linux, the `fs` segment base points to the thread control block, so a thread-local access is an `fs`-relative load. Go has no thread-local variables: a goroutine can move between threads, so per-thread data would not be per-goroutine data.
+
+## What this means for your code
+
+- **Prefer zero-initialized globals for large buffers.** They cost no file space and no startup time. One nonzero byte moves the whole buffer into the file.
+- **Never write through a pointer to a string literal.** Use `const char *` for literals, and copy into an array when you need to change the text.
+- **Do not let a C++ global read a global from another file in its constructor.** Use a function-local static, `constinit`, or explicit setup in `main`.
+- **Use LazyLock or OnceLock in Rust for computed globals.** They make the first-use cost and the thread safety explicit.
+- **Treat static locals as shared state.** They are globals, and threads share them.
+
+## Connect
+
+- [Object files and ELF](/systems/linking/object-files-and-elf) shows the section headers, symbols and relocations of these globals.
+- [Loading a program](/os/processes/loading-a-program-elf-and-the-dynamic-linker) shows how the kernel maps the segments.
+- [Address spaces](/os/vm/address-spaces) shows where the segments sit among the heap, the mmap area and the stack.
+- [Stack and heap](/systems/memory/stack-and-heap) covers the other two places where data lives.
+- [Zig comptime](/systems/comptime/zig-comptime) explains how Zig computes those constant initializers.
+
+<Recall cards={[
+  { q: "Why does a large zero array in .bss not make the program file larger?", a: ".bss is NOBITS: the file stores only its size. The loader maps zero pages for it, because the program header has p_memsz larger than p_filesz." },
+  { q: "Where does rustc put an immutable static of zeros, and why?", a: "In .rodata, because an immutable static can never change. Its zeros take file space. A static mut or an atomic of zeros goes to .bss." },
+  { q: "What is the difference between char *s = \"hi\" and char a[] = \"hi\"?", a: "The pointer s refers to a read-only literal: a write through it is undefined behavior, and it faults on Linux. The array a is a new writable copy of the bytes." },
+  { q: "What is the static initialization order fiasco?", a: "In C++, dynamic initializers in different files run in an unspecified order, in practice the link order. So a global can read another global before its constructor runs." },
+  { q: "How does Go choose the order of package-level variable initialization?", a: "Step by step, it picks the earliest variable in declaration order whose initializer has no uninitialized dependencies. A cycle is a compile error." },
+  { q: "Why does Go split its data into .data and .noptrdata?", a: "The garbage collector must scan globals that hold pointers as roots. Globals without pointers go to the noptr sections, which it skips." },
+]} />

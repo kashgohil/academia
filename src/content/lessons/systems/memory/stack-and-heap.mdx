@@ -1,0 +1,128 @@
+---
+summary: "Where a value lives and why: lifetime decides, not size. Stack frames, the heap, Go's escape analysis, stack limits for threads and goroutines, and what each language does when a pointer outlives its frame."
+---
+import { SysMemoryReturnLocalDemo, SysMemoryEscapeDemo, SysMemoryStackBudgetDemo } from "@/demos/sys/SysMemoryStackDemos";
+
+A running program keeps its data in three kinds of places. **Static storage** holds globals for the whole run. The **stack** holds the local variables of the functions that are running now. The **heap** holds objects that a program asks for and gives back at any time. The C standard names four **storage durations** in section 6.2.4 of N1570: static, thread, automatic and allocated.
+
+A common rule says "small things go on the stack, big things go on the heap". That rule is wrong. **Lifetime** decides where a value lives. A stack frame dies when its function returns, so a value that must live longer cannot stay in the frame. Size matters only at the edges, because a stack is small.
+
+<Predict
+  id="go-return-local"
+  question="A Go function declares x := 42 and returns &x. main stores the pointer, calls another function, and prints *p. What happens?"
+  options={[
+    "It prints garbage, as the same program does in C",
+    "It does not compile, as in Rust",
+    "It prints 42: the compiler moves x to the heap",
+  ]}
+  answer={2}
+  explain="Go's escape analysis sees that &x leaves the function. It allocates x on the heap, and the garbage collector frees it when no pointer reaches it. C compiles the same program with a warning. With clang the pointer dangles; GCC returns a null pointer instead. Rust refuses it."
+>
+<SysMemoryReturnLocalDemo />
+</Predict>
+
+Things to try:
+
+1. Step through **C**. The demo shows what clang builds. At step 4, `make` returns, and its frame turns grey. The frame is free stack now, but its bytes stay. The read at line 11 still gets 42.
+2. Keep stepping. The call to `other` puts a new frame at the same addresses, and `z = 7` writes over the dead `x`. The same read through `p` now gives 7.
+3. Select **Rust**. The program does not compile. The fix returns `Box<i32>`: the heap block lives until the `Box` is dropped.
+4. Select **Zig**. A direct `return &x` is a compile error in Zig 0.17.1. The same address through a local variable compiles, and it dangles at run time.
+5. Select **Go**. The frame of `newInt` has no `x`. The variable is a heap object from the start.
+
+The C result depends on the compiler. Clang (Apple clang 21 here) keeps the stale address, as the demo shows. GCC warns "function returns address of local variable" and returns a null pointer instead. Both `c_finish_return` in its C front end and its `isolate-paths` pass do this. With GCC, the first read through `p` crashes.
+
+## Lifetime decides
+
+A **stack frame** is the block of stack memory for one call of a function. It holds the return address, saved registers and local variables. The function makes it on entry and drops it on return. Calls nest, so frames die in the reverse order of their birth. This last-in, first-out order is the whole reason a stack works.
+
+A value fits the stack when its lifetime ends before its function returns. A value that must outlive the call needs storage that does not follow call order. That storage is the heap. An **allocator** manages the heap: it finds free bytes for each request and takes them back later. The [allocators module](/systems/allocators/general-purpose-allocators) shows what `malloc` does inside.
+
+Each language makes this choice in a different place:
+
+| Language | Who decides stack or heap | What happens when a pointer outlives its frame |
+|---|---|---|
+| C, C++ | the programmer (`malloc`, `new`) | compiles; the pointer dangles, and a use is undefined behavior |
+| Rust | the programmer, in the type (`Box`, `Vec`, `Rc`) | the borrow checker rejects it (E0515, E0106) |
+| Zig | the programmer, through an `Allocator` | some direct cases are compile errors; others dangle |
+| Go | the compiler (escape analysis) | the value moves to the heap; the program is correct |
+
+Rust, Zig and C never move a value to the heap on their own. In Rust, `Box::new` or a growable type such as `Vec` allocates. In Zig, every allocation goes through an `Allocator` value that you pass in. Go hides the choice. This makes the program safe, but the cost of an allocation is not visible in the source.
+
+## What a frame costs
+
+On x86-64, the **prologue** of a function moves the stack pointer `rsp` down by the size of the frame, in one `sub` instruction. The epilogue moves it back. Ten locals or a hundred cost the same. The memory is also hot in the cache, because the last call used the same addresses. The [calling conventions lesson](/architecture/isa/calling-conventions) shows a frame instruction by instruction.
+
+A heap allocation is a function call. The allocator searches its free lists, may take a lock, and must free the block later. In this lesson's model, one small heap allocation costs about 20 ns. That is a **model input**, not a measurement. With it, a function that allocates once and runs 10 million times per second spends 0.2 s of every second in the allocator.
+
+The heap has a second cost: lifetime is now your problem. Every heap block needs exactly one owner that frees it. A missed free is a leak. A second free, or a use after the free, is undefined behavior. Garbage collectors and Rust's ownership rules exist to solve this problem.
+
+## Go's escape analysis
+
+**Escape analysis** is a compiler pass that finds the values whose address can outlive their function. Such a value **escapes**, and the compiler allocates it on the heap. All other values stay on the stack, even when the code takes their address. The Go compiler prints its decisions with `go build -gcflags=-m`.
+
+<SysMemoryEscapeDemo />
+
+Things to try:
+
+1. Answer each function before you look. Functions 2, 3, 5 and 6 move a value to the heap because an address leaves the function.
+2. Look at function 4. `Sum` takes a pointer, but the compiler proves that `p does not escape`. So the caller can keep its `Point` on the stack.
+3. Compare functions 7 and 8. The same `make` call stays on the stack at 64 bytes and goes to the heap at 65,537 bytes, although nothing escapes.
+4. Look at function 9. Since Go 1.25, `make([]byte, n)` with a variable `n` gets a 32-byte stack buffer. A larger `n` still calls the heap allocator at run time.
+5. Look at function 11. Converting `n` to an interface value for `fmt.Println` makes it escape. Logging in a hot loop allocates.
+
+The limits come from `cmd/compile/internal/ir/cfg.go` in Go 1.25. `MaxStackVarSize` is 128 KiB for an explicit variable. `MaxImplicitStackVarSize` is 64 KiB for `new(T)`, `&T{}` and `make`. The 32-byte buffer is `VariableMakeThreshold` in `cmd/compile/internal/base/flag.go`.
+
+The analysis is conservative. If it cannot prove that a pointer stays inside, the value escapes. A call through an interface or a function value hides the callee, so arguments to it often escape. Inlining helps: when the compiler inlines a callee, it can see what the callee does with the pointer.
+
+## How big is the stack
+
+<SysMemoryStackBudgetDemo />
+
+Things to try:
+
+1. Keep a 1 KiB frame. The main thread holds 8,192 frames, and a 2 MiB Rust thread holds 2,048. Move the depth to 10,000: only the goroutine survives.
+2. Move the frame size to 64 KiB, the size of one large local buffer. A 2 MiB thread stack now holds only 32 frames.
+3. Set the depth to 2,000,000 with 1 KiB frames. Even the goroutine fails, at its 512 MiB maximum.
+4. Watch the goroutine line as you move the depth. Its stack doubles, and each growth copies the old stack.
+
+The defaults differ by kind of stack:
+
+- **Linux main thread.** The limit is `RLIMIT_STACK`. Its default is 8 MiB (`_STK_LIM` in the kernel), so `ulimit -s` shows 8192. The kernel grows the stack mapping on demand up to that limit.
+- **glibc threads.** NPTL takes the default thread stack size from `RLIMIT_STACK` at program start. When the limit is "unlimited", it uses 2 MB on most architectures (man 3 `pthread_create`).
+- **Rust threads.** `std::thread::spawn` gives 2 MiB on all Tier 1 platforms (rustc 1.96 documentation). `RUST_MIN_STACK` or `Builder::stack_size` changes it. Rust does not choose the size of the main thread.
+- **Goroutines.** A goroutine starts with `fixedStack` bytes: `stackMin` (2,048) plus an OS reserve, rounded up to a power of two (`runtime/stack.go`, Go 1.25). That is 2 KiB on Linux and macOS, 4 KiB on iOS and 8 KiB on Windows. When a call needs more, the runtime allocates a stack twice as large, copies the old one, and fixes the pointers into it.
+
+A thread stack has a **guard page** below it: a page with no access rights. A frame that reaches it causes a fault. The main stack instead grows on demand until it reaches `RLIMIT_STACK`, and an access below that limit faults. Linux also keeps `stack_guard_gap`, 256 pages by default, free of other mappings below the main stack. A C program dies with SIGSEGV. A Rust program prints `thread 'main' (…) has overflowed its stack` and aborts; we checked this with rustc 1.96.
+
+A goroutine stack can grow because Go knows where every pointer into it is. The runtime limit is `maxstacksize = 1000000000` bytes on 64-bit targets. The size doubles from 2 KiB, so the largest stack that fits is $2^{29}$ bytes, 512 MiB. The next growth fails with `goroutine stack exceeds 1000000000-byte limit`, which we saw with Go 1.25.6. Since Go 1.19, the runtime can also start new goroutines with the average stack size that it measured at the last garbage collection.
+
+## alloca and variable-length arrays
+
+C99 added **variable-length arrays** (VLAs): `char buf[n]` with a size known only at run time. C11 made them optional, with the macro `__STDC_NO_VLA__`. The nonstandard `alloca(n)` does the same: it moves `rsp` down by `n`. Both are fast, and both are dangerous when an attacker controls `n`.
+
+A large `n` can move `rsp` past the guard page in one step, into another mapping. No fault happens, and the next stores corrupt that memory. This is the **stack clash** attack. GCC 8 added `-fstack-clash-protection`, which touches each page as the stack grows. Neither Rust nor Zig has VLAs in the language: the length of an array type is always a compile-time constant.
+
+## What this means for your code
+
+- **Ask what outlives the call.** A value that outlives its function needs the heap or static storage. Size alone is rarely the reason.
+- **Do not put large buffers on a thread stack.** A 64 KiB local array uses one thirty-second of a 2 MiB Rust thread stack. Deep recursion on a thread can fail where the same code works on the main thread.
+- **Read the escape report in hot Go code.** `go build -gcflags=-m` shows each allocation that you did not write.
+- **Convert recursion on input data to a loop with an explicit stack.** Input depth is not under your control. A parser that recurses once per nesting level can overflow on a crafted file.
+- **Treat a pointer to a local as a borrowed value.** In C and C++, never store it where it can outlive the frame. In Rust, the compiler checks this for you.
+
+## Connect
+
+- [Address spaces](/os/vm/address-spaces) shows where the stack and the heap sit in a process.
+- [Calling conventions](/architecture/isa/calling-conventions) builds a frame instruction by instruction.
+- [General-purpose allocators](/systems/allocators/general-purpose-allocators) explains what `malloc` does with a request.
+- [Ownership in Rust](/systems/ownership/ownership-in-rust) and [Go's GC](/systems/gc/gos-gc) are the two answers to "who frees the heap".
+- [What UB really means](/systems/ub/what-ub-really-means) explains why a dangling read can print anything.
+
+<Recall cards={[
+  { q: "What decides whether a value can live on the stack?", a: "Its lifetime. It must end before the function that owns the frame returns. Size matters only at the limits." },
+  { q: "What does Go do with a local whose address is returned?", a: "Escape analysis moves it to the heap, and the garbage collector frees it later. go build -gcflags=-m prints 'moved to heap: x'." },
+  { q: "What are the default stack sizes of a Linux main thread, a Rust spawned thread and a new goroutine?", a: "8 MiB (RLIMIT_STACK default), 2 MiB, and 2 KiB that doubles on demand (up to 512 MiB in practice on 64-bit)." },
+  { q: "Why can a goroutine stack grow by copying, but a C thread stack cannot?", a: "The Go runtime knows every pointer into the stack and can fix them after a move. A C program can hold untracked pointers to stack memory anywhere." },
+  { q: "Why can a large alloca or VLA be a security bug even with a guard page?", a: "One large decrement of rsp can jump over the guard page into another mapping, so no fault happens. -fstack-clash-protection probes each page." },
+  { q: "Why does fmt.Println(n) make n escape in Go?", a: "The argument becomes an interface value that holds a pointer, and the analysis cannot prove that Println keeps no copy." },
+]} />

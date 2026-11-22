@@ -8,7 +8,7 @@
  *   <source-name>  ::= <length> <identifier>                                  ("3geo")
  *   builtin types are one letter (i int, d double, c char, m unsigned long, v void as an empty parameter list);
  *   P pointer, R lvalue reference, O rvalue reference, K const; template args I ... E; template params T_, T0_.
- *   Substitutions (5.1.8 "Compression"): each prefix, template prefix and non-builtin type gets the next seq-id when
+ *   Substitutions (5.1.10 "Compression"): each prefix, template prefix and non-builtin type gets the next seq-id when
  *   it first appears; a later use writes S_ (the first), S0_, S1_, ... S9_, SA_ ... (base 36) instead.
  *   For a function template, the return type is encoded first (5.1.5 "Type encodings", "bare-function-type").
  *

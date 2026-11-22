@@ -10,7 +10,7 @@
  *
  * The output uses the format of LLVM's c++filt (east const: "char const*", "std::vector<int>" with no space between
  * closing brackets). tests/unit/sys-abi-mangle.test.ts checks it against c++filt (Apple LLVM 21) on symbols compiled
- * with clang. The substitution rules are those of 5.1.8 "Compression": every prefix except the last component of a
+ * with clang. The substitution rules are those of 5.1.10 "Compression": every prefix except the last component of a
  * nested name, every template prefix, and every type that is not a builtin and not itself a substitution.
  *
  * Not read: local names (Z ... E), lambdas and unnamed types, ABI tags (B), expressions in template arguments, pointers

@@ -2,7 +2,7 @@
  * Smart pointer models for the smart-pointers lesson.
  *
  * - rcCycle: two `Rc<Node>` objects on the shared memory machine. Each node can point to the other with a strong
- *   `Rc` or a `Weak`. The rules are the ones in the Rust standard library (library/alloc/src/rcs/rc.rs, `RcInner` is `repr(C)` with strong, weak, value): an Rc
+ *   `Rc` or a `Weak`. The rules are the ones in the Rust standard library (library/alloc/src/rc.rs in Rust 1.96: `RcInner` is `#[repr(C, align(2))]` with the fields strong, weak, value): an Rc
  *   allocation holds a strong count, a weak count and the value. Dropping an Rc decrements the strong count; at zero
  *   the value is dropped, and then the implicit weak reference that all strong references share is released. The
  *   allocation is freed when the weak count reaches zero. `Rc::weak_count` does not show the implicit one.
@@ -36,7 +36,7 @@ export interface RcStep extends MemStep {
 }
 
 /** The Rc allocation of a node, as the model lays it out: two counts, the RefCell borrow flag, and the link. */
-export const RC_NODE: Type = struct("RcBox<Node>", [["strong", T.usize], ["weak", T.usize], ["borrow", T.isize], ["next", ptr()]]);
+export const RC_NODE: Type = struct("RcInner<Node>", [["strong", T.usize], ["weak", T.usize], ["borrow", T.isize], ["next", ptr()]]);
 
 export function rcSource(ab: Link, ba: Link): string[] {
   // Node has `next: RefCell<Option<Rc<Node>>>` and `back: RefCell<Option<Weak<Node>>>`

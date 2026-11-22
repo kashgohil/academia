@@ -545,7 +545,7 @@ class Lowerer {
     if (b.val?.t === "ref") {
       // a method through a reference: a use of the reference
       if (m.self === "mut" && !b.val.mut) {
-        this.emit({ op: "error", line, diag: { code: "E0596", line, message: `cannot borrow \`*${b.name}\` as mutable, as it is behind a \`&\` reference`, labels: [{ line, text: `\`${b.name}\` is a \`&\` reference, so the data it refers to cannot be borrowed as mutable`, primary: true }] } });
+        this.emit({ op: "error", line, diag: { code: "E0596", line, message: `cannot borrow \`*${b.name}\` as mutable, as it is behind a \`&\` reference`, labels: [{ line, text: `\`${b.name}\` is a \`&\` reference, so it cannot be borrowed as mutable`, primary: true }] } });
       }
       const args = e.args.map((a) => this.value(a, line, this.temp()));
       this.emit({ op: "use", line, holder: b.id });
@@ -705,7 +705,7 @@ class Lowerer {
           this.value(s.value, s.line, this.temp());
           this.emit({ op: "use", line: s.line, holder: b.id, deref: true });
           if (b.val?.t === "ref" && !b.val.mut) {
-            this.emit({ op: "error", line: s.line, diag: { code: "E0594", line: s.line, message: `cannot assign to \`*${b.name}\`, which is behind a \`&\` reference`, labels: [{ line: s.line, text: `\`${b.name}\` is a \`&\` reference, so the data it refers to cannot be written`, primary: true }] } });
+            this.emit({ op: "error", line: s.line, diag: { code: "E0594", line: s.line, message: `cannot assign to \`*${b.name}\`, which is behind a \`&\` reference`, labels: [{ line: s.line, text: `\`${b.name}\` is a \`&\` reference, so it cannot be written to`, primary: true }] } });
           }
           const to = b.val?.t === "ref" ? b.val.to : undefined;
           if (to?.t === "int") this.arith(to, s);

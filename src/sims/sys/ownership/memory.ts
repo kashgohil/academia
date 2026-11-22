@@ -10,7 +10,8 @@
  * - moveCompare: C++ `std::string b = std::move(a);` (steal the buffer, leave `a` empty, run two destructors) and
  *   Rust `let b = a;` (copy three words, forget `a`, run one drop).
  * - unwindMemory: the `save` function of cpp.ts on the machine: with manual cleanup an exception leaks the buffer
- *   and the FILE, and LeakSanitizer reports them at exit.
+ *   and leaves the FILE open; LeakSanitizer reports the buffer at exit, but not the FILE, which glibc's list of open
+ *   streams (`_IO_list_all`, modelled as a global) still reaches.
  *
  * Layout simplifications, said in the demos too: a String or std::string is shown as three words (ptr, cap, len);
  * Rust does not specify the order of String's fields, and libc++ packs its fields differently and keeps strings of
@@ -43,7 +44,6 @@ function recorder(m: Machine) {
 
 /** A string object as three words. */
 export const STRING = struct("String", [["ptr", ptr(T.u8)], ["cap", T.usize], ["len", T.usize]]);
-const bytesOf = (s: string) => [...s].map((c) => c.charCodeAt(0));
 
 // ---------------------------------------------------------------- let t = s;
 
@@ -52,21 +52,21 @@ export type AssignMode = "rust" | "copy" | "shallow";
 export const ASSIGN_SOURCE: Record<AssignMode, string[]> = {
   rust: [
     "fn main() {",
-    '    let s = String::from("hello");',
+    '    let s = "x".repeat(40); // 40 bytes on the heap',
     "    let t = s;          // move: copy 3 words",
     '    println!("{}", t);',
     "}                       // drop(t) only",
   ],
   copy: [
     "int main() {",
-    '    std::string s = "hello";',
+    "    std::string s(40, 'x'); // > 22 bytes: heap",
     "    std::string t = s;  // copy constructor",
     "    std::cout << t;",
     "}                       // ~t(), then ~s()",
   ],
   shallow: [
     "int main(void) {",
-    '    struct str s = str_from("hello");',
+    "    struct str s = str_repeat('x', 40);",
     "    struct str t = s;   // copies the pointer",
     '    printf("%s", t.ptr);',
     "    str_free(&t);",
@@ -78,25 +78,27 @@ export const ASSIGN_SOURCE: Record<AssignMode, string[]> = {
 export function stringAssign(mode: AssignMode): MemStep[] {
   const m = new Machine();
   const { steps, step } = recorder(m);
-  const hello = bytesOf("hello");
+  // 40 bytes: more than the 22 bytes that libc++ keeps inside a std::string, so every version uses the heap
+  const N = 40;
+  const text = Array(N).fill(120);
   let block: Ptr = { addr: 0 };
   step(1, "main gets a frame with room for s and t: three words each.", () => m.call("main", [{ name: "s", type: STRING }, { name: "t", type: STRING }]));
-  step(2, "The string asks the allocator for 5 bytes and writes hello there. s holds the pointer, the capacity and the length.", () => {
-    block = m.malloc(5, undefined, '"hello"');
-    m.store(block, array(T.u8, 5), hello);
-    m.set("s", { ptr: block, cap: 5, len: 5 });
+  step(2, `The string asks the allocator for ${N} bytes and fills them with x. s holds the pointer, the capacity and the length.${mode === "copy" ? " libc++ keeps strings of up to 22 bytes inside the object, so this one needs the heap." : ""}`, () => {
+    block = m.malloc(N, undefined, `${N} × 'x'`);
+    m.store(block, array(T.u8, N), text);
+    m.set("s", { ptr: block, cap: N, len: N });
   });
   if (mode === "rust") {
     step(3, "The move copies the three words of s into t. No heap work. The compiler now treats s as uninitialized: any use of s is error E0382.", () => m.set("t", m.get("s")), ["s"]);
-    step(4, "println reads the bytes through t.", () => m.load((m.get("t") as { ptr: Ptr }).ptr, array(T.u8, 5)));
+    step(4, "println reads the bytes through t.", () => m.load((m.get("t") as { ptr: Ptr }).ptr, array(T.u8, N)));
     step(5, "Scope end: t is dropped and frees the block. s is not dropped, because the compiler knows it was moved. One allocation, one free.", () => { m.free((m.get("t") as { ptr: Ptr }).ptr); m.exit(0); });
   } else if (mode === "copy") {
-    step(3, "The copy constructor allocates a second block and copies the 5 bytes. s and t own different blocks.", () => {
-      const b2 = m.malloc(5, undefined, '"hello" copy');
-      m.memcpy(b2, block, 5);
-      m.set("t", { ptr: b2, cap: 5, len: 5 });
+    step(3, `The copy constructor allocates a second block and copies the ${N} bytes. s and t own different blocks.`, () => {
+      const b2 = m.malloc(N, undefined, `${N} × 'x' (copy)`);
+      m.memcpy(b2, block, N);
+      m.set("t", { ptr: b2, cap: N, len: N });
     });
-    step(4, "The output reads the bytes through t.", () => m.load((m.get("t") as { ptr: Ptr }).ptr, array(T.u8, 5)));
+    step(4, "The output reads the bytes through t.", () => m.load((m.get("t") as { ptr: Ptr }).ptr, array(T.u8, N)));
     step(5, "Scope end: ~t() frees the copy, then ~s() frees the original, in reverse order of construction. Two allocations, two frees.", () => {
       m.free((m.get("t") as { ptr: Ptr }).ptr);
       m.free((m.get("s") as { ptr: Ptr }).ptr);
@@ -104,7 +106,7 @@ export function stringAssign(mode: AssignMode): MemStep[] {
     });
   } else {
     step(3, "Plain struct assignment copies the three words. Now two structs point at one block, and C does not know which one owns it.", () => m.set("t", m.get("s")));
-    step(4, "printf reads the bytes through t.", () => m.load((m.get("t") as { ptr: Ptr }).ptr, array(T.u8, 5)));
+    step(4, "printf reads the bytes through t.", () => m.load((m.get("t") as { ptr: Ptr }).ptr, array(T.u8, N)));
     step(5, "str_free(&t) frees the block.", () => m.free((m.get("t") as { ptr: Ptr }).ptr));
     step(6, "str_free(&s) frees the same block a second time: a double free. With glibc this can corrupt the allocator's lists.", () => m.free((m.get("s") as { ptr: Ptr }).ptr));
     step(7, "main returns.", () => m.exit(0));
@@ -230,21 +232,25 @@ export function unwindMemory(style: CleanupStyle, at: ThrowAt): MemStep[] {
   const m = new Machine();
   const { steps, step } = recorder(m);
   const run = unwind(style, at);
-  const raii = style === "raii";
-  const locals = raii
-    ? [{ name: "buf", type: ptr(T.char) }, { name: "f", type: ptr() }]
-    : [{ name: "buf", type: ptr(T.char) }, { name: "f", type: ptr() }];
+  const locals = [{ name: "buf", type: ptr(T.char) }, { name: "f", type: ptr() }];
+  // glibc links every open FILE into a global list (_IO_list_all), so an open FILE stays reachable
+  m.global("_IO_list_all", ptr());
   step(0, "The caller calls save inside a try block.", () => { m.call("caller"); m.call("save", locals); });
   for (const e of run.events) {
     step(e.line, e.text, () => {
       if (e.kind === "acquire" && /4096|new/.test(e.text)) m.set("buf", m.malloc(4096, undefined, "char[4096]"));
-      else if (e.kind === "acquire" && /open/.test(e.text)) m.set("f", m.allocNamed("FILE", "f", { size: 216 }));
+      else if (e.kind === "acquire" && /open/.test(e.text)) { const f = m.allocNamed("FILE", "f", { size: 216 }); m.set("f", f); m.set("_IO_list_all", f); }
       else if (e.kind === "release" && /buffer|delete/.test(e.text)) m.free(m.get("buf") as Ptr);
-      else if (e.kind === "release" && /file|fclose/.test(e.text)) m.free(m.get("f") as Ptr);
+      else if (e.kind === "release" && /file|fclose/.test(e.text)) { m.set("_IO_list_all", null); m.free(m.get("f") as Ptr); }
       else if (e.kind === "catch" || e.kind === "return") m.ret();
       else m.note(e.text);
     });
   }
-  step(0, run.held.length ? `The program exits. ${run.held.includes("lock") ? "mu is still locked, so the next call to save waits forever. " : ""}LeakSanitizer looks for heap blocks that nothing points to.` : "The program exits. Every resource was released.", () => m.exit(0));
+  const parts = [
+    run.held.includes("lock") ? "mu is still locked, so the next call to save waits forever." : "",
+    run.held.includes("file") ? "The FILE is still open. glibc's list of open streams still points to it, so LeakSanitizer does not report it, but its file descriptor stays open." : "",
+    run.held.includes("buffer") ? "LeakSanitizer reports the buffer: nothing points to it." : "",
+  ].filter(Boolean);
+  step(0, run.held.length ? `The program exits. ${parts.join(" ")}` : "The program exits. Every resource was released.", () => m.exit(0));
   return steps;
 }

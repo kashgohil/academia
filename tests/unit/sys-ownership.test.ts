@@ -58,6 +58,10 @@ describe("more programs, checked with rustc 1.96.1", () => {
 });
 
 describe("rustc-style labels", () => {
+  test("E0596 and E0594 through a & reference use rustc 1.96's label text", () => {
+    expect(check('let mut s = String::from("hi");\nlet r = &s;\nr.push_str("x");').errors[0]!.labels[0]!.text).toBe("`r` is a `&` reference, so it cannot be borrowed as mutable");
+    expect(check("let mut x = 5;\nlet r = &x;\n*r = 6;").errors[0]!.labels[0]!.text).toBe("`r` is a `&` reference, so it cannot be written to");
+  });
   test("E0502 has the three labels that rustc prints", () => {
     const e = check(byId("push").src).errors[0]!;
     expect(e.labels.map((l) => [l.line, l.text])).toEqual([[2, "immutable borrow occurs here"], [3, "mutable borrow occurs here"], [4, "immutable borrow later used here"]]);
@@ -106,6 +110,9 @@ describe("memory scripts", () => {
     expect(s.flatMap((x) => x.ub)).toEqual([]);
     expect(s[s.length - 1]!.snap.heap.filter((b) => b.state === "freed")).toHaveLength(1);
   });
+  test("the strings are 40 bytes: more than libc++'s 22-byte inline buffer, so the C++ copy uses the heap", () => {
+    expect(stringAssign("copy")[2]!.snap.heap.map((b) => b.size)).toEqual([40]);
+  });
   test("deep copy: two blocks, two frees", () => {
     const s = stringAssign("copy");
     expect(s.flatMap((x) => x.ub)).toEqual([]);
@@ -126,10 +133,10 @@ describe("memory scripts", () => {
       expect(s[s.length - 1]!.snap.heap.filter((b) => b.state === "freed")).toHaveLength(1);
     }
   });
-  test("unwinding: manual cleanup leaks two blocks; RAII leaks none", () => {
+  test("unwinding: manual cleanup leaks the buffer (the FILE stays reachable from glibc's stream list); RAII leaks none", () => {
     const leaks = (st: "manual" | "raii", at: "none" | "new" | "fill" | "write") => unwindMemory(st, at).flatMap((x) => x.ub).filter((u) => u.kind === "memory-leak").length;
-    expect(leaks("manual", "fill")).toBe(2);
-    expect(leaks("manual", "write")).toBe(2);
+    expect(leaks("manual", "fill")).toBe(1);
+    expect(leaks("manual", "write")).toBe(1);
     expect(leaks("manual", "new")).toBe(0);
     expect(leaks("manual", "none")).toBe(0);
     for (const at of ["none", "new", "fill", "write"] as const) expect(leaks("raii", at)).toBe(0);

@@ -53,7 +53,7 @@ export function UnwindDemo() {
         </div>
       } />
       {s.atEnd && <Banner tone={run.held.length ? "bad" : "good"}>
-        {run.held.length ? `After the catch, the program still holds: ${run.held.map((r) => RES_TEXT[r]).join(", ")}. No variable refers to them any more.` : "Every resource that the function took was released, in the reverse order of acquisition."}
+        {run.held.length ? `After the catch, the program still holds: ${run.held.map((r) => RES_TEXT[r]).join(", ")}. None of the program's own variables refers to them any more.` : "Every resource that the function took was released, in the reverse order of acquisition."}
       </Banner>}
     </Demo>
   );

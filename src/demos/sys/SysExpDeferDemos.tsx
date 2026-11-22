@@ -1,7 +1,7 @@
 /** Demos for "defer and errdefer": pick the error path and watch the cleanups; a defer inside a loop. */
 import { useMemo } from "react";
 import { Banner, ButtonRow, Demo, Legend, Line, Param, Plot, RuleY, SectionLabel, StepButtons, StepCaption, StepSlider, Stats, range, seg, select, useParams, useStepper } from "../../kit";
-import { BUGS, FAIL_POINTS, LOOP_SOURCE, deferSource, loopFds, runDefer, type Bug, type FailAt, type Lang, type LoopVariant } from "../../sims/sys/explicit";
+import { BUGS, FAIL_POINTS, GO_LINUX_POLLER_FDS, LOOP_SOURCE, STD_FDS, deferSource, loopFds, runDefer, type Bug, type FailAt, type Lang, type LoopVariant, type Platform } from "../../sims/sys/explicit";
 import { HeapBlocks, UbBanner } from "./SysViews";
 import { CleanupStack, Code } from "./SysExpUi";
 
@@ -58,7 +58,8 @@ export function CleanupPathDemo() {
 
 const LP = {
   files: range({ label: "Files to process", min: 10, max: 5000, step: 10, default: 2000, log: true }),
-  limit: select({ label: "Open-file limit", options: [{ value: "256", label: "256" }, { value: "1024", label: "1024" }, { value: "65536", label: "65536" }], default: "1024", segmented: true }),
+  platform: seg<Platform>("Platform", [["macos", "macOS"], ["linux", "Linux"]], "macos"),
+  limit: select({ label: "Open-file limit (soft = hard)", options: [{ value: "256", label: "256" }, { value: "1024", label: "1024" }, { value: "65536", label: "65536" }], default: "1024", segmented: true }),
   variant: seg<LoopVariant>("Code", [["go-loop", "Go: defer in loop"], ["go-func", "Go: func literal"], ["zig-block", "Zig: block defer"]], "go-loop"),
 };
 
@@ -66,18 +67,21 @@ export function DeferLoopDemo() {
   const P = useParams("sys-exp-loop", LP);
   const { files, variant } = P.values;
   const limit = Number(P.values.limit);
+  const platform = P.values.platform;
   const runs = useMemo(() => ({
-    "go-loop": loopFds(files, limit, "go-loop"), "go-func": loopFds(files, limit, "go-func"), "zig-block": loopFds(files, limit, "zig-block"),
-  }), [files, limit]);
+    "go-loop": loopFds(files, limit, "go-loop", platform), "go-func": loopFds(files, limit, "go-func", platform), "zig-block": loopFds(files, limit, "zig-block", platform),
+  }), [files, limit, platform]);
+  const base = STD_FDS + (platform === "linux" && variant !== "zig-block" ? GO_LINUX_POLLER_FDS : 0);
   const r = runs[variant];
   const step = Math.max(1, Math.floor(files / 200));
   const pts = (v: LoopVariant) => runs[v].open.filter((_, i) => i % step === 0 || i === runs[v].open.length - 1).map((y, i0) => [Math.min(files, i0 * step + 1), y] as [number, number]);
-  const ymax = Math.min(limit, files + 3) * 1.08;
+  const ymax = Math.min(limit, files + base) * 1.08;
   const src = LOOP_SOURCE[variant];
   return (
     <Demo title="defer inside a loop" controls={<>
       <Param spec={LP.files} value={files} onChange={(v) => P.set("files", v as number)} />
       <Param spec={LP.limit} value={P.values.limit} onChange={(v) => P.set("limit", v as never)} />
+      <Param spec={LP.platform} value={platform} onChange={(v) => P.set("platform", v as Platform)} />
       <Param spec={LP.variant} value={variant} onChange={(v) => P.set("variant", v as LoopVariant)} />
     </>}>
       <Code lines={src.lines} />
@@ -92,7 +96,8 @@ export function DeferLoopDemo() {
         { label: "deferred calls waiting at the peak", value: r.pendingAtPeak },
         { label: "result", value: r.failedAt ? `open #${r.failedAt}: too many open files` : `all ${files} files done` },
       ]} />
-      {r.failedAt && <Banner tone="bad">File {r.failedAt} cannot open: {limit} descriptors are in use (3 for stdin, stdout and stderr). The deferred Close calls would run only when the function returns.</Banner>}
+      {r.failedAt && <Banner tone="bad">File {r.failedAt} cannot open: {limit} descriptors are in use ({base === STD_FDS ? "3 for stdin, stdout and stderr" : "3 for stdin, stdout and stderr, 2 for Go's netpoller"}). The deferred Close calls would run only when the function returns.</Banner>}
+      <div className="muted" style={{ fontSize: 12, marginTop: 6 }}>The limit here is the soft limit with soft = hard. A Go program raises its soft limit to one below the hard limit at start, so with a larger hard limit it opens many more files.</div>
     </Demo>
   );
 }

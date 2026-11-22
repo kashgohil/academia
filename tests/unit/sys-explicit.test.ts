@@ -197,6 +197,9 @@ describe("lesson numbers: defer and errdefer", () => {
     expect(r.peak).toBe(1024);
     expect(loopFds(2000, 1024, "zig-block").peak).toBe(4);
     expect(loopFds(2000, 1024, "go-func").peak).toBe(4);
+    // Linux: Go's first os.Open adds the netpoller's epoll fd and eventfd
+    expect(loopFds(2000, 1024, "go-loop", "linux").failedAt).toBe(1020);
+    expect(loopFds(2000, 1024, "zig-block", "linux").peak).toBe(4);
     const big = loopFds(2000, 65536, "go-loop");
     expect(big.failedAt).toBeNull();
     expect(big.peak).toBe(2003);

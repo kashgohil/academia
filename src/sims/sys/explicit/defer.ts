@@ -268,6 +268,12 @@ export const LOOP_SOURCE: Record<LoopVariant, { lang: "go" | "zig"; lines: strin
 
 /** Descriptors open before the loop: stdin, stdout and stderr. */
 export const STD_FDS = 3;
+/**
+ * Descriptors that Go's first os.Open adds on Linux: the netpoller's epoll instance and its eventfd. On macOS the
+ * loop needs none (checked by running it with go1.25.6 on macOS, soft = hard limit = 1024).
+ */
+export const GO_LINUX_POLLER_FDS = 2;
+export type Platform = "macos" | "linux";
 
 export interface LoopRun {
   /** Open descriptors after each iteration (index i = after file i + 1). */
@@ -279,11 +285,17 @@ export interface LoopRun {
   pendingAtPeak: number;
 }
 
-export function loopFds(files: number, limit: number, v: LoopVariant): LoopRun {
+/**
+ * `limit` is the soft open-file limit while the loop runs, with soft = hard. (Go raises the soft limit to one below
+ * the hard limit at start, so with a larger hard limit the Go loop would get much further.)
+ */
+export function loopFds(files: number, limit: number, v: LoopVariant, platform: Platform = "macos"): LoopRun {
   const open: number[] = [];
   let cur = STD_FDS, peak = cur, failedAt: number | null = null, pending = 0, pendingAtPeak = 0;
+  const poller = platform === "linux" && v !== "zig-block" ? GO_LINUX_POLLER_FDS : 0;
   for (let i = 1; i <= files; i++) {
-    if (cur + 1 > limit) { failedAt = i; break; }
+    if (cur + 1 + (i === 1 ? poller : 0) > limit) { failedAt = i; break; }
+    if (i === 1) cur += poller;
     cur++;
     if (v === "go-loop") pending++;
     else cur--; // closed at the end of the iteration

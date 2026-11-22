@@ -6,7 +6,7 @@
  * - zigfmt.ts: the comptime walk of `std.Io.Writer.print` in zig 0.17.1 (`checkFormat`, `emittedCalls`), with
  *   a table of what each specifier does for each type (`SPEC_TABLE`, measured).
  * - cppinst.ts: template instantiation in two C++ translation units, COMDAT copies, `extern template` and the
- *   link (`CALL_SITES`, `SYMS`, `instantiate`). Symbol names and sizes are from clang 21 ELF objects.
+ *   link (`CALL_SITES`, `SYMS`, `instantiate`). Symbol names and sizes are from ELF objects of clang 22.1.8 (inside zig 0.17.1).
  * - budget.ts: the step and depth limits of clang's constant evaluator and Zig's branch quota (`cost`,
  *   `largestBudgetN`, `MEASURED_MAX`, `fibTree`).
  * - dispatch.ts: a replay of rustc's x86-64 code for a generic call and a `dyn` call (`frames`, listings,

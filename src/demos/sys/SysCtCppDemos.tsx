@@ -83,15 +83,15 @@ export function CppInstDemo() {
 const FN_CODE: Record<BudgetFn, Record<Evaluator, string[]>> = {
   sumTo: {
     clang: ["constexpr long sum_to(long n) {", "  long s = 0;", "  for (long i = 0; i < n; ++i) s += i;", "  return s;", "}", "constexpr long v = sum_to(N);"],
-    zig: ["fn sumTo(n: u64) u64 {", "    var s: u64 = 0;", "    var i: u64 = 0;", "    while (i < n) : (i += 1) s += i;", "    return s;", "}", "const v = comptime sumTo(N);"],
+    zig: ["fn sumTo(n: u64) u64 {", "    var s: u64 = 0;", "    var i: u64 = 0;", "    while (i < n) : (i += 1) s += i;", "    return s;", "}", "fn use() u64 {", "    return comptime sumTo(N); // one call per body", "}"],
   },
   fibLoop: {
-    clang: ["constexpr unsigned long fib_loop(unsigned long n) {", "  unsigned long a = 0, b = 1;", "  for (unsigned long i = 0; i < n; ++i) {", "    unsigned long t = a + b;", "    a = b;", "    b = t;", "  }", "  return a;", "}"],
-    zig: ["fn fibLoop(n: u64) u64 {", "    var a: u64 = 0;", "    var b: u64 = 1;", "    var i: u64 = 0;", "    while (i < n) : (i += 1) {", "        const t = a +% b;", "        a = b;", "        b = t;", "    }", "    return a;", "}"],
+    clang: ["constexpr unsigned long fib_loop(unsigned long n) {", "  unsigned long a = 0, b = 1;", "  for (unsigned long i = 0; i < n; ++i) {", "    unsigned long t = a + b;", "    a = b;", "    b = t;", "  }", "  return a;", "}", "constexpr unsigned long v = fib_loop(N);"],
+    zig: ["fn fibLoop(n: u64) u64 {", "    var a: u64 = 0;", "    var b: u64 = 1;", "    var i: u64 = 0;", "    while (i < n) : (i += 1) {", "        const t = a +% b;", "        a = b;", "        b = t;", "    }", "    return a;", "}", "fn use() u64 {", "    return comptime fibLoop(N);", "}"],
   },
   fib: {
     clang: ["constexpr long fib(long n) {", "  return n < 2 ? n : fib(n - 1) + fib(n - 2);", "}", "constexpr long v = fib(N);"],
-    zig: ["fn fib(n: u64) u64 {", "    if (n < 2) return n;", "    return fib(n - 1) + fib(n - 2);", "}", "const v = comptime fib(N);"],
+    zig: ["fn fib(n: u64) u64 {", "    if (n < 2) return n;", "    return fib(n - 1) + fib(n - 2);", "}", "fn use() u64 {", "    return comptime fib(N);", "}"],
   },
 };
 const UNIT: Record<Evaluator, string> = { clang: "steps", zig: "branches" };

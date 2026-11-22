@@ -7,7 +7,7 @@
  * declaration stops b.cpp from instantiating `max_of<int>`; then some other TU must provide it, or the link fails.
  *
  * The symbol names and sizes are facts about one compiler: `zig c++ -target x86_64-linux-gnu -O0
- * -fno-sanitize=all` (clang 21 inside zig 0.17.1), read with `nm -S`. At -O2 the same files keep no
+ * -fno-sanitize=all` (zig 0.17.1 bundles clang 22.1.8), read with `nm -S`. At -O2 the same files keep no
  * template instance at all: every call is inlined.
  */
 
@@ -35,7 +35,7 @@ export interface CallSite {
   /** What the compiler deduces or reads, for the caption. */
   note: string;
   creates: SymId[];
-  /** A deduction failure: clang 21's message. */
+  /** A deduction failure: Apple clang 21's message. */
   error?: string[];
 }
 

@@ -1,0 +1,120 @@
+---
+summary: "A concurrent, non-moving, non-generational mark-sweep collector with a hybrid write barrier. The heap goal and GOGC, GOMEMLIMIT and its CPU limiter, real gctrace output read field by field, and the Green Tea collector."
+---
+import { GoPacerDemo, GcTraceDemo } from "@/demos/sys/SysGcGoDemos";
+import { InterleaveDemo } from "@/demos/sys/SysGcConcDemos";
+
+The comment at the top of `src/runtime/mgc.go` (Go 1.25) describes the collector in one paragraph. It "runs concurrently with mutator threads, is type accurate (aka precise)", and it is "a concurrent mark and sweep that uses a write barrier". It is also "non-generational and non-compacting". Every term in that sentence is now familiar from this module. This lesson shows how Go puts them together, and which knobs you have.
+
+## One cycle
+
+A Go GC cycle has four phases. Two of them stop the world, but only for a short time:
+
+1. **Sweep termination** (stop the world): finish any sweeping left from the last cycle. Then turn on the write barrier on every P (a P is a scheduler slot that runs Go code).
+2. **Mark** (concurrent): scan the stacks, the globals and the heap. A stack scan stops only its own goroutine, and only for that scan. Background mark workers use 25% of the P (`gcBackgroundUtilization` in `mgcpacer.go`). A goroutine that allocates fast must also do some marking itself: a **mark assist**.
+3. **Mark termination** (stop the world): check that no gray objects are left, and turn off the write barrier.
+4. **Sweep** (concurrent): sweep spans in the background and lazily, when an allocation needs a span.
+
+Objects that the program allocates during marking are black at once, so they survive the cycle.
+
+## The hybrid barrier
+
+Go 1.5 made the collector concurrent, with a Dijkstra insertion barrier. Like any insertion-only barrier, it had to rescan the stacks at the end with the world stopped. That rescan could take a long time in programs with many goroutines or deep stacks. Austin Clements and Rick Hudson proposed a **hybrid barrier** ("Eliminate STW stack re-scanning", Go proposal 17503), and Go 1.8 shipped it. The Go 1.8 release notes say that pauses are now "usually under 100 microseconds and often as low as 10 microseconds".
+
+From `src/runtime/mbarrier.go`:
+
+```text
+writePointer(slot, ptr):
+    shade(*slot)
+    if current stack is grey:
+        shade(ptr)
+    *slot = ptr
+```
+
+The deletion part, `shade(*slot)`, stops a goroutine from hiding an object by moving its only pointer from the heap to its stack. The insertion part, `shade(ptr)`, stops it from moving a pointer from its unscanned stack into a black object. After a stack is scanned, everything it points to is shaded, so the insertion part is no longer needed. In practice, `mgc.go` says that the barrier shades both values on every pointer write during marking. The barrier does not first check the color of the object that holds the slot. The `mbarrier.go` comment explains that a safe check would need an expensive memory fence.
+
+<InterleaveDemo id="sys-gc-gohybrid" barrier="hybrid" scenario="stack" />
+
+Things to try:
+
+1. Keep **Go hybrid** and the stack scenario. Click: marker, mutator, mutator, then finish. The deletion `B.f0 = nil` shades C, so C survives, and no rescan is needed.
+2. Select **Dijkstra** with the rescan off and repeat. C is lost. Turn the rescan on: C survives, but the cost is a stop-the-world scan of every stack.
+3. Select the heap scenario with **Go hybrid**. Click: marker, marker, mutator, mutator, finish. The shade of the old value saves C here too.
+
+## The heap goal
+
+When does the next cycle start? Go sets a **heap goal**: the heap size at which the cycle should finish. The GC guide (go.dev/doc/gc-guide) gives the formula:
+
+$$
+\text{Target heap memory} = \text{Live heap} + (\text{Live heap} + \text{GC roots}) \cdot \frac{\text{GOGC}}{100}
+$$
+
+GOGC is 100 by default. So with 100 MiB live, the heap may grow to about 200 MiB before the next cycle ends. The roots, stacks and globals, count in the formula since Go 1.18. The guide also sets a minimum total heap of 4 MiB. In the runtime source, that minimum scales with GOGC: `heapMinimum = defaultHeapMinimum * GOGC / 100`.
+
+<Predict
+  id="goal"
+  question="A Go program has 100 MiB of live heap and 2 MiB of stacks and globals, with GOGC=100. What is the heap goal?"
+  options={["200 MiB", "202 MiB", "204 MiB"]}
+  answer={1}
+  explain="100 + (100 + 2) × 100/100 = 202 MiB. The roots count once, because the guide adds them to the live heap only inside the GOGC term."
+>
+<GoPacerDemo />
+</Predict>
+
+Things to try:
+
+1. Read the defaults: the goal is 202 MiB. With an allocation rate of 500 MiB/s, a cycle runs 4.9 times per second, and the GC takes 6.3% of 8 P. Those CPU costs come from model inputs.
+2. Set GOGC to 200. The runway doubles, and the GC runs 2.45 times per second with 3.1% of the CPU. But the process needs 324 MiB instead of 222 MiB.
+3. Turn on **GOGC=off**. The heap grows without limit. Then turn on **GOMEMLIMIT** at 400 MiB: the goal is now the limit minus the memory that is not heap.
+4. Move the limit down toward the live heap. At 130 MiB with GOGC off, the GC would need 63.8% of the CPU. The limiter caps it at about 50%, so the heap goes over the limit instead.
+
+The GC guide models the CPU cost of a cycle as a fixed part plus a part proportional to the live heap. The runway between cycles is $\text{goal} - \text{live}$. So doubling GOGC halves the number of cycles and roughly halves the GC CPU. It doubles the extra memory. GOGC is a price list for memory: the same trade as the space-time curve of the [mark and sweep](/systems/gc/mark-and-sweep) lesson.
+
+**GOMEMLIMIT** (Go 1.19, or `runtime/debug.SetMemoryLimit`) is a soft limit on the total memory of the Go runtime. Near the limit, the goal shrinks so that the heap stays under it. A program whose live heap is close to the limit would then collect all the time. To stop this, the runtime limits GC CPU to "roughly 50%" over a window of `2 * GOMAXPROCS` CPU-seconds, as the guide says.
+
+In a container, set GOMEMLIMIT about 5 to 10% under the container limit. GOGC=off is safe only if the program owns that memory. If the live heap nears the limit, GC can take up to about half of the CPU.
+
+## Read gctrace
+
+Set `GODEBUG=gctrace=1`, and the runtime prints one line for each cycle to standard error. The format is in the `runtime` package documentation, and it can change between versions. The demo below shows real lines from go1.25.6 on an Apple M4 Pro. The program keeps about 10 MiB live and allocates 200 MiB of short-lived chains in 64-byte objects.
+
+<GcTraceDemo />
+
+Things to try:
+
+1. Read line 7: `18->20->11 MB, 21 MB goal`. The heap was 18 MiB at the start, 20 MiB at the end, and 11 MiB was live. The goal of 21 MiB came from the previous line's live heap of 10 MiB: about twice that, as GOGC=100 says. The runtime prints bytes shifted right by 20, so "MB" means MiB, rounded down.
+2. Read the clock times of line 7: 0.002 ms and 0.013 ms of stop-the-world, and 0.93 ms of concurrent marking. The pauses are about 1.6% of the cycle.
+3. Read the CPU times. The background workers spent 2.4 ms and idle marking 3.2 ms, while mark assists took only 0.014 ms. The program allocated slowly enough for the background workers.
+4. Move to the GOGC=400 lines. The live heap is still 11 MiB, but the goal is 57 MiB. One run with each setting gave 43 cycles at GOGC=50, 23 at GOGC=100 and 5 at GOGC=400.
+5. Move to the GOGC=off, GOMEMLIMIT=40MiB lines. The goals are 30 to 31 MiB: the limit minus the memory that is not heap. That run had 11 cycles.
+
+## What this means for your Go code
+
+The GC cost is the allocation rate times the price per allocated byte. You lower it with fewer heap allocations:
+
+- **Keep values on the stack.** The compiler's escape analysis decides where each value lives. `go build -gcflags=-m` prints the decisions. For a function that returns `&p`, go1.25.6 prints `./main.go:11:2: moved to heap: p`. A local that does not escape costs the GC nothing.
+- **Reuse buffers.** `sync.Pool` keeps objects between uses, and the GC may empty it. A preallocated slice with `make([]T, 0, n)` avoids repeated growth.
+- **Fewer pointers.** The GC scans only memory that holds pointers. A `[]int64` of 100 MiB is never scanned for pointers; a `[]*T` of the same size is.
+- **Set GOMEMLIMIT in containers.** Without it, a heap at twice the live data can exceed a container limit, and the kernel kills the process.
+
+## Green Tea
+
+Go 1.25 added an experimental collector called **Green Tea**, enabled with `GOEXPERIMENT=greenteagc` at build time. Go 1.26 made it the default. The Go 1.26 release notes say that its design "improves the performance of marking and scanning small objects through better locality and CPU scalability". They expect "somewhere between a 10–40% reduction in garbage collection overhead" in programs that use the collector heavily. On newer amd64 CPUs, it also uses vector instructions to scan small objects. The opt-out, `GOEXPERIMENT=nogreenteagc`, is expected to go away in Go 1.27.
+
+The traces in this lesson come from go1.25.6, where the experiment is off by default.
+
+## Connect
+
+- Escape analysis and stack allocation: [stack and heap](/systems/memory/stack-and-heap).
+- Goroutines and the scheduler slots (P) that the GC borrows: [Go channels and select](/concurrency/message-passing/go-channels-and-select).
+- GC pauses are one source of [tail latency](/performance/systems/tail-latency), and gctrace is a cheap first tool before [profilers](/performance/measurement/profilers).
+- A memory limit in a container is enforced by [cgroups](/os/isolation/cgroups); without GOMEMLIMIT the next stop is the [OOM killer](/os/memory/swapping-and-the-oom-killer).
+
+<Recall cards={[
+  { q: "Write the heap goal of the Go GC guide.", a: "Target heap = live heap + (live heap + GC roots) × GOGC / 100. With GOGC=100 the heap may grow to about twice the live data plus the roots." },
+  { q: "Which two phases of a Go GC cycle stop the world, and why are they short?", a: "Sweep termination (turn on the write barrier) and mark termination (check that marking is done). The marking itself and the sweep run concurrently." },
+  { q: "What does Go's hybrid barrier shade, and what did it remove?", a: "The old value of the slot, and the new value while the goroutine's stack is not yet scanned. It removed the stop-the-world stack rescan of Go 1.5 to 1.7." },
+  { q: "What happens to GC frequency and memory when you double GOGC?", a: "The runway between cycles doubles, so there are about half as many cycles and about half the GC CPU. The extra heap above the live data doubles." },
+  { q: "Why does GOMEMLIMIT come with a GC CPU limit of about 50%?", a: "Near the limit the heap goal shrinks, so a program whose live heap almost fills the limit would collect all the time. The cap lets the heap exceed the soft limit instead." },
+  { q: "In a gctrace line, what do the three numbers in 18->20->11 MB mean?", a: "Heap size at the start of the cycle, at its end, and the live heap that it marked, in MiB." },
+]} />

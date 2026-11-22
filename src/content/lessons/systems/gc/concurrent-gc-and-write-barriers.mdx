@@ -1,0 +1,114 @@
+---
+summary: "Mark while the program runs. The tri-color invariant, how a mutator can hide an object from the marker, the Dijkstra insertion barrier and the Yuasa deletion barrier, and load barriers for moving collectors."
+---
+import { InterleaveDemo, BarrierTrialsDemo } from "@/demos/sys/SysGcConcDemos";
+
+A stop-the-world collector pauses the program for the whole mark phase, and the mark phase grows with the live data. With the model inputs of the [mark and sweep](/systems/gc/mark-and-sweep) lesson, 100 MiB of live data costs a pause of about 105 ms. Most servers cannot accept that. The fix is to mark while the program runs. An **incremental** collector does the marking in small steps between steps of the program. A **concurrent** collector marks on other threads at the same time as the program.
+
+Both have the same new problem. The **mutator** changes pointers while the **marker** reads them. The marker can finish with a wrong picture of the heap, and then the sweep frees an object that the program still uses.
+
+Recall the three colors. White objects are not reached yet. Gray objects are reached, but their fields are not read. Black objects are reached, and their fields are read. The marker never reads a black object again. So a pointer that the mutator stores into a black object is invisible to the marker.
+
+<Predict
+  id="lost"
+  question="The marker has scanned A (black) and has shaded B (gray). B points to C (white). Now the mutator runs A.f0 = B.f0, then B.f0 = nil. Then the marker finishes. What happens to C?"
+  options={["C is marked, because A points to it", "C is freed, although A still points to it", "The marker notices the change and starts again"]}
+  answer={1}
+  explain="A is black, so the marker never reads A.f0 again. The only gray path to C was B.f0, and the mutator cut it. The marker scans B, finds nothing, and finishes. C stays white and the sweep frees it. A now holds a dangling pointer."
+>
+<InterleaveDemo />
+</Predict>
+
+Things to try:
+
+1. With **none**, click: marker, marker, mutator, mutator, then finish. C is lost. The edge from A turns red: a dangling pointer in a memory-safe language.
+2. Reset and click finish first, then run the mutator. Nothing is lost. The same program fails only with one order of events: a race.
+3. Select **Dijkstra** and repeat step 1. The first mutator write shades C when it lands in A, so C survives.
+4. Select **Yuasa** and repeat step 1. The second write shades C when it is deleted from B, so C survives.
+5. Select **pointer hidden on the stack** and **Dijkstra**, with the rescan off. Click: marker, mutator, mutator, then finish. C is lost again, because a write to a stack slot runs no barrier. Turn on the rescan and try again.
+
+## The two conditions
+
+The danger comes down to two conditions. An object is lost only if both happen during marking:
+
+1. The mutator stores a pointer to a white object into a black object.
+2. The mutator destroys every path to that white object from gray objects.
+
+A **write barrier** is code that the compiler adds to each pointer store. It breaks one of the two conditions.
+
+The **insertion barrier** of Edsger Dijkstra and his coauthors ("On-the-fly garbage collection: an exercise in cooperation", CACM, November 1978) breaks condition 1. When the mutator stores a pointer, the barrier shades the new target gray. So a black object never points to a white one. This is the **strong tri-color invariant**.
+
+The **deletion barrier** of Taiichi Yuasa ("Real-time garbage collection on general-purpose machines", Journal of Systems and Software, 1990) breaks condition 2. When the mutator overwrites a pointer, the barrier shades the old target. So no object loses its last path while marking runs. Everything that was reachable when marking started survives this cycle. Later authors call this **snapshot at the beginning**.
+
+In the pseudocode style of Go's `mbarrier.go`:
+
+```text
+// Dijkstra: shade the new value
+writePointer(slot, ptr):
+    shade(ptr)
+    *slot = ptr
+
+// Yuasa: shade the old value
+writePointer(slot, ptr):
+    shade(*slot)
+    *slot = ptr
+```
+
+`shade` makes a white object gray and puts it on the work list. It does nothing to gray or black objects.
+
+## The stack problem
+
+Compilers do not put barriers on writes to stack slots and registers. Those writes are far too frequent, and the frame belongs to one thread. But a stack slot is a root. A pointer can move from the heap into a local, and then the heap copy can be deleted. With only an insertion barrier, the marker does not see that.
+
+So a collector with a Dijkstra barrier must scan the stacks again at the end of marking, with the world stopped. This rescan is a pause, and it grows with the number and the depth of the stacks. Go 1.5 to 1.7 worked this way. The Go proposal that removed it says: "the whole re-scan process happens with the world stopped."
+
+A Yuasa barrier does not need the rescan at the end. It needs the stacks at the start instead: the collector must scan or snapshot all stacks before marking scans the heap. In the original design, the world stops for this. The model in the demos avoids the issue, because its marker scans all roots in one step.
+
+After that start, the stacks keep what they held, and every deletion from the heap shades the old target. Its price is **floating garbage**: objects that die during marking still survive until the next cycle.
+
+## Many random runs
+
+The race needs a precise order of events, so it is rare. The next demo runs random programs against random schedules and counts the losses.
+
+<BarrierTrialsDemo />
+
+Things to try:
+
+1. Read the defaults. With no barrier, 10 of 1000 runs lose an object. Each run makes 12 pointer writes on a graph of 6 objects.
+2. Look at **Dijkstra, no stack rescan**: 7 of 1000 runs still lose an object, all through a stack slot. With the rescan, none do.
+3. Compare the floating garbage: 1.24 objects per run for Dijkstra and 1.77 for Yuasa. Shading old values keeps more dead objects.
+4. Compare the barrier work: Yuasa shades 0.80 objects per run and Dijkstra 0.43.
+5. Move the mutator share down to 30%. The marker finishes earlier, so fewer writes hit the marking window, and losses become rarer.
+
+A bug that appears once in 100 runs passes most tests and then crashes in production. That is why barriers are designed from an invariant and a proof, not tested into shape.
+
+## Details that real collectors handle
+
+- **New objects**: an object that the mutator allocates during marking has no fields to read yet. Go allocates such objects black, so they survive this cycle.
+- **Memory ordering**: the barrier and the marker run on different cores. Go's `mbarrier.go` explains why its barrier shades without first checking the color of the slot's object. A safe check would need a store-load fence on every pointer write. See [memory orderings](/concurrency/atomics/memory-orderings-relaxed-acquire-release-seq-cst) for why a store followed by a load can reorder.
+- **Termination**: with many marking threads, "no gray objects left" is a distributed decision. The last worker must know that no other worker or barrier still holds gray objects.
+
+## Moving while the program runs
+
+A concurrent copying or compacting collector has a harder problem. The mutator can read an object while the collector moves it. So moving collectors add a **load barrier**, also called a read barrier. It is code on each pointer load that checks if the object moved, and fixes the pointer.
+
+- **ZGC** (OpenJDK) keeps metadata bits in each pointer, called **colored pointers**. A load barrier checks those bits on every reference load. JEP 439 (JDK 21) describes generational ZGC as using "colored pointers, load barriers, and store barriers".
+- **Shenandoah** (OpenJDK 12, JEP 189) first used read barriers through a forwarding pointer in each object. In JDK 13 it switched to **load reference barriers**.
+
+A load barrier costs more than a write barrier, because programs load pointers far more often than they store them. In return, the pauses can stay short even for very large heaps.
+
+## Connect
+
+- The marker and the mutator share memory without locks, so the rules of [happens-before](/concurrency/atomics/happens-before) apply to every barrier.
+- Lock-free data structures face the same "is anyone still using this node" question without a collector: [epoch-based reclamation](/concurrency/lock-free/epoch-based-reclamation) and [hazard pointers](/concurrency/lock-free/hazard-pointers).
+- A write barrier in a [generational](/systems/gc/generational-gc) collector records old-to-young pointers. Here it protects the marking invariant. OpenJDK's G1 needs both: its marking is snapshot at the beginning, and it also keeps remembered sets of 512-byte cards.
+- Next: [Go's GC](/systems/gc/gos-gc) combines both barriers so that it needs no stack rescan.
+
+<Recall cards={[
+  { q: "Which two conditions must both hold for a concurrent marker to lose a live object?", a: "The mutator stores a pointer to a white object into a black object, and it destroys every path to that white object from gray objects." },
+  { q: "What does a Dijkstra insertion barrier shade, and which invariant does it keep?", a: "The new target of each pointer store. It keeps the strong tri-color invariant: no black object points to a white one." },
+  { q: "What does a Yuasa deletion barrier shade, and what is its side effect?", a: "The old target that a store overwrites. Everything reachable at the start of marking survives, so objects that die during marking float until the next cycle." },
+  { q: "Why does a collector with only an insertion barrier need to rescan the stacks at the end of marking?", a: "Stack writes have no barrier. A pointer can move from the heap into a local after the stack was scanned, and the heap copy can be deleted." },
+  { q: "Why do concurrent moving collectors such as ZGC need a load barrier?", a: "The mutator may load a pointer to an object that the collector is moving or has moved. The load barrier checks and fixes the pointer before the program uses it." },
+  { q: "Why are lost-object bugs hard to find by testing?", a: "They need a narrow interleaving of mutator writes and marker steps. In the random model, only about 1 run in 100 loses an object with no barrier." },
+]} />

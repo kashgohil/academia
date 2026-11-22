@@ -1,0 +1,90 @@
+---
+summary: "Most objects die young, so collect the young ones often and the old ones rarely. The nursery, promotion, minor and major collections, and the write barrier that keeps old-to-young pointers visible."
+---
+import { LifetimeDemo, CardTableDemo } from "@/demos/sys/SysGcGenDemos";
+
+The last two lessons gave two facts. A tracing collector pays for the live data that it visits. A copying collector pays for live data only, and it never touches garbage. A third fact comes from measurements of real programs: most objects die very young. A string built for one log line, an iterator, a temporary vector, a request object: each one is garbage a few microseconds after its birth.
+
+This is the **weak generational hypothesis**. Henry Lieberman and Carl Hewitt proposed a collector based on it ("A Real-Time Garbage Collector Based on the Lifetimes of Objects", CACM, June 1983). David Ungar's **generation scavenging** (1984) made it practical for Smalltalk. The idea: put new objects in a small **nursery**, and collect only the nursery most of the time. Most of the nursery is dead, so a copying collector empties it for the price of the few survivors.
+
+GC research measures the lifetime of an object in **bytes allocated** between its birth and its death, not in seconds. This clock ticks only when the program allocates, so it measures the pressure on the collector directly.
+
+<Predict
+  id="survival"
+  question="95% of objects die after about 16 KiB of further allocation; the other 5% live for megabytes. The nursery is 512 KiB. What share of the nursery's bytes does a minor collection copy?"
+  options={["About 50%", "About 8%", "About 0.1%"]}
+  answer={1}
+  explain="At any moment, the young-dying objects that are still alive are about 0.95 × 16 KiB ≈ 15 KiB. Almost all of the long-lived 5% survive: about 0.05 × 512 KiB ≈ 26 KiB. That is about 41 KiB of 512 KiB, so 8%. The model measures 7.9%."
+>
+<LifetimeDemo />
+</Predict>
+
+Things to try:
+
+1. Read the defaults. There are 64 minor collections and 6 major ones. The generational collector copies or marks 4.55 MiB in total. A non-generational mark-sweep collector with the same peak memory marks 11.04 MiB in 34 collections.
+2. Compare the pauses. The largest minor collection copies 45 KiB. The largest non-generational one marks 414 KiB. The rare major collections are still large: 410 KiB.
+3. Move **Objects that die young** to 50%. Now half of every nursery survives, and the generational collector does 33.9 MiB of work against 20.9 MiB for the simple one. When the hypothesis is false, generations make things worse.
+4. Make the nursery smaller. Minor collections run more often, and objects get less time to die before a collection. More of them are promoted, and the old generation fills faster.
+5. Move the young lifetime up toward the nursery size. The survival rate climbs, because objects are still alive when the nursery fills.
+
+The plot shows the sawtooth of the heap: each minor collection drops the nursery to zero, and the old generation grows by the survivors. All lifetimes and sizes are model inputs, listed under the demo.
+
+## Minor and major collections
+
+A **minor** collection traces from the roots, but it stops at old objects. It copies the live nursery objects out, either to a survivor space or directly into the old generation. Moving an object to the old generation is **promotion**. Many collectors promote an object only after it survives several minor collections. Then an object born just before a collection gets more time to die. The demo promotes after one survival, the simplest rule.
+
+A **major** collection traces the whole heap. It runs when the old generation fills, which happens only as fast as objects are promoted. The old generation often uses mark-sweep or mark-compact, because most of its objects are alive and a semispace copy would double its memory.
+
+Two costs remain:
+
+- **Premature promotion**: an object promoted just before it dies stays in the old generation until the next major collection. The demo counts these bytes as "promoted, then died old".
+- **Nepotism**: a dead old object still points to young objects. A minor collection does not know that the old object is dead, so it keeps its young children too.
+
+## Pointers from old to young
+
+A minor collection does not trace the old generation. So how does it know about a young object that only an old object points to? The roots alone miss it. The collector needs a record of every pointer from an old object into the nursery: a **remembered set**. The mutator itself must build that record, because only the mutator knows when it stores a pointer. The code that does this at each pointer store is a **write barrier**.
+
+The common form is a **card table**. The old generation is divided into cards of a fixed size. A table holds one byte per card. On each reference store, the barrier marks the card of the written object as **dirty**. A minor collection then treats every object on a dirty card as an extra root, and cleans the cards.
+
+In OpenJDK's HotSpot, a card is 512 bytes by default. A clean card is −1 and a dirty card is 0. Since JDK 18, the flag `-XX:GCCardSizeInBytes` sets the size. It must be a power of 2 from 128 to 1024 bytes on 64-bit systems.
+
+<CardTableDemo />
+
+Things to try:
+
+1. Keep the barrier off and step to the end. The program stores Y3 into O5 and drops its own pointer. The minor collection traces from the roots, does not see O5, and frees Y3. O5 now holds a dangling pointer.
+2. Turn on the barrier and step again. The store dirties card 2, the card of O5. The minor collection reads O4 and O5, finds Y3, and keeps it.
+3. Count the objects that the minor collection reads in the old generation: 2, not 8. The card size sets this cost. Small cards mean a large table; large cards mean more objects to read for each dirty card.
+
+The barrier is two or three instructions on every reference store. In schematic x86-64, after the store `obj.f = young`:
+
+```asm
+mov  [rdi + 16], rsi        ; the store itself: obj.f = young
+shr  rdi, 9                 ; card index = address of obj >> 9
+mov  byte [rdx + rdi], 0    ; card_table[index] = dirty (0); rdx holds the table base
+```
+
+This is a sketch of the idea, not compiler output. A barrier like this does not check whether the stored pointer is young. It dirties a card on every reference store, which makes it short and branch-free. A **sequential store buffer** is the other common form of remembered set: the barrier appends the address of the written field to a log.
+
+## Who uses generations
+
+- **OpenJDK**: G1, the default collector, is generational. Oracle's JDK 21 tuning guide says that G1 divides the heap into cards, "by default 512 byte sized areas". Its remembered sets are indexed by card. ZGC got a generational mode in JDK 21 (JEP 439), and JDK 23 made it the default mode of ZGC (JEP 474).
+- **CPython**: the cycle collector is generational, with the thresholds from the [reference counting](/systems/gc/reference-counting) lesson. Python 3.14.0 to 3.14.4 used an incremental collector with only a young and an old generation.
+- **Go**: the runtime source says that its collector is "non-generational and non-compacting". The [Go GC](/systems/gc/gos-gc) lesson shows how Go keeps its pauses short without generations.
+
+The hypothesis is a fact about programs, not a law. A cache that keeps objects for minutes and then drops them breaks it. Its objects survive the nursery, get promoted, and die in the old generation. In code that you control, a pool or an arena for such objects can take them out of the collector's view.
+
+## Connect
+
+- A nursery with bump allocation is an [arena](/systems/allocators/arena-allocators) that the collector empties: the survivors move out, and the rest dies at once.
+- The write barrier here is a cost on every pointer store. The next lesson, [concurrent GC and write barriers](/systems/gc/concurrent-gc-and-write-barriers), needs a barrier for a different reason.
+- The same old-and-young idea shapes storage engines: see [MVCC garbage collection](/databases/transactions/mvcc-garbage-collection), where old row versions must stay while a snapshot needs them.
+
+<Recall cards={[
+  { q: "What does the weak generational hypothesis say, and why does it suit a copying collector?", a: "Most objects die young. A copying collector pays only for survivors, so a nursery that is mostly dead is cheap to empty." },
+  { q: "Why does GC research measure object lifetime in bytes allocated?", a: "The collector only feels allocation pressure. A clock that ticks with allocation measures how much memory an object holds across collections." },
+  { q: "Why does a minor collection need a remembered set?", a: "It does not trace the old generation. Without a record of old-to-young pointers, it would free a young object that only an old object points to." },
+  { q: "How does a card-marking write barrier work, and what does the minor collection do with it?", a: "On each reference store it marks the card (for example 512 bytes) of the written object dirty. The minor collection treats every object on a dirty card as a root, then cleans the cards." },
+  { q: "What is premature promotion?", a: "An object is moved to the old generation just before it dies. It then holds memory until the next major collection." },
+  { q: "When does a generational collector do more work than a simple one?", a: "When many objects survive the nursery. Each survivor is copied, then promoted and marked again in major collections." },
+]} />

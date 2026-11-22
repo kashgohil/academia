@@ -1,0 +1,118 @@
+---
+summary: "Copy the live objects into empty space and forget the rest. Cheney's two pointers, forwarding pointers, bump allocation, the price of twice the memory, and why the copy order is the memory layout."
+---
+import { CheneyDemo, LocalityDemo, SpaceTimeDemo } from "@/demos/sys/SysGcCopyDemos";
+
+Mark-sweep touches every object twice: once to mark the live ones, once to sweep all of them. It also leaves holes. A **copying collector** does something more radical. It copies every live object into an empty region and then treats the old region as empty. It never looks at a dead object, and the live objects end up packed together with no holes.
+
+Robert Fenichel and Jerome Yochelson described this for Lisp in 1969. They divided memory into two **semispaces**. The program allocates in one of them, the **from-space**. A collection copies the live objects into the other, the **to-space**, and then the two swap roles. Their copy routine was recursive. Cheney removed the recursion in "A Nonrecursive List Compacting Algorithm" (CACM, November 1970).
+
+## Cheney's algorithm
+
+Cheney uses two pointers into to-space. **free** is where the next copy goes. **scan** is the next copied object whose fields still point into from-space. Everything between scan and free is a queue of work. So the algorithm needs no stack and no extra memory.
+
+When an object moves, the collector writes a **forwarding pointer** into the old copy: the new address. If another pointer to the same object comes later, the collector finds the forwarding pointer and only updates the field. This is how sharing and cycles survive a copy.
+
+<Predict
+  id="order"
+  question="Root r points to A, and root s points to E. A points to B and C, and B and C both point to D. In which order do the objects land in to-space?"
+  options={["A, B, D, C, E: each path to its end, like a recursive copy", "A, E, B, C, D: the roots first, then level by level", "A, B, C, D, E: in address order"]}
+  answer={1}
+  explain="The roots are copied first: A and E. Then scan moves through to-space in order, and each object it scans adds its children at free. The queue makes the order breadth first."
+>
+<CheneyDemo />
+</Predict>
+
+Things to try:
+
+1. Step past the roots. A and E are in to-space, and the roots point to them. Their fields still hold from-space addresses, shown in red.
+2. Step through the scan of A. B and C are copied to free, and the fields of A get the new addresses.
+3. Watch the scan of C. D already has a forwarding pointer, so the collector only updates the field. Then D points back to A, which is also forwarded.
+4. Look at G. It points into the live set, but nothing points to G. The collector never reads it. At the end, all of from-space is free, G included.
+
+Compare the colors with the mark phase of the last lesson. In from-space, an object that is not copied is white. In to-space, the objects between scan and free are gray, and the objects before scan are black. Cheney's queue is a tri-color marker that also moves the objects.
+
+This C version compiles with clang 21. A real collector puts the forwarding pointer in the object header, not in a field of its own:
+
+```c
+static char *scan, *next;  /* next is Cheney's "free" pointer */
+
+static struct obj *copy(struct obj *o) {
+    if (o == NULL) return NULL;
+    if (o->forward) return o->forward;           /* already moved */
+    struct obj *n = (struct obj *)next;
+    memcpy(n, o, size_of(o));
+    next += size_of(o);
+    o->forward = n;                               /* leave a forwarding pointer */
+    return n;
+}
+
+void collect(struct obj **roots, size_t nroots, char *to_space) {
+    scan = next = to_space;
+    for (size_t i = 0; i < nroots; i++) roots[i] = copy(roots[i]);
+    while (scan < next) {                         /* to-space is the queue */
+        struct obj *o = (struct obj *)scan;
+        for (size_t i = 0; i < o->nfields; i++) o->field[i] = copy(o->field[i]);
+        scan += size_of(o);
+    }
+}
+```
+
+## What copying buys
+
+- **Work proportional to live data only.** The cost is the bytes copied. The amount of garbage does not matter, so a heap that is 95% garbage is cheap to collect.
+- **No fragmentation.** The survivors are contiguous, and the free space is one block.
+- **Bump allocation.** With one free block, allocation is a pointer increment and a limit check, as in a [bump allocator](/systems/allocators/bump-allocators). There is no free-list search.
+
+The price is memory. The program can only use one semispace, so a heap of size $H$ holds at most $H/2$ of objects. A collection must fit all live data $L$ into to-space, so the copier cannot run at all unless $H > 2L$. It runs once per $H/2 - L$ allocated bytes, and each run copies $L$ bytes.
+
+<SpaceTimeDemo />
+
+Things to try:
+
+1. Keep the defaults. At $H = 3L$, mark-sweep costs 0.65 ns per allocated byte and copying costs 4.00 ns. Copying is cheaper only above $31.4L$. The per-byte costs are model inputs.
+2. Move the sweep cost to 0.5 ns per byte. A sweep that is expensive makes copying win above $7.5L$.
+3. Set the copy cost to 1 ns, the same as marking. Copying now wins above $12.0L$.
+4. Move $H$ below $2L$. The copying line ends: the live data does not fit in one half.
+
+So a pure semispace copier is a poor choice for a heap that is mostly live. It is a very good choice for a region where most objects are dead, and the [generational GC](/systems/gc/generational-gc) lesson uses exactly that. **Mark-compact** collectors get the packing without the second half: they mark, then slide the live objects toward one end in place. They pay with more passes over the heap.
+
+## The copy order is the memory layout
+
+A copying collector decides where every survivor goes. So it decides the locality of the program after each collection. Cheney's order is breadth first, which separates a parent from its children in a deep tree. A depth-first copier puts each child next to its parent, but it needs a stack again.
+
+<LocalityDemo />
+
+Things to try:
+
+1. Keep the tree and the recursive walk. The fragmented heap misses 30 times in a 4-line cache. After a Cheney copy it misses 21 times, and after a depth-first copy only 16 times: one miss per line.
+2. Select **level by level**. Now the Cheney layout is best, with 16 misses, and the depth-first layout misses 24 times. No order is best for every walk.
+3. Select the linked list. Both copy orders are the same for a list, and the misses fall from 31 to 16. Compaction alone fixes the scattered list.
+
+The model is small on purpose: a cache of 4 lines and 32-byte objects. On a real machine, the same effect shows up in L1, L2 and the TLB. The [locality](/architecture/caches/locality) lesson explains why.
+
+## Moving has costs
+
+A moving collector must find and update every pointer to a moved object. So it needs precise roots: a conservative scan cannot change a word that may be an integer. Other costs:
+
+- **Address hashing**: a hash table keyed by object address breaks when the object moves. A runtime with a moving collector computes the hash once and stores it with the object, for example in its header.
+- **Pinning**: C code that holds a pointer into the heap must stop the collector from moving that object. C# has the `fixed` statement for this.
+- **Copy cost for large objects**: copying a 100 MiB array is slow. Many collectors keep large objects in a separate space that never moves.
+
+Go never moves heap objects, but it does move goroutine stacks. Since Go 1.3, a stack that is too small is copied to a larger one. The runtime then adjusts the pointers into it. This is possible because the compiler knows the type of each stack slot. Rust, C and C++ have no collector that moves objects, and their raw pointers depend on stable addresses.
+
+## Connect
+
+- The free block after a copy is used by a [bump allocator](/systems/allocators/bump-allocators); the holes that copying avoids are the [fragmentation](/systems/allocators/fragmentation) of free lists.
+- Packing objects in access order is the subject of [cache-friendly code](/performance/memory/cache-friendly-code) and [locality](/architecture/caches/locality).
+- Copy-on-write file systems face a similar "live data only" trade: see [log-structured and copy-on-write file systems](/os/fs/log-structured-and-copy-on-write-filesystems).
+- Next: [generational GC](/systems/gc/generational-gc) uses a copying collector where it is cheapest.
+
+<Recall cards={[
+  { q: "What are Cheney's scan and free pointers, and when does the collection end?", a: "free is where the next copied object goes; scan is the next copied object whose fields are not yet updated. The collection ends when scan reaches free." },
+  { q: "What is a forwarding pointer for?", a: "When an object moves, its old copy records the new address. A later pointer to the same object is then updated to the new address, so shared objects and cycles are copied once." },
+  { q: "Why does a copying collector never touch garbage?", a: "It only follows pointers from the roots and copies what it reaches. Dead objects are left in from-space, which is then reused as a whole." },
+  { q: "A semispace copier has heap H and live data L. When can it run, and how often?", a: "Only if L fits in one half, so H > 2L. It runs once per H/2 − L allocated bytes, and each run copies L bytes." },
+  { q: "Why is Cheney's copy order breadth first, and what does that mean for a tree walked recursively?", a: "To-space is a FIFO queue between scan and free. A parent's children land after the whole current level, so a depth-first walk jumps between distant addresses." },
+  { q: "Why can a conservative collector not move an object that an ambiguous stack word points to?", a: "It would have to update that word, but the word may be an integer, and changing it would change the program's data." },
+]} />

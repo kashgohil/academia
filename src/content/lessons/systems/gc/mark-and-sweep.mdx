@@ -1,0 +1,137 @@
+---
+summary: "Trace from the roots, mark what you reach, free the rest. The mark stack, sweeping into free lists, the cost of each phase, and how a collector finds its roots: stack maps or a conservative guess."
+---
+import { MarkSweepDemo, StackScanDemo, TracingCostDemo } from "@/demos/sys/SysGcMsDemos";
+
+Reference counting asks each object how many pointers it has. A **tracing collector** asks a different question: which objects can the program reach? It starts at the roots, follows every pointer, and treats everything it does not reach as garbage. Cycles are no problem, because nothing outside an unreachable cycle leads into it.
+
+John McCarthy described the first tracing collector in 1960, for Lisp ("Recursive Functions of Symbolic Expressions and Their Computation by Machine, Part I", CACM 3(4)). When the free-storage list was empty, his program first found all registers that the base registers reach and made their sign bit negative. Then it went through the whole list area and put every register whose sign had not changed back on the free-storage list. That is **mark and sweep**, and most tracing collectors still follow it.
+
+The demo uses three colors for the marking state. These terms come from Dijkstra and his coauthors (1978), and the lesson on concurrent collection needs them:
+
+- **White**: not reached yet. At the end of marking, white means garbage.
+- **Gray**: reached, but its fields are not read yet. Gray objects are the work list.
+- **Black**: reached, and all its fields are read.
+
+<Predict
+  id="frag"
+  question="The sweep frees 5 objects with 208 bytes in total. Then the program asks for one 128-byte object. Does it fit in the freed space?"
+  options={["Yes: 208 bytes are free", "No: the free bytes are in pieces, and the largest piece is smaller", "Yes, because the sweep moves the live objects together"]}
+  answer={1}
+  explain="Mark-sweep does not move objects. The freed objects are between live ones, so the free space is 3 runs, and the largest is 96 bytes. The request must go to fresh memory."
+>
+<MarkSweepDemo />
+</Predict>
+
+Things to try:
+
+1. Step through the roots. Each target gets its mark bit and goes on the **mark stack**.
+2. Step through the mark phase. Each pop reads the fields of one object. C is pushed only once, although A and D both point to it, because its mark bit is already set.
+3. Watch E point back to A. The mark bit stops the cycle: A is not pushed again.
+4. Watch the sweep. It visits all 10 objects in address order. G2 and G3 are neighbors, so they join one free run, and so do G4 and G5.
+5. Look at the last frame. Mark scanned 5 objects and read 10 fields. Sweep visited 10 objects, the garbage too.
+
+## The mark phase
+
+A recursive mark function is the easy version, and it is wrong for real heaps. A linked list of a million nodes needs a million nested calls. So real collectors keep an explicit **mark stack**. This C function compiles with clang 21 (`-std=c11 -Wall -Wextra`):
+
+```c
+struct obj {
+    bool marked;
+    size_t nfields;
+    struct obj *field[];
+};
+
+void mark(struct obj **roots, size_t nroots, struct obj **stack) {
+    size_t top = 0;
+    for (size_t i = 0; i < nroots; i++)
+        if (roots[i] && !roots[i]->marked) { roots[i]->marked = true; stack[top++] = roots[i]; }
+    while (top > 0) {
+        struct obj *o = stack[--top];
+        for (size_t i = 0; i < o->nfields; i++) {
+            struct obj *t = o->field[i];
+            if (t && !t->marked) { t->marked = true; stack[top++] = t; }
+        }
+    }
+}
+```
+
+The function sets the mark bit when it pushes an object, not when it pops it. So each object enters the stack at most once, and a stack with one slot per object is always enough. Real collectors use a smaller stack and handle overflow, for example by a rescan of the heap for marked objects with unmarked children.
+
+The mark phase must know which words of an object are pointers. In a language with exact type information, the compiler or the allocator records a **pointer map** for each type. Go's runtime keeps such maps, and its source calls the collector "type accurate (aka precise)". The cost of marking is proportional to the **live** data: the collector touches each live object once and reads each of its pointer fields.
+
+## The sweep phase
+
+The sweep walks the whole heap in address order. Each unmarked object goes back to the allocator, and each marked object gets its bit cleared for the next cycle. Its cost is proportional to the **heap size**, garbage included. The output of a sweep is a set of free runs, so a mark-sweep heap is a [free list](/systems/allocators/free-lists) heap. It has the same problem: [fragmentation](/systems/allocators/fragmentation). Mark-sweep never moves an object, so the free space stays in the holes between live objects.
+
+Two methods reduce the cost:
+
+- **Lazy sweeping**: the collector does not sweep after marking. The allocator sweeps a block of memory just before it reuses it. The pause then holds the mark phase only. Go sweeps this way, span by span, in the background and on allocation.
+- **Size classes**: a heap of segregated pages, one object size for each page, makes the sweep of a page a bitmap operation. Fragmentation inside a page remains, but no free run is ever too small for its size class.
+
+## What it costs
+
+A collection runs when the free memory is used up. Mark-sweep frees $H - L$ bytes per cycle, where $H$ is the heap size and $L$ is the live data. So the GC work per allocated byte is
+
+$$
+\text{cost per byte} = \frac{c_{\text{mark}} \cdot L + c_{\text{sweep}} \cdot H}{H - L}
+$$
+
+<TracingCostDemo />
+
+Things to try:
+
+1. Keep the defaults: $L$ = 100 MiB and $H = 3L$. The cost is 0.65 ns per allocated byte, and a collection runs 5.12 times for each GiB allocated. The per-byte costs are model inputs, not measurements.
+2. Move $H$ down to $1.1L$. The cost goes to 11.1 ns per byte. A heap that is almost full collects almost all the time.
+3. Move $H$ up to $6L$. The cost falls, but the pause does not change: the mark phase still visits all live data.
+4. Double $L$. The stop-the-world pause doubles: 136 ms becomes 273 ms with the defaults. Lazy sweeping removes only the sweep part from the pause.
+
+This is the central trade of tracing collection. Memory buys throughput: with more heap, the collector runs less often. The pause of a stop-the-world collector depends on the live data, and more heap does not shorten it. The later lessons attack the pause in two ways. One collects a small part of the heap ([generational GC](/systems/gc/generational-gc)). The other marks while the program runs ([concurrent GC](/systems/gc/concurrent-gc-and-write-barriers)).
+
+## Finding the roots
+
+The roots are the globals, the registers and every pointer in every stack frame. A **precise** collector knows which stack slots hold pointers at each **safepoint**: a point in the code where a collection may happen. The compiler emits a **stack map** for each safepoint. A **conservative** collector has no such map. It treats every word on the stack that looks like a heap address as a pointer.
+
+Hans Boehm and Mark Weiser built the classic conservative collector for C ("Garbage collection in an uncooperative environment", Software: Practice and Experience, 1988). The bdwgc library is its descendant. Its README says that pointers from the stack or registers "may point to anywhere inside an object". For heap pointers, interior pointers are on by default, and `GC_set_all_interior_pointers(0)` turns them off. The API looks like this (bdwgc is not installed here, so this code is not compiled):
+
+```c
+#include <gc.h>
+
+int main(void) {
+    GC_INIT();
+    struct node *list = GC_MALLOC(sizeof *list);  /* scanned for pointers */
+    char *pixels = GC_MALLOC_ATOMIC(1 << 20);     /* never scanned: holds no pointers */
+    GC_gcollect();                                /* a full, world-stop collection */
+}
+```
+
+The demo builds a small C program in the shared memory machine of this track. Its frame holds a real pointer, `list`, and an integer, `n`. Then it finds the roots in both ways.
+
+<StackScanDemo />
+
+Things to try:
+
+1. Keep **conservative** and **address of D**. The scan reads 16 words. The integer `n` matches the address of D, so D stays alive, and E stays because D points to it. That is 32 bytes of **false retention**.
+2. Select **precise**. The stack map names only `list`, so the scan reads 3 slots, and D and E are freed.
+3. Select **an address inside D**. D still stays alive. Like bdwgc, the scan treats a stack word that points anywhere inside a block as a pointer to that block. C code often keeps such interior pointers. This makes false retention more likely.
+4. Select **42**. Small integers never look like heap addresses, so both scans agree.
+
+Go itself was conservative for stack values before Go 1.3. Its 1.3 release notes say that since then, an integer "will never be mistaken for a pointer".
+
+False retention is usually small, but it has no upper bound. An integer that hits the head of a long list keeps the whole list. A conservative collector also cannot move an object that an ambiguous word points to, because it cannot update a word that may be an integer. The `GC_MALLOC_ATOMIC` call helps: a large pixel buffer that holds no pointers is never scanned, so its bytes cannot retain anything.
+
+## Connect
+
+- The sweep produces [free lists](/systems/allocators/free-lists), and the holes are the [fragmentation](/systems/allocators/fragmentation) of the allocators module.
+- The stack slots that a precise collector must find are laid out by the [calling convention](/architecture/isa/calling-conventions).
+- The next lesson, [copying collectors](/systems/gc/copying-collectors), avoids the sweep and the holes by moving live objects together.
+- A collector that does not move objects keeps the addresses of [pointers and references](/systems/memory/pointers-and-references) stable, which C code depends on.
+
+<Recall cards={[
+  { q: "Why does a mark function set the mark bit when it pushes an object, not when it pops it?", a: "Then no object enters the stack twice, so a stack with one slot per object is always big enough." },
+  { q: "The cost of marking is proportional to what, and the cost of sweeping to what?", a: "Marking: the live data, because it visits each live object once. Sweeping: the whole heap, because it visits every object, garbage included." },
+  { q: "With live data L and heap H, how much does one mark-sweep cycle free, and what happens as H approaches L?", a: "H − L bytes. The cost per allocated byte, (mark · L + sweep · H) / (H − L), grows without bound, because collections run almost all the time." },
+  { q: "What is false retention in a conservative collector?", a: "A word that is not a pointer, such as an integer, looks like a heap address. The collector keeps the object it points into, and everything that object reaches." },
+  { q: "What does a precise collector need from the compiler to find stack roots?", a: "A stack map for each safepoint: which stack slots and registers hold pointers at that point in the code." },
+  { q: "Why does more heap not shorten the pause of a stop-the-world mark-sweep collector?", a: "The pause is the mark phase (and the sweep if it is not lazy), and marking visits all live data. More heap only makes collections less frequent." },
+]} />

@@ -1,0 +1,136 @@
+---
+summary: "Count the pointers to each object and free it at zero. The cascade of frees, the cycles that leak, trial deletion, deferred counts, and what an atomic count costs."
+---
+import { RcBuildDemo, TrialDeletionDemo, RcCostDemo } from "@/demos/sys/SysGcRcDemos";
+
+A **garbage collector** frees heap objects that the program can no longer reach. The program itself is the **mutator**: it allocates objects and changes pointers. The collector must never free an object that a chain of pointers from a **root** still reaches. A root is a pointer outside the heap, such as a local variable or a global.
+
+This module treats each collector as an algorithm with three costs. **Pause time** is how long the mutator must stop. **Throughput** is the share of CPU time that the program keeps for its own work. **Memory overhead** is the extra memory that the collector needs to do its job. Every collector in this module runs on the same small object graph, so you can compare them directly.
+
+The simplest collector does its work at every pointer write. **Reference counting** (George Collins, 1960) keeps a count in each object: the number of pointers to it. A store `p = q` increments the count of the new target and decrements the count of the old target. When a count reaches zero, nothing can reach the object, so the program frees it at once.
+
+<Predict
+  id="dlist"
+  question="A doubly linked list of 3 nodes has one root r that points to the first node. You set r to null. How many nodes does reference counting free?"
+  options={["All 3, in a cascade", "1: only the first node", "None"]}
+  answer={2}
+  explain="The first node has a count of 2: the root and the back pointer of the second node. Without the root, its count is 1, not 0. Each node holds its neighbor, so all three counts stay above zero for ever. The list leaks."
+>
+<RcBuildDemo />
+</Predict>
+
+Things to try:
+
+1. Select **list** and click the arrow from r. The count of A goes to 0, A is freed, and its field decrements B. The log shows the **cascade**: three frees, each one level deeper.
+2. Select **shared child**. D starts with a count of 2. Cut A.f0, and D survives with a count of 1. Then cut the root: the cascade frees all four objects.
+3. Select **doubly linked** and cut the root. All three nodes stay, with counts above zero. The demo then copies the same heap into the shared memory machine of this track and runs its LeakSanitizer-style check at exit.
+4. Select **ring**, and store A into the root again before you cut anything. The count of A goes up first and down after, so the store frees nothing.
+
+## Why a count is a collector
+
+A count is a local fact: it says how many pointers exist, not if a root reaches the object. For acyclic data the two facts agree. An object with no root path has no pointers from live objects, so its count is zero. A cycle breaks this. Each member of an unreachable cycle has a pointer from another member, so no count ever reaches zero.
+
+The order of operations in a store matters. Increment first, then write, then decrement. If the code decremented first, `x = x` could drop the last count, free the object, and then store a dangling pointer.
+
+The work of reference counting is spread over the program. This gives three useful properties:
+
+- **Prompt reclamation**: memory comes back at the moment the last pointer goes. A destructor or `Drop` runs at a known point, so files and locks close at once.
+- **No tracing**: the collector never walks the whole heap. Its work is proportional to the pointer writes, not to the heap size.
+- **Bounded memory**: there is no garbage that waits for a collection, except cycles.
+
+The pause is not always small. Freeing the last pointer to a long list frees every node in one cascade. With `Rc` in Rust, the generated drop code is recursive. This program builds a list of 1,000,000 `Rc` nodes and drops the head:
+
+```rust
+use std::rc::Rc;
+struct Node { _next: Option<Rc<Node>> }
+fn main() {
+    let mut head: Option<Rc<Node>> = None;
+    for _ in 0..1_000_000 { head = Some(Rc::new(Node { _next: head })); }
+    drop(head); // the last count goes to zero: a cascade of 1,000,000 frees
+}
+```
+
+```text
+thread 'main' (8736127) has overflowed its stack
+fatal runtime error: stack overflow, aborting
+```
+
+That output is from rustc 1.96.1 on macOS, with `-O`. A long list needs a `Drop` implementation that unlinks the nodes in a loop.
+
+## Cycles leak in every language that counts
+
+The same leak shows up in each language that uses counts alone. In Rust, the `Rc` documentation states: "A cycle between `Rc` pointers will never be deallocated." This program makes a cycle of two nodes. Rust 1.96.1 prints the counts and then nothing more, because no `Drop` runs:
+
+```rust
+let a = Rc::new(Node { name: "a", next: RefCell::new(None) });
+let b = Rc::new(Node { name: "b", next: RefCell::new(Some(Rc::clone(&a))) });
+*a.next.borrow_mut() = Some(Rc::clone(&b));      // a -> b -> a
+println!("a: {}, b: {}", Rc::strong_count(&a), Rc::strong_count(&b));  // a: 2, b: 2
+```
+
+Swift uses **automatic reference counting** (ARC): the compiler inserts the count operations. The Swift book calls a cycle a "strong reference cycle" and resolves it with `weak` or `unowned` references. A Swift 6.3.3 version of the same cycle never runs either `deinit`. The fix in both languages is a **weak reference**: a pointer that does not keep its target alive. A back pointer, such as a child to its parent, is the usual weak one. The ownership module covers [smart pointers](/systems/ownership/smart-pointers) such as `Rc`, `Weak` and `std::shared_ptr` as library types.
+
+CPython uses counts for almost everything and adds a separate **cycle collector**, the `gc` module. It looks only at container objects. In Python 3.9.6, a cycle of two plain objects makes `gc.collect()` return 4: the two objects and their two attribute dictionaries. With `__slots__`, the same cycle returns 2. Python 3.11 and later usually create no separate attribute dictionary, so there the plain cycle also returns 2.
+
+The default thresholds changed between versions: (700, 10, 10) through 3.12, and (2000, 10, 10) from 3.13. Python 3.14.0 to 3.14.4 shipped an incremental collector with only a young and an old generation. Python 3.14.5 went back to the collector of 3.13.
+
+## Trial deletion
+
+How can a counting system find a garbage cycle without a full trace?
+
+The answer is a **trial deletion**, also called local mark-scan. It comes from Martínez, Wachenchauzer and Lins (1990) and from Lins (1992). David Bacon and V. T. Rajan made it run in linear time in "Concurrent Cycle Collection in Reference Counted Systems" (ECOOP 2001).
+
+The key observation: a garbage cycle can only appear when a count drops to a value above zero. So each such object becomes a **candidate root** (purple). Later, the collector does a trial: it subtracts every count that comes from inside the subgraph of the candidates.
+
+<TrialDeletionDemo />
+
+Things to try:
+
+1. Step through **MarkGray**. Each pointer inside the gray subgraph removes 1 from its target. C, D and E reach 0. A keeps 1: the root r.
+2. Watch **Scan** on A. Its trial count is above zero, so an outside pointer holds it. **ScanBlack** gives back the counts of A and B.
+3. Watch **CollectWhite**. It frees C, D and E. E was not in a cycle, but only the cycle held it.
+
+The work is proportional to the subgraph under the candidates, not to the whole heap. Bacon and Rajan also buffer the candidates and process them in batches, so one object that keeps changing count costs one trial, not many.
+
+## Make counting cheaper
+
+Most count updates come from local variables.
+
+A loop `cur = cur.next` over a counted list increments each node and decrements it again one step later. **Deferred reference counting** (L. Peter Deutsch and Daniel Bobrow, CACM 1976) does not count pointers from the stack at all. An object whose count reaches zero goes into a **zero count table** (ZCT). From time to time, the system scans the stack. It frees each ZCT object that no stack slot names.
+
+Compilers remove pairs too. The Swift compiler has ARC optimization passes that delete a retain and a later release that cancel each other. In Rust, you avoid the pair by design: a function that takes `&Node` borrows the node and does no count update. A clone happens only where you write `Rc::clone`.
+
+The cost of one update depends on sharing. A plain count is an add in the cache. A count that several threads can change must be **atomic**. Rust's `Arc` documentation says that it "uses atomic operations for its reference counting". For `std::shared_ptr`, cppreference notes that the counts are typically incremented with an equivalent of `std::atomic::fetch_add` with relaxed order. The Swift runtime keeps its counts in a `std::atomic` word.
+
+<RcCostDemo />
+
+Things to try:
+
+1. Read the 1-thread row. On this machine, an atomic pair costs 3.82 ns and a plain pair costs 2.61 ns. The difference is small while the cache line stays in one core.
+2. Move to 8 threads. With its own `Arc` for each thread, the pair still costs about 3.86 ns. With one shared `Arc`, it costs 380.07 ns: 98.5 times more.
+3. Read the walk time. Eight threads that walk the same list with counted cursors pay this on every step. With borrowed cursors they pay nothing.
+
+The slow case is not the atomic instruction. It is the cache line of the count, which moves from core to core on every write. Read-mostly data that many threads share is the worst case for counting. A tracing collector also writes to objects when it keeps mark bits or forwarding pointers in their headers. Only a collector with a separate mark table and no moving leaves shared objects untouched.
+
+| | Reference counting | Tracing (next lessons) |
+|---|---|---|
+| Work is proportional to | pointer writes | live data (mark) or heap size (sweep) |
+| When memory comes back | at once | at the next collection |
+| Cycles | leak, or need a cycle collector | collected |
+| Writes to shared objects | yes, on every copy of a pointer | once per collection, or none with a separate mark table |
+
+## Connect
+
+- The ownership module covers the library types: [smart pointers](/systems/ownership/smart-pointers) (`Rc`, `Arc`, `Weak`, `shared_ptr`).
+- Lock-free code needs other ways to free shared nodes: [hazard pointers](/concurrency/lock-free/hazard-pointers) and [epoch-based reclamation](/concurrency/lock-free/epoch-based-reclamation).
+- The cache-line traffic of a shared count is the same effect as [false sharing](/performance/concurrency/false-sharing) and [contention](/performance/concurrency/contention).
+- The next lesson, [mark and sweep](/systems/gc/mark-and-sweep), finds garbage by tracing from the roots, so cycles are no problem.
+
+<Recall cards={[
+  { q: "Why must a reference-counted store increment the new target before it decrements the old one?", a: "Old and new can be the same object. Then a decrement first can drop the count to zero and free it, and the store writes a dangling pointer." },
+  { q: "Why can plain reference counting never free an unreachable cycle?", a: "Each member of the cycle has a pointer from another member, so its count stays at 1 or more, although no root reaches it." },
+  { q: "In trial deletion, which objects become candidate roots, and what does MarkGray do to them?", a: "Objects whose count dropped to a value above zero. MarkGray walks their subgraph and subtracts 1 for each pointer inside it; objects that reach 0 have no outside pointers." },
+  { q: "What does deferred reference counting (Deutsch and Bobrow) stop counting, and what does it need instead?", a: "Pointers from the stack. Objects with a zero heap count go into a zero count table, and a periodic stack scan decides which of them are really free." },
+  { q: "Eight threads clone and drop the same Arc. Why is each pair about 100 times slower than with one Arc per thread?", a: "Every update writes the same cache line, so the line moves between cores on each operation. The atomic instruction itself is cheap when the line stays in one core." },
+  { q: "Why can dropping the last Rc to a long list crash a Rust program?", a: "The drop of each node drops the next node recursively. A cascade of a million frees needs a million nested calls, and the stack overflows." },
+]} />

@@ -1,0 +1,135 @@
+---
+summary: "The tools that catch UB at run time: ASan's shadow memory, redzones and quarantine, HWASan's pointer tags, UBSan, MSan, TSan and LSan, Valgrind's synthetic CPU and Miri's interpreter. What each one sees, what it misses, and what it costs."
+---
+import { UbShadowDemo, UbToolsDemo } from "@/demos/sys/SysUbSanDemos";
+
+The hardware checks almost nothing. A use after free reads whatever bytes are there, and an overflow writes into the next object. The program often continues, and the damage shows much later. A **sanitizer** is a compiler option that adds checks to the program. Each check finds one class of bug at the moment it happens, and prints where.
+
+Sanitizers find bugs only on the paths that run. They do not prove that a program is correct. But they turn a silent corruption into a clear report with a stack trace, so they belong in every test build.
+
+## AddressSanitizer: shadow memory
+
+AddressSanitizer (ASan) is the paper "AddressSanitizer: A Fast Address Sanity Checker" by Serebryany, Bruening, Potapenko and Vyukov (USENIX ATC 2012). It keeps one **shadow byte** for each 8 bytes of application memory. The shadow byte says how many of the 8 bytes the program may access.
+
+$$
+\text{shadow}(a) = (a \gg 3) + \text{offset}
+$$
+
+On x86-64 Linux the offset is `0x7fff8000`. The compiler puts a short check before each load and store. For an access of 1, 2 or 4 bytes it is:
+
+```c
+k = *(int8_t *)((addr >> 3) + 0x7fff8000);
+if (k != 0 && ((addr & 7) + size - 1) >= k)
+    report_and_abort(addr, size);
+```
+
+A shadow byte of 0 means that all 8 bytes are valid. A value k from 1 to 7 means that only the first k bytes are valid. A negative value means that no byte is valid, and its value says why. The demo uses a model of the ASan heap. Its chunk sizes match a real run of `clang -fsanitize=address` on macOS for 40-byte blocks.
+
+<Predict
+  id="asan-skip"
+  question="a and b are two malloc(40) blocks, and b starts 64 bytes after a. The program reads a[16], which is the first int of b. What does ASan report?"
+  options={[
+    "heap-buffer-overflow, because a[16] is past the end of a",
+    "Nothing, because the shadow byte of a[16] is 00",
+    "heap-use-after-free",
+  ]}
+  answer={1}
+  explain="ASan checks the address, not the pointer that the address came from. The int a[16] is a valid byte of b, so its shadow byte is 00 and the check passes. A real ASan build on macOS printed b's value for this read and reported nothing."
+>
+<UbShadowDemo />
+</Predict>
+
+Things to try:
+
+1. Keep i = 10. `a[10]` is the first int after the 40 bytes of `a`. Its shadow byte is `fa`, so the check fails with heap-buffer-overflow, "0 bytes after 40-byte region".
+2. Move i to 9 and then to −1. The read of `a[9]` passes. `a[-1]` is in the **left redzone**: 16 bytes before each block, where the real ASan keeps the chunk header.
+3. Move i to 16. The address is inside `b`, and ASan says nothing. Bigger jumps past the redzone go unseen too.
+4. Click **free(a)**, then set i = 3. The shadow of `a` is now `fd`, and the report is heap-use-after-free.
+5. With the quarantine at 64 B, click **free(b)**. The quarantine is full, so `a` leaves it. Click **c = malloc(40)**: `c` gets the old bytes of `a`, and `a[3]` passes the check again.
+6. Click **free(a)** a second time. ASan reports a double free.
+
+### Redzones and quarantine
+
+ASan replaces `malloc` and `free`. Each block gets **redzones**: poisoned bytes before and after it. The minimum redzone is 16 bytes, and larger blocks get larger ones. A linear overflow, such as a loop that runs one step too far, always hits a redzone first. A jump over the redzone does not, as the demo shows.
+
+`free` poisons the block with `fd` and puts it in a **quarantine**, a FIFO queue of freed blocks. The default limit is 256 MB (`quarantine_size_mb`; 16 MB on Android and iOS). A use after free is found while the block is in the queue. When the block leaves the queue, the allocator may reuse it, and a stale pointer then reads valid memory.
+
+The compiler also puts redzones around stack arrays and globals. This is part of a real report for `int a[4]` read at index 4:
+
+```text
+ERROR: AddressSanitizer: stack-buffer-overflow on address 0x00016fcce830 ...
+    [32, 48) 'a' (line 3) <== Memory access at offset 48 overflows this variable
+=>0x00016fcce800: f1 f1 f1 f1 00 00[f3]f3 00 00 00 00 00 00 00 00
+```
+
+The two `00` bytes are the 16 bytes of `a`. `f1` is the left redzone of the stack frame and `f3` the right redzone. The access hit the shadow byte in brackets.
+
+### Cost
+
+The paper measured an average slowdown of 73% on SPEC CPU2006, and 3.37 times the memory. The Clang documentation says that the typical slowdown is 2x. The memory goes to the shadow (one eighth of the address space is reserved), the redzones and the quarantine.
+
+## HWASan: tags instead of redzones
+
+HWASan uses a feature of AArch64 called **top-byte ignore**: the CPU ignores the top 8 bits of a pointer. HWASan stores a random **tag** there. It also stores a tag for each 16-byte **granule** of memory in a shadow area. `malloc` gives the block and the pointer the same tag, and each access checks that the two tags match. `free` gives the memory a new tag.
+
+An overflow into a neighbour block, the case that ASan misses, now fails the check, because the neighbour has a different tag. A stale pointer fails too, with no quarantine. The detection is probabilistic: with 8-bit tags, two tags match by chance with a probability of 1/256. HWASan needs much less memory than ASan, because it has no redzones and its shadow is 1 byte per 16. Android uses it on AArch64.
+
+## The other sanitizers
+
+| Tool | Flag | Finds | Typical cost (from its docs) |
+|---|---|---|---|
+| UBSan | `-fsanitize=undefined` | signed overflow, bad shifts, null and misaligned access, out-of-bounds index of a known array, and more | small |
+| MSan | `-fsanitize=memory` | use of uninitialized memory | about 3x |
+| TSan | `-fsanitize=thread` | data races | 5x to 15x; 5x to 10x memory |
+| LSan | `-fsanitize=leak`, or part of ASan | leaks at exit | at exit only |
+
+**UBSan** puts a check at each operation that can be UB. By default it prints a report and continues. `-fsanitize=undefined` does not include `unsigned-integer-overflow`, because unsigned wrap is defined. `-fsanitize-trap=undefined` replaces each report with a trap instruction and needs no run-time library. `-fsanitize-minimal-runtime` is small enough for production builds.
+
+Zig's `zig cc` turns UBSan on by default in debug builds. Before Zig 0.14, a failed check was a trap with no message. Since 0.14, a small runtime prints the report.
+
+**MemorySanitizer** keeps one shadow bit for each bit of memory. It reports when an uninitialized value decides a branch, is used as a pointer, or is passed to a function or to libc. All code must be instrumented, including libc, so it needs special builds of every library. It works on Linux, NetBSD and FreeBSD only.
+
+**ThreadSanitizer** finds data races with vector clocks. The concurrency track explains it: see [race conditions](/concurrency/foundations/race-conditions) and [happens-before](/concurrency/atomics/happens-before). ASan, TSan and MSan cannot go in the same binary. Clang 21 says: `'-fsanitize=address' not allowed with '-fsanitize=thread'`. So CI needs one build for ASan with UBSan, and one for TSan.
+
+**LeakSanitizer** runs at exit. It scans memory for pointers to live blocks, and it reports each block that no root reaches. On Linux, ASan runs it by default. Apple clang 21 on macOS said: "detect_leaks is not supported on this platform".
+
+<UbToolsDemo />
+
+Things to try:
+
+1. Select **Index lands in the next block**. UBSan catches it only at -O1 and above, when the optimizer can see the malloc size. Only Miri always catches it, because it tracks provenance: which allocation a pointer came from. The memory model of this track does the same.
+2. Select **Signed overflow**. Only UBSan catches it. Valgrind runs the machine code, and an `add` instruction has no UB.
+3. Select **Use after free**. ASan and Valgrind catch it only until the freed memory is reused.
+4. Click the rows for the uninitialized value and the data race. Each needs its own tool: MSan or Valgrind, and TSan.
+
+## Valgrind and Miri: no recompile, or no machine code
+
+**Valgrind Memcheck** runs an unmodified binary on a synthetic CPU. It tracks which bytes are addressable and which bits are defined, so it finds leaks, heap overflows and uses of uninitialized values. It needs no recompile, and it works with libraries that you cannot rebuild. The cost is speed: its manual gives 10 to 50 times slower. It sees only machine code, so it cannot find source-level UB such as signed overflow or a type-based aliasing violation. It also misses most overflows of stack arrays, because the stack has no redzones.
+
+**Miri** is an interpreter for Rust's mid-level IR (MIR). It runs `cargo miri test` on nightly Rust. It checks every access against provenance, alignment, initialization and the [aliasing model](/systems/ub/aliasing-rules) of Rust. It also finds data races, and it reports memory that is still allocated at exit. Miri is far slower than a native run, and it cannot run most foreign (C) code. It checks only the executions that it runs.
+
+**Zig** puts many checks in the language. In the debug and safe modes, the compiler adds checks for overflow, bounds, null optionals, bad casts and wrong union tags. These are on by default, so most Zig tests run with them. They do not cover use after free.
+
+For the heap, `std.heap.DebugAllocator` helps: it reports double frees and leaks with stack traces. It does not reuse addresses if its backing allocator does not reuse them. It also returns unused pages to the system, so many stale accesses fault.
+
+## What this means for your code
+
+- Run the tests under ASan and UBSan on every change. Add a TSan build if the code has threads. Run MSan or Valgrind from time to time for uninitialized memory.
+- A sanitizer finds only bugs on paths that run. Fuzzing (libFuzzer, AFL) makes the paths, and the sanitizers make the bugs visible. They are designed to work together.
+- No report does not mean no UB. ASan misses a jump into another block, and every tool misses code that the tests do not run.
+- In Rust, run the unsafe parts under Miri. In Zig, test in the debug or safe mode before you ship `-O fast`.
+
+## Connect
+
+- [Free lists](/systems/allocators/free-lists) and [general-purpose allocators](/systems/allocators/general-purpose-allocators) show the heap that ASan replaces.
+- [Address spaces](/os/vm/address-spaces) explains how ASan can reserve one eighth of the virtual address space for shadow.
+- [Race conditions](/concurrency/foundations/race-conditions) covers ThreadSanitizer and Go's race detector.
+
+<Recall cards={[
+  { q: "What is ASan's shadow address for an application address a on x86-64 Linux, and what does a shadow byte of 5 mean?", a: "(a >> 3) + 0x7fff8000. A shadow byte of 5 means that only the first 5 of the 8 bytes may be accessed." },
+  { q: "Why does ASan miss a[16] when a and b are adjacent 40-byte blocks?", a: "a[16] is a valid byte of b, so its shadow byte is 00. ASan checks addresses, not the allocation that a pointer came from." },
+  { q: "Why can ASan miss a use after free?", a: "Freed blocks stay poisoned only while they are in the quarantine. After a block leaves it, the allocator may reuse the memory, and the stale pointer reads valid bytes." },
+  { q: "How does HWASan find bugs without redzones, and how often does it miss?", a: "It stores a random 8-bit tag in the pointer's top byte (AArch64 top-byte ignore). Each 16-byte granule also has a tag, and each access checks that they match. Two tags match by chance with a probability of 1/256." },
+  { q: "Why can Valgrind not find signed overflow?", a: "It runs the machine code, and the add instruction wraps with no error. Signed overflow is UB only in the C source." },
+  { q: "Why do you need separate CI builds for ASan and TSan?", a: "Clang does not allow -fsanitize=address with -fsanitize=thread (or memory) in the same binary." },
+]} />

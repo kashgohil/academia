@@ -1,0 +1,144 @@
+---
+summary: "Two pointers to one object block many optimizations. How restrict, strict aliasing and Rust's &mut tell the compiler that pointers do not overlap, what goes wrong when they do, and how to read the bits of a value safely."
+---
+import { UbHoistDemo, UbTbaaDemo, UbPunDemo } from "@/demos/sys/SysUbAliasDemos";
+
+Two pointers **alias** when they can reach the same bytes. Aliasing is the main reason that compilers reload values from memory. After a store through one pointer, every value that another pointer reads may have changed. Unless the compiler can prove that the two pointers do not overlap, it must read memory again.
+
+C gives the compiler two ways to prove it. The programmer can promise it with `restrict`. Or the compiler can use the types: an `int` store cannot change a `float` object. Rust gives the same promise for every `&mut`. This lesson shows each rule in real compiler output, and what happens when the program breaks the promise.
+
+## Hoist a load out of a loop
+
+This function multiplies each element of an array by `*k`. If `k` cannot point into `a`, the compiler can load `*k` once, before the loop. That is called **hoisting** the load.
+
+```c
+void scale(int *a, const int *k, int n) {
+    for (int i = 0; i < n; i++)
+        a[i] = a[i] * *k;
+}
+```
+
+<Predict
+  id="restrict"
+  question="a is int a[4] = {1, 2, 3, 4}. The parameter a is declared int *restrict a, and the call is scale(a, &a[1], 4). What does the clang -O2 build leave in a?"
+  options={[
+    "{2, 4, 12, 16}, the same as -O0",
+    "{2, 4, 6, 8}",
+    "clang rejects the call, because a and k overlap",
+  ]}
+  answer={1}
+  explain="With restrict, clang loads *k once, before the loop. That value is 2, so every element is multiplied by 2. The -O0 build reloads *k after a[1] becomes 4, so a[2] and a[3] are multiplied by 4. The call breaks the restrict promise, so it is UB. No compiler error is required, and clang gives none."
+>
+<UbHoistDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **k points to** at v. Every build gives 3, 6, 9, 12. The real -O2 output still loads `[rsi]` (that is `*k`) inside the loop, because a store to `a[i]` may change `*k`.
+2. Select **int \*restrict a**. The load of `[rsi]` moves before the loop. The array result does not change, because `k` points to `v`.
+3. Move **k points to** to a[1] with restrict on. The hoisted build gives 2, 4, 6, 8. A native build of this code with clang -O2 printed exactly these values, and -O0 printed 2, 4, 12, 16.
+4. Move it to a[3]. The program is still UB, because `a[3]` is written through `a` and read through `k`. But both builds give the same array: UB does not always show.
+5. Move it to a[0]. The first iteration sets a[0] to 1 · 1, so `*k` stays 1 and nothing changes.
+
+## restrict
+
+C99 added `restrict` (C11 6.7.3.1). The rule is about objects, not pointers. Suppose an object is accessed through a `restrict` pointer `p`, and the object is modified by any means. Then every access to it in that block must use a pointer based on `p`. A call that breaks the rule has UB. The compiler does not check it, and usually it cannot.
+
+The vectorizer also uses this rule. Without `restrict`, clang -O2 still vectorizes `scale`, but it adds a run-time test first. If `k` points into the range of `a`, the plain loop runs. The demo listings use `-fno-vectorize` so that the hoisted load is easy to see.
+
+C++ has no `restrict`. GCC, Clang and MSVC accept `__restrict` as an extension.
+
+## Strict aliasing: the types decide
+
+C11 6.5p7 says that an object "shall have its stored value accessed only by an lvalue expression" of certain types:
+
+- a type compatible with its effective type, or a qualified version of it;
+- the signed or unsigned version of that type;
+- an aggregate or union type that has one of those types as a member;
+- a character type.
+
+The **effective type** (6.5p6) is the declared type of the object. Memory from `malloc` has no declared type. Its effective type is set by a store through a non-character lvalue, or by `memcpy` or `memmove`. So an `int` lvalue may not read an object that is a `float`. The compiler uses this rule with **type-based alias analysis** (TBAA): a store to a `float` cannot change an `int`.
+
+The last line of the list is the exception: `char`, `signed char` and `unsigned char` may read any object. That is why `memcpy` works, and why a `char*` parameter blocks some optimizations.
+
+<UbTbaaDemo />
+
+Things to try:
+
+1. Click **Back** to step 0, then **Next**. Look at the bytes of `x`. The int store writes `01 00 00 00`, then the float store writes the bits of 2.0f over them: `00 00 00 40`.
+2. At the last step, compare the builds. Memory holds 1073741824, the int value of the bits of 2.0f. The -O2 build returns 1, the value that it stored before.
+3. Look at the real -O2 output. The function stores 1, stores 1073741824, and returns the constant 1. It never loads `x` again.
+4. Select another float. The bytes change, but the -O2 result is always 1.
+
+This optimization also works inside loops. In `scale` with `float *a` and `const int *k`, clang -O2 hoists the load of `*k` without `restrict`, because a store to a `float` cannot change an `int`. With `-fno-strict-aliasing`, it loads `*k` in each iteration again. The Linux kernel builds with `-fno-strict-aliasing`, because kernel code often reads one memory area with different types.
+
+## Type punning that is defined
+
+**Type punning** is reading the bytes of one type as another type, for example the bits of a `float` as a `uint32_t`. The obvious cast `*(uint32_t *)&f` breaks 6.5p7. It is UB in C and in C++, even though today's clang compiles it to the expected instruction.
+
+<UbPunDemo />
+
+Things to try:
+
+1. Move **f** to 1. The bytes are `00 00 80 3f`, so the value is 0x3f800000.
+2. Select each C method. All three compile to one instruction, `movd eax, xmm0`. Only the standard rules differ.
+3. Select **union**. It is defined in C: footnote 95 of C11 6.5.2.3 says that the bytes are "reinterpreted". In C++, only the active member of a union may be read.
+4. Select **memcpy**. The call is gone. Compilers know `memcpy` and turn a 4-byte copy into a register move.
+
+The safe choice in each language:
+
+| Language | Method | Note |
+|---|---|---|
+| C | `memcpy`, or a union | both compile to one move |
+| C++20 | `std::bit_cast<uint32_t>(f)` | also works in a constant expression |
+| Rust | `f.to_bits()` | safe; one `fmov w0, s0` on AArch64 |
+| Zig | `@bitCast(f)` | the sizes are checked at compile time |
+| Go | `math.Float32bits(f)` | |
+
+## Rust: every &mut is restrict
+
+In Rust, a `&mut T` is unique. While it exists, no other pointer may read or write the same memory. A `&T` is shared and read-only, except for memory inside an `UnsafeCell`. The compiler rustc tells LLVM this: the parameters of `fn f(a: &mut i32, b: &mut i32)` get the `noalias` attribute in the LLVM IR, the same attribute that C `restrict` gives.
+
+```rust
+pub fn f(a: &mut i32, b: &mut i32) -> i32 { *a = 1; *b = 2; *a }
+pub unsafe fn g(a: *mut i32, b: *mut i32) -> i32 { *a = 1; *b = 2; *a }
+```
+
+With rustc 1.96 `-O` on AArch64, `f` ends with `mov w0, #1`: it returns the constant. The raw-pointer version `g` ends with `ldr w0, [x0]`: it must load again. So Rust gets the `restrict` optimization in safe code, and the borrow checker proves the promise.
+
+Unsafe code can break the promise. The exact rules for raw pointers and references are not decided yet; the Reference says so. Two formal models exist, and the interpreter **Miri** checks programs against them:
+
+- **Stacked Borrows** (Jung, Dang, Kang and Dreyer, POPL 2020). Each location has a stack of permissions. A new `&mut` pops the permissions of older pointers. This is Miri's default.
+- **Tree Borrows** (Villani, Hostert, Dreyer and Jung, PLDI 2025). Permissions form a tree, which accepts more real unsafe code. Miri uses it with `-Zmiri-tree-borrows`.
+
+```rust
+let mut x = 0i32;
+let p = &mut x as *mut i32; // a raw pointer from a unique borrow
+let r = &mut x;             // a new unique borrow of x
+unsafe { *p = 1 };          // write through the older pointer
+*r = 2;
+```
+
+This compiles with no warning and prints 2. Under the Stacked Borrows rules, creating `r` removes the permission of `p`, so the write through `p` is UB. This lesson did not run Miri on it.
+
+## What this means for your code
+
+- Do not cast between unrelated pointer types to read memory. Use `memcpy`, `std::bit_cast`, `to_bits` or `@bitCast`.
+- Use `restrict` only on function parameters that you can prove do not overlap, and write the promise in the comment.
+- If a C code base depends on punning everywhere, build it with `-fno-strict-aliasing`, as Linux does. It costs some speed in loops like `scale`.
+- In unsafe Rust, do not keep a raw pointer alive across a new `&mut` to the same place. Run the tests under Miri.
+
+## Connect
+
+- [Struct layout](/systems/memory/struct-layout-alignment-and-padding) and [pointers and references](/systems/memory/pointers-and-references) cover what a pointer can point to.
+- [Auto-vectorization](/performance/cpu/auto-vectorization) shows the run-time overlap checks in vectorized loops.
+- [IEEE 754](/architecture/data/ieee-754-floating-point) explains the float bits that the punning demo shows.
+
+<Recall cards={[
+  { q: "What does restrict promise, and who checks the promise?", a: "Take an object that is accessed through the restrict pointer and is modified. Every access to it in the block uses a pointer based on that pointer. Nobody checks it: a call that breaks it is UB." },
+  { q: "Which lvalue types may read an object of effective type float in C?", a: "float (or a qualified float), an aggregate or union that contains a float, and a character type. An int or uint32_t lvalue may not." },
+  { q: "Why does clang -O2 return 1 from *i = 1; *f = 2.0f; return *i; even when i and f point to the same int?", a: "Strict aliasing: a store through a float lvalue cannot change an int object, so the compiler forwards the stored 1 and does not load again." },
+  { q: "How do you read the bits of a float in C, C++20, Rust and Zig?", a: "C: memcpy (or a union). C++20: std::bit_cast. Rust: f.to_bits(). Zig: @bitCast. Each compiles to one register move." },
+  { q: "What does rustc put on a &mut parameter in LLVM IR, and what does it allow?", a: "The noalias attribute, as for C restrict. LLVM may keep values in registers across stores through other pointers." },
+  { q: "Name the two aliasing models for unsafe Rust and their venues.", a: "Stacked Borrows (POPL 2020), Miri's default, and Tree Borrows (PLDI 2025), used with -Zmiri-tree-borrows." },
+]} />

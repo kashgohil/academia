@@ -1,0 +1,142 @@
+---
+summary: "Signed overflow is UB in C and C++, and compilers use that to widen loop counters and delete checks. How to write overflow checks that survive -O2, the flags that change the rules, and the malloc(n * size) bug class."
+---
+import { UbWidenDemo, UbCheckStepDemo, UbCheckFormsDemo, UbMallocDemo } from "@/demos/sys/SysUbIntDemos";
+
+The lesson [two's complement](/architecture/data/twos-complement) shows what the hardware does at the edge: the bits wrap, and the flags tell you. It also has a table of what each language does with `INT_MAX + 1`. This lesson takes the compiler's side. In C and C++, signed overflow is UB (C11 6.5p5: the result is "not in the range of representable values for its type"). Unsigned arithmetic "can never overflow": it is reduced modulo $2^n$ (6.2.5p9).
+
+That difference looks small. But it gives the optimizer a strong fact about every signed `+`, `-` and `*`: the result is the exact mathematical value. The examples below are real clang -O2 output for x86-64 Linux.
+
+## Widen the loop counter
+
+On x86-64, an `int` is 32 bits and a pointer is 64 bits. To use `i + k` as an index, the code must extend it to 64 bits. If `i + k` can wrap, the extension must happen after each add. If it cannot wrap, the compiler can extend `k` once and count with a 64-bit register.
+
+<Predict
+  id="widen"
+  question="The loop for (i = 0; i < n; i++) a[i + k] = 0.0f; is compiled with int i, n, k and with unsigned i, n, k. Which version does clang -O2 turn into one call to memset?"
+  options={[
+    "Both, because the loop only writes zeros",
+    "Only the int version",
+    "Only the unsigned version, because unsigned arithmetic is simpler",
+  ]}
+  answer={1}
+  explain="With int, i + k cannot overflow in a defined execution. So the indices k, k + 1, … are contiguous, and one memset of 4n bytes is correct. With unsigned, i + k may wrap from UINT_MAX to 0. The writes are then not contiguous, so clang keeps a loop that zero-extends i + k in each iteration."
+>
+<UbWidenDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **int** and k = MAX − 1 with n = 4. As written, the third index wraps to −2,147,483,648. The memset writes index 2,147,483,648 instead. The source has UB, so both are correct translations.
+2. Move k to MAX − 8. Now nothing overflows, and both builds write the same indices.
+3. Select **unsigned** with k = MAX − 1. The indices wrap to 0 and 1. That is defined behavior, so the -O2 code must do the same. Look at `mov ecx, edx` in the listing: it zero-extends `i + k` in every iteration.
+4. With **unsigned** and k = MAX − 8, nothing wraps. But clang cannot know the values at compile time, so the loop stays.
+
+The same fact simplifies other code. The compiler folds `x + 1 > x` to 1, `(x * 2) / 2` to `x`, and `x + 1 < y + 1` to `x < y`. It can also compute the trip count of `for (int i = 0; i <= n; i++)`. With an `unsigned` counter, that loop never ends when `n` is `UINT_MAX`.
+
+## The check that disappears
+
+A common mistake is to test for overflow after the operation, by looking at the wrapped result.
+
+<UbCheckStepDemo />
+
+Things to try:
+
+1. Step through to the end. The fact in step 2 turns `a + b < a` into `b < 0`, and then the whole condition is false.
+2. With the input a = `INT_MAX` − 5, b = 6, the -O0 build returns −1: the check works there. The -O2 build returns the wrapped sum.
+3. Select a = −7, b = −9. All three builds return −16: there is no UB, so the deleted check changes nothing.
+
+The fix is to test before the operation, with values that cannot overflow, or to ask the compiler for the flag.
+
+<UbCheckFormsDemo />
+
+Things to try:
+
+1. Select each check with the input that overflows. Only `a + b < a` returns the wrong value.
+2. Compare the listings. `__builtin_add_overflow` compiles to one `add`, then `cmovno` reads the overflow flag. The test before the add needs more instructions.
+3. Select **unsigned add**. Unsigned arithmetic wraps by definition, so the check stays. The conversion back to `int` is implementation-defined (C11 6.3.1.3p3); GCC and Clang wrap.
+
+The checked operations in each language:
+
+| Language | Checked | Wrapping | Saturating |
+|---|---|---|---|
+| C23 | `ckd_add(&r, a, b)` in `stdckdint.h` (7.20) returns true on overflow | cast to unsigned and back | none |
+| GCC, Clang | `__builtin_add_overflow(a, b, &r)` | `-fwrapv` (whole file) | Clang: `__builtin_elementwise_add_sat(a, b)`; GCC: none |
+| Rust | `a.checked_add(b)` gives `Option`; `overflowing_add` gives `(value, bool)` | `a.wrapping_add(b)` | `a.saturating_add(b)` |
+| Zig | `@addWithOverflow(a, b)` gives a tuple; `std.math.add` gives an error | `a +% b` | `a +\| b` |
+
+In Rust, plain `+` panics when debug assertions are on and wraps in release builds. That is the default; `-C overflow-checks=on` keeps the checks in release. Plain `+` in Zig panics in the debug and safe modes. The `-O fast` and `-O small` modes do not check it, so there it is unchecked illegal behavior.
+
+## Flags that change the rules
+
+| Flag | Effect on signed overflow |
+|---|---|
+| `-fwrapv` | defined: it wraps in two's complement. The check in the demo stays. |
+| `-fno-strict-overflow` | in GCC and Clang, signed and pointer overflow wrap. Linux uses it. |
+| `-ftrapv` | traps. On AArch64 macOS, a test that adds 1 to `INT_MAX` stopped with SIGTRAP. Clang for x86-64 emits `ud1` (SIGILL); GCC calls a libgcc helper that aborts. |
+| `-fsanitize=signed-integer-overflow` | prints a report and continues |
+
+The UBSan report from clang 21 is exact:
+
+```text
+runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+```
+
+`-fwrapv` costs speed only where the fact helps, for example in loops like `fill`. It does not make overflow correct. It only makes it predictable.
+
+## Size computations
+
+The worst overflow bugs are in sizes. In this code, `n` comes from the network:
+
+```c
+uint32_t bytes = n * size;   /* wraps modulo 2^32 */
+T *p = malloc(bytes);
+for (size_t i = 0; i < n; i++)
+    p[i] = read_item();      /* writes n elements */
+```
+
+The multiply is unsigned, so it is defined, and no tool sees UB in it. But with `size` = 16 and `n` = $2^{28}$ + 1, the product 4,294,967,312 wraps to 16. The program allocates 16 bytes and then writes far past them. OpenSSH 2.9.9 to 3.3 had this kind of bug in its challenge-response code (CVE-2002-0639), and it allowed remote code execution.
+
+<UbMallocDemo />
+
+Things to try:
+
+1. Keep n = $2^{28}$ + 1 and size 16. malloc gets 16 bytes. The second element write goes past the block, and the third one overwrites the `session` object next to it.
+2. Select n = $2^{28}$. The product wraps to 0. `malloc(0)` returns either NULL or a pointer that you may not use (C11 7.22.3p1).
+3. Select **size_t n \* size**. On a 64-bit target the product is exact here. The real malloc either gives 4 GiB or fails.
+4. Select **checked multiply**. The code returns NULL before it calls malloc.
+
+The library functions check for you. `calloc(n, size)` must return NULL if `n * size` wraps (C23 7.24.3.2 says so; glibc uses `__builtin_mul_overflow` for it). `reallocarray(p, n, size)` does the same for resizes; it came from OpenBSD 5.6, glibc has it since 2.26, and POSIX.1-2024 includes it. In Rust, `Vec::with_capacity` with a size that is too large panics with `capacity overflow`. In Zig, `std.math.mul(u32, n, size)` returns `error.Overflow`.
+
+## Unsigned wrap: defined, but still a bug
+
+Unsigned wrap is not UB, so the optimizer leaves it alone, and UBSan does not report it by default. It is still a frequent bug:
+
+```c
+for (size_t i = n - 1; i >= 0; i--)   /* i >= 0 is always true: when n is 0, i starts at SIZE_MAX */
+    use(a[i]);
+```
+
+Clang has `-fsanitize=unsigned-integer-overflow` for this. It is not part of `-fsanitize=undefined`, because the wrap is legal and much correct code depends on it, for example hash functions.
+
+## What this means for your code
+
+- Never test for signed overflow by looking at the result. Test the operands first, or use `__builtin_add_overflow` or `ckd_add`.
+- Compute sizes with a checked multiply, or with `calloc` and `reallocarray`. A wrap in a size is a security bug.
+- Prefer signed loop counters of pointer width (`ptrdiff_t`, `isize`) for indexing. Then no extension is needed in the loop.
+- In Rust, decide on purpose: `checked_*` at trust boundaries, `wrapping_*` for hashes and counters that may wrap.
+
+## Connect
+
+- [Two's complement](/architecture/data/twos-complement) has the bit-level view and the table of language rules.
+- [What UB really means](/systems/ub/what-ub-really-means) explains how a fact becomes a deleted branch.
+- [General-purpose allocators](/systems/allocators/general-purpose-allocators) shows the heap that a size bug corrupts.
+
+<Recall cards={[
+  { q: "Why can clang turn for (int i = 0; i < n; i++) a[i + k] = 0; into one memset, but not the unsigned version?", a: "Signed overflow is UB, so i + k is exact and the indices k, k + 1, … are contiguous. Unsigned i + k may wrap to 0, so the writes may not be contiguous." },
+  { q: "What does clang -O2 do with if (b > 0 && a + b < a) return -1;?", a: "It deletes it. a + b is exact in a defined execution, so a + b < a means b < 0, and b > 0 && b < 0 is false." },
+  { q: "Give two ways to write a signed add-overflow check that survives -O2 in C.", a: "Test before the add: b > 0 && a > INT_MAX - b. Or use __builtin_add_overflow(a, b, &r), or C23 ckd_add(&r, a, b)." },
+  { q: "uint32_t bytes = n * 16 with n = $2^{28}$ + 1. What does malloc get?", a: "16 bytes. The product 4,294,967,312 wraps modulo $2^{32}$ to 16." },
+  { q: "Which C library functions check n * size for overflow?", a: "calloc (required by C23) and reallocarray. Both return NULL if the product does not fit." },
+  { q: "Is unsigned overflow reported by -fsanitize=undefined?", a: "No. Unsigned wrap is defined. Clang reports it only with -fsanitize=unsigned-integer-overflow (part of -fsanitize=integer)." },
+]} />

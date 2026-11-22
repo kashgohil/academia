@@ -1,0 +1,119 @@
+---
+summary: "Undefined behavior is not a crash and not a random value: it is a promise that the compiler may assume. How C, C++, Rust, Zig and Go define it, and how an optimizer turns it into deleted code."
+---
+import { UbOptimizerDemo, UbContractsDemo } from "@/demos/sys/SysUbBasicsDemos";
+
+A C program that reads through a null pointer does not have "a crash". It has **undefined behavior** (UB). The C11 standard (N1570, 3.4.3) defines UB as behavior "for which this International Standard imposes no requirements". The standard gives no rule for such an execution, so the compiler needs no rule either.
+
+This is the key idea of this module. UB is a contract between you and the compiler. You promise that your program never does certain things. In return, the compiler may assume that these things never happen, and it may use that assumption to make the code faster.
+
+## Three kinds of "the standard does not say"
+
+C has three related terms. They are easy to confuse, but they give the compiler very different freedom.
+
+| Term (N1570) | Meaning | Example |
+|---|---|---|
+| Implementation-defined (3.4.1) | Each compiler picks one behavior and documents it. | Right shift of a negative `int`; the size of `long` |
+| Unspecified (3.4.4) | The standard allows two or more results; the compiler need not document its choice. | The order in which function arguments are evaluated |
+| Undefined (3.4.3) | No requirements at all. | Signed overflow, a null dereference, an out-of-bounds read |
+
+There is a fourth path to UB. Section 4p2 says that UB also occurs when a "shall" outside a constraint is violated, or when the standard simply gives no definition. Annex J.2 of the standard collects the cases in one long list.
+
+## Be the optimizer
+
+The demo shows three small functions. For each one, step through what clang may assume and what it does with that assumption. Then run each build on an input.
+
+<Predict
+  id="nullcheck"
+  question="get(int *p) reads *p first and checks p == NULL after the read. A program has mapped page 0, so a read of address 0 gives 0x1337 (4919). What does the clang -O2 build return for get(NULL)?"
+  options={[
+    "−1, because the check is still in the code",
+    "4919, because the check is gone",
+    "It crashes with SIGSEGV",
+  ]}
+  answer={1}
+  explain="The read of *p is UB when p is NULL. So clang may assume that p is not NULL after line 2. Then p == NULL is false, and the check is dead code. The -O2 output is one load and a return. The -O0 build does the load and then the check, so it returns −1."
+>
+<UbOptimizerDemo />
+</Predict>
+
+Things to try:
+
+1. Step through **Null check after a dereference** with the slider. Look at the fact in step 2: the dereference on line 2 tells the compiler that p is not NULL.
+2. Select the input **p = &v, v = 5**. All three builds return 5. When there is no UB, the optimizer must keep the result the same.
+3. Select **x + 1 > x** and the input INT_MAX. The -O0 build wraps and returns 0, the -O2 build returns 1, and -fwrapv returns 0 again.
+4. Select **A search loop that never ends**. The C++ build returns 1 at once. The C build of the same code loops forever.
+
+## How an optimizer uses UB
+
+An optimizer does not look for UB to punish it. It works from facts. Each operation that can be UB gives the compiler a fact for free: "if this line ran, the operation was valid". A dereference of `p` gives "p is not NULL". An `int` addition `x + 1` gives "x is less than `INT_MAX`". Normal passes then use these facts as they use any other fact: constant folding, dead-code elimination, loop analysis.
+
+The rule that allows all of this is the **as-if rule**. The index of N1570 uses that name, but the normative text does not. N1570 5.1.2.3p6 says that the compiler must keep only the **observable behavior**: volatile accesses, the data written to files, and interactive input and output. Any program that gives the same observable behavior is a correct translation. For an execution with UB, there is no required behavior, so every translation is correct.
+
+Compilers use these facts because they pay. The fact "a signed loop counter does not wrap" lets the compiler compute the trip count of a loop. It can also widen the counter to 64 bits. The fact "an `int*` and a `float*` do not point to the same object" lets it keep values in registers. The [integer overflow](/systems/ub/integer-overflow) and [aliasing](/systems/ub/aliasing-rules) lessons show the real code.
+
+## When the fact is wrong
+
+In 2009, Linux 2.6.30 had this code in the tun driver (CVE-2009-1897):
+
+```c
+struct sock *sk = tun->sk;   /* dereference first */
+if (!tun)
+    return POLLERR;          /* GCC removed this check */
+```
+
+GCC removed the check, exactly as in the demo. On a normal system the read of `tun->sk` faults, so the bug is only a crash. But an attacker could map page 0, so the read worked and the check was gone. The result was a local privilege escalation. The kernel now builds with `-fno-delete-null-pointer-checks`. Its top-level Makefile also has `-fno-strict-aliasing` and `-fno-strict-overflow`, so it turns off the three facts of this module.
+
+The flag `-fno-delete-null-pointer-checks` does more than keep the `if`. The real clang output in the demo tests `rdi` first and loads only if it is not zero. The compiler is free to move the load, because the load has no observable effect.
+
+## UB and time
+
+UB is not an event at one point in time. The C++23 standard ([intro.abstract]p5) says that for an execution that contains an undefined operation, it places no requirement on the implementation. It adds: "not even with regard to operations preceding the first undefined operation". So a compiler may move work across the UB, or delete a path that leads to UB even before the UB happens.
+
+Newer C++ limits this with **observable checkpoints** (paper P1494, "Partial program correctness"). The observable behavior up to the last checkpoint before the undefined operation must still happen. Code that you compile today with C++17 or C++20 does not get this rule.
+
+The search loop in the demo shows another rule. C++ [intro.progress]p1 lets the compiler assume that each thread eventually terminates, does I/O, accesses a volatile, or does an atomic or synchronization operation. The loop does none of these things, so clang assumes that it ends. Its only exit returns 1, so the function returns 1. C11 6.8.5p6 has a similar rule, but only for loops whose condition is not a constant expression. The condition `1` is a constant, so the C build keeps the loop.
+
+Since Clang 19, a **trivial** infinite loop such as `while (1) {}` is not UB in C++ (paper P2809R3, applied to all language modes). The demo loop is not trivial, because it has a body.
+
+## One bug, four contracts
+
+Other languages make different promises about the same operations. The demo runs four edge cases in each build mode. Every message in it is real output from rustc 1.96, zig 0.17.1, go 1.25 and clang 21 on an AArch64 Mac.
+
+<UbContractsDemo />
+
+Things to try:
+
+1. Keep **x + 1** at INT_MAX. Only C and Zig in `-O fast` leave it undefined. Go wraps by its spec, and Rust release wraps because overflow checks are off. The other modes stop with a message.
+2. Select **a[i]** and move i from 3 to 4. Rust checks the index in every build. Zig checks it in `-O debug` and `-O safe` only.
+3. Select the shift `1 << s` and move s to 31 and then to 32. In C, `1 << 31` is already UB, because the result does not fit in an `int`.
+4. Select the null case and compare Zig `-O fast` with Go. The same mistake gives a quiet 0 in one and a clear panic in the other.
+
+**Rust.** Safe Rust has no UB: that is the soundness promise of the language. UB is possible only in `unsafe` code.
+
+The Rust Reference has a list, "Behavior considered undefined". It includes data races, a dangling or misaligned access, and breaking the pointer aliasing rules. It also includes an invalid value, for example a `bool` that is 3. Integer overflow is not on the list. It panics when debug assertions are on, and wraps otherwise (RFC 560).
+
+**Zig.** Zig calls it **illegal behavior**, since 0.14. Most illegal behavior is safety-checked: in `-O debug` and `-O safe` it panics. In `-O fast` and `-O small` the checks are off, and the result is like UB in C: "anything can happen". You can change this for one scope with `@setRuntimeSafety`. Zig 0.17 renamed the modes; before it, they were `Debug`, `ReleaseSafe`, `ReleaseFast` and `ReleaseSmall`.
+
+**Go.** Go defines overflow, shifts and nil dereferences. Its main gap is the data race. The Go memory model (2022) is clear about it. In most Go implementations, an interface, map, slice or string holds a pair of words. A race on such a value can give a pair that no write produced, and then "arbitrary memory corruption".
+
+## What this means for your code
+
+- Do not reason about UB from what the hardware does. The question is what the compiler may assume, and the answer changes with the flags, the compiler version and the code around it.
+- Test with the checks on: `-fsanitize=undefined,address` in C and C++, a debug build in Rust, `-O safe` in Zig. The [sanitizers](/systems/ub/sanitizers) lesson shows how each tool works.
+- When you need a behavior, ask for it in the code. Put the null check before the dereference. Use `__builtin_add_overflow` or `wrapping_add` for overflow, and `memcpy` for type punning.
+
+## Connect
+
+- [Two's complement](/architecture/data/twos-complement) has the bit-level view of overflow and the MIN / −1 trap.
+- [Race conditions](/concurrency/foundations/race-conditions) and [happens-before](/concurrency/atomics/happens-before) define the data race, the UB of concurrent code.
+- [Pointers and references](/systems/memory/pointers-and-references) covers what a valid pointer is.
+
+<Recall cards={[
+  { q: "What is the difference between implementation-defined and undefined behavior in C?", a: "Implementation-defined: the compiler chooses one behavior and documents it, for example the right shift of a negative int. Undefined: the standard imposes no requirements at all, so any translation of that execution is correct." },
+  { q: "How does an optimizer use UB, in one sentence?", a: "Each operation that is UB on some inputs gives the compiler a fact: p is not NULL, or x + 1 does not overflow. Normal passes such as constant folding and dead-code elimination then use that fact." },
+  { q: "Why did GCC delete the NULL check in the 2009 Linux tun driver bug, and which flag does the kernel use now?", a: "tun->sk was read before the check, so GCC inferred that tun was not NULL and removed the check. The kernel now builds with -fno-delete-null-pointer-checks." },
+  { q: "Why does clang compile a C++ search loop with no I/O to return 1, but keep the same loop in C?", a: "C++ [intro.progress] lets the compiler assume that a loop with no I/O, volatile or atomic operations ends. C11 6.8.5p6 allows this only when the loop condition is not a constant expression, and while (1) has a constant condition." },
+  { q: "What does Zig do with illegal behavior in each build mode?", a: "The debug and safe modes check most illegal behavior and panic. The fast and small modes do not check it, and unchecked illegal behavior is like UB in C." },
+  { q: "Is i32 overflow UB in Rust?", a: "No. It panics when debug assertions (overflow checks) are on and wraps in two's complement otherwise. Safe Rust has no UB." },
+]} />

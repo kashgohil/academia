@@ -32,6 +32,10 @@ export const LEVELS: Record<Level, string> = {
 
 /** Lessons with a written MDX page. Paths must match `src/content/lessons/<path>.mdx`. */
 export const LIVE = new Set<string>([
+  "systems/ub/aliasing-rules",
+  "systems/ub/integer-overflow",
+  "systems/ub/sanitizers",
+  "systems/ub/what-ub-really-means",
   "systems/linking/object-files-and-elf",
   "systems/linking/static-and-dynamic-linking",
   "systems/linking/symbols-and-relocation",

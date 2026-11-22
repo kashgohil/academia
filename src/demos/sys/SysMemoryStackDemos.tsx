@@ -135,7 +135,7 @@ const budgetSchema = {
 };
 
 const OVERFLOW: Record<string, string> = {
-  main: "SIGSEGV: the next frame touches the guard gap below the stack",
+  main: "SIGSEGV: the kernel will not grow the stack past RLIMIT_STACK (8 MiB)",
   pthread: "SIGSEGV in the guard page below the thread stack",
   rust: "thread '…' has overflowed its stack (Rust's guard-page handler)",
   go: "runtime: goroutine stack exceeds 1000000000-byte limit",
@@ -168,7 +168,7 @@ export function SysMemoryStackBudgetDemo() {
           </div>
         );
       })}
-      <Note>Bars use a log scale. The main thread and thread sizes are fixed when the stack is made. A goroutine starts small and doubles by copying; the 1 GB limit ({int(GO_MAX_STACK)} bytes) means the largest stack is 512 MiB.</Note>
+      <Note>Bars use a log scale. With the usual 8 MiB limit, glibc threads also get 8 MiB; the 2 MB row is the case of ulimit -s unlimited. The main thread and thread sizes are fixed when the stack is made. A goroutine starts small and doubles by copying; the 1 GB limit ({int(GO_MAX_STACK)} bytes) means the largest stack is 512 MiB.</Note>
     </Demo>
   );
 }

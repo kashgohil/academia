@@ -83,7 +83,7 @@ export const FAT_POINTERS: FatPointer[] = [
   { id: "rs-slice", lang: "Rust", type: "&[u32]", words: [{ name: "ptr", bytes: 8, to: "data" }, { name: "len", bytes: 8 }], size: 16, len: true, nullable: "never", shape: "slice",
     note: "A fat pointer: address and element count. &str is the same, with a length in bytes of UTF-8." },
   { id: "rs-dyn", lang: "Rust", type: "&dyn Shape", words: [{ name: "data", bytes: 8, to: "data" }, { name: "vtable", bytes: 8, to: "vtable" }], size: 16, len: false, nullable: "never", shape: "dyn",
-    note: "The second word points to a vtable: drop, size, align, then the trait's methods. Box<dyn Shape> has the same two words." },
+    note: "The second word points to a vtable: drop, size, align, then the trait's methods. Box<dyn Shape> has the same two words. The word order is what rustc does today, not a guarantee." },
   { id: "rs-vec", lang: "Rust", type: "Vec<u32>", words: [{ name: "ptr", bytes: 8, to: "data" }, { name: "cap", bytes: 8 }, { name: "len", bytes: 8 }], size: 24, len: true, nullable: "never", shape: "vec",
     note: "Not a pointer but an owner: three words on the stack, the elements on the heap. The field order is not specified." },
   { id: "go-slice", lang: "Go", type: "[]int32", words: [{ name: "ptr", bytes: 8, to: "data" }, { name: "len", bytes: 8 }, { name: "cap", bytes: 8 }], size: 24, len: true, nullable: "nil slice: ptr 0, len 0", shape: "goslice",
@@ -169,8 +169,12 @@ export interface GrowthRun {
   copied: number;
 }
 
-/** Push n elements one at a time onto an empty array. */
-export function pushAll(policy: Policy, n: number, elem: number): GrowthRun {
+/**
+ * Push n elements one at a time onto an empty array. `goStackBuf`: Go 1.25 gives a slice that does not escape a
+ * 32-byte stack buffer for its first backing array (cmd/compile VariableMakeThreshold; checked: a local []int starts
+ * at cap 4 and a local []byte at cap 32). Pass 0 for a slice that escapes (heap only).
+ */
+export function pushAll(policy: Policy, n: number, elem: number, goStackBuf = 0): GrowthRun {
   let cap = 0;
   let reallocs = 0;
   let copied = 0;
@@ -178,7 +182,8 @@ export function pushAll(policy: Policy, n: number, elem: number): GrowthRun {
   for (let len = 1; len <= n; len++) {
     if (len > cap) {
       copied += len - 1;
-      cap = policy === "go" ? goGrow(len, cap, elem) : policy === "rust" ? rustGrow(len, cap, elem) : cppGrow(len, cap);
+      const buf = cap === 0 && policy === "go" ? Math.floor(goStackBuf / elem) : 0;
+      cap = buf >= len ? buf : policy === "go" ? goGrow(len, cap, elem) : policy === "rust" ? rustGrow(len, cap, elem) : cppGrow(len, cap);
       reallocs++;
     }
     caps.push(cap);

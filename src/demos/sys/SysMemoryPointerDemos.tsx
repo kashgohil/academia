@@ -6,9 +6,9 @@
  * - SysMemoryGrowthDemo: the capacity policies of Go's append, Rust's Vec and libc++'s vector.
  */
 import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
-import { Banner, ButtonRow, Demo, Legend, Line, MiniTable, Note, Param, Plot, SectionLabel, Stats, StepButtons, StepCaption, StepSlider, int, mono, range, select, tint, useStepper } from "../../kit";
+import { Banner, ButtonRow, Demo, Legend, Line, MiniTable, Note, Param, Plot, SectionLabel, Stats, StepButtons, StepCaption, StepSlider, int, mono, range, select, tint, toggle, useStepper } from "../../kit";
 import { array, hex, layoutC } from "../../sims/sys/mem";
-import { arith, distinctCaps, ELEMS, FAT_POINTERS, HOLD, pushAll, runScript, sliceOf, type HoldLang, type Policy } from "../../sims/sys/memory";
+import { arith, distinctCaps, ELEMS, FAT_POINTERS, GO_VARIABLE_MAKE_BYTES, HOLD, pushAll, runScript, sliceOf, type HoldLang, type Policy } from "../../sims/sys/memory";
 import { HeapBlocks, StackView, StructBytes, UbBanner } from "./SysViews";
 import { CodeLines, CompilerBox } from "./SysMemoryUi";
 
@@ -176,6 +176,7 @@ export function SysMemoryHoldDemo() {
 
 const nSpec = range({ label: "Elements pushed", min: 1, max: 20000, default: 1000, log: true, format: (v) => int(Math.round(v)) });
 const sizeSpec = select({ label: "Element size", options: [{ value: "1", label: "1 byte" }, { value: "4", label: "4 bytes" }, { value: "8", label: "8 bytes" }], default: "8", segmented: true });
+const escSpec = toggle({ label: "Go slice escapes (heap only)", default: true });
 const POLICIES: { id: Policy; label: string; color: string }[] = [
   { id: "go", label: "Go append", color: "var(--c1)" },
   { id: "rust", label: "Rust Vec", color: "var(--c3)" },
@@ -198,14 +199,16 @@ function steps(caps: number[]): [number, number][] {
 export function SysMemoryGrowthDemo() {
   const [n0, setN] = useState(1000);
   const [size, setSize] = useState("8");
+  const [escapes, setEscapes] = useState(true);
   const n = Math.round(n0);
   const elem = Number(size);
-  const runs = POLICIES.map((p) => ({ ...p, run: pushAll(p.id, n, elem) }));
+  const runs = POLICIES.map((p) => ({ ...p, run: pushAll(p.id, n, elem, escapes ? 0 : GO_VARIABLE_MAKE_BYTES) }));
   const maxCap = Math.max(...runs.map((r) => r.run.caps[r.run.caps.length - 1] ?? 1));
   return (
     <Demo title="How capacity grows: Go, Rust and C++" controls={<>
       <Param spec={nSpec} value={n0} onChange={(v) => setN(v as number)} />
       <Param spec={sizeSpec} value={size} onChange={(v) => setSize(v as string)} />
+      <Param spec={escSpec} value={escapes} onChange={(v) => setEscapes(v as boolean)} />
     </>}>
       <Plot x={[1, Math.max(2, n)]} y={[1, Math.max(2, maxCap)]} logX logY height={230} xLabel="length" yLabel="capacity" xTicks={DECADES.filter((d) => d <= n)} yTicks={DECADES.filter((d) => d <= maxCap)} xFormat={(v) => int(v)} yFormat={(v) => int(v)}>
         {runs.map((r) => <Line key={r.id} points={steps(r.run.caps)} color={r.color} width={1.8} dash={r.id === "cpp" ? "5 3" : undefined} />)}

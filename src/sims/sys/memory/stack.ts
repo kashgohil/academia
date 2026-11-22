@@ -12,7 +12,8 @@
  * shows 8192. glibc's NPTL takes the default thread stack size from RLIMIT_STACK at program start, or 2 MB on most
  * architectures when the limit is "unlimited" (man 3 pthread_create, NOTES). Rust's std gives a spawned thread 2 MiB
  * (`DEFAULT_MIN_STACK_SIZE` in library/std/src/sys/thread/unix.rs, rustc 1.96; `RUST_MIN_STACK` overrides it). Go 1.25:
- * `stackMin = 2048` (runtime/stack.go), the stack doubles in `newstack` (`newsize := oldsize * 2`), and
+ * a goroutine starts with `fixedStack` = stackMin (2048) + stackSystem, rounded up to a power of two (runtime/stack.go):
+ * 2 KiB on Linux and macOS, 4 KiB on iOS, 8 KiB on Windows; the stack doubles in `newstack` (`newsize := oldsize * 2`), and
  * `maxstacksize = 1000000000` on 64-bit (runtime/proc.go). Since the size is a power of two, the largest stack that
  * fits under the limit is 2²⁹ bytes (512 MiB); the next doubling fails with "goroutine stack exceeds
  * 1000000000-byte limit" (go1.25.6, checked: the failing stack was [0x140201e0000, 0x140401e0000), 512 MiB).
@@ -52,7 +53,7 @@ const cScript = (m: Machine, step: StepFn) => {
   step(1, "make gets a frame below main's frame.", () => m.call("make", [{ name: "x", type: int }]));
   step(2, "x = 42 writes 4 bytes in make's frame.", () => m.set("x", 42));
   step(3, "make returns &x. Its frame is free stack now, so p points at a dead object.", () => { px = m.addrOf("x"); m.ret(); m.set("p", px); });
-  step(11, "*p reads the dead x. A sanitizer reports it. The hardware reads the old 42.", () => m.set("a", m.load(m.get("p") as Ptr, int)));
+  step(11, "*p reads the dead x. A sanitizer reports it. With clang the hardware reads the old 42 (GCC would have returned a null pointer, and this read would crash).", () => m.set("a", m.load(m.get("p") as Ptr, int)));
   step(5, "other gets a frame at the same addresses that make had.", () => m.call("other", [{ name: "z", type: int }]));
   step(6, "z = 7 writes over the bytes of the dead x.", () => m.set("z", 7));
   step(7, "other returns.", () => m.ret());
@@ -286,7 +287,7 @@ export const LINUX_MAIN_STACK = 8 * MiB;
 export const GLIBC_THREAD_UNLIMITED = 2 * MiB;
 /** Rust std::thread::spawn default (rustc 1.96, Unix). */
 export const RUST_THREAD_STACK = 2 * MiB;
-/** Go runtime `stackMin` on Linux. */
+/** Go runtime `fixedStack` on Linux and macOS: stackMin (2048) + stackSystem (0) rounded to a power of two. It is 8 KiB on Windows (stackSystem 4096) and 4 KiB on iOS arm64 (stackSystem 1024). */
 export const GO_STACK_MIN = 2048;
 /** Go runtime `maxstacksize` on 64-bit platforms. */
 export const GO_MAX_STACK = 1_000_000_000;
@@ -304,7 +305,7 @@ export interface StackKind {
 
 export const STACK_KINDS: StackKind[] = [
   { id: "main", label: "Linux main thread", limit: LINUX_MAIN_STACK, grows: false, source: "RLIMIT_STACK, default 8 MiB (_STK_LIM)" },
-  { id: "pthread", label: "glibc thread (ulimit -s unlimited)", limit: GLIBC_THREAD_UNLIMITED, grows: false, source: "man 3 pthread_create" },
+  { id: "pthread", label: "glibc thread when ulimit -s is unlimited", limit: GLIBC_THREAD_UNLIMITED, grows: false, source: "man 3 pthread_create (with a finite RLIMIT_STACK, threads get that limit: 8 MiB by default)" },
   { id: "rust", label: "Rust std::thread::spawn", limit: RUST_THREAD_STACK, grows: false, source: "std::thread docs, 2 MiB" },
   { id: "go", label: "Go goroutine", limit: GO_MAX_STACK, grows: true, source: "runtime/stack.go, proc.go" },
 ];

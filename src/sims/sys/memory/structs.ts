@@ -5,7 +5,8 @@
  * - GALLERY: real and teaching structs. Each one was checked with `zig cc -target <triple>` (zig 0.17.1) and
  *   offsetof/sizeof, and the Rust ones with rustc 1.96 (size_of, offset_of!). `struct epoll_event` is packed on x86
  *   (glibc bits/epoll.h for x86 defines __EPOLL_PACKED as __attribute__((__packed__)); the kernel's uapi eventpoll.h
- *   packs it on x86-64 "to make the 64bit structure have the same alignment as the 32bit structure"), so it is 12
+ *   packs it under #ifdef __x86_64__: "On x86-64 make the 64bit structure have the same alignment as the 32bit
+ *   structure. This makes 32bit emulation easier."), so it is 12
  *   bytes there and 16 bytes on AArch64 and RISC-V.
  * - packedAccess: a packed array of `struct { uint8_t tag; uint32_t len; }` on the shared machine, read three ways:
  *   through the struct (the compiler knows the field is unaligned), through a `uint32_t *` (UB when misaligned), and

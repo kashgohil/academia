@@ -201,6 +201,12 @@ describe("numbers quoted in the lessons", () => {
     expect(pushAll("go", 1, 1).caps[0]).toBe(8);
     expect(pushAll("rust", 1, 1).caps[0]).toBe(8);
     expect(goNextSliceCap(4, 3)).toBe(6);
+    // Go 1.25, a slice that does not escape: 32-byte stack buffer first (checked with go run: 4 8 16 ... and 32 64 ...)
+    const local = pushAll("go", 1000, 8, 32);
+    expect([local.reallocs, local.copied]).toEqual([10, 1868]);
+    expect(distinctCaps(pushAll("go", 20000, 8, 32).caps)).toEqual([4, 8, 16, 32, 64, 128, 256, 512, 848, 1280, 1792, 2560, 3408, 5120, 7168, 9216, 12288, 16384, 21504]);
+    expect(distinctCaps(pushAll("go", 20000, 1, 32).caps)).toEqual([32, 64, 128, 256, 512, 896, 1408, 2048, 3072, 4096, 5376, 6912, 9472, 12288, 16384, 21760]);
+    expect(distinctCaps(pushAll("go", 5000, 4, 32).caps)).toEqual([8, 16, 32, 64, 128, 256, 512, 864, 1344, 2048, 3072, 4096, 5440]);
   });
   test("struct layout: M on i386 and padding positions on x86-64", () => {
     const M = GALLERY.find((g) => g.id === "worst")!.type("i386-linux");

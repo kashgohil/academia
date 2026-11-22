@@ -5,7 +5,8 @@
  * - `rcStore` writes one pointer: it increments the new target first, then writes, then decrements the old target.
  *   An object whose count reaches zero is freed at once, and its own fields are decremented in turn: the cascade.
  *   An object whose count drops to a value above zero becomes a candidate root of a garbage cycle ("purple").
- * - `trialDeletion` is the synchronous cycle collector of Bacon and Rajan (ECOOP 2001, "Concurrent Cycle Collection
+ * - `trialDeletion`: trial deletion (local mark-scan, Martínez, Wachenchauzer and Lins 1990; Lins 1992) in the
+ *   linear-time synchronous form of Bacon and Rajan (ECOOP 2001, "Concurrent Cycle Collection
  *   in Reference Counted Systems", LNCS 2072): three phases, MarkRoots (MarkGray subtracts the counts that come
  *   from inside the candidate subgraph), ScanRoots (Scan restores the objects that still have an outside count, with
  *   ScanBlack) and CollectRoots (CollectWhite frees the rest). It returns one frame per change, for a stepper.

@@ -8,7 +8,7 @@
  *   collection. The baseline is a non-generational mark-sweep collector with the same peak memory. Both count work in
  *   bytes traced or copied, not in time.
  * - `cardFrames` steps through one old-to-young store and the next minor collection, with or without a card-marking
- *   write barrier. Cards are 512 bytes, as in HotSpot's card table (card shift 9).
+ *   write barrier. Cards are 512 bytes, the default card size of HotSpot (fixed before JDK 18; set by -XX:GCCardSizeInBytes since).
  */
 import { rng } from "./heap";
 

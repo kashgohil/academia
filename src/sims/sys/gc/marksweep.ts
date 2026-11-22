@@ -129,7 +129,12 @@ export const NODE = struct("node", [["next", ptr()], ["val", T.long]]);
  * The program: `list` points to a 3-node list A → B → C. D → E was the old list; nothing points to it any more.
  * The local `long n` holds a plain number: 42, or by bad luck the address of D, or an address inside D.
  */
-export function stackScan(nValue: WordValue, mode: "precise" | "conservative", interior = true): ScanResult {
+/**
+ * As in bdwgc, a stack word that points anywhere inside a heap block counts as a pointer to it. `heapInterior` sets
+ * the same rule for words inside heap blocks (bdwgc's GC_all_interior_pointers, on by default); off, a heap word
+ * must equal the start of a block.
+ */
+export function stackScan(nValue: WordValue, mode: "precise" | "conservative", heapInterior = true): ScanResult {
   const m = new Machine();
   const blocks = ["A", "B", "C", "D", "E"].map((l) => [l, m.allocNamed("node", l, { type: NODE })] as const);
   const p = Object.fromEntries(blocks);
@@ -144,7 +149,7 @@ export function stackScan(nValue: WordValue, mode: "precise" | "conservative", i
   const before = m.snapshot();
   const heap = before.heap.filter((b) => b.state === "live");
   const label = (id: number) => heap.find((b) => b.id === id)!.label;
-  const hit = (v: number) => heap.find((b) => (interior ? v >= b.addr && v < b.addr + b.size : v === b.addr));
+  const hit = (v: number, interior = true) => heap.find((b) => (interior ? v >= b.addr && v < b.addr + b.size : v === b.addr));
   const roots: ScanRoot[] = [];
   let words = 0;
   const frame = before.frames.find((f) => f.live)!;
@@ -181,7 +186,7 @@ export function stackScan(nValue: WordValue, mode: "precise" | "conservative", i
       if (mode === "precise" && off !== 0) continue;
       words += mode === "conservative" ? 1 : 0;
       const v = Number(m.rawLoad(b.addr + off, T.u64));
-      const t = mode === "precise" ? heap.find((x) => x.addr === v) : hit(v);
+      const t = mode === "precise" ? heap.find((x) => x.addr === v) : hit(v, heapInterior);
       if (t && !retained.has(t.id)) work.push(t.id);
     }
   }

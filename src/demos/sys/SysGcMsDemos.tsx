@@ -1,7 +1,7 @@
 /** Demos for "Mark and sweep": a mark-sweep stepper, precise vs conservative stack scanning, and the cost model. */
 import { useMemo } from "react";
 import {
-  Banner, Chip, Controls, Demo, Dots, Line, Plot, RuleX, SectionLabel, Stats, StepButtons, StepCaption, StepSlider, fixed, mono, range, seg, tint, toggle, useParams, useStepper, useWidth,
+  Banner, Chip, Controls, Demo, Dots, Line, Plot, RuleX, SectionLabel, Stats, StepButtons, StepCaption, StepSlider, fixed, mono, range, seg, tint, useParams, useStepper, useWidth,
 } from "../../kit";
 import { COST_DEFAULTS, MS_GRAPH, MS_POS, freeStats, layoutHeap, markSweep, nameOf, stackScan, tracingCost, type MsFrame, type WordValue } from "../../sims/sys/gc";
 import { hex } from "../../sims/sys/mem";
@@ -70,12 +70,11 @@ export function MarkSweepDemo() {
 const SCAN = {
   n: seg<WordValue>("long n holds", [["small", "42"], ["base", "address of D"], ["interior", "an address inside D"]], "base"),
   mode: seg<"precise" | "conservative">("Root finding", [["precise", "precise (stack map)"], ["conservative", "conservative"]], "conservative"),
-  interior: toggle({ label: "A pointer into the middle of a block counts", default: true }),
 };
 
 export function StackScanDemo() {
   const P = useParams("sys-gc-scan", SCAN);
-  const r = useMemo(() => stackScan(P.values.n, P.values.mode, P.values.interior), [P.values.n, P.values.mode, P.values.interior]);
+  const r = useMemo(() => stackScan(P.values.n, P.values.mode), [P.values.n, P.values.mode]);
   return (
     <Demo title="Find the roots: stack map or guess" controls={<Controls params={P} />}>
       <GcCode lines={r.source} at={3} />

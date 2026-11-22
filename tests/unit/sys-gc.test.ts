@@ -94,8 +94,10 @@ describe("mark and sweep", () => {
     expect(c.wordsScanned).toBe(16);
     expect(c.snap.heap.filter((b) => b.state === "freed")).toEqual([]);
     expect(stackScan("small", "conservative").falseRetained).toEqual([]);
+    // as in bdwgc, a stack word that points inside a block always counts; the heap rule does not change that
     expect(stackScan("interior", "conservative", true).falseRetained).toEqual(["D", "E"]);
-    expect(stackScan("interior", "conservative", false).falseRetained).toEqual([]);
+    expect(stackScan("interior", "conservative", false).falseRetained).toEqual(["D", "E"]);
+    expect(stackScan("interior", "precise").falseRetained).toEqual([]);
   });
   test("the cost model (model inputs: 1 ns mark, 0.1 ns sweep)", () => {
     const c = tracingCost(COST_DEFAULTS);

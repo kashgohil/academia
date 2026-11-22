@@ -1,0 +1,142 @@
+---
+summary: "Rust checks a generic function once against its trait bounds, then copies it for each type. How that compares with dyn Trait, vtables, coherence and const generics."
+---
+import { DispatchDemo, OrphanDemo } from "@/demos/sys/SysCtRustDemos";
+
+Rust has two ways to write code that works for many types. A **generic** function, `fn total<S: Shape>(v: &[S])`, gets one copy for each concrete type. This is **monomorphization**, and the calls in each copy are direct. A **trait object**, `&dyn Shape`, uses one copy of the code for all types, and each method call goes through a table of function pointers. This lesson shows both at the level of machine code, using rustc 1.96.1.
+
+## Bounds are checked at the definition
+
+A C++ template is checked when it is instantiated. A Rust generic function is type-checked once, at its definition, against its **trait bounds**. The body can use only what the bounds promise:
+
+```rust
+pub trait Shape { fn area(&self) -> f64; }
+pub fn total<S>(v: &[S]) -> f64 { v.iter().map(|s| s.area()).sum() }
+```
+
+```text
+error[E0599]: no method named `area` found for reference `&S` in the current scope
+  = help: items from traits can only be used if the type parameter is bounded by the trait
+help: ... perhaps you need to restrict type parameter `S` with it:
+  | pub fn total<S: Shape>(v: &[S]) -> f64 { ... }
+```
+
+After this check, the code generator copies the function for each type that a caller uses. So a type error does not appear deep inside an instance, as it can in C++. The bound is the contract between the caller and the body. C++20 concepts check the call against a contract too, but the body of a constrained template is still checked only at instantiation.
+
+## Static and dynamic dispatch, instruction by instruction
+
+```rust
+pub fn total_static<S: Shape>(v: &[S]) -> f64 { v.iter().map(|s| s.area()).sum() }
+pub fn total_dyn(v: &[&dyn Shape]) -> f64 { v.iter().map(|s| s.area()).sum() }
+```
+
+The demo replays the x86-64 code that rustc 1.96.1 makes with `-C opt-level=3` for `total_static::<Square>` and for `total_dyn`. The listings are real. The addresses in the memory view are made up, but the offsets come from the code.
+
+<Predict
+  id="calls"
+  question="The loop of total_static::<Square> adds up the areas of a slice of Squares. How many call instructions does its loop body contain?"
+  options={["One for each element: it calls Square::area", "One for each group of 4 elements", "None"]}
+  answer={2}
+  explain="In the instance for Square, the compiler knows the exact method. It inlines Square::area, so each element costs one load, one multiply and one add. For long slices it also unrolls the loop by 4."
+>
+<DispatchDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Next** through the first element of `total_dyn`. The fat pointer gives two loads: the data pointer, then the vtable pointer. The call reads the address at vtable + 24.
+2. Watch the saved sum. The callee can change any `xmm` register, so the loop stores the sum on the stack before the call and loads it after.
+3. Step to the second element. It is a `Circle`, so the same `call` instruction goes to a different function. The CPU must predict an indirect target.
+4. Select `total_static::<Square>`. There is no call and no memory traffic for the sum. The per-element cost drops from 17 or 19 instructions to 6, or 3.75 in the unrolled loop.
+
+### What a `&dyn Shape` is
+
+A reference to a trait object is a **fat pointer**: a data pointer and a pointer to a **vtable**. The vtable is a static table that the compiler makes for each pair of a concrete type and a trait. You can see both halves in the smallest functions:
+
+```asm
+; pub fn one_dyn(s: &dyn Shape) -> f64 { s.area() }
+    jmp   qword ptr [rsi + 24]      ; rdi = data, rsi = vtable
+
+; pub fn make(s: &Square) -> &dyn Shape { s }
+    mov   rax, rdi                  ; data pointer
+    lea   rdx, [rip + l_anon.12d6...0]   ; vtable pointer (label shortened)
+```
+
+The Rust Reference guarantees only that a pointer to an unsized type is at least as large as a normal pointer. It notes that all such pointers are currently two `usize` wide, and that you should not rely on this.
+
+The documentation of `std::ptr::DynMetadata` says that the vtable contains the size, the alignment, a pointer to the `drop_in_place` code and a pointer for each method. It does not give an order. In rustc 1.96.1 the order is drop, size, align, then the methods, so `area` is at offset 24. For `Square`, the drop slot is null, because a `Square` needs no drop code.
+
+### What the indirect call costs
+
+The call itself is cheap when the target is predictable. The larger cost is what the compiler cannot do:
+
+- **No inlining.** The compiler does not know the target, so it cannot copy the body into the loop. Every constant fold and every loop optimization that depends on the body is lost.
+- **No vectorization.** A loop with an unknown call does not vectorize: see [auto-vectorization](/performance/cpu/auto-vectorization).
+- **Spills.** The System V ABI makes all `xmm` registers caller-saved. Live floating-point values go to the stack around each call: see [calling conventions](/architecture/isa/calling-conventions).
+- **Target prediction.** The branch target buffer predicts the target from history. A slice that mixes types in a random order mispredicts more often than a sorted one: see [branch prediction](/architecture/pipelining/branch-prediction).
+
+LLVM can sometimes **devirtualize** a call, when it can prove which vtable reaches it. You cannot depend on that across function boundaries.
+
+### When dyn is the right choice
+
+Use `dyn` when the set of types is open. Also use it when code size and compile time matter more than the speed of each call. A `Vec<Box<dyn Shape>>` can hold different types, and a generic `Vec<S>` cannot. A plugin interface needs one function signature, not one per type.
+
+Not every trait can be a trait object. A vtable needs a fixed list of entries, so a trait with a generic method fails. The exception is a generic method with the bound `where Self: Sized`. For the failing case, rustc 1.96.1 says:
+
+```text
+error[E0038]: the trait `Generic` is not dyn compatible
+   ...because method `visit` has generic type parameters
+```
+
+The method `visit<T>` would need one vtable entry for each `T`, and that list is not known when the vtable is built.
+
+## Coherence and the orphan rule
+
+For a trait and a type, a program may have at most one impl. This property is **coherence**. Without it, two crates could each implement `Display` for `Vec<u8>`, and a third crate that uses both would have two answers. The compiler enforces coherence with the **orphan rule**, which needs no knowledge of other crates.
+
+<OrphanDemo />
+
+Things to try:
+
+1. Read down the `Describe` column. A local trait can be implemented for any type, even `T`.
+2. Compare `Vec<Meters>` with `Box<Meters>` for `fmt::Display`. `Box` is a **fundamental** type, so `Box<Meters>` counts as local. `Vec` is not fundamental.
+3. Click `From<Meters>` for `f64`. The trait and `f64` are foreign, but the trait argument `Meters` is local, so the impl is allowed.
+4. Click `From<Meters>` for `Meters`. The orphan rule allows it, but std already has `impl<T> From<T> for T`, so the two impls overlap.
+
+The Rust Reference states the rule for `impl<P1..=Pn> Trait<T1..=Tn> for T0`. The impl is allowed if the trait is local. Otherwise, at least one of the types T0 to Tn must be local. Let Ti be the first local one.
+
+No **uncovered** type parameter may appear in T0 to Ti before it. A parameter is covered when it is inside another type, as in `Vec<T>`. The types `&`, `&mut`, `Box` and `Pin` are fundamental: they do not cover their parameter. A fundamental wrapper of a local type counts as local. The current form of the rule comes from RFC 2451.
+
+The usual way around the rule is a **newtype**: `struct Bytes(Vec<u8>);` is a local type, so `impl Display for Bytes` is allowed. The wrapper costs nothing at run time.
+
+## More tools for generic code
+
+- **Associated types**, such as `Iterator::Item`, are outputs of an impl. Each type has one `Item`, so the caller does not choose it.
+- **`impl Trait` in a parameter** is short for an anonymous generic parameter. **In a return type**, it hides a concrete type but keeps static dispatch. Both became stable in Rust 1.26. The `dyn` keyword arrived in Rust 1.27, and return-position `impl Trait` in traits in Rust 1.75.
+- **Const generics** take values, not types: `fn sum<const N: usize>(a: [u32; N]) -> u32`. The minimum form became stable in Rust 1.51. Each `N` is a new instance, as each comptime value is in Zig.
+
+```rust
+fn sum<const N: usize>(a: [u32; N]) -> u32 { a.iter().sum() }
+
+fn biggest(v: &[Box<dyn Shape>]) -> impl Iterator<Item = f64> + '_ {
+    v.iter().map(|s| s.area()).filter(|&a| a > 1.0)
+}
+// sum([1, 2, 3]) is 6 and sum([1u32; 10]) is 10: two instances of sum.
+```
+
+Monomorphization makes the fast path free, but each instance costs compile time and code. The next lesson, [monomorphization costs](/systems/comptime/monomorphization-costs), measures that cost. It also shows how the standard library keeps the copies small.
+
+## Connect
+
+- Zig makes instances from comptime values: see [Zig comptime](/systems/comptime/zig-comptime). C++ makes them from templates: see [C++ templates and constexpr](/systems/comptime/c-templates-and-constexpr).
+- `Box<dyn Trait>` combines a heap allocation with a vtable: see [smart pointers](/systems/ownership/smart-pointers).
+- An indirect call that the CPU predicts badly costs a pipeline flush: see [branch prediction and branchless code](/performance/cpu/branch-prediction-and-branchless-code).
+
+<Recall cards={[
+  { q: "When does rustc type-check the body of a generic function, and against what?", a: "Once, at the definition, against the trait bounds. The body can use only what the bounds promise. Instances are made later, at code generation." },
+  { q: "What are the two words of a &dyn Shape, and which of this is guaranteed?", a: "A data pointer and a vtable pointer. The two-word layout is current behaviour; the Reference guarantees only that it is at least one pointer wide." },
+  { q: "What does a rustc vtable contain, and what is not documented?", a: "Size, alignment, the drop_in_place pointer and one pointer per method. The order is not documented. rustc 1.96.1 puts drop, size, align first, so the first method is at offset 24." },
+  { q: "Why does a dyn call in a loop cost more than the call instruction itself?", a: "The compiler cannot inline the target, so it cannot fold, unroll or vectorize. Live xmm values must be saved around the call, and the CPU must predict an indirect target." },
+  { q: "Why can a trait with a generic method not be used as dyn Trait?", a: "The vtable needs a fixed list of method pointers. A generic method would need one entry for each type argument." },
+  { q: "Why is impl Display for Box<Meters> allowed, but impl Display for Vec<Meters> rejected?", a: "Box is a fundamental type, so Box<Meters> counts as local. Vec is not fundamental, so Vec<Meters> is a foreign type, and both trait and type are foreign (E0117)." },
+]} />

@@ -1,0 +1,170 @@
+---
+summary: "Templates generate code by substitution, and constexpr runs an interpreter in the compiler. How instantiation, lookup, concepts and the constexpr budget work in clang."
+---
+import { CppInstDemo, ConstBudgetDemo } from "@/demos/sys/SysCtCppDemos";
+
+C++ has two compile-time systems. **Templates** generate code: the compiler substitutes types and values into a pattern. **`constexpr`** runs code: the compiler contains an interpreter for a large subset of C++. The two grew apart. C++17 added `if constexpr`, and C++20 brought them closer with concepts and `consteval`.
+
+Template metaprogramming started by accident. At the C++ standards meeting in San Diego in 1994, Erwin Unruh showed a template program that did not compile. The error messages of the MetaWare compiler listed the prime numbers. Templates were a programming language, and nobody had planned it.
+
+The examples here use Apple clang 21 (`clang++ -std=c++20`), and `zig c++ -target x86_64-linux-gnu` for ELF objects. Zig 0.17.1 bundles clang 22.1.8 for that. The messages are copied from those runs.
+
+## Instantiation on use
+
+A template is not code. It becomes code when a translation unit (TU) uses it with concrete arguments. This step is **implicit instantiation**. The compiler first **deduces** the template arguments from the call, then it substitutes them and compiles the result.
+
+```cpp
+// max.h
+template <class T> T max_of(T a, T b) { return a < b ? b : a; }
+
+template <class T> struct Stack {
+  T items[16];
+  int len = 0;
+  void push(T v) { items[len++] = v; }
+  T pop() { return items[--len]; }
+  int size() const { return len; }
+};
+```
+
+Two rules matter for cost. First, each TU that uses `max_of<int>` compiles its own copy. Second, a member function of a class template is instantiated only when the code uses it. A `Stack<int>` that never calls `size()` has no `Stack<int>::size()` in the object file.
+
+<Predict
+  id="comdat"
+  question="a.cpp and b.cpp both include max.h and both call max_of(x, y) with two ints. They are compiled at -O0 and linked. How many copies of max_of<int> are in the final program?"
+  options={["Two: one from each object file", "One", "None: templates are always inlined"]}
+  answer={1}
+  explain="Each object file has a copy, as a weak symbol in its own COMDAT group. The linker keeps one copy and drops the other. The compiler still did the work twice."
+>
+<CppInstDemo />
+</Predict>
+
+Things to try:
+
+1. Look at the symbol lists. Each instance is a `W` (weak) symbol. The orange one is in both object files, and the link keeps one copy.
+2. Turn on `extern template` in b.cpp. Now b.o has a `U` (undefined) reference instead of a copy.
+3. Then remove call a1. No file instantiates `max_of<int>`, and the link fails. Turn on the explicit instantiation in a.cpp to fix it.
+4. Add `max_of(x, 2.5)`. Deduction gets `int` from one argument and `double` from the other, so the call does not compile.
+5. Compare the two `Stack` lines. `Stack<int>` has `pop` but no `size`, and `Stack<double>` has `size` but no `pop`.
+
+### Weak symbols and COMDAT
+
+The compiler cannot know if another TU also makes `max_of<int>`. So it puts each instance in its own section, such as `.text._Z6max_ofIiET_S0_S0_`, inside a COMDAT group. The symbol is weak. At link time, the linker keeps the first group with that name and drops the others. The program is correct, but the compile work and the object-file size grow with the number of TUs.
+
+The name is the Itanium C++ ABI mangling of `int max_of<int>(int, int)`. In `_Z6max_ofIiET_S0_S0_`, the part `IiE` is the template argument list `<int>`. `T_` is the return type, the first template parameter. Each `S0_` refers back to that same type. The lesson on [name mangling](/systems/abi/name-mangling) explains the grammar.
+
+At -O2, these files keep no template instance at all. The calls are inlined, and a weak template copy that nothing calls is not emitted. The compile cost stays, because the compiler instantiated and optimized each body before it inlined it.
+
+### extern template
+
+C++11 added the **explicit instantiation declaration**, `extern template int max_of<int>(int, int);`. It tells the compiler not to instantiate that specialization in this TU, because another TU provides it. That other TU contains an **explicit instantiation definition**, `template int max_of<int>(int, int);`. The standard ([temp.explicit] in C++11) lists exceptions: inline functions and class template specializations can still be instantiated. Libraries use this pair to compile common instances once. For example, libc++ declares `extern template` for many members of `std::basic_string<char>`, and its shared library provides them.
+
+## Two-phase lookup
+
+The compiler reads a template in two phases. At the definition, it looks up and binds every name that does not depend on a template parameter. At instantiation, it looks up the dependent names. For a dependent function call, argument-dependent lookup (ADL) also searches the instantiation context.
+
+```cpp
+template <class T> int f(T x) {
+  return g(x) + h();   // g(x) depends on T; h() does not
+}
+// clang 21, with no instantiation of f at all:
+// error: use of undeclared identifier 'h'
+```
+
+The call `g(x)` waits until `T` is known, because ADL can find a `g` in the namespace of `T`. The call `h()` must resolve at the definition, even if nothing ever instantiates `f`.
+
+## SFINAE and concepts
+
+A template can say which arguments it accepts. Before C++20, the tool was **SFINAE** (substitution failure is not an error). If substitution into the declaration fails, the compiler silently removes that overload from the set. C++20 **concepts** state the requirement directly:
+
+```cpp
+template <class T, class = std::enable_if_t<std::is_integral_v<T>>>
+T half_sfinae(T x) { return x / 2; }
+
+template <std::integral T>
+T half(T x) { return x / 2; }
+```
+
+Both reject `half(3.0)` at the call. Clang 21 gives good messages for both small cases. The real difference shows in a large library. A call of `std::sort` on a `std::list` has no constraint in the declaration, so the error comes from deep inside the algorithm. Clang 21 with libc++ prints 142 lines and 4 errors, and the first one is in `make_heap.h`. The constrained `std::ranges::sort(l)` fails at the call, in 22 lines:
+
+```text
+error: no matching function for call to object of type 'const __sort'
+note: candidate template ignored: constraints not satisfied [with _Range = std::list<int> &, ...]
+note: because 'std::list<int> &' does not satisfy 'random_access_range'
+```
+
+A constraint also has a compile-time effect. The compiler checks it before it instantiates the body. An unconstrained template must be instantiated to find the error, and that work can be large.
+
+## constexpr: an interpreter in the compiler
+
+A `constexpr` function can run at compile time when its arguments are constants. The language has extended it in each standard:
+
+| Standard | What a constexpr function can do |
+|---|---|
+| C++11 | One `return` statement, plus declarations such as `static_assert` and `using` |
+| C++14 | Local variables, loops, more than one statement (paper N3652) |
+| C++17 | `if constexpr`; constexpr lambdas |
+| C++20 | Virtual calls (P1064), `try` blocks (P1002), and allocation that is freed before the evaluation ends (P0784). Also `consteval` (P1073) and `constinit` (P1143) |
+
+```cpp
+constexpr int sum_squares(int n) {
+  std::vector<int> v;                      // C++20: allocation during constant evaluation
+  for (int i = 1; i <= n; ++i) v.push_back(i * i);
+  return std::accumulate(v.begin(), v.end(), 0);
+}                                          // the vector frees its memory here
+static_assert(sum_squares(10) == 385);
+
+consteval int twice(int n) { return n * 2; }   // must run at compile time
+constinit int table_size = twice(21);          // must be initialized at compile time
+```
+
+Memory that is still allocated at the end of the evaluation is an error. Clang 21 says "allocation performed here was not deallocated". A constant that points to heap memory is also an error: "pointer to heap-allocated object is not a constant expression". A call of a `consteval` function with a runtime argument is also an error.
+
+`if constexpr` discards the branch that the condition rules out. In a template, the discarded branch is not instantiated, so it may contain code that is wrong for this `T`. Before C++17, this needed overloads or tag dispatch.
+
+### The evaluator has a budget
+
+Clang does not compile constexpr code to machine code. It interprets the code, one statement at a time, and it counts the work. The defaults in `clang/include/clang/Basic/LangOptions.def` are 1048576 steps (`-fconstexpr-steps`) and a call depth of 512 (`-fconstexpr-depth`). The template instantiation depth limit is 1024 (`-ftemplate-depth`). GCC uses other limits, for example `-fconstexpr-ops-limit` of 33554432.
+
+<Predict
+  id="budget"
+  question="Clang allows 1048576 evaluation steps. A naive recursive constexpr fib(n) uses about two steps for each call. What is the largest n for which constexpr long v = fib(n) compiles?"
+  options={["About 500,000", "About 20,000", "26"]}
+  answer={2}
+  explain="The naive recursion makes 2·F(n+1) − 1 calls. That is 392,835 calls for fib(26), or 785,670 steps. fib(27) makes 635,621 calls, or 1,271,242 steps. The budget grows linearly, but the work grows exponentially."
+>
+<ConstBudgetDemo />
+</Predict>
+
+Things to try:
+
+1. Move N from 1 to 8 on the recursive fib, and watch the tree. Each increase of N by one multiplies the calls by about 1.6.
+2. Click **Set N to the largest that fits**, then **One more**. The model gives the same limits as the real compilers, which the table shows.
+3. Select **fib, loop**. The loop body has three statements, so it costs 4 steps for each iteration. It reaches N = 262142, about 10,000 times more than the recursion.
+4. Select **zig 0.17.1 comptime**. Zig counts calls and loop iterations, and its default budget is 1000, so its limits are much lower.
+
+The model charges clang one step for each statement that it evaluates, a compound statement included. This rule is fitted to measurements. The sum loop then costs n + 5 steps, and the recursive fib costs 2 steps for each call. For all three functions, the model predicts the measured limits exactly.
+
+When the budget is too small, change the algorithm before you raise the limit. The real limit is the compile time of every build of every user of the header.
+
+## What it costs, and how to measure
+
+Templates in headers are compiled again in each TU that includes them. The [measurement of monomorphization costs](/systems/comptime/monomorphization-costs) shows how size and time grow with the number of instances. Some tools:
+
+- `-ftime-trace` (since Clang 9) writes a JSON trace of each compile next to the object file. It shows the time for each template instantiation and each header. Open it in a trace viewer.
+- `nm -C` on an object file lists the weak instances that it contains.
+- `extern template` for common instances, and a smaller set of headers, cut the repeated work.
+
+## Connect
+
+- The weak symbols and COMDAT groups are resolved by the linker: see [symbols and relocation](/systems/linking/symbols-and-relocation) and [object files and ELF](/systems/linking/object-files-and-elf).
+- Zig does the same jobs with one mechanism: see [Zig comptime](/systems/comptime/zig-comptime).
+- Rust checks a generic body once, at the definition, against its bounds. C++20 concepts check only the call. See [Rust generics and traits](/systems/comptime/rust-generics-and-traits).
+
+<Recall cards={[
+  { q: "When does a member function of a class template get instantiated?", a: "Only when code uses it. A Stack<int> that never calls size() has no Stack<int>::size() in the object file." },
+  { q: "Two .cpp files both instantiate max_of<int>. What does each object file contain, and what does the linker do?", a: "Each has a copy as a weak symbol in its own COMDAT section group. The linker keeps one copy and drops the others. The compile work was done twice." },
+  { q: "What do extern template and template (without extern) do for one specialization?", a: "The extern form is an explicit instantiation declaration: this TU does not instantiate it. The form without extern is the definition: this TU provides it for the others." },
+  { q: "In two-phase lookup, which names are looked up at the template definition?", a: "Names that do not depend on a template parameter. Dependent names wait until instantiation, where ADL can also search the instantiation context." },
+  { q: "Why does std::ranges::sort on a std::list give a shorter error than std::sort?", a: "Its declaration has a concept constraint (random_access_range), so the call fails at overload resolution. std::sort fails inside the instantiated algorithm body." },
+  { q: "What are clang's default constexpr limits?", a: "1048576 evaluation steps (-fconstexpr-steps) and a call depth of 512 (-fconstexpr-depth). The template depth limit is 1024." },
+]} />

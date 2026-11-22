@@ -32,6 +32,10 @@ export const LEVELS: Record<Level, string> = {
 
 /** Lessons with a written MDX page. Paths must match `src/content/lessons/<path>.mdx`. */
 export const LIVE = new Set<string>([
+  "systems/comptime/c-templates-and-constexpr",
+  "systems/comptime/monomorphization-costs",
+  "systems/comptime/rust-generics-and-traits",
+  "systems/comptime/zig-comptime",
   "architecture/hw-design/building-a-risc-v-core",
   "architecture/hw-design/fpgas",
   "architecture/hw-design/hdls-verilog-basics",

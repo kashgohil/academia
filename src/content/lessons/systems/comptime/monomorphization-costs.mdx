@@ -1,0 +1,137 @@
+---
+summary: "Each generic instance is one more function to optimize and emit. A model of the copies, a real rustc measurement, and the outlining trick of the Rust standard library."
+---
+import { MonoModelDemo, SortMeasureDemo } from "@/demos/sys/SysCtMonoDemos";
+
+The last three lessons showed how Zig, C++ and Rust make a copy of generic code for each type or value. This is **monomorphization**. It gives fast code, because each copy knows its types, and the optimizer can inline and vectorize. It also has a price. Each copy is one more function that the compiler must optimize and emit, and that the CPU must hold in its instruction cache.
+
+This lesson counts that price with a model, then measures it with rustc 1.96.1.
+
+## Copies multiply
+
+A generic function that calls another generic function with the same `T` makes the second one generic too. A chain of D generic functions, used with K types, gives K · D copies. The model below compares three ways to write the same chain.
+
+- **Generic**: every function is copied for every type.
+- **Outlined**: each generic function is a thin wrapper. It converts its argument and calls one non-generic **inner** function.
+- **dyn**: each function takes `&dyn Trait`, so there is one copy, plus one vtable for each type.
+
+The sizes in the model are inputs, not measurements. A body is 400 B, and a wrapper is 24 B. A vtable has 8 B for each of its 3 header words and for each method.
+
+<Predict
+  id="copies"
+  question="f1<T> calls f2<T>, and f2<T> calls f3<T>. The program uses them with 4 types. How many function copies does a generic build contain?"
+  options={["3", "7", "12"]}
+  answer={2}
+  explain="Each of the 3 functions gets a copy for each of the 4 types: 3 × 4 = 12. With the default model inputs, that is 4,800 B against 1,488 B for the outlined form and 1,360 B for dyn."
+>
+<MonoModelDemo />
+</Predict>
+
+Things to try:
+
+1. Move **Types T used** from 1 to 16. The generic size grows in proportion to K. The outlined and dyn sizes grow by a wrapper or a vtable for each type.
+2. Set K to 1. Then dyn is larger than generic, because it adds a vtable and gains nothing. With these inputs, dyn becomes smaller at 2 types.
+3. Set the body to 50 B. Small bodies are cheap to copy, and the inliner would copy them anyway. Outlining only helps large bodies.
+4. Look at **Indirect calls**. Only dyn pays at run time. Outlined code still uses direct calls, and the wrapper usually inlines into the caller.
+
+The model has no optimizer. A real compiler inlines some copies into their callers, and that adds more code. LLVM can also merge two copies whose machine code is identical. The only reliable number is a measurement.
+
+## A measurement: one sort per closure
+
+In Rust, each closure has its own anonymous type. So each call of `v.sort_by(|a, b| ...)` with a new closure makes a new instance of the whole sort algorithm. The test crate has N functions. Each one sorts a slice of records with a different comparison closure. The **generic** version passes the closure to `sort_by`. The **dyn** version passes it as `&dyn Fn(&Rec, &Rec) -> Ordering` to one shared `sort_dyn` function:
+
+```rust
+#[inline(never)]
+pub fn sort_dyn(v: &mut [Rec], f: &dyn Fn(&Rec, &Rec) -> Ordering) {
+    v.sort_by(|x, y| f(x, y))     // one instance of the sort, for all callers
+}
+pub fn sort_k0(v: &mut [Rec]) { sort_dyn(v, &|x: &Rec, y: &Rec| /* key 0 */ ...) }
+```
+
+```sh
+rustc --edition 2024 -C opt-level=3 --crate-type=lib --emit=obj=s.o s.rs
+size -m s.o        # the __text section; aarch64-apple-darwin
+```
+
+<Predict
+  id="sortsize"
+  question="Each new closure that calls v.sort_by adds how much machine code to the object file?"
+  options={["About 100 B: one more call", "About 5 KiB: one more copy of the sort", "Nothing: LLVM merges the copies"]}
+  answer={1}
+  explain="Each closure is a new type, so sort_by is instantiated again. The comparison is inlined into the sort, so the copies differ, and LLVM cannot merge them. Each copy adds 5,376 B in this crate."
+>
+<SortMeasureDemo />
+</Predict>
+
+Things to try:
+
+1. Move the slider from 1 to 32 closures. The generic object grows from 5,292 B to 171,948 B. The dyn object grows from 6,560 B to 9,536 B.
+2. Look at N = 1. Generic is smaller than dyn there, because dyn adds the shared function and a vtable for one closure.
+3. Compare the times. At 32 closures, rustc needs 1.91 s for generic and 0.13 s for dyn, about 15 times longer. These times are the best of 3 runs on an Apple M4 Pro, and they change with the machine.
+4. Switch the source between generic and dyn, and find the one line that differs in each function.
+
+Both size lines are straight. A line through N = 1 and N = 32 gives 5,376 B for each extra generic closure and 96 B for each extra dyn closure. It fits all six runs exactly. At 32 closures, the generic object is 18 times larger.
+
+The dyn version has a price at run time. Each comparison is now an indirect call that the compiler cannot inline into the sort. For a sort that runs once at startup, that is a good trade. For the hot sort of a database, it is not. Measure both before you decide.
+
+## The outlining trick in the standard library
+
+The Rust standard library uses outlining in its file functions. This is `std::fs::read` in the rust-src of rustc 1.96.1 (`library/std/src/fs.rs`):
+
+```rust
+pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
+    fn inner(path: &Path) -> io::Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let size = file.metadata().map(|m| usize::try_from(m.len()).unwrap_or(usize::MAX)).ok();
+        let mut bytes = Vec::try_with_capacity(size.unwrap_or(0))?;
+        io::default_read_to_end(&mut file, &mut bytes, size)?;
+        Ok(bytes)
+    }
+    inner(path.as_ref())
+}
+```
+
+A caller can pass a `&str`, a `String`, a `PathBuf` or a `&Path`. Each type makes an instance of `read`, but that instance is only the call `path.as_ref()` and a call to `inner`. The real work, `inner`, has one copy. The same file uses the pattern in `read_to_string` and `write`.
+
+The pattern works in any language:
+
+- **Rust**: a generic wrapper around a function that takes `&[u8]`, `&Path`, `&dyn Trait` or a function pointer.
+- **Zig**: keep `comptime` and `anytype` parameters at the edge. Pass slices and runtime values to the large inner function.
+- **C++**: put the type-independent part in a non-template base class or function, and keep the template thin. Use `extern template` for instances that many files use.
+
+## How other languages pay
+
+Go 1.18 chose a middle way, called **GC shape stenciling with dictionaries**. Types with the same underlying type share one instance, and all pointer types share one shape. Each call passes a hidden dictionary with the type information that the shared code needs. A method call on a type parameter goes through that dictionary, much like a vtable. So Go makes fewer copies than Rust, and some generic calls cost more at run time.
+
+## Measure your own code
+
+| Tool | What it shows |
+|---|---|
+| `cargo bloat --release` | The functions and crates that take the most space in the binary |
+| `cargo llvm-lines` | Lines of LLVM IR for each generic function, summed over all its copies, with the number of copies |
+| `clang -ftime-trace` | A JSON trace of one compile, with the time for each template instantiation |
+| `nm -S` (ELF) or `size -m` (Mach-O) | The size of each symbol or section |
+
+`cargo llvm-lines` is the best first tool for compile time. LLVM spends its time in proportion to the IR that it gets, and a generic function with 40 copies is often at the top.
+
+<Steps>
+<div>Find the generic functions with the most copies or the most IR.</div>
+<div>Move the code that does not depend on the type into a non-generic inner function.</div>
+<div>Where a call happens rarely, take `&dyn Trait` or a function pointer instead of a generic parameter.</div>
+<div>Keep the hot loops generic. Measure the speed before and after each change.</div>
+</Steps>
+
+## Connect
+
+- The vtable call that dyn uses is shown instruction by instruction in [Rust generics and traits](/systems/comptime/rust-generics-and-traits).
+- C++ duplicates instances across translation units before the linker removes them: see [C++ templates and constexpr](/systems/comptime/c-templates-and-constexpr).
+- A larger binary can miss more in the instruction cache. Profile the real program: see [profilers](/performance/measurement/profilers).
+
+<Recall cards={[
+  { q: "A chain of D generic functions is used with K types. How many copies does a fully monomorphized build contain?", a: "K · D: each function gets one copy for each type. A generic function that calls another generic function passes its T on." },
+  { q: "Why does each v.sort_by(|a, b| ...) with a new closure add a copy of the sort?", a: "Each closure has its own anonymous type, so sort_by is instantiated again. In the measured crate, each copy added 5,376 B." },
+  { q: "What is the outlining trick, and where does std use it?", a: "A thin generic wrapper converts its argument and calls one non-generic inner function. std::fs::read, read_to_string and write use it: the generic part is only path.as_ref()." },
+  { q: "When is dyn larger than the generic version?", a: "With one or very few types. dyn adds a vtable and shared code, and gains nothing until several instances would exist." },
+  { q: "How does Go 1.18 limit the number of instances?", a: "GC shape stenciling: types with the same underlying type, and all pointer types, share one instance. A hidden dictionary passes the type information." },
+  { q: "Which tool shows the LLVM IR of each generic function summed over its copies?", a: "cargo llvm-lines. It lists the lines of IR and the number of copies for each generic function." },
+]} />

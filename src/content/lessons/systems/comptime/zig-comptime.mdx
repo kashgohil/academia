@@ -1,0 +1,178 @@
+---
+summary: "Zig runs ordinary Zig code in the compiler: comptime parameters, types as values, reflection and the branch quota, and what each instance costs."
+---
+import { ZigSpecializeDemo, ZigFormatDemo } from "@/demos/sys/SysCtZigDemos";
+
+Most languages have two languages for generic code: the normal one, and a second one for templates or macros. Zig has one. The keyword `comptime` tells the compiler to run ordinary Zig code while it compiles. The result of that code can be a number, a string, a function body or a type.
+
+This lesson uses zig 0.17.1. Every Zig snippet and every compiler message here comes from that version. Comptime details change between Zig releases, so check the language reference of your version.
+
+## Be the compiler
+
+A **comptime parameter** is a function parameter whose value must be known at compile time. For each new value, the compiler makes a new copy of the function: an **instance**. In the instance, the parameter is a constant. The compiler runs all code that depends only on constants, and it emits machine code only for the rest.
+
+```zig
+fn power(x: i64, comptime n: u32) i64 {
+    var r: i64 = 1;
+    inline for (0..n) |_| r *= x;
+    return r;
+}
+```
+
+An `inline for` loop does not exist at run time. The compiler copies the loop body once for each iteration. The demo below is a model of this process: a small partial evaluator for a few Zig functions. It does the comptime work step by step and writes the code that is left for run time.
+
+<Predict
+  id="quota"
+  question="The call power(x, 1000) compiles. The call power(x, 1001) only adds one more copy of the loop body. What does zig 0.17.1 do with it?"
+  options={["It compiles, and the instance is one multiply larger", "It stops with a compile error", "It falls back to a normal loop at run time"]}
+  answer={1}
+  explain="Each iteration of an inline loop counts as one backward branch. The default limit is 1000 branches, and each instance of power has its own counter. The 1001st branch stops the build with: evaluation exceeded 1000 backwards branches."
+>
+<ZigSpecializeDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Back** and **Next** with n = 13. Each copy of the loop body adds one line to the instance. The first copy adds no line, because the model folds 1 · x to x. Real Zig emits that multiply, and LLVM removes it.
+2. Select **powSq**. The loop now runs on the bits of n, so n = 13 needs 4 iterations and 5 multiplies, not 12. The last `base * base` is dead code.
+3. Move n to 1001 with **power**. The branch counter passes 1000, and the build stops. Then select the quota 2000.
+4. Select **sumTo**. The whole call runs at compile time. The binary gets only the constant. Move n to 999, and then to 1000.
+5. Turn on **Pass a runtime n instead**. A comptime parameter needs a value that the compiler knows.
+
+## What an instance is
+
+Zig makes one instance for each different set of comptime arguments. The calls `power(a, 3)`, `power(b, 5)` and `power(c, 3)` make two instances, not three. Zig memoizes calls at compile time, so the second call with n = 3 uses the first instance again.
+
+You can see the instances in an object file. In a Debug build, `nm` shows two local functions, `inst.power__func_0` and `inst.power__func_1`. In a ReleaseFast build, LLVM inlines both into the caller. This is the AArch64 code of `power(a, 3) + power(b, 5) + power(c, 3)`:
+
+```asm
+mul   x8, x0, x0        // a*a
+mul   x8, x8, x0        // a*a*a
+mul   x9, x1, x1        // b*b
+mul   x10, x9, x1       // b*b*b
+madd  x8, x10, x9, x8   // b^3*b^2 + a^3
+mul   x9, x2, x2
+madd  x0, x9, x2, x8    // c^2*c + ...
+```
+
+Each multiply count is fixed at compile time, and LLVM can see the whole chain. This is the main speed benefit of specialization. The cost is one more function body for each distinct comptime value.
+
+## What the compiler can run
+
+The Zig language reference gives the rules for a comptime expression. All its variables are comptime variables. All `if`, `while`, `for` and `switch` decisions happen at compile time, or the compiler reports an error. Code that has a runtime side effect is an error. For example, a comptime call of an `extern` function gives "comptime call of extern function".
+
+So comptime code cannot open a file or read the clock. To use a file at compile time, use `@embedFile`, which gives the file contents as a constant array. For larger generated code, `build.zig` can run a program and add its output as a module.
+
+The compiler also limits the work. Each loop iteration and each function call at compile time counts as one **backward branch**. The default limit is 1000. All comptime code in one function body shares this one counter. `@setEvalBranchQuota(n)` raises the limit for that body. These limits are measured with zig 0.17.1, with one call in each function body:
+
+| Code | Largest n that compiles | Why |
+|---|---|---|
+| `inline for (0..n)` | 1000 | n iterations |
+| `comptime sumTo(n)`, a `while` loop | 999 | 1 call + n iterations |
+| `comptime fib(n)`, naive recursion | 13 | 753 calls; fib(14) needs 1219 |
+
+```text
+error: evaluation exceeded 1000 backwards branches
+note: use @setEvalBranchQuota() to raise the branch limit from 1000
+```
+
+The counter is shared. Two `comptime sumTo(600)` calls in one function fail, but each compiles alone. The calls `power(x, 600)` and `power(x, 601)` compile together, because each instance is its own function body.
+
+The quota is not a bug guard only. It also keeps compile time predictable. A library that does real work at compile time sets its own quota for that work. The `print` function of the standard library is an example.
+
+## Types are values
+
+At compile time, `type` is an ordinary value type. A function can take a type and return a type. This is how Zig writes generic data structures:
+
+```zig
+fn Stack(comptime T: type, comptime cap: usize) type {
+    return struct {
+        items: [cap]T = undefined,
+        len: usize = 0,
+
+        const Self = @This();
+
+        pub fn push(self: *Self, v: T) error{Full}!void {
+            if (self.len == cap) return error.Full;
+            self.items[self.len] = v;
+            self.len += 1;
+        }
+    };
+}
+
+comptime std.debug.assert(Stack(u8, 4) == Stack(u8, 4)); // memoized: the same type
+comptime std.debug.assert(Stack(u8, 4) != Stack(u16, 4));
+```
+
+On a 64-bit target, `@sizeOf(Stack(u8, 4))` is 16 and `@sizeOf(Stack(u32, 8))` is 40. The `@typeName` of the second type is `generic.Stack(u32,8)`. Here, `generic` is the file name. The type is the result of a function call, and Zig gives it the name of that call.
+
+Memoization is necessary for this design. Without it, two uses of `Stack(u8, 4)` would make two different types. A function that takes one could not take a value of the other.
+
+## Reflection: read and build types
+
+`@typeInfo(T)` returns a description of a type as a normal comptime value of type `std.lang.Type`. In zig 0.17.1, a struct description has the lists `field_names`, `field_types` and `field_attrs`. An `inline for` can walk these lists, and `@field` reads a field by its comptime name:
+
+```zig
+fn dump(v: anytype) void {
+    const info = @typeInfo(@TypeOf(v)).@"struct";
+    inline for (info.field_names) |name| {
+        std.debug.print("{s} = {any}\n", .{ name, @field(v, name) });
+    }
+}
+// dump(Point{ .x = 1.5, .y = -2, .tag = 3 }) prints x = 1.5, y = -2, tag = 3
+```
+
+The other direction also exists. In zig 0.17.1, builtins such as `@Int`, `@Struct`, `@Enum` and `@Fn` make a new type from comptime data. For example, `@Int(.unsigned, 24)` is the type `u24`. A serializer, an ORM or a command-line parser can read a struct and generate all its code at compile time. In C++ or Rust, the same tool often needs a macro or a code generator.
+
+## Format strings are checked by Zig code
+
+`std.debug.print` takes the format string as a `comptime` parameter. The function `print` in `lib/std/Io/Writer.zig` walks the string with `inline while` loops. For each literal part, it leaves a `writeAll` call. For each placeholder, it leaves a call that formats one argument. If the string and the arguments do not match, it calls `@compileError`. There is no special compiler support for format strings: it is library code that runs at compile time.
+
+<Predict
+  id="fmt"
+  question="The format string is {d} items, and the call passes the tuple .{ count, name }. That is one argument too many. What happens?"
+  options={["It prints 42 items and ignores name", "It panics at run time", "It does not compile"]}
+  answer={2}
+  explain="The comptime walk marks each argument that a placeholder uses. At the end, one argument is not marked, so print calls @compileError with: unused argument in '{d} items'."
+>
+<ZigFormatDemo />
+</Predict>
+
+Things to try:
+
+1. Click **Too few**. The second placeholder has no argument: "too few arguments".
+2. Click **Wrong type**. The specifier `s` is for strings, and `count` is a `u32`.
+3. Put `{}` in front of `name`. A slice needs a specifier, so the error lists the four that work.
+4. Click **Braces** and **By position**. The walk handles `{{`, `}}` and `[N]` at compile time, so they cost nothing at run time.
+5. Make the string longer and look at the quota. `print` sets `@setEvalBranchQuota(fmt.len * 1000)` for its own walk.
+
+## What comptime costs
+
+- **Code size.** Each distinct comptime argument makes one more instance. A comptime `n` that takes 50 values makes 50 functions. The lesson on [monomorphization costs](/systems/comptime/monomorphization-costs) measures this.
+- **Compile time.** The compiler interprets comptime code. That is much slower than the same code compiled to machine code. Heavy comptime work, such as a large lookup table, can be the slowest part of a build.
+- **Errors.** A comptime error shows a trace of comptime calls, much like a C++ template error. The difference is that the code in the trace is ordinary Zig.
+- **Analysis on use.** Zig type-checks a function only when code uses it. Syntax errors and unknown names still appear, but a type error in an unused generic function does not. Tests must call each generic path.
+
+In C++, the same jobs need templates, `constexpr` functions and sometimes macros: see [C++ templates and constexpr](/systems/comptime/c-templates-and-constexpr). Rust uses generics, `const fn` and procedural macros: see [Rust generics and traits](/systems/comptime/rust-generics-and-traits). Odin has compile-time parameters (`$T` and `$N`) and a compile-time `when` statement. Its overview describes no general compile-time function execution like Zig comptime.
+
+```odin
+// Odin, not checked: no compiler installed
+my_new :: proc($T: typeid) -> ^T {
+    return (^T)(alloc(size_of(T), align_of(T)))
+}
+```
+
+## Connect
+
+- Allocators in Zig are runtime values, not comptime ones: see [allocators as parameters in Zig](/systems/explicit/allocators-as-parameters-in-zig).
+- Specialized code is what makes [auto-vectorization](/performance/cpu/auto-vectorization) possible: the vectorizer needs known types and simple loops.
+- The instance names end up as symbols in the object file: see [symbols and relocation](/systems/linking/symbols-and-relocation).
+
+<Recall cards={[
+  { q: "What does a comptime parameter make the compiler do, and when does it make a new instance?", a: "It makes a copy of the function in which the parameter is a constant. It makes a new instance for each different set of comptime arguments. Equal arguments use the same memoized instance." },
+  { q: "What counts against the eval branch quota, and what is the default?", a: "Each loop iteration and each comptime function call counts as one backward branch. The default is 1000, for all comptime code in one function body. @setEvalBranchQuota raises it for that body." },
+  { q: "Why does Zig need comptime calls to be memoized for generic types?", a: "A generic type is the result of a function call. Without memoization, two uses of Stack(u8, 4) would be two different, incompatible types." },
+  { q: "How do you read the fields of a struct at compile time in zig 0.17.1?", a: "Use @typeInfo(T).@\"struct\" to get field_names and field_types, walk them with inline for, and read a field with @field(v, name)." },
+  { q: "Why can comptime code not read a file, and what do you use instead?", a: "Comptime code must have no runtime side effects, so I/O is an error. Use @embedFile, or generate code in build.zig." },
+  { q: "Who checks the format string in std.debug.print?", a: "Ordinary library code in std.Io.Writer.print. It runs at compile time and calls @compileError on a mismatch." },
+]} />

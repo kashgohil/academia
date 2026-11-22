@@ -1,0 +1,173 @@
+---
+summary: "What a compiler writes for the linker: the sections, symbols and relocation entries of a real ELF relocatable file, COMDAT groups for C++ inline code, and how -ffunction-sections with --gc-sections removes dead code."
+---
+import { ObjBytesDemo, GcSectionsDemo } from "@/demos/sys/SysLinkObjDemos";
+
+A compiler does not write a program. It writes one **object file** for each source file, and a **linker** joins the object files into a program. On Linux the object file is an ELF **relocatable file** (type `ET_REL`). The OS lesson [Loading a program](/os/processes/loading-a-program-elf-and-the-dynamic-linker) shows the other end: the executable that the kernel maps. This lesson looks at the input of the linker.
+
+Here is the C file that this module uses. It reads a global variable from another file and calls a function from another file.
+
+```c
+extern int counter;      // defined in lib.c
+int add(int a, int b);   // defined in lib.c
+static int calls;
+int *where = &counter;
+int main(void) {
+  calls += 1;
+  counter += calls;
+  return add(counter, 2);
+}
+```
+
+<Predict
+  id="hole"
+  question="main ends with a jump to add, which lib.c defines. The compiler sees only main.c. What does it write in the 4 address bytes of that jmp instruction?"
+  options={[
+    "The address of add, which it gets from a header file",
+    "Zeros, and a separate entry that tells the linker what to put there",
+    "The address of a PLT stub, because add is in another file",
+  ]}
+  answer={1}
+  explain="The compiler cannot know where add will be. It writes 00 00 00 00 and adds a relocation entry: R_X86_64_PLT32 against add, with addend -4. The linker fills the hole later."
+>
+<ObjBytesDemo />
+</Predict>
+
+Things to try:
+
+1. Read the selected row, `.text+0x20 PLT32 add-4`. The dark bytes in the hex view are the hole: four zeros at the end of the `jmp`.
+2. Click each relocation in turn. The hex view jumps to its hole. Four holes are for data and one is for the call: 20 of the 36 bytes of `.text` are unknown.
+3. Open **Symbols**. Find `counter` and `add`. Their section is `UND`, so this file uses them but does not define them.
+4. Open **Sections** and click `.bss`. Its header says 4 bytes, but no bytes in the file belong to it.
+5. Switch to **-fPIE**. The read of `counter` now loads an address from a table, with type `REX_GOTPCRELX`. The next lesson shows what the linker does with it.
+
+## What a relocatable file holds
+
+The file starts with the 64-byte **ELF header**. It gives the file type, the machine and the place of the section header table. A relocatable file has no program headers, because nobody loads it. Every section has the address 0, because the linker chooses the addresses.
+
+The **section header table** describes each part of the file. Clang 22.1.8 wrote these sections for `main.c` at `-O2`:
+
+| Section | Type | What it holds |
+|---|---|---|
+| `.text` | PROGBITS | machine code: 36 bytes for `main` |
+| `.rela.text` | RELA | 5 relocation entries for the holes in `.text` |
+| `.data` | PROGBITS | initialized globals: `where`, 8 bytes |
+| `.rela.data` | RELA | 1 entry: the initial value of `where` is the address of `counter` |
+| `.bss` | NOBITS | zero-initialized globals: `calls`, 4 bytes, none in the file |
+| `.symtab` | SYMTAB | the symbol table, 8 entries |
+| `.strtab` | STRTAB | the names of symbols and sections |
+| `.note.GNU-stack` | PROGBITS | empty; it says that the stack need not be executable |
+
+The demo hid three more sections with compiler flags. `-fno-asynchronous-unwind-tables` removed `.eh_frame`, the unwind tables. `-fno-ident` removed `.comment`, and `-fno-addrsig` removed `.llvm_addrsig`. A normal build has them, and a debug build adds many `.debug_*` sections.
+
+**Sections and segments.** The linker works with sections. The loader works with segments, which are ranges of the output file with permissions. The linker groups output sections into segments: code into a read-execute segment, data into a read-write segment. The OS lesson shows the segments of an executable.
+
+## Symbols
+
+Each symbol is a 24-byte `Elf64_Sym` entry with six fields:
+
+| Field | Bytes | Meaning |
+|---|---|---|
+| `st_name` | 4 | offset of the name in `.strtab` |
+| `st_info` | 1 | binding in the high 4 bits, type in the low 4 bits |
+| `st_other` | 1 | visibility: DEFAULT, INTERNAL, HIDDEN or PROTECTED |
+| `st_shndx` | 2 | the section that holds the symbol, or UND, ABS, COMMON |
+| `st_value` | 8 | offset in that section |
+| `st_size` | 8 | size of the function or object |
+
+The **binding** tells the linker who can see the name. A `LOCAL` symbol, such as the `static` variable `calls`, is private to its file. A `GLOBAL` symbol, such as `main`, must have exactly one definition in the program. A `WEAK` symbol is a global that another definition can replace. The next lesson gives all the rules.
+
+The gABI requires that all local symbols come before the global ones. The `sh_info` field of `.symtab` gives the index of the first global symbol. A linker can then skip the locals of a file when it builds its global table.
+
+A program file can have two symbol tables. `.symtab` lists every symbol, for the linker and for debuggers, and `strip` removes it. `.dynsym` lists only the symbols that the dynamic loader needs. It is in a loaded segment, and `strip` keeps it.
+
+## Relocation entries
+
+A **relocation** is an instruction for the linker: "put the value of this formula at this place". Each `Elf64_Rela` entry has 24 bytes:
+
+- `r_offset`: the place, as an offset in the section that the entry patches.
+- `r_info`: the symbol index in the high 32 bits and the relocation type in the low 32 bits.
+- `r_addend`: a constant `A` that the formula adds.
+
+The read of `calls` shows two details. First, the entry names the section symbol `.bss` and not `calls`. A static variable has no global name, so the compiler refers to the start of its section plus an offset. Second, the addend is -4. The CPU computes a `rip`-relative address from the start of the *next* instruction, which is 4 bytes after the hole. The [next lesson](/systems/linking/symbols-and-relocation) does the arithmetic.
+
+## Other languages
+
+The model is the same in each compiled language, but the unit of compilation differs.
+
+- **C and C++** write one object file for each source file.
+- **Rust** compiles a whole crate and splits it into **codegen units**. Each unit becomes one object file. A release build uses 16 units by default, so that LLVM can work in parallel. An `.rlib` is an archive file with these objects and the crate metadata.
+- **Go** has its own object format and its own linker, `cmd/link`. For most cgo programs, `cmd/link` writes one ELF object, `go.o`, and calls the system linker. This is called external linking.
+- **Zig** compiles all the Zig code of a program as one unit. With the LLVM backend, as in a ReleaseFast build, it writes one object file for that unit and runs ld.lld. In a Debug build for x86-64 Linux, Zig 0.17.1 uses its own backend and linker, and it writes no object file for the Zig code.
+
+## COMDAT groups
+
+C++ has code that every file that uses it must compile: inline functions and template instantiations. Two files that call `twice<int>` each contain a copy. The linker must keep only one.
+
+The compiler puts each copy in its own section, inside a **section group** (`SHT_GROUP`) with the flag `GRP_COMDAT`. The group has a signature, here the mangled name `_Z5twiceIiET_S0_`. The linker keeps the first group with each signature and drops the later ones. The Itanium C++ ABI, section 5.2 "Vague Linkage", sets these rules. It also covers the vtables of classes that have no key function.
+
+```text
+$ llvm-readelf -g a.o
+COMDAT group section [    4] `.group' [_Z5twiceIiET_S0_] contains 1 sections:
+   [    5]   .text._Z5twiceIiET_S0_
+COMDAT group section [    6] `.group' [_Z5scalei] contains 1 sections:
+   [    7]   .text._Z5scalei
+```
+
+This rule has a dangerous failure: the linker does not compare the copies.
+
+Suppose `a.cpp` defines `inline int scale(int x)` as `x * 3`, and `b.cpp` defines it as `x * 5`. This breaks the one-definition rule, and the linker reports nothing. We compiled both files with clang 22 at `-O0` and linked both orders with ld.lld 22. With `a.o b.o`, the program multiplies by 3 everywhere. With `b.o a.o`, it multiplies by 5.
+
+At `-O2` the result is different again. Each file inlines its own copy of `scale`, and the compiler writes no COMDAT copy. So `fa` multiplies by 3 and `fb` by 5, in one program. The same problems happen when two files compile one header with different macros or flags.
+
+## Dead code and --gc-sections
+
+The linker can remove sections that nothing uses. With `--gc-sections`, it marks the section that holds the entry symbol, then every section that a live section refers to through a relocation. Other roots are the symbols that the output exports and sections that must stay, such as `.init_array`. All unmarked sections are removed. The unit of removal is the section, not the function.
+
+<Predict
+  id="gc"
+  question="app.c has main and an unused function debug_dump. util.c has parse, which main calls, and report, which only debug_dump calls. You link with --gc-sections but compile with default flags. Does report stay in the program?"
+  options={[
+    "No: nothing that main reaches calls report",
+    "Yes: report is in the same .text section as parse, and debug_dump keeps report's file alive too",
+    "No: the linker removes every unused function with --gc-sections",
+  ]}
+  answer={1}
+  explain="By default all functions of a file share one .text section. The main function keeps that section of app.o alive. It also holds debug_dump, which refers to report. Only -ffunction-sections gives each function its own section, which the linker can remove alone."
+>
+<GcSectionsDemo />
+</Predict>
+
+Things to try:
+
+1. Step through the mark with the default flags. The mark reaches `app.o(.text)`, then `util.o(.text)`, `.bss` and `.rodata`. `extra.o` is never marked, so its code and its 272 bytes of `.bss` go.
+2. Turn on **-ffunction-sections -fdata-sections** and step again. Now `debug_dump`, `report`, `table` and `errors` are each in a section of their own, and none of them is marked.
+3. Compare the sizes. `.text` is 145 bytes with no garbage collection, 121 bytes with it, and 75 bytes with both flags.
+4. Turn off **--gc-sections** with the split sections. The output is as large as the first build: the flags alone remove nothing.
+
+The 75 bytes are not the sum of two functions. Each function section has an alignment of 16, so the linker pads `main` (10 bytes) to 16 before `parse` (59 bytes). Split sections cost some padding, and they make the object files and the link step larger. Measure the size of your program before and after you turn them on.
+
+## What this means for your code
+
+- An undefined symbol in an object file is normal. It becomes an error only if no input file defines it.
+- Put `static` (or an anonymous namespace in C++) on everything that other files do not use. The name then stays local, and it cannot clash with a name in another file.
+- An inline function or a template must be the same in every file. The linker keeps one copy and does not check the others, and the optimizer may inline a different copy into each file.
+- To remove dead code in C and C++, use `-ffunction-sections -fdata-sections` with `-Wl,--gc-sections`. To see what was removed, add `-Wl,--print-gc-sections`.
+- `llvm-readelf -S -s -r file.o` and `llvm-objdump -d -r file.o` show the sections, symbols and relocations of any object file.
+
+## Connect
+
+- [Loading a program: ELF and the dynamic linker](/os/processes/loading-a-program-elf-and-the-dynamic-linker): the executable side of ELF, its segments, and the PLT.
+- [Symbols and relocation](/systems/linking/symbols-and-relocation): the rules for symbol resolution, and the relocation formulas.
+- [Static data and the binary layout](/systems/memory/static-data-and-the-binary-layout): where `.data`, `.bss` and `.rodata` go in memory.
+- [Name mangling](/systems/abi/name-mangling): how `_Z5twiceIiET_S0_` encodes a template name.
+- [Monomorphization costs](/systems/comptime/monomorphization-costs): why templates and generics make many copies of code.
+
+<Recall cards={[
+  { q: "Why does a relocatable object have no program headers, and why are all its section addresses 0?", a: "Nobody loads it. The linker reads it, merges its sections with those of other files, and only then chooses addresses and segments." },
+  { q: "What three fields does a RELA relocation entry have, and what does each one say?", a: "The offset: where to patch. The info word: which symbol (high 32 bits) and which formula (low 32 bits). The addend: the constant A to add." },
+  { q: "Why is the addend of a rip-relative data access usually -4?", a: "The CPU adds the displacement to the address of the next instruction. The 4-byte hole is at the end of the instruction, so the next instruction is 4 bytes after the hole." },
+  { q: "Two C++ files compile the same inline function differently. What does the linker do?", a: "It keeps the first COMDAT group with that signature and drops the other with no error. The behavior then depends on the link order and on what the optimizer inlined." },
+  { q: "Why does --gc-sections alone often remove little?", a: "The linker removes whole sections. Without -ffunction-sections and -fdata-sections, all functions of a file share one .text section, so one live function keeps all of them." },
+  { q: "What is the difference between .symtab and .dynsym?", a: "The .symtab table lists all symbols for the linker and debuggers, and strip removes it. The .dynsym table lists only the symbols that the dynamic loader needs, in a loaded segment." },
+]} />

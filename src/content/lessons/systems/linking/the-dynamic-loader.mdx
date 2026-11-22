@@ -1,0 +1,156 @@
+---
+summary: "How ld.so decides which definition a name gets: the lookup scope, LD_PRELOAD and interposition, -Bsymbolic, visibility and -fno-semantic-interposition, dlopen flags, the GNU hash table with its Bloom filter, glibc symbol versions, and IFUNC."
+---
+import { ScopeDemo, GnuHashDemo, VersionDemo } from "@/demos/sys/SysLinkLoaderDemos";
+
+The OS lesson [Loading a program](/os/processes/loading-a-program-elf-and-the-dynamic-linker) shows what the dynamic loader `ld.so` does at startup. It maps the libraries, fills the GOT, and binds PLT slots on the first call. This lesson asks the next question: when several loaded files define the same name, which one does a reference get? It also covers how ld.so finds a name fast, and how a program says which version of a function it needs.
+
+## The lookup scope
+
+ld.so does not ask "which library did the linker see?". It searches a list of loaded objects, the **lookup scope**, and takes the first definition that it finds. The global scope has this order:
+
+1. the executable;
+2. the libraries in `LD_PRELOAD`, which ld.so loads "before all others";
+3. the `DT_NEEDED` libraries of the executable, then their own `DT_NEEDED` libraries, in breadth-first order;
+4. libraries that the program opened later with `dlopen(..., RTLD_GLOBAL)`.
+
+This rule is called **interposition**: an earlier object can replace a function of a later one. It applies to calls between libraries, and also to calls inside one library, if they go through the PLT.
+
+<Predict
+  id="interpose"
+  question="libfoo.so has logopen, which calls fmt, a large function in the same file that the compiler does not inline. The program also links libbar.so, before libfoo.so, and libbar.so happens to define a function named fmt. Which fmt does logopen call?"
+  options={[
+    "The fmt of libfoo.so, because the call is inside one library",
+    "The fmt of libbar.so, because libbar.so comes earlier in the lookup scope",
+    "Neither: ld.so reports a duplicate symbol",
+  ]}
+  answer={1}
+  explain="libfoo.so was compiled with -fPIC, so its own fmt is preemptible. The call goes through the PLT. The loader searches the scope in order and finds libbar.so first. It never reports duplicates: the first definition wins."
+>
+<ScopeDemo />
+</Predict>
+
+Things to try:
+
+1. Read the default case. `libfoo.so` calls the `fmt` of `libbar.so`. Turn off **app also links libbar.so**, and the call goes back to `libfoo.so`.
+2. Turn on **LD_PRELOAD=libtrace.so**. It enters the scope in second place, and both `malloc` references now go to it. This is how tools replace `malloc` with no rebuild.
+3. Turn `libbar.so` back on and try each item of **libfoo.so protects its call to fmt with**. Each one binds the call before ld.so runs.
+4. Click the `plugin2.so → plugin_api` row. With `RTLD_LOCAL`, the lookup fails. Switch to `RTLD_GLOBAL`, and `plugin.so` joins the global scope.
+5. With **hidden**, look at the box of `libfoo.so`: `fmt` is no longer exported at all.
+
+### Interposition is a feature with a cost
+
+`LD_PRELOAD` and interposition make useful things possible. A program can use another `malloc` with no rebuild, and a test can replace a system call wrapper. The cost is paid by every shared library, all the time:
+
+- GCC does not inline such a function into its callers by default (`-fsemantic-interposition`), because the function at run time may be a different one. Clang 22 inlines it unless you give `-fsemantic-interposition`.
+- A call that the compiler does not inline goes through the PLT, which is an indirect jump.
+- A read of the library's own global variable goes through a GOT slot.
+
+The Python 3.10 release notes give a measure of this. Builds with `--enable-optimizations` add `-fno-semantic-interposition`. This makes `--enable-shared` builds with GCC up to 30% faster.
+
+### Ways to opt out
+
+| Method | Where | Effect |
+|---|---|---|
+| `-fvisibility=hidden`, then `__attribute__((visibility("default")))` on the API | compiler | hidden symbols are not in `.dynsym`; nothing can find or replace them |
+| `__attribute__((visibility("protected")))` | compiler | exported, but references from inside the library use its own copy |
+| `-fno-semantic-interposition` | compiler | the compiler may assume that interposition does not change a function, so it calls it directly and GCC may inline it |
+| `-Wl,-Bsymbolic` | linker | the linker binds every reference to a definition in the same library and sets `DF_SYMBOLIC` |
+| `RTLD_DEEPBIND` | `dlopen` | the library's own scope comes before the global scope |
+
+We checked the effects with clang 22.1.8 and ld.lld 22.1.8. With `-fno-semantic-interposition`, a call from `api` to `helper` in the same file has no relocation at all. With `-fvisibility=hidden`, a read of the library's own variable becomes a direct `PC32` access. With `-Bsymbolic`, the library has no dynamic relocations for its own symbols.
+
+Drepper's "How To Write Shared Libraries" (version 4.1.2, December 2011) describes export control in its section 2.2. It also discusses `DF_SYMBOLIC`, the flag that `-Bsymbolic` sets, and it lists many disadvantages of that approach. Visibility is the more precise tool: the API stays preemptible, and the internals do not.
+
+### dlopen and RTLD_LOCAL
+
+`dlopen(3)` takes two kinds of flags. `RTLD_LAZY` binds functions at the first call, and `RTLD_NOW` binds everything before `dlopen` returns. `RTLD_LOCAL`, the default, keeps the library out of the global scope. The man page says: "symbols defined in this shared object are not made available to resolve references in subsequently loaded shared objects". `RTLD_GLOBAL` adds it to the global scope.
+
+So a plugin that uses symbols of another plugin has two options. It can list the other one in `DT_NEEDED`, or the host can open the other one with `RTLD_GLOBAL`. If neither is true, `dlopen` fails with `RTLD_NOW`. With `RTLD_LAZY`, a missing function fails later, at the first call. A missing variable still makes `dlopen` fail, because only function references are lazy. The error message names the missing symbol: `undefined symbol: plugin_api`.
+
+To see what ld.so does, set `LD_DEBUG=scopes` to print the scopes, and `LD_DEBUG=bindings` to print each binding. `LD_DEBUG=statistics` prints relocation statistics.
+
+## Finding a name fast
+
+At startup, ld.so looks up every symbol that a relocation names, in scope order. A large program has thousands of such names and dozens of libraries. Most libraries in the scope do not define a given name, so the important case is a fast "no".
+
+The **GNU hash table** (`.gnu.hash`) gives that "no". The GNU C library added it in glibc 2.5, and GNU ld got `--hash-style=gnu` in binutils 2.18. The lookup in glibc's `do_lookup_x` has four steps:
+
+1. Hash the name: `h = h * 33 + c` for each byte, from `h = 5381`.
+2. Read one 64-bit word of a **Bloom filter**: word `(h / 64) mod n`, for a filter of `n` words. Test two bits: `h mod 64` and `(h >> shift) mod 64`. The table header stores `shift`. If either bit is clear, the name is certainly not in this library.
+3. If both bits are set, read the bucket `h mod nbuckets`. It gives the first symbol of a chain.
+4. Walk the chain. Each entry stores the hash of its symbol, so the loader calls `strcmp` only when the hashes match.
+
+<Predict
+  id="bloom"
+  question="ld.so looks up a name that only the last of 20 libraries defines. Each library exports 500 names. About how many string compares does it make?"
+  options={[
+    "About 20: one or more in each library",
+    "About 1: the Bloom filters reject almost every other library, and stored hashes avoid most compares",
+    "Thousands: it walks the symbol table of each library",
+  ]}
+  answer={1}
+  explain="In the demo, the Bloom filter rejects 19 of the 20 libraries with two memory reads each. In the last library the stored 32-bit hashes match only the right name, so one strcmp finds it."
+>
+<GnuHashDemo />
+</Predict>
+
+Things to try:
+
+1. Look up `malloc`. Both of its bits are set in Bloom word 0, and its bucket is 1. The chain finds it at index 5 with one string compare.
+2. Look up `strcpy` and the other names that are not in the table. Most stop at the Bloom filter. Find one that passes the filter and walks a bucket for nothing.
+3. In the scope of 20 libraries, binding 500 random names visits 5,286 libraries. The Bloom filter answers 98.4% of the visits that do not find the name, and only 76 visits walk a chain for nothing.
+4. Move **Libraries in the scope** to 40. The number of visits grows with the length of the scope, but the string compares stay at one for each name.
+
+The demo uses the table that ld.lld 22 builds for these 12 names: 3 buckets, 4 Bloom words and shift 26. The ld.lld linker always writes 26, and GNU ld computes the shift for each table. The test of this sim compares every byte with the `.gnu.hash` section of a real `.so`. The older `.hash` table (`DT_HASH`) stores no hashes in its chains and has no Bloom filter. So each "no" costs a walk of a chain, with a `strcmp` for each entry.
+
+The search is still linear in the number of libraries. Start-up time therefore grows with the number of libraries and the number of symbol relocations. Fewer exported symbols help twice: they make smaller tables and fewer relocations.
+
+## Symbol versions
+
+A library can keep several versions of one function. The GNU C library does this to change a function and still run old programs. Each version has a name, such as `GLIBC_2.14`. The static linker records the default version of each function that the program uses. The loader checks these versions when it loads the program.
+
+The memcpy case shows why this exists. In glibc 2.13, the C library got a faster x86-64 `memcpy` that copied in a different order. Programs that called `memcpy` on overlapping buffers broke. Version 2.14 gave the new `memcpy` the version `GLIBC_2.14`. Old programs refer to `memcpy@GLIBC_2.2.5`, which is now `memmove`.
+
+Later, glibc 2.34 moved `libpthread` into `libc`. In the same release, a separate change to the start-up code gave `__libc_start_main` the new version `GLIBC_2.34`.
+
+<VersionDemo />
+
+Things to try:
+
+1. Build against glibc 2.39 and run on 2.31. The loader stops with "version `GLIBC_2.34' not found". The only cause is `__libc_start_main`, which the C start-up code calls in every program.
+2. Build against 2.28 and run on 2.39. Every version is there, because glibc keeps old versions.
+3. Add `pthread_create` and build against 2.28. It comes from `libpthread.so.0`. Build against 2.34 and it comes from `libc.so.6`.
+4. Add `getrandom` and build against 2.17. The program does not compile, because `getrandom` is not in glibc before 2.25.
+
+ELF stores the versions in three GNU sections. `.gnu.version` has one version index for each `.dynsym` entry. `.gnu.version_r` lists the versions that the file needs from each library, and `.gnu.version_d` lists the versions that the file defines. The practical rule follows: build on the oldest glibc that you support. `zig cc -target x86_64-linux-gnu.2.28` does this with no old machine, and Python's manylinux wheels do it with old build images.
+
+## IFUNC and thread-local storage
+
+Two more kinds of work happen in ld.so. An **IFUNC** symbol (`STT_GNU_IFUNC`, type 10) points to a resolver function, not to the function itself. The loader calls the resolver during relocation. The resolver returns the implementation to use. The GNU C library selects `memcpy` and `strlen` this way, from the CPU features. The cost is one resolver call at startup and an indirect call through the GOT after that.
+
+**Thread-local storage** has four access models: general dynamic, local dynamic, initial exec and local exec. Code in a shared library uses general dynamic by default. It calls `__tls_get_addr` to find a variable, because the library can be loaded by `dlopen` after threads exist. Code in an executable can use local exec for its own TLS variables. That is a fixed offset from the thread pointer, which is `fs` on x86-64. A TLS variable from a shared library needs initial exec, which reads its offset from the GOT.
+
+## What this means for your code
+
+- Build shared libraries with `-fvisibility=hidden` and mark the public API. You get smaller tables, fewer relocations, faster calls and no accidental interposition.
+- Give library-internal names a prefix anyway. Hidden symbols in static archives still clash at static link time.
+- Do not rely on the order of libraries to choose between two definitions of one name. Rename one of them.
+- Ship Linux binaries that are built against an old glibc, or link statically with musl.
+- When a plugin cannot find a symbol, check the `dlopen` flags of the host and the `DT_NEEDED` entries of the plugin.
+
+## Connect
+
+- [Loading a program: ELF and the dynamic linker](/os/processes/loading-a-program-elf-and-the-dynamic-linker): mapping, relocation, the PLT and lazy binding.
+- [Static and dynamic linking](/systems/linking/static-and-dynamic-linking): preemptible symbols, the GOT and the PLT from the static linker's side.
+- [The C ABI as lingua franca](/systems/abi/c-abi-as-lingua-franca): what a library exports to other languages.
+- [Address spaces](/os/vm/address-spaces): where ld.so maps each library.
+
+<Recall cards={[
+  { q: "In what order does ld.so search the global scope?", a: "The executable, then the LD_PRELOAD libraries, then the DT_NEEDED libraries in breadth-first order, then libraries opened with RTLD_GLOBAL. The first definition wins." },
+  { q: "Why does a -fPIC library call its own default-visibility function through the PLT, when the compiler does not inline the call?", a: "Another object earlier in the scope may define the same name and replace it. The call must go to whichever definition ld.so finds." },
+  { q: "Name three ways to stop interposition of a library's internal function, and where each one acts.", a: "Hidden visibility (compiler: the name is not exported), -fno-semantic-interposition (compiler: direct calls and inlining), -Bsymbolic (linker: binds all references locally). Protected visibility also works." },
+  { q: "Plugin B uses a symbol of plugin A. The host opened A with dlopen and the default flags. Why does B fail?", a: "The default is RTLD_LOCAL, so A is not in the global scope. B must list A in DT_NEEDED, or the host must open A with RTLD_GLOBAL." },
+  { q: "What two things make a GNU hash lookup fast in a library that does not have the name?", a: "A Bloom filter: two bits in one 64-bit word reject most names. And stored hashes in the chain, so strcmp runs only on a hash match." },
+  { q: "A program built on a new distribution fails on an old one with version GLIBC_2.34 not found. Why, and what is the fix?", a: "The program refers to a symbol version that the old glibc does not define, here __libc_start_main@GLIBC_2.34. Build against the oldest glibc that you support." },
+]} />

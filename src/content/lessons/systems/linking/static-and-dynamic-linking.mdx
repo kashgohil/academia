@@ -1,0 +1,129 @@
+---
+summary: "The build side of libraries: how a linker searches static archives and why the order of -l flags matters, --start-group and --whole-archive, what -fno-pic, -fPIE and -fPIC code becomes in an executable or a shared library, copy relocations, and when to link statically."
+---
+import { ArchiveOrderDemo, PicMatrixDemo } from "@/demos/sys/SysLinkStaticDemos";
+
+A library comes in two forms. A **static library** (`libz.a`) is an archive of object files, made with `ar`. The linker copies the members that it needs into the program. A **shared library** (`libz.so`) is a finished ELF file of type `ET_DYN`. The linker only records its name in the program, and the dynamic loader maps it at run time.
+
+The OS lesson [Loading a program](/os/processes/loading-a-program-elf-and-the-dynamic-linker) shows that run-time part. This lesson is about the decisions that the static linker makes.
+
+## Archives and the order of the command line
+
+An archive has an index, the **armap**, that lists the symbols that each member defines. The linker does not copy a whole archive. It extracts a member only if that member defines a symbol that is undefined at that moment.
+
+In this example, `main.o` calls `compress`. In `libz.a`, `deflate.o` defines `compress` and needs `log_msg`. In `liblog.a`, `log.o` defines `log_msg` and needs `crc32`, which is in `libz.a` again.
+
+<Predict
+  id="order"
+  question="You link with GNU ld: ld main.o libz.a liblog.a. Every symbol is defined in some input. What happens?"
+  options={[
+    "It links: the linker finds each symbol in some archive",
+    "It fails: crc32 is undefined, because libz.a was searched before log.o needed it",
+    "It fails: compress is undefined, because main.o comes first",
+  ]}
+  answer={1}
+  explain="GNU ld searches each archive once, at its place on the command line. When it searched libz.a, nothing needed crc32 yet. Later, log.o from liblog.a needs crc32. The linker does not go back to libz.a."
+>
+<ArchiveOrderDemo />
+</Predict>
+
+Things to try:
+
+1. Step through the default order with **GNU ld**. `deflate.o` comes in for `compress`, `log.o` comes in for `log_msg`, and then `crc32` is left undefined.
+2. Move `liblog.a` before `libz.a`. Now `log_msg` is left undefined. No order of the two archives works, because each one needs the other.
+3. Turn on **Repeat libz.a at the end**, or **--start-group**. Both work. The group repeats its search until a full pass extracts nothing.
+4. Switch to **ld.lld** with the first order. It links, but it warns about a backward reference. Move `main.o` to the end and count the warnings: there are two.
+5. In every case, `gzip.o` and `level.o` stay out. Nothing refers to them.
+
+### The rules
+
+The GNU ld manual is exact about this. The linker "will search an archive only once, at the location where it is specified on the command line". A symbol that an object needs later "will not cause the linker to search the archive again". Inside one search, the linker repeats until no member of that archive is needed. So members of one archive can depend on each other in any order.
+
+`--start-group a.a b.a --end-group` searches the group "repeatedly until no new undefined references are created". The manual warns that this "has a significant performance cost". The usual alternative is to list a library twice.
+
+ld.lld uses a different rule. It "remembers the symbol table of archives that it has previously seen". A later reference still extracts a member from an earlier archive. Most order mistakes therefore link with ld.lld, then fail with GNU ld on another machine. `--warn-backrefs` prints a warning for each reference that GNU ld would not resolve.
+
+### Members that nothing references
+
+A member that defines no needed symbol never enters the program, even if it has useful side effects. This breaks a common C++ pattern: a file whose only job is a static constructor that registers a plugin. Nothing calls into that file, so the linker drops it, and the plugin never registers. `--whole-archive` forces the linker to take every member of the archives that follow it, until `--no-whole-archive`. A weak reference also does not extract a member. The gABI says: "the link editor does not extract archive members to resolve undefined weak symbols".
+
+## Position-independent code
+
+A shared library can load at any address, and it is mapped read-only and shared between processes. So its code cannot contain absolute addresses or direct references to symbols that another module might define. The compiler has three modes:
+
+- `-fno-pic`: code for a non-PIE executable. It may use absolute addresses and assumes that every symbol is in the program.
+- `-fPIE`: code for an executable at any address. It uses `rip`-relative addresses. It assumes that symbols defined in this file stay in the program. Clang reaches an `extern` variable through the GOT. GCC on x86-64 accesses it directly by default (`-mdirect-extern-access`), and the linker may then need a copy relocation.
+- `-fPIC`: code for a shared library. A module may replace any default-visibility global symbol at load time, even one from this file. So each one goes through the GOT or the PLT.
+
+A symbol is **preemptible** if a definition in another module can replace it at load time. In an executable, only symbols from shared libraries are preemptible. In a shared library, every default-visibility global symbol is preemptible, because the executable or an `LD_PRELOAD` library may define the same name. The [dynamic loader lesson](/systems/linking/the-dynamic-loader) shows why.
+
+<Predict
+  id="pie-shared"
+  question="get.c defines int hits and increments it. You compile get.c with -fPIE and link it into a shared library. What does ld.lld do?"
+  options={[
+    "It links, and hits gets a GOT slot",
+    "It refuses: the PC32 access to hits assumes that hits cannot be replaced, which is false in a shared library",
+    "It links, and the access to hits stays direct",
+  ]}
+  answer={1}
+  explain="-fPIE code reaches hits with a direct rip-relative access (R_X86_64_PC32). In a shared library hits is preemptible, so a direct access could read the wrong copy. So ld.lld stops with this error. Relocation R_X86_64_PC32 cannot be used against symbol 'hits'; recompile with -fPIC."
+>
+<PicMatrixDemo />
+</Predict>
+
+Things to try:
+
+1. Click the **-fPIC** row, **.so** cell. Three dynamic relocations: a GOT slot for `hits`, a GOT slot for `counter`, and a PLT slot for `add`. The library pays for its own variable `hits`, because something may replace it.
+2. Turn on **-Bsymbolic**. The count goes to 0: the linker binds the library's own symbols to its own definitions.
+3. Click **-fPIC** with **PIE**. Every access is direct or relaxed to `lea`. PIC code costs nothing in an executable when all symbols are in the link.
+4. Set **counter and add are in** to **libdef.so**, and click **-fno-pic** with **exe**. `counter` gets a **copy relocation**.
+5. Click **-fPIE** with **exe** for the same case. With Clang's `-fPIE` code, `counter` uses a GOT slot, and the copy relocation is gone. GCC's `-fPIE` code would still get a copy relocation.
+
+### What the linker does with each reference
+
+| The object file has | The symbol is not preemptible | The symbol is preemptible |
+|---|---|---|
+| `PC32` (direct data access) | direct access | executable: copy relocation; shared library: error |
+| `REX_GOTPCRELX` (GOT load) | relaxed to `lea` | GOT slot with `R_X86_64_GLOB_DAT` |
+| `PLT32` (call) | direct call | PLT stub with `R_X86_64_JUMP_SLOT` |
+
+All 18 cells of the demo match real links with clang 22.1.8 and ld.lld 22.1.8. The `-fPIE` row is Clang's: GCC writes `PC32` for the `extern` variable too.
+
+**Copy relocations.** Non-PIC code in an executable reads `counter` at a fixed address, but `counter` is in a shared library. The linker solves this with a trick.
+
+It reserves space for `counter` in the executable's `.bss` and emits `R_X86_64_COPY`. At startup, ld.so copies the initial value from the library into that space. The library itself reaches `counter` through its GOT, and the lookup finds the executable's copy first. Everybody uses one copy, but the size of the variable is now fixed in the executable. If a new version of the library makes the variable larger, the old program breaks.
+
+## Static or dynamic
+
+The OS lesson compares the two at run time. From the build side, these points matter:
+
+- **Link-time optimization** (`-flto`) can inline across object files and archives that the linker sees. It cannot see into a shared library.
+- **Unused code.** A static link takes only the archive members that the program needs. A shared library brings all of its exported code, although only touched pages use memory.
+- **Start-up.** A static executable has no interpreter, so ld.so does no lookups and no relocations for libraries. The [dynamic loader lesson](/systems/linking/the-dynamic-loader) counts that work.
+- **Updates.** A security fix in a static library needs a new link of every program. A shared library fix needs only a new file.
+- **glibc and static links.** Some glibc functions, such as name lookup through NSS, load other libraries with `dlopen` at run time. A static glibc program needs those libraries anyway. **musl** has no such dependency. So `x86_64-unknown-linux-musl` in Rust and `-target x86_64-linux-musl` in Zig give static programs by default.
+- **Go** links a pure-Go program statically, with its own linker. A program that uses cgo is a dynamic executable that needs libc. Such a program uses the system linker by default (external linking), unless its only cgo packages are `net`, `os/user` and `runtime/cgo`.
+
+## What this means for your code
+
+- Put libraries after the objects that use them, and put a library after every library that uses it. For a cycle, use `--start-group` or list the library twice.
+- If a build links with ld.lld but not with GNU ld, run ld.lld with `--warn-backrefs`. It shows each order problem.
+- If a registration file disappears from a static build, the linker did not extract it. Use `--whole-archive`, or refer to a symbol in it from `main`.
+- Compile code for shared libraries with `-fPIC` and code for executables with `-fPIE`. A `-fno-pic` or `-fPIE` object in a shared library fails with "recompile with -fPIC".
+- Do not export variables from a shared library if you can avoid it. Copy relocations make their size part of the ABI. Export functions that return or change the value.
+
+## Connect
+
+- [Loading a program: ELF and the dynamic linker](/os/processes/loading-a-program-elf-and-the-dynamic-linker): the GOT, the PLT and lazy binding at run time.
+- [Symbols and relocation](/systems/linking/symbols-and-relocation): the formulas behind GOT and PLT relocations.
+- [The dynamic loader](/systems/linking/the-dynamic-loader): preemption, interposition and how ld.so finds a symbol.
+- [The C ABI as lingua franca](/systems/abi/c-abi-as-lingua-franca): why libraries in every language export C symbols.
+
+<Recall cards={[
+  { q: "GNU ld: main.o needs f from liba.a, and f needs g from libb.a. Which order works, and why?", a: "main.o liba.a libb.a. Each archive is searched once, at its place, so a library must come after everything that needs it." },
+  { q: "Two archives need each other. Name two fixes.", a: "Wrap them in --start-group ... --end-group, which repeats the search, or list one of them a second time after the other." },
+  { q: "Why does a static constructor that registers a plugin sometimes vanish from a static build?", a: "Nothing refers to a symbol in its archive member, so the linker never extracts that member. --whole-archive forces it in." },
+  { q: "What is a preemptible symbol, and which symbols are preemptible in a shared library?", a: "A symbol that a definition in another module can replace at load time. In a shared library, every default-visibility global symbol is preemptible, unless -Bsymbolic or visibility binds it locally." },
+  { q: "Why does -fPIE code fail in a shared library?", a: "-fPIE assumes that its own global symbols stay in the program, so it accesses them directly (PC32). In a shared library they are preemptible, so the linker refuses the direct access." },
+  { q: "What is a copy relocation, and what does it cost?", a: "Non-PIC executable code reads a library variable at a fixed address. So the linker reserves space in the executable, and ld.so copies the initial value there. The variable's size becomes part of the ABI." },
+]} />

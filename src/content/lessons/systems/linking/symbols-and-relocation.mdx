@@ -1,0 +1,142 @@
+---
+summary: "How a linker picks one definition for each name (strong, weak, tentative, COMMON and local symbols, and the -fno-common change), and how it patches each hole with the x86-64 relocation formulas, relaxation and range checks."
+---
+import { ResolveDemo, RelocateDemo } from "@/demos/sys/SysLinkSymDemos";
+
+A static linker does two main jobs. First it **resolves symbols**: for each global name, it finds the one definition that all references use. Then it **relocates**: it gives every section an address and fills every hole that the compiler left. This lesson does both jobs by hand, with real object files from clang 22 and real results from ld.lld 22.
+
+## One name, two files
+
+A C file can mention a global name in five ways, or not at all. Each way makes a different symbol table entry:
+
+| Declaration | Symbol in the object file |
+|---|---|
+| `extern int x;` (and a use of `x`) | `x` GLOBAL, section UND: a reference |
+| `int x;` | a **tentative definition**: GLOBAL in `.bss`, or COMMON with `-fcommon` |
+| `int x = 1;` | GLOBAL in `.data`: a strong definition |
+| `__attribute__((weak)) int x = 1;` | WEAK in `.data` |
+| `static int x = 1;` | LOCAL: invisible to other files |
+
+<Predict
+  id="tentative"
+  question="a.c says int x; and b.c says int x = 2;. You compile both with clang 22 and its default flags, and link them. What happens?"
+  options={[
+    "It links. The int x; in a.c is only a declaration, so both files use b.c's x",
+    "ld.lld stops with: duplicate symbol: x",
+    "It links, and each file gets its own x",
+  ]}
+  answer={1}
+  explain="Since GCC 10 and Clang 11, -fno-common is the default. Then int x; is a real definition in .bss, and two strong definitions of one name are an error. With -fcommon, int x; becomes a COMMON symbol, and the strong definition in b.c wins."
+>
+<ResolveDemo />
+</Predict>
+
+Things to try:
+
+1. Turn on **-fcommon**. The same pair now links, and `main` returns 22: both files read the `x` of `b.o`.
+2. With **-fcommon**, set both files to `int x;`. The two COMMON symbols merge into one, and `main` returns 0. Turn **-fcommon** off: the pair is an error.
+3. Set a.c to **weak int x = N;** and b.c to **int x = N;**. The strong definition wins in both orders. Two weak definitions do not conflict: the first one wins.
+4. Set a.c to **static int x = N;** and b.c to **extern int x;**. The link fails: a static variable does not satisfy a reference from another file.
+5. Look at the grid. A red cell always has either two strong definitions or a reference with no definition.
+
+## The resolution rules
+
+The linker reads the files in command-line order. It keeps one table entry for each global name, and it applies these rules:
+
+1. Two **strong** definitions of one name are an error. The ld.lld linker says `duplicate symbol: x`, and GNU ld reports a multiple definition.
+2. A strong definition replaces a **weak** one, in either order. Of two weak definitions, the first one wins. The gABI says that the linker "honors the global definition and ignores the weak ones".
+3. A **COMMON** symbol loses to a strong definition. Two COMMON symbols merge, and the larger size wins. In ld.lld 22, a COMMON symbol also replaces a weak definition.
+4. A reference that has no definition is an error: `undefined symbol: x`. A **weak reference** with no definition is not an error. Its address becomes 0, so the program can test `if (&hook)` before it calls `hook`.
+5. A **local** symbol never takes part. Each file keeps its own.
+
+**COMMON and -fno-common.** Traditional Unix C compilers treated `int x;` in several files as one shared variable. The linker merged these COMMON symbols. Many C programs depended on this, and they declared a global in a header with no `extern`. GCC 10 made `-fno-common` the default, and Clang 11 did the same. These programs now fail with duplicate definitions.
+
+The correct fix is `extern int x;` in the header and one definition in one `.c` file. `-fcommon` brings back the old behavior.
+
+**Other languages.** C++ has no tentative definitions: `int x;` at namespace scope is always a definition. Rust gives each item a mangled name that contains the crate, so two crates cannot clash. A clash comes back with `#[no_mangle]`, which exports the plain name. Zig exports a plain C name only with `export`. Go names a symbol by its package path, such as `main.main`.
+
+## Relocation formulas
+
+After resolution, the linker merges the input sections into output sections and gives each one an address. Then it walks every relocation entry. The x86-64 psABI defines a formula for each type, with these terms:
+
+- `S`: the address of the symbol.
+- `A`: the addend from the entry.
+- `P`: the address of the hole.
+- `L`: the address of the symbol's PLT entry. In a static link, `L` is `S`.
+- `G + GOT`: the address of the symbol's slot in the global offset table.
+
+| Type | Number | Formula | Hole | Typical use |
+|---|---|---|---|---|
+| `R_X86_64_64` | 1 | `S + A` | 8 bytes | a pointer in initialized data |
+| `R_X86_64_PC32` | 2 | `S + A - P` | 4 bytes, signed | `rip`-relative data access |
+| `R_X86_64_PLT32` | 4 | `L + A - P` | 4 bytes, signed | `call` and `jmp` |
+| `R_X86_64_32` | 10 | `S + A` | 4 bytes, zero-extended | an absolute address in an immediate |
+| `R_X86_64_32S` | 11 | `S + A` | 4 bytes, sign-extended | an absolute address in a displacement |
+| `R_X86_64_REX_GOTPCRELX` | 42 | `G + GOT + A - P` | 4 bytes, signed | load an address from the GOT |
+
+<RelocateDemo />
+
+Things to try:
+
+1. Step through the six relocations of `main.o`. The first one: `S` is `.bss` at `0x2021a4`, `A` is -4, and `P` is `0x201162`. The value is `0x103e`.
+2. Read the bytes after relocation 1: `3e 10 00 00`. Compare them with the dump of a real link: ld.lld writes `8b 3d 3e 10 00 00` at the same place.
+3. Go to relocation 6, `R_X86_64_64` in `.data`. It needs no `P`: the value is the full address of `counter`, `0x2021a0`.
+4. Move **Distance from .text to .data** to 2 GiB. The first `PC32` value for `calls` is now $2^{31} + 6$. That is too large for a signed 32-bit hole, and the linker stops with the error that ld.lld prints. The other values still fit.
+5. Switch to **-fPIE**. Relocation 3 is now `REX_GOTPCRELX`. The linker turns the `mov` into a `lea`, because `counter` is in the same program. Turn off **Relax GOT loads** to get a real GOT slot.
+
+### Why S + A - P works
+
+A `rip`-relative instruction reads the address that is `disp` bytes after the next instruction. For the first read of `calls`, the hole is at `P` and the next instruction starts at `P + 4`. The CPU computes `(P + 4) + disp`. The linker must make this equal to `S`. So `disp = S - 4 - P = S + A - P`, with `A = -4`.
+
+The addend is not always -4. In `extra.c` of the previous lesson, `csv_buf[0] = ','` compiles to a store with a 1-byte immediate after the hole. The next instruction is 5 bytes after the hole, so the compiler writes `csv_buf - 5`.
+
+### Relaxation
+
+With `-fPIE` or `-fPIC`, the compiler does not know if `counter` will be in this program or in a shared library. So it loads the address from the GOT:
+
+```asm
+48 8b 05 00 00 00 00    mov rax, qword ptr [rip + counter@GOTPCREL]
+```
+
+The `X` in `REX_GOTPCRELX` tells the linker that it may rewrite the instruction. If the symbol is in the same output file, the psABI allows the linker to change `mov` into `lea`. The opcode byte goes from `8b` to `8d`, and no GOT slot is needed:
+
+```asm
+48 8d 05 2b 20 00 00    lea rax, [rip + 0x202b]    # counter
+```
+
+The instruction length does not change, so no other address moves. With `--no-relax`, ld.lld keeps the `mov`. It makes an 8-byte `.got` section at `0x202208`, which holds the address of `counter`.
+
+### Range and code models
+
+A 4-byte signed hole reaches from $-2^{31}$ to $2^{31} - 1$ bytes. So the default **small code model** requires that all code and static data of a program fit in 2 GiB. A larger program needs `-mcmodel=medium`, which moves large data to `.ldata` with 64-bit addresses. It can also use `-mcmodel=large`, which uses 64-bit addresses everywhere and is slower. The linker reports the overflow; it cannot fix it. This error comes from a link with `.data` at `0x80201158`, so the value differs from the demo:
+
+```text
+ld.lld: error: main.o:(function main: .text+0x2): relocation R_X86_64_PC32 out of range:
+  2147483650 is not in [-2147483648, 2147483647]; references section '.bss'
+```
+
+Other machines split an address over two instructions. On AArch64, `adrp` gets the 4 KiB page of the symbol, and an `add` or `ldr` adds the low 12 bits. Each instruction has its own relocation type. On RISC-V, `auipc` and `addi` do the same. The RISC-V linker can also delete instructions when a target is near. See [addressing modes](/architecture/isa/addressing-modes) for the instruction side.
+
+## What this means for your code
+
+- Declare each global variable `extern` in a header and define it in exactly one source file. Then `-fno-common` costs you nothing.
+- Use weak symbols for optional hooks and default implementations. Remember that a weak reference with no definition is a null pointer.
+- A static library can define a weak symbol that the program overrides. This is how a program replaces a default function without a change to the library.
+- "relocation out of range" means that the program is larger than its code model allows. Reduce static data, or compile with `-mcmodel=medium`.
+- Read a hole with `llvm-objdump -d -r file.o`. Each relocation is printed under its instruction.
+
+## Connect
+
+- [Object files and ELF](/systems/linking/object-files-and-elf): the sections, symbols and relocation entries that this lesson uses.
+- [Static and dynamic linking](/systems/linking/static-and-dynamic-linking): archives, and what changes when the symbol is in a shared library.
+- [Addressing modes](/architecture/isa/addressing-modes): `rip`-relative addressing in hardware.
+- [Name mangling](/systems/abi/name-mangling): why C++ and Rust names rarely clash.
+
+<Recall cards={[
+  { q: "With -fno-common, a.c has int x; and b.c has int x = 2;. What does the linker say, and why?", a: "duplicate symbol: x. With -fno-common, int x; is a strong definition in .bss, so there are two strong definitions." },
+  { q: "State the rule for a strong and a weak definition of one name, and for two weak ones.", a: "The strong one wins in either order. Of two weak ones, the first in link order wins. Neither case is an error." },
+  { q: "What address does an undefined weak reference get, and how do programs use that?", a: "0. A program tests the address of the symbol, for example if (&hook), before it calls it." },
+  { q: "Derive the value of R_X86_64_PC32 for a hole at P, for an instruction that ends right after the hole.", a: "The CPU computes (P + 4) + disp, which must equal S. So disp = S - 4 - P = S + A - P, with A = -4." },
+  { q: "What does GOTPCRELX relaxation change, and when is it allowed?", a: "The linker rewrites mov reg, [rip + GOT slot] (opcode 8b) into lea reg, [rip + symbol] (8d), and drops the slot. It is allowed when the symbol is defined in the same output file and cannot be replaced at load time." },
+  { q: "Why does the small code model limit a program to 2 GiB of code and static data?", a: "Its references are signed 32-bit offsets from rip, so a target must be within $-2^{31}$ to $2^{31} - 1$ bytes of the instruction." },
+]} />

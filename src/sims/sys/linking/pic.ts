@@ -11,6 +11,9 @@
  *
  * and counter and add are defined either in another object of the same link, or in a shared library.
  *
+ * The -fPIE row is Clang's code: a GOT load for the extern variable. GCC on x86-64 defaults to
+ * -mdirect-extern-access, so its -fPIE code reads counter with PC32, as -fno-pic does here.
+ *
  * The rules are the ones that ld.lld applies (and GNU ld too, for these cases):
  * - A symbol is preemptible if a definition in another module may replace it at load time. In an executable,
  *   only symbols from shared libraries are preemptible. In a shared library, every default-visibility global

@@ -19,6 +19,7 @@ export const dlNewHash = (name: string): number => {
   return h;
 };
 
+/** The shift that ld.lld always writes. The table header stores it; GNU ld computes it for each table. */
 export const BLOOM_SHIFT = 26;
 
 export interface GnuHashTable {

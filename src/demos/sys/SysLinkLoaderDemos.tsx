@@ -117,7 +117,7 @@ export function GnuHashDemo() {
       <SmallLabel>One library: 12 names, the .gnu.hash table that ld.lld builds for them</SmallLabel>
       <div style={{ ...mono, fontSize: 12, lineHeight: 1.6 }}>
         <div>1. hash("{name}") = {hx(t.hash)} <span className="muted">(h = h × 33 + c, from 5381)</span></div>
-        <div>2. Bloom word = h / 64 mod {TABLE.bloom.length} = <b>{t.bloomWord}</b>; bits {t.bits[0]} (h mod 64) and {t.bits[1]} (h ≫ {BLOOM_SHIFT} mod 64)</div>
+        <div>2. Bloom word = h / 64 mod {TABLE.bloom.length} = <b>{t.bloomWord}</b>; bits {t.bits[0]} (h mod 64) and {t.bits[1]} (h ≫ shift mod 64; this table stores shift {BLOOM_SHIFT})</div>
       </div>
       <Bits64 word={word} bits={t.bits} />
       <div className="muted" style={{ fontSize: 11.5, ...mono }}>bit 63 … bit 0 of bloom[{t.bloomWord}]. Outlined: the two bits for this name. Green: set. Red: not set.</div>

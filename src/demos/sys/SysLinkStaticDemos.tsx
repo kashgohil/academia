@@ -174,7 +174,7 @@ export function PicMatrixDemo() {
           </tbody>
         </table>
       </div>
-      <Note>Each cell matches a real link with clang 22 and ld.lld 22. Click a cell to see it.</Note>
+      <Note>Each cell matches a real link with clang 22 and ld.lld 22. GCC's -fPIE code reads counter directly (PC32), like -fno-pic here. Click a cell to see it.</Note>
     </Demo>
   );
 }

@@ -32,6 +32,10 @@ export const LEVELS: Record<Level, string> = {
 
 /** Lessons with a written MDX page. Paths must match `src/content/lessons/<path>.mdx`. */
 export const LIVE = new Set<string>([
+  "systems/abi/c-abi-as-lingua-franca",
+  "systems/abi/calling-conventions",
+  "systems/abi/ffi-across-languages",
+  "systems/abi/name-mangling",
   "systems/memory/pointers-and-references",
   "systems/memory/stack-and-heap",
   "systems/memory/static-data-and-the-binary-layout",

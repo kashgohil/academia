@@ -1,0 +1,143 @@
+---
+summary: "How separately compiled code passes and returns structs: the System V eightbyte classes, AAPCS64 HFAs, Windows x64 by-reference rules, RISC-V flattening and Go's register ABI, with hidden result pointers, varargs, and the conventions of Rust, Go and Zig."
+---
+import { AbiStructPassDemo, AbiBigStructDemo } from "@/demos/sys/SysAbiCallDemos";
+
+The lesson [Calling conventions](/architecture/isa/calling-conventions) shows the machine view: argument registers, saved registers, stack frames and the red zone. That view stops at integers. Real code passes a `struct Point`, returns a `std::pair`, calls `printf` with a variable number of arguments, and calls Go or Rust code from C. This lesson is about that part of the contract.
+
+An **ABI** (application binary interface) is the set of rules that two pieces of machine code must share to work together. It includes type layout, symbol names and the calling convention. A compiler applies these rules without a warning. If two sides disagree, the program reads the wrong registers and nothing reports it.
+
+## Which registers carry a struct
+
+<Predict
+  id="vec3"
+  question="struct Vec3 { double x, y, z; } is passed by value on x86-64 Linux. Where does it go?"
+  options={["In xmm0, xmm1 and xmm2, one double in each", "On the stack: the caller copies all 24 bytes", "The caller passes a pointer to it in rdi"]}
+  answer={1}
+  explain="The System V psABI classifies the struct in 8-byte pieces. It has three of them, and no SSEUP class, so the post-merger cleanup makes it MEMORY. The caller copies it onto the stack. AAPCS64 on Arm64 does pass it in v0, v1 and v2."
+>
+<AbiStructPassDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **Vec3: three doubles** and click each convention. Only AAPCS64 and Go keep the struct in registers. The other three put it in memory, in two different ways.
+2. Remove field `c`. Now System V passes two SSE eightbytes in `xmm0` and `xmm1`. Windows x64 still passes a pointer, because 16 bytes is not 1, 2, 4 or 8.
+3. Select **char, float, double**. On System V the first eightbyte holds a `char` and a `float`, and INTEGER wins the merge: `rdi` and `xmm0`. On RISC-V the struct has three fields, so the floating-point rule does not apply.
+4. Select **double and long** and move **Integer arguments before it** to 6. System V needs one integer register, but none is free, so the whole struct goes to the stack. The `double` does not stay in `xmm0`.
+5. Select **int[3]** and **Go amd64**. Go assigns registers field by field, but an array with more than one element fails the assignment, so the struct goes to the stack.
+
+## The System V algorithm
+
+The System V AMD64 psABI, section 3.2.3 "Parameter Passing", classifies each argument before it assigns registers. The rule works on **eightbytes**: the 8-byte pieces of the object in memory.
+
+<Steps>
+<div>If the struct is larger than 8 eightbytes, or if it has unaligned fields, its class is MEMORY. C++ objects that are not trivial for calls go by invisible reference: the caller passes a pointer.</div>
+<div>Each eightbyte starts as NO_CLASS. Each field merges its class into the eightbyte that holds it. An integer or a pointer is INTEGER, and a `float` or a `double` is SSE. A `long double` is X87 and X87UP.</div>
+<div>The merge rules: equal classes stay; NO_CLASS gives way; MEMORY wins; then INTEGER wins; X87 against another class gives MEMORY; else SSE.</div>
+<div>Cleanup: any MEMORY makes the whole struct MEMORY. A struct over two eightbytes is MEMORY unless the rest is SSEUP, which only vector types produce.</div>
+<div>Assignment: INTEGER takes the next of `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`, and SSE the next of `xmm0` to `xmm7`. If any eightbyte has no free register, the whole struct goes to the stack.</div>
+</Steps>
+
+Return values use the same classes. INTEGER eightbytes come back in `rax` and `rdx`, and SSE eightbytes in `xmm0` and `xmm1`. For class MEMORY, the caller reserves the result and passes its address in `rdi` as a hidden first argument. The callee returns the same address in `rax`.
+
+## Four other answers
+
+| Convention | Small structs | Large structs | Big result |
+|---|---|---|---|
+| System V x86-64 | Up to 16 bytes, by eightbyte class | Copied onto the stack | Hidden pointer in `rdi` |
+| AAPCS64 | HFA in `v0`–`v7`; else up to 16 bytes in `x` registers | Copy in memory, pointer in an `x` register | Pointer in `x8` |
+| Microsoft x64 | Only 1, 2, 4 or 8 bytes, as an integer | Copy in memory, pointer in the argument's register | Pointer in `rcx` |
+| RISC-V LP64D | One or two float fields in `fa` registers; else up to 16 bytes in `a` registers | Copy in memory, pointer in an `a` register | Pointer in `a0` |
+| Go ABIInternal (amd64) | Each field in its own register | Each field in its own register, or all on the stack | On the stack, in the caller's frame |
+
+A **homogeneous floating-point aggregate** (HFA) is an AAPCS64 term: a struct of one to four members that all have the same floating-point type. Rule C.2 of AAPCS64 gives each member its own `v` register, so `Vec3` and a 4×`float` color travel in registers. A composite larger than 16 bytes that is not an HFA is copied to memory "allocated by the caller", and the argument becomes a pointer to that copy (rule B.4).
+
+Microsoft x64 has the strictest rule. Each argument gets exactly one register by position: `rcx`, `rdx`, `r8`, `r9`, or `xmm0` to `xmm3`. Structs of 8, 16, 32 or 64 bits travel as integers, even when their fields are floats. Every other size is passed as a pointer to a caller copy that is 16-byte aligned.
+
+The RISC-V psABI first **flattens** the struct: it looks through nested structs and arrays, and each array element counts as a field. So `struct { float a[2]; }` goes in `fa0` and `fa1`. One or two floating-point fields, or one float and one integer, can use the `fa` registers. Otherwise the integer rules apply. RISC-V is also the only convention here that splits a struct: if one `a` register is left, the first 8 bytes go in it and the rest go on the stack.
+
+## Where a big struct lives
+
+<AbiBigStructDemo />
+
+Things to try:
+
+1. Step through **SysV x86-64** with **3 doubles**. The caller copies 24 bytes of `a` into the stack-argument area, and the callee writes 24 bytes through the hidden pointer into `r`. That is 48 bytes of copies for one call.
+2. Switch to **AAPCS64**. The struct is an HFA, so the fields travel in `v0`, `v1` and `v2`, and `k` in `v3`. No byte goes to memory.
+3. Select **Windows x64**. The result pointer takes `rcx`, so the copy's address moves to `rdx` and `k` moves to `xmm2`. The callee changes the temporary copy, never `a`.
+4. Select **3 long longs** with **AAPCS64**. Now the struct is not an HFA. The caller passes the copy's address in `x0`, and the result address in `x8`.
+
+The demo runs unoptimized code, but the places come from the psABIs, and optimized code uses the same places. Here is clang -O2 output for `scale` with three doubles. The x86-64 version (`zig cc -target x86_64-linux-gnu -O2`) reads and writes the struct in memory. The AArch64 version needs no memory access at all.
+
+```asm
+; x86-64 System V: v at 16(%rbp), result pointer in rdi
+movq     %rdi, %rax
+movapd   %xmm0, %xmm1
+unpcklpd %xmm0, %xmm1
+mulpd    16(%rbp), %xmm1
+movapd   %xmm1, 16(%rbp)
+mulsd    32(%rbp), %xmm0
+movsd    %xmm0, 32(%rbp)
+movq     32(%rbp), %rcx
+movq     %rcx, 16(%rdi)
+movaps   16(%rbp), %xmm0
+movups   %xmm0, (%rdi)
+```
+
+```asm
+// AArch64 AAPCS64: v.x, v.y, v.z in d0, d1, d2; k in d3
+fmul d1, d1, d3
+fmul d0, d0, d3
+fmul d2, d2, d3
+ret
+```
+
+## Varargs
+
+A variadic function such as `printf` does not know the types of its extra arguments. Each convention adds a rule for them. On System V, the caller sets `al` to an upper bound on the number of vector registers that it used. Microsoft x64 puts a floating-point vararg in both the `xmm` register and the matching integer register.
+
+Apple's Arm64 platforms differ from AAPCS64 here. For `printf("%d %f\n", a, b)`, Apple clang 21 for `arm64-apple-macos` stores `a` and `b` on the stack. The same code for `aarch64-linux-gnu` passes `a` in `w1` and keeps `b` in `d0`. So a call through the wrong prototype, variadic against fixed, works on Linux by luck and fails on a Mac.
+
+## Each language's own convention
+
+The platform's C convention is the shared one. Most languages also have a private one, which they use between their own functions:
+
+- **C and C++** use the platform psABI. The Itanium C++ ABI (section 3.1.2.3) adds that a class with a non-trivial copy constructor or destructor goes by invisible reference. This holds on every platform that uses the Itanium C++ ABI, such as Linux on x86-64 and AArch64, and macOS.
+- **Rust** functions use the "Rust" ABI by default. The Rust Reference says that this ABI "offers no stability guarantees". Only `extern "C"` functions follow the platform convention, and only `#[repr(C)]` structs have the C layout.
+- **Go** 1.17 added a register-based convention on `linux/amd64`, `darwin/amd64` and `windows/amd64`. Go 1.18 extended it to `arm64`, `ppc64`, `ppc64le` and to `amd64` on all operating systems, and later releases added `riscv64` and `loong64`. Its document, `abi-internal.md`, lists nine integer registers and `X0` to `X14`. It has no callee-saved registers. Assembly code uses the stable stack convention, ABI0, and the compiler generates wrappers between the two.
+- **Zig** functions use `callconv(.auto)` by default, which is also unspecified. An `export fn` or a `callconv(.c)` function uses the C convention, and an `extern struct` has the C layout.
+
+```zig
+const Point = extern struct { x: f64, y: f64 };
+
+// zig 0.17.1: the C convention, so p arrives in xmm0 and xmm1 on x86-64 Linux
+export fn norm2(p: Point) f64 {
+    return p.x * p.x + p.y * p.y;
+}
+```
+
+## What this means for your code
+
+- **Small structs are cheap to pass by value**, but "small" depends on the platform. Up to 16 bytes is cheap on System V, AAPCS64 and RISC-V. On Windows x64, only 8 bytes or less is cheap.
+- **Large structs by value cost copies.** Pass a pointer to const data when the callee only reads. Return large results by value anyway: the hidden pointer lets the callee write into the caller's variable.
+- **Group floats into small uniform structs** for Arm64 math code. An HFA of up to four floats or doubles stays in registers both ways.
+- **Never call a variadic function through a non-variadic prototype**, and never the reverse. The error is silent, and it depends on the platform.
+- **Put `extern "C"`, `#[repr(C)]` or `extern struct` on every boundary.** The private conventions of Rust, Go and Zig can change with the compiler version.
+
+## Connect
+
+- [Calling conventions](/architecture/isa/calling-conventions) has the register roles and frames on the machine side.
+- [x86-64 and Arm compared](/architecture/isa/x86-64-and-arm-compared) compares the instruction sets under these conventions.
+- [Struct layout, alignment and padding](/systems/memory/struct-layout-alignment-and-padding) explains the offsets that the classes work on.
+- [The C ABI as lingua franca](/systems/abi/c-abi-as-lingua-franca) shows why every language speaks this convention.
+- [System calls](/os/processes/system-calls) uses yet another convention, for calls into the kernel.
+
+<Recall cards={[
+  { q: "How does System V x86-64 decide where a struct argument goes?", a: "It splits the struct into eightbytes and classifies each one: INTEGER, SSE or MEMORY. Anything over 16 bytes (without vector types) is MEMORY and goes on the stack. INTEGER eightbytes take rdi, rsi, ...; SSE eightbytes take xmm0 to xmm7." },
+  { q: "Where does a large struct result go on System V, AAPCS64 and Windows x64?", a: "The caller reserves the memory and passes its address. System V uses rdi, AAPCS64 uses x8, and Windows uses rcx as argument 1. System V and Windows return the address in rax." },
+  { q: "What is an HFA, and why does it matter?", a: "A homogeneous floating-point aggregate: one to four members of the same floating-point type. AAPCS64 passes and returns it in v registers, one member each, even when it is larger than 16 bytes." },
+  { q: "Which struct sizes go in a register on Windows x64?", a: "Only 1, 2, 4 or 8 bytes, as an integer. Every other size goes as a pointer to a caller-made copy." },
+  { q: "What happens on System V when a struct needs one integer register and none is free?", a: "The whole struct goes on the stack. The psABI never splits an argument between registers and the stack; any registers already chosen for it are given back." },
+  { q: "How does Go's ABIInternal pass a struct, and what makes it go to the stack?", a: "Each field gets its own register: integers from RAX, RBX, RCX, RDI, RSI, R8-R11, floats from X0-X14. An array longer than 1, or running out of registers, puts the whole value on the stack." },
+]} />

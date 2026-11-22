@@ -1,0 +1,134 @@
+---
+summary: "Calling C from Rust, Go, Zig, Odin and Python, and calling back: strings that need a zero byte, who frees what, the measured price of a cgo or ctypes call, the cgo pointer rules, callbacks with a user-data pointer, and what happens when a Rust panic meets a C frame."
+---
+import { AbiStringDemo, AbiCrossCostDemo, AbiUnwindDemo } from "@/demos/sys/SysAbiFfiDemos";
+
+A **foreign function interface** (FFI) lets code in one language call code in another. The earlier lessons gave the binary contract: the [calling convention](/systems/abi/calling-conventions), the [symbol names](/systems/abi/name-mangling) and the [C layout](/systems/abi/c-abi-as-lingua-franca). With them, a Rust program can call `strlen` and get an answer.
+
+The contract does not cover meaning. C does not know that a Rust `&str` has no zero byte at its end. It does not know which allocator made a buffer, or that a Go stack can move. A panic and a C frame also follow different rules. This lesson is about these gaps.
+
+## Strings at the boundary
+
+<Predict
+  id="asptr"
+  question="Rust passes s.as_ptr() to C's strlen, where s is the &str “hello”. What does strlen return?"
+  options={["5: the string has 5 bytes", "A number of 5 or more that depends on the bytes after the string", "Rust refuses to compile the call"]}
+  answer={1}
+  explain="A &str is a pointer and a length, and its bytes have no zero byte after them. C's strlen counts bytes until it finds a zero. So it reads past the string into whatever comes next. The call compiles, because the cast and the unsafe block say that you take the responsibility."
+>
+<AbiStringDemo />
+</Predict>
+
+Things to try:
+
+1. Step through **Rust: s.as_ptr()**. strlen reads the 5 bytes, then two bytes of the next static, and stops at its zero byte. It returns 7. The model reports a global-buffer-overflow, as AddressSanitizer would.
+2. Select **Rust: CString**. The copy on the heap has 6 bytes, with the zero byte, and strlen returns 5. Rust frees the copy when the CString is dropped.
+3. Select **Rust: temporary CString**. The CString dies at the end of its statement, so the pointer dangles before strlen runs. The call still returns 5 here, because the freed bytes have not changed yet.
+4. Select **Go: C.CString, no free**. The copy is C memory, which the Go garbage collector never frees. At exit, the leak check finds 6 lost bytes.
+5. Select **Go: C.CString + C.free** to see the fix.
+
+Each language has its own string, and C has a different one:
+
+| Language | String type | At the C boundary |
+|---|---|---|
+| C | `char *`, ends at the first zero byte | — |
+| Rust | `&str`: pointer and length, UTF-8, no zero byte | `CString::new` copies and adds the zero byte; it fails on an interior zero. `CStr::from_ptr` reads a C string. |
+| Go | `string`: pointer and length, immutable | `C.CString` copies into C's `malloc`; free it with `C.free`. `C.GoString` copies back. |
+| Zig | `[]const u8` slice; `[:0]const u8` has a zero byte after the last element | A `[*:0]const u8` is a C string. `std.mem.span` turns it into a slice. |
+| Python | `str` (Unicode) and `bytes` | ctypes passes `bytes` as `char *` to a function with `c_char_p` arguments. |
+
+The rule behind the table: **a copy has one owner, and the owner frees it with the allocator that made it.** In Rust, `CString::into_raw` gives ownership to C, and only `CString::from_raw` may take it back. If C allocates, C must also free, through a function that the library exports.
+
+## The price of a crossing
+
+A call through an FFI can cost much more than a normal call. These numbers were measured on one machine (an Apple M4 Pro under load) and are model inputs, not constants. Each is one call of `int add1(int x)` in a dependent loop:
+
+| Call | Time per call |
+|---|---|
+| Go → Go (`//go:noinline`), go 1.25.6 | 0.77 ns |
+| Go → C through cgo | 22.8 ns |
+| Rust → Rust (`#[inline(never)]`), rustc 1.96.1 | 1.74 ns |
+| Rust → C, `extern "C"`, static library without LTO | 1.74 ns |
+| Python → Python, Python 3.9.6 | 63 ns |
+| Python → C through ctypes | 152 ns |
+
+<AbiCrossCostDemo />
+
+Things to try:
+
+1. Keep **Go → C (cgo)** at 10 ns of work per item. The crossing takes 69.5% of the time: 22.8 ms against 10 ms for a million items.
+2. Move **Items per call** to 100. The crossing drops to 2.2% of the time. One call that handles a batch pays the crossing once.
+3. Select **Rust → C**. The curve sits far to the left: an `extern "C"` call from Rust is a normal machine call.
+4. Select **Python → C (ctypes)** at 10 ns of work. The crossing takes 93.8% of the time. In Python, the call to a C function costs more than a call to a Python function.
+
+Rust and Zig compile to machine code that already follows the C convention, so a call to C is just a `call` instruction.
+
+Go must do more. Goroutines run on small stacks that the runtime grows and moves, and C code cannot run on them. The Go 1.25 source, `runtime/cgocall.go`, describes each cgo call. `runtime.cgocall` calls `entersyscall`, "so as not to block other goroutines or the garbage collector". Then `runtime.asmcgocall` switches to the thread's own system stack (`g0`) and calls the C function. On return, `exitsyscall` waits until the thread may run Go code again.
+
+## Pointers that cross
+
+Go's garbage collector must find every Go pointer, and it may move goroutine stacks. So cgo has rules, in the documentation of `cmd/cgo`, section "Passing pointers". A Go pointer may go to C "provided the memory to which it points does not contain any Go pointers to memory that is unpinned". C "may not keep a copy of a Go pointer after the call returns, unless the memory it points to is pinned". The `runtime.Pinner` type pins memory. With the default `GODEBUG=cgocheck=1`, the runtime does "reasonably cheap dynamic checks" of these rules.
+
+To give C a handle to a Go value, use `runtime/cgo.Handle`. It stores the value in a table and gives C a plain integer. Rust has no garbage collector, but the same idea applies to a `Box`: `Box::into_raw` gives C a pointer, and `Box::from_raw` takes ownership back.
+
+## Callbacks and user data
+
+A C library that calls back, such as `qsort` or an event loop, takes a function pointer. A good C API also takes a `void *user` argument and passes it to each callback. That pointer carries the caller's state. Without it, a callback can only use global variables.
+
+Rust can pass a function as `extern "C" fn`. The standard library guarantees that `Option<extern "C" fn(...)>` has the size and ABI of the function pointer. Its `None` is null. A Rust closure cannot cross directly: a small `extern "C"` function receives the user pointer and calls the closure through it.
+
+## A panic meets a C frame
+
+<AbiUnwindDemo />
+
+Things to try:
+
+1. Step through **extern "C"**. The panic starts in `cmp`, but `cmp` promises not to unwind. The process aborts at that boundary. The `catch_unwind` in `main` never runs.
+2. Select **extern "C-unwind"**. The unwinder passes through the C frame of `qsort`, and `catch_unwind` in `main` catches the panic. The array may stay half sorted.
+3. Select **catch inside cmp**. The panic never reaches C. `cmp` returns a normal value, and `main` resumes the panic afterward, in Rust frames only.
+
+Rust 1.71 added the `"C-unwind"` ABI, from RFC 2945. Since Rust 1.81, a panic that tries to leave an `extern "C"` function aborts the process. With rustc 1.96.1, the program prints "panic in a function that cannot unwind" and exits with status 134, which is SIGABRT. With `"C-unwind"` on `cmp` and on the `qsort` declaration, the same program prints "caught: true". The C code must also tolerate the unwind: it runs no cleanup, so locks and buffers that it holds stay as they are. Catch inside the callback whenever you can.
+
+## The languages side by side
+
+In the 2024 edition, Rust requires `unsafe extern` blocks. A function inside the block is unsafe to call, unless it is marked `safe`. The compiler, rustc 1.96, reports "error: extern blocks must be unsafe" for the old form.
+
+Zig declares a C function with `extern fn` and uses the C convention for it. Zig 0.17 removed `@cImport`, so header translation now runs in the build. Odin uses a `foreign` block. The Odin code below is not checked here, because no Odin compiler was available:
+
+```odin
+// Odin (not compiled here)
+import "core:c"
+
+foreign import libc "system:c"
+
+@(default_calling_convention="c")
+foreign libc {
+    strlen :: proc(s: cstring) -> c.size_t ---
+}
+```
+
+Python's ctypes needs no compiler. It loads a shared library at run time and builds each call from the declared `argtypes` and `restype`. If those declarations are wrong, ctypes passes the wrong bytes, with no error.
+
+## What this means for your code
+
+- **Make every string conversion explicit.** Use `CString`, `C.CString` or a sentinel-terminated slice, never a raw `as_ptr()` of a Rust or Go string.
+- **Pair every allocation with its free on the same side.** Export a free function for every object that crosses.
+- **Batch your FFI calls in Go and Python.** At 23 ns or 150 ns per call, a crossing per item can cost more than the work.
+- **Pass a user-data pointer with every callback,** and never let a panic or exception leave through a C frame.
+- **Keep Go pointers out of long-lived C memory.** Pin them with `runtime.Pinner`, or pass a `cgo.Handle`.
+
+## Connect
+
+- [Calling conventions](/systems/abi/calling-conventions) gives the register rules that every FFI call follows.
+- [The C ABI as lingua franca](/systems/abi/c-abi-as-lingua-franca) shows how to design the C side of the boundary.
+- [System calls](/os/processes/system-calls) is another boundary with its own convention, and Go's cgo treats each C call like one.
+- [Go's GC](/systems/gc/gos-gc) explains why Go pointers have rules at the boundary.
+
+<Recall cards={[
+  { q: "Why is strlen(s.as_ptr()) wrong for a Rust &str?", a: "A &str is a pointer and a length with no zero byte after it. C's strlen reads until it finds a zero byte, so it reads past the string. Use CString, which copies the text and adds the zero byte." },
+  { q: "Who frees the memory that C.CString returns in Go?", a: "The Go code must call C.free on it. It is C malloc memory, so the Go garbage collector never frees it." },
+  { q: "Why does a cgo call cost much more than a Go call?", a: "The runtime calls entersyscall, so the scheduler and the GC can continue. It switches from the small goroutine stack to the thread's system stack (g0) and calls C. Then it switches back and calls exitsyscall." },
+  { q: "What happens since Rust 1.81 when a panic reaches the end of an extern \"C\" function?", a: "The process aborts with \"panic in a function that cannot unwind\". To let the panic unwind through C frames, use the \"C-unwind\" ABI; better, catch it inside the callback." },
+  { q: "What must Go code do to let C keep a Go pointer after the call returns?", a: "Pin the memory with runtime.Pinner, or pass a runtime/cgo.Handle, which is a plain integer that C can store." },
+  { q: "Why should a C callback API take a void *user argument?", a: "It carries the caller's state into each callback. Without it, the callback can only reach globals, and a Rust closure or a Go value cannot cross." },
+]} />

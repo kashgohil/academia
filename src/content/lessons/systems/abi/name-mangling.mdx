@@ -1,0 +1,116 @@
+---
+summary: "Why C++ and Rust put types into symbol names: the Itanium C++ ABI grammar with nested names, templates and S_ substitutions, mangled and demangled by hand; MSVC decoration; Rust legacy and v0 symbols; extern \"C\", no_mangle and Zig export; Go and Zig internal names."
+---
+import { AbiManglerDemo, AbiDemangleDemo } from "@/demos/sys/SysAbiMangleDemos";
+
+A linker knows nothing about types, namespaces or overloads. It matches **symbols**: plain strings in the symbol table of each object file (see [Symbols and relocation](/systems/linking/symbols-and-relocation)). In C this is easy, because a function name is unique in a program. The symbol of `int print(int)` is `print`. On macOS, the Mach-O format adds one leading underscore: `_print`.
+
+C++ allows `print(int)` and `print(double)` in one program. It also has namespaces, classes and templates. So the compiler must put all of this into one string that the linker can compare. This is **name mangling**. GCC and Clang on Linux, macOS and the BSDs use the scheme of the Itanium C++ ABI, section 5.1 "External Names". MSVC uses its own scheme.
+
+## Be the mangler
+
+<Predict
+  id="subst"
+  question="void geo::move(geo::Point &, const geo::Point &) has the type geo::Point twice. How often does the text 5Point appear in its Itanium symbol?"
+  options={["Twice: once for each parameter", "Once: the second parameter refers back to the first", "Never: types are not part of the symbol"]}
+  answer={1}
+  explain="The symbol is _ZN3geo4moveERNS_5PointERKS0_. The second parameter is RKS0_: a reference to const S0_, and S0_ is geo::Point, the second entry in the substitution table. Even geo appears only once: NS_5Point means geo::Point, with S_ for geo."
+>
+<AbiManglerDemo />
+</Predict>
+
+Things to try:
+
+1. Start from **print(int)**, then **print(double)**. The symbols are `_Z5printi` and `_Z5printd`. The parameter types make overloads distinct.
+2. Turn on **extern "C"**. The symbol is the plain name. Two overloads with extern "C" would get the same symbol, so C++ does not allow them.
+3. Start from **geo::detail::area**. The second `const geo::Point *` becomes `S3_`. Read the table: `S_` is `geo`, `S0_` is `geo::detail`, `S1_` is `geo::Point`, `S2_` adds const, and `S3_` adds the pointer.
+4. Start from `max_of<int>`. Now the return type is in the symbol, and the parameters say `T_`, not `i`. Set **T = double**: only the template argument changes.
+5. Turn on **Member of geo::Point** and **const member function**. A `K` after the `N` marks the const method. MSVC writes `QEBA` there: public, 64-bit `this`, const, `__cdecl`.
+
+## The Itanium grammar
+
+The demo uses a small part of the grammar, but the same part covers most symbols that you see in a profile or a crash:
+
+<Steps>
+<div>Every C++ symbol starts with `_Z`. A name in a namespace or a class is a **nested name**: `N`, then the scopes, then the function, then `E`. Each name is written as its length and its text: `3geo`.</div>
+<div>Builtin types are one letter: `i` int, `j` unsigned int, `l` long, `m` unsigned long, `x` long long, `d` double, `c` char, `b` bool. An empty parameter list is `v`, for void.</div>
+<div>Type operators come before the type: `P` pointer, `R` lvalue reference, `O` rvalue reference, `K` const. So `PKc` is `const char *`.</div>
+<div>Templates add their arguments in `I ... E`. The return type of a function template comes first, before the parameters. A non-template function does not encode its return type.</div>
+<div>Compression (section 5.1.10): each scope prefix, template prefix and non-builtin type becomes a numbered **substitution** at its first use. Later uses write `S_` for the first one, then `S0_`, `S1_` and so on, in base 36.</div>
+</Steps>
+
+Special functions have special names. A constructor is `C1` (complete object) or `C2` (base object), and a destructor is `D0` (deleting), `D1` or `D2`. Every class has both entry points, and clang emits both for `geo::Point`. They differ only for a class with virtual bases. Vtables are `_ZTV`, and type information is `_ZTI`.
+
+The demo's mangler and demangler are small TypeScript programs. A test compares the mangler with 160 random declarations that clang 21 compiled, and the demangler with `c++filt` on 183 real symbols. They agree on all of them.
+
+## Read a symbol backward
+
+<AbiDemangleDemo />
+
+Things to try:
+
+1. Step through `_ZN3geo4moveERNS_5PointERKS0_`. Watch the table grow: `S_` = `geo` after the first name, and `S0_` = `geo::Point` when the parameter is read.
+2. Pick `_Z2cbPFviPvES_`. `PF...E` is a pointer to a function type. The last `S_` refers back to `void*`, the first type that got an entry.
+3. Pick the `std::vector` symbol. The `St` abbreviation means `std`, and `NS_9allocator` reuses `std::__1`, the inline namespace of libc++.
+4. Pick `_Z7pair_upIcN3geo5PointEEvPT_RT0_RKS2_`. The parameters use `T_` and `T0_`, which point back into the template arguments.
+
+## MSVC decoration
+
+MSVC writes the same facts in a different scheme. For `geo::move` it emits this symbol (clang 21 with `-target x86_64-windows-msvc`):
+
+```text
+?move@geo@@YAXAEAUPoint@1@AEBU21@@Z
+```
+
+The name comes first, then the scopes from the inside out, each ended by `@`. `YA` is a free `__cdecl` function, and `X` is the void return type. MSVC encodes the return type of every function, unlike Itanium. `AEAU...` is a reference to a struct, and `AEBU...` a reference to a const struct. The digits `1` and `2` are back-references to earlier names.
+
+Microsoft does not publish a specification. Its documentation says the conventions "have changed in various versions of Visual Studio" and can differ between target architectures.
+
+## Other languages
+
+**Rust** also mangles, because two crates may both have a function `norm`. The stable compiler, rustc 1.96, still uses the **legacy** scheme by default. Nightly rustc has used v0 by default since November 2025.
+
+The legacy scheme looks like an Itanium nested name and ends with a hash. The **v0** scheme of RFC 2603 starts with `_R` and encodes generic arguments, so a demangler can show `max_of::<i32>`. `-C symbol-mangling-version=v0` selects it. These symbols come from rustc 1.96.1 on macOS, without the extra Mach-O underscore:
+
+```text
+legacy: _ZN3geo3geo4norm17h0de8ca290a0851d5E
+legacy: _ZN3geo3geo6max_of17hd7d9ec8465c3bfc5E
+v0:     _RNvNtCs2MrXdVOqv69_3geo3geo4norm
+v0:     _RINvNtCs2MrXdVOqv69_3geo3geo6max_oflEB4_
+```
+
+The legacy name of `max_of::<i32>` holds no type. Only the hash tells two instances apart. In v0, the `l` before the `E` is the type `i32`.
+
+To give a Rust function a C name, mark it `extern "C"` and turn off mangling. In the 2024 edition the attribute is unsafe, because a plain name can collide with any other symbol. The compiler, rustc 1.96, rejects the old form with "error: unsafe attribute used without unsafe". It suggests `#[unsafe(no_mangle)]`:
+
+```rust
+#[unsafe(no_mangle)]
+pub extern "C" fn geo_norm(x: f64, y: f64) -> f64 {
+    (x * x + y * y).sqrt()
+}
+```
+
+**Zig** has no overloads, so a qualified name is enough. In a zig 0.17.1 Debug build, internal functions get local symbols such as `geo.norm`. Two instances of a generic function got `geo.maxOf__func_0` and `geo.maxOf__func_1`. An `export fn` gets the plain C name. **Go** uses the package path and the method form: `main.(*Point).Norm`. Go 1.25 names generic instances by their GC shape, such as `main.MaxOf[go.shape.int]`, and adds a dictionary symbol for each instance.
+
+## What this means for your code
+
+- **Demangle before you read.** Use `c++filt` or `nm -C` for C++, and `rustfilt` or a v0-aware tool for Rust. Profilers and debuggers do this for you, but linker errors often do not.
+- **An undefined C++ symbol is often a type mismatch.** If the header says `long` and the definition says `long long`, the symbols end in `l` and `x`. The linker then reports an undefined reference. In C, the same mismatch always links. It works by luck on LP64, where both types are 8 bytes, and gives wrong values on Windows and 32-bit targets.
+- **Itanium does not catch a changed return type** of a normal function. Changing `int f()` to `long f()` keeps the symbol, so the old caller still links.
+- **Export a C name at a language boundary.** `extern "C"`, `#[unsafe(no_mangle)]` and `export fn` give a name that every language and every linker understands.
+
+## Connect
+
+- [Symbols and relocation](/systems/linking/symbols-and-relocation) shows how the linker matches these strings.
+- [Object files and ELF](/systems/linking/object-files-and-elf) puts each template instance in a COMDAT group named by its mangled name.
+- [C++ templates and constexpr](/systems/comptime/c-templates-and-constexpr) shows where template instances come from.
+- [The C ABI as lingua franca](/systems/abi/c-abi-as-lingua-franca) explains why the plain C name is the shared one.
+
+<Recall cards={[
+  { q: "Why does C++ need name mangling, and C does not?", a: "C has one function per name, so the symbol is the name. C++ has overloads, namespaces, classes and templates, so the symbol must also encode the scopes and parameter types." },
+  { q: "Decode _Z5printPKc.", a: "_Z starts a C++ name, 5print is the name print, and PKc is a pointer to const char: print(const char *)." },
+  { q: "What do S_ and S0_ mean in an Itanium symbol?", a: "They are back-references into the substitution table. S_ is the first scope or type that got an entry, and S0_ is the second. Then come S1_, S2_ and so on, in base 36." },
+  { q: "When does an Itanium symbol contain the return type?", a: "Only for function templates (and a few special cases). A normal function's symbol has only the name and the parameter types." },
+  { q: "What do C1 and C2 mean at the end of a constructor's symbol?", a: "C1 is the complete object constructor and C2 the base object constructor. Every class has both; their code differs only when the class has virtual bases." },
+  { q: "How do Rust's legacy and v0 symbols differ?", a: "Legacy symbols look like Itanium nested names and end with a hash, and generic arguments are not readable. The v0 symbols of RFC 2603 start with _R and encode the crate, the path and the generic arguments." },
+]} />

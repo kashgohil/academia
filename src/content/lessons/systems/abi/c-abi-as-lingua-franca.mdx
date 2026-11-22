@@ -1,0 +1,130 @@
+---
+summary: "Why every language talks to every other language through C: what \"the C ABI\" really is (one psABI per platform, not the C standard), API against ABI compatibility, one header change checked on six platforms, an old program that meets a new library, and the rules for a C API that survives: opaque handles, size fields, fixed-width types, error codes and ownership."
+---
+import { AbiHeaderChangeDemo, AbiOldProgramDemo } from "@/demos/sys/SysAbiCDemos";
+
+Rust calls SQLite, Python calls NumPy's C core, Go calls OpenSSL, and Zig calls the Windows API. In each case the two sides meet at a C function. Most languages cannot call each other directly, but all of them can call C, and most of them can export C functions. C is the **lingua franca**: the shared language of binary interfaces.
+
+There are three reasons. First, operating systems publish their APIs in C: POSIX, the Linux system call wrappers in libc, and Win32. Second, the C rules are simple. A C function has one name, no overloads and no exceptions, and its types are plain bytes. Its only hidden arguments, such as a result pointer, are fixed by the psABI. Third, the rules have stayed stable for decades on each platform, so a library built today still works with a program built ten years ago.
+
+## The C ABI is not in the C standard
+
+The C standard says almost nothing about bytes. N1570 (C11), section 6.7.2.1, requires that struct members have increasing addresses in declaration order, and that there is no padding before the first member. It does not give the size of `long`, the alignment of `double`, or any register. Those rules come from each platform's **psABI** (processor-specific ABI): the System V AMD64 psABI, AAPCS64, the Microsoft x64 conventions, the RISC-V ELF psABI, and others.
+
+So "the C ABI" is really a family of ABIs, one for each platform. They agree on the general ideas and differ in details. The **data model** is one difference. A `long` is 8 bytes on 64-bit Linux and macOS (LP64). It is 4 bytes on 64-bit Windows (LLP64) and on 32-bit targets (ILP32).
+
+## One header, six ABIs
+
+<Predict
+  id="int64"
+  question="Version 2 of a library changes long count to int64_t count in a public struct. Programs built with version 1 still run against it. On which platforms does this break them?"
+  options={["Nowhere: long and int64_t are both 64-bit integers", "Only where long is 4 bytes: 64-bit Windows and the 32-bit targets", "Everywhere: any change to a public struct breaks the ABI"]}
+  answer={1}
+  explain="On LP64 Linux, long is already 8 bytes, so nothing moves. On Windows x64, i386 and RV32, long is 4 bytes, so count grows to 8 bytes. On i386 the fields after it move. On Windows x64 and RV32, count grows into a padding hole, and its upper 4 bytes are bytes that the old program never set."
+>
+<AbiHeaderChangeDemo />
+</Predict>
+
+Things to try:
+
+1. Keep **long → int64_t** and click the rows. On x86-64 Windows, the size stays 32, but `count` grows from 4 to 8 bytes into a padding hole. The size alone does not show the break.
+2. Select **Append a field**. No old field moves, so programs that only read through a pointer still work. The size grows from 32 to 40 bytes on x86-64 Linux, but stays 32 on RV32: the new field fits into tail padding there.
+3. Select **double → long double**. This breaks five platforms. On Windows x64, `long double` is the same as `double`, so it breaks nothing there.
+4. Select **uint32_t size → size_t size**. It breaks all 64-bit platforms and none of the 32-bit ones.
+5. Select **Rename flags → options**. The bytes stay the same, so the ABI is the same. But every program that writes `c.flags` stops compiling.
+
+The last case shows two different promises. **API compatibility** means that old source code still compiles against the new header. **ABI compatibility** means that old binaries still work with the new library, with no rebuild. A rename breaks the API and keeps the ABI. A change from `long` to `int64_t` keeps the API and can break the ABI.
+
+## What an old program does with a new library
+
+The program below was compiled with the version 1 header. The library is version 2, which adds an `int retries` field. In this memory model, the next local variable, `budget`, sits right after the struct.
+
+<AbiOldProgramDemo />
+
+Things to try:
+
+1. Step through **public struct** with **appends retries**. The program reserves 32 bytes, but the library writes 40. The last write lands in `budget`, which changes from 100 to 3. The program reads `scale` correctly and never notices.
+2. Select **inserts retries**. Now `scale` moves from offset 16 to 24 in the library's view. The program reads offset 16 and gets 5e-323: the bits of the integer 10, read as a `double`.
+3. Select **size field** with **appends retries**. The program writes `c.size = 32`, and the library writes only the fields that fit. No overflow, and every value is correct.
+4. Keep **size field** and select **inserts retries**. The size field does not help: the library still uses its new offsets. A size field protects only changes that append.
+5. Select **opaque handle**. The library allocates the struct, and the program only holds a pointer. Both changes work, because only the library knows the layout.
+
+Nothing in the toolchain reports these errors. The compiler sees a correct program, the linker finds every symbol, and the loader loads the library. Only a sanitizer or a wrong result shows that something is broken.
+
+## Rules for a C API that survives
+
+**Opaque handles.** Declare `typedef struct cfg cfg;` in the header and keep the fields in the library. The program cannot allocate, copy or read the struct, so the library can change it freely. The cost is a function call for each field and a heap allocation for each object.
+
+**Size fields for public structs.** If a struct must be public, put its size in the first field and only append to it. Win32 uses this pattern widely: the documentation of `WNDCLASSEXW` says "Set this member to `sizeof(WNDCLASSEX)`" for its `cbSize` field.
+
+**Exact-width types.** Use exact-width types such as `int32_t` and `uint64_t`, not `long`. A type whose size depends on the data model makes the header mean different things on different platforms. Note that `size_t` also changes size between 32-bit and 64-bit targets.
+
+**Error codes, not exceptions.** Return a status code and write results through an out-pointer. No C++ exception, Rust panic or Go panic may leave the library through a C function.
+
+**One owner for each allocation.** Memory that the library allocates must go back to the library: give the library its own `cfg_free`. On Windows, Microsoft warns that each copy of the C runtime "has its own heap manager". A free through a different copy "can cause heap corruption".
+
+Here is a header that follows these rules, and its declarations in Rust and Zig. Each one compiles with the local toolchains: clang 21, rustc 1.96 (2024 edition) and zig 0.17.1.
+
+```c
+#include <stddef.h>
+#include <stdint.h>
+
+typedef struct cfg cfg;            /* opaque: no size in the header */
+
+uint32_t cfg_version(void);        /* what the program loaded */
+int32_t  cfg_parse(const char *text, size_t len, cfg **out); /* 0 or an error code */
+double   cfg_scale(const cfg *c);
+void     cfg_free(cfg *c);         /* the library frees what it made */
+```
+
+```rust
+use std::ffi::c_char;
+
+#[repr(C)]
+pub struct Cfg { _private: [u8; 0] }   // opaque: Rust never sees the fields
+
+unsafe extern "C" {
+    pub safe fn cfg_version() -> u32;
+    pub fn cfg_parse(text: *const c_char, len: usize, out: *mut *mut Cfg) -> i32;
+    pub fn cfg_scale(c: *const Cfg) -> f64;
+    pub fn cfg_free(c: *mut Cfg);
+}
+```
+
+```zig
+const Cfg = opaque {};
+
+extern fn cfg_version() u32;
+extern fn cfg_parse(text: [*]const u8, len: usize, out: *?*Cfg) i32;
+extern fn cfg_scale(c: *const Cfg) f64;
+extern fn cfg_free(c: *Cfg) void;
+```
+
+## Symbols and tools
+
+The ABI also covers the functions themselves. Adding a function is compatible. Removing one, or changing its parameters, breaks old programs, and C symbols do not carry the types, so the loader cannot see the change. The GNU C library keeps old behavior with **symbol versions**. An old program binds to an old version of a function, such as one tagged `GLIBC_2.2.5`. See [The dynamic loader](/systems/linking/the-dynamic-loader).
+
+Nobody writes these declarations by hand for a large library. The **bindgen** tool reads C headers and generates Rust declarations. The **cbindgen** tool reads Rust code and writes a C header for its `extern "C"` items. Zig 0.17 removed the `@cImport` builtin: zig 0.17.1 reports "invalid builtin function". The same translate-c code is now a separate package that a `build.zig` uses. Go's cgo reads the C header in the comment above `import "C"`.
+
+## What this means for your code
+
+- **Treat a public header as a binary contract.** Before a release, compare the old and new layouts on every platform that you ship, not only on your own machine.
+- **Prefer opaque handles.** They let the library change freely, and they cost one call per access.
+- **Never put `long` or an enum in a struct** that crosses a library boundary. Their sizes depend on the platform or the compiler. Use fixed-width types.
+- **Give every allocation an owner,** and export a matching free function.
+- **Check the version at run time** with a function such as `cfg_version`. A program can then refuse a library that is too old, with a clear message.
+
+## Connect
+
+- [Calling conventions](/systems/abi/calling-conventions) is the part of the C ABI that passes arguments.
+- [Struct layout, alignment and padding](/systems/memory/struct-layout-alignment-and-padding) computes the offsets that the demos compare.
+- [Static and dynamic linking](/systems/linking/static-and-dynamic-linking) explains why a library update reaches old programs at all.
+- [FFI across languages](/systems/abi/ffi-across-languages) uses this contract from Rust, Go, Zig and Python.
+
+<Recall cards={[
+  { q: "Where are the rules of 'the C ABI' written down, if not in the C standard?", a: "In each platform's psABI: the System V AMD64 psABI, AAPCS64, the Microsoft x64 conventions, the RISC-V ELF psABI. The C standard only fixes member order and no padding before the first member." },
+  { q: "What is the difference between API and ABI compatibility?", a: "API compatibility: old source code still compiles. ABI compatibility: old binaries still work without a rebuild. A field rename breaks only the API; a size change can break only the ABI." },
+  { q: "Why does changing long to int64_t break some platforms and not others?", a: "A long is 8 bytes on LP64 (64-bit Linux and macOS), so nothing changes there. It is 4 bytes on LLP64 Windows and on 32-bit targets, so the field grows to 8 bytes. On i386 later fields move. On Windows x64 and RV32 it grows into padding, so its upper half is garbage from old programs." },
+  { q: "What does a size field at the start of a public struct protect against, and what not?", a: "It lets a newer library see that the caller's struct is smaller, so it skips appended fields. It does not help when a field is inserted or moved: the offsets still differ." },
+  { q: "Why should a library export its own free function?", a: "Memory must go back to the allocator that made it. The program may use a different allocator or, on Windows, a different C runtime copy with its own heap." },
+]} />

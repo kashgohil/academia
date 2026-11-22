@@ -140,6 +140,8 @@ b .katex, strong .katex, .predict-q .katex, .stats b .katex { font-weight: bold;
 /* Code blocks. Shiki colors them at build time; these rules give the frame and pick the theme's colors. */
 .prose pre { overflow-x: auto; max-width: 100%; margin: 0 0 18px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--subtle) !important; font-size: 13px; line-height: 1.55; tab-size: 4; }
 .prose pre code { background: none; padding: 0; border-radius: 0; font-size: inherit; }
+/* A long identifier in inline code (a mangled name, an Odin procedure) may break anywhere, so it never widens a phone screen. */
+.prose :not(pre) > code { overflow-wrap: anywhere; }
 .prose .shiki, .prose .shiki span { color: var(--shiki-light); }
 :root[data-theme="dark"] .prose .shiki, :root[data-theme="dark"] .prose .shiki span { color: var(--shiki-dark); }
 /* 3. Links in lesson text must look like links. */

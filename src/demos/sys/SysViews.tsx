@@ -126,7 +126,10 @@ const SEG_TEXT: Record<string, string> = { stack: "stack (grows down)", mmap: "m
 export function AddressSpaceMap({ snapshot, highlight = [] }: { snapshot: Snapshot; highlight?: { addr: number; label: string }[] }) {
   const segs = [...snapshot.segments].sort((a, b) => b.lo - a.lo);
   const marks = [...highlight, { addr: snapshot.rsp, label: "rsp" }, { addr: snapshot.brk, label: "brk" }];
-  const inSeg = (s: Snapshot["segments"][number], a: number) => a >= s.lo && a <= s.hi && !(s.name === "heap" && a === s.hi && a !== snapshot.brk);
+  // Segments are [lo, hi). The one exception: the end of the heap (brk) and the top of the stack (rsp before any push)
+  // sit exactly at hi and belong to that segment.
+  const inSeg = (s: Snapshot["segments"][number], a: number) =>
+    (a >= s.lo && a < s.hi) || (a === s.hi && ((s.name === "heap" && a === snapshot.brk) || s.name === "stack"));
   return (
     <div style={{ ...scroll }}>
       <div style={{ minWidth: 300, fontSize: 12, ...mono }}>

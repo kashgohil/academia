@@ -1,0 +1,130 @@
+---
+summary: "One owner for each value, moves as plain byte copies, drops that the compiler inserts in reverse order, drop flags for conditional moves, and why a leak is still safe Rust."
+---
+import { OwnAssignDemo, OwnDropDemo } from "@/demos/sys/SysOwnRustDemos";
+
+Every heap block must be freed exactly once. If no one frees it, the program leaks. If two parts of the program free it, the result is a double free, which is undefined behavior (UB).
+
+Languages give three answers to the question "who frees this block?". In C and Zig, you do, with an explicit call. In Go, Java and JavaScript, a garbage collector does it at run time. In Rust and C++, the compiler inserts the call, at a place that the source code determines.
+
+Rust makes the compiler's answer a rule of the type system. **Ownership** means three things. Each value has exactly one owner, which is a variable or a field. A value has one owner at a time. When the owner goes out of scope, the compiler inserts a call that **drops** the value. The drop runs the value's destructor and frees what the value owns.
+
+## One buffer, one owner
+
+A `String` is three machine words on the stack: a pointer to a heap buffer, the capacity and the length. On a 64-bit target, `size_of::<String>()` is 24. The text itself is in the heap buffer. So the question is what `let t = s;` does with the buffer.
+
+<Predict
+  id="move"
+  question="A String s holds 40 bytes of text. The program runs let t = s; and then the scope ends. How many heap buffers hold the text, and how many frees run?"
+  options={["Two buffers and two frees, as with a C++ copy", "One buffer and one free", "One buffer and two frees, one for s and one for t"]}
+  answer={1}
+  explain="A move copies the three words of s into t and makes no heap call. The compiler then treats s as uninitialized, so it drops only t. One buffer, one free. The third answer is what a plain C struct copy does, and the machine reports it as a double free."
+>
+<OwnAssignDemo />
+</Predict>
+
+Things to try:
+
+1. Step through **Rust move**. Line 3 copies 24 bytes and no heap call runs. The stale words stay in the frame of s, but the compiler never reads them again.
+2. Select **C++ copy**. The string has 40 bytes, more than the 22 bytes that libc++ keeps inside the object, so it is on the heap. The copy constructor allocates a second block and copies the bytes. At the end, two destructors free two blocks, in reverse order of construction.
+3. Select **C struct copy**. The structs share one block. The second `str_free` is a double free, and the machine reports it as AddressSanitizer would.
+4. Compare the heap counts. Rust and C use one block. C++ uses two, because a copy must own its own buffer. A short C++ string, such as "hello", would make no heap allocation at all.
+
+## A move is a memcpy and a promise
+
+A move in Rust is always a bitwise copy of the value's bytes. There are no move constructors. After the copy, the source is **moved from**: the compiler marks it as uninitialized and rejects every later use of it. The error is E0382. This is the real message from rustc 1.96:
+
+```text
+error[E0382]: borrow of moved value: `s`
+  |     let s = String::from("hello");
+  |         - move occurs because `s` has type `String`, which does not implement the `Copy` trait
+  |     let t = s;
+  |             - value moved here
+  |     println!("{}", s);
+  |                    ^ value borrowed here after move
+```
+
+A function call moves too. `consume(s)` moves the String into the parameter. The callee then owns it and drops it when it returns, unless it returns the String to the caller. So a signature tells you who frees: a parameter of type `String` takes ownership, and a parameter of type `&str` only borrows.
+
+Some types are **Copy**: integers, `bool`, `char`, shared references `&T`, and tuples and arrays of Copy types. For a Copy type, the old variable stays valid after an assignment, because a bitwise copy is a full copy. A type that implements `Drop` cannot be Copy. The compiler stops it with E0184: "the trait `Copy` cannot be implemented for this type; the type has a destructor". Without that rule, two copies would run the same destructor. For a real copy of a String, you call `s.clone()`, which allocates a new buffer.
+
+## Drop order
+
+The compiler inserts the drops. The Rust Reference ("Destructors") fixes the order:
+
+- Local variables drop at the end of their scope, in **reverse order of declaration**.
+- The fields of a struct drop in **declaration order**, after the struct's own `Drop::drop` returns.
+- The elements of an array or owned slice drop from the first to the last. `Vec` and `Box` drop what they own, then free their buffer.
+- A temporary drops at the end of its statement. `let _ = Noisy("t");` binds nothing, so the value is a temporary and drops at once.
+- Assignment drops the old value before the variable takes the new one.
+
+The demo below runs a toy subset of Rust. A type named `Noisy` prints "drop" and its name in its `Drop` impl, so you can see each drop. Every preset was compiled and run with rustc 1.96.1, and the toy checker gives the same errors and the same output.
+
+<Predict
+  id="drops"
+  question="The program declares a, then b, then a block with c, then let _ = Noisy(temp), then let _d = Noisy(d), then calls drop(a). Which value drops last?"
+  options={["a, because it was declared first", "b", "d, because it was declared last"]}
+  answer={1}
+  explain="The call drop(a) moves a into the drop function, which drops it at once. The value c drops at the end of its block. The temporary drops at the end of its statement. At the end of main, the locals drop in reverse order of declaration: _d first, then b."
+>
+<OwnDropDemo />
+</Predict>
+
+Things to try:
+
+1. Read the arrows in **Scopes, a temporary and drop()**. The temporary drops on its own line. Then click **Edit the code**, rename `_` to `_t`, and see the drop move to the end of main.
+2. Select **Shadowing does not drop**. The second `let x` makes a new variable. The first value lives until the end of the scope.
+3. Select **let _ = x does not move x**. The wildcard pattern does not bind, so `a` stays the owner.
+4. Select **mem::forget leaks without UB**. The forgotten value never prints "drop a".
+5. Select **Move the same value twice**. The second move is E0382, with the error on line 3.
+
+## Drop flags: when the compiler cannot know
+
+Sometimes a value is moved on one path only:
+
+```rust
+let s = String::from("x");
+if std::env::args().count() > 5 {
+    consume(s); // s moves on this path only
+}
+// does main drop s here or not?
+```
+
+The compiler cannot know the answer at compile time. So it keeps a **drop flag**: a hidden boolean on the stack that records whether `s` still owns its value. At the end of the scope, the generated code tests the flag and calls the destructor only if the flag is set. The Rustonomicon describes this in "Drop Flags".
+
+When the compiler knows the state at the end of the scope, it makes no flag at all. Rust's MIR drop elaboration decides this. The toy checker in this lesson has no branches, so it never needs one.
+
+## A leak is safe Rust
+
+Ownership makes sure that a value is freed at most once. It does not make sure that a value is freed at all.
+
+The function `std::mem::forget(x)` takes ownership and never runs the destructor. Its documentation explains why the function is not `unsafe`: "Rust's safety guarantees do not include a guarantee that destructors will always run". `Box::leak` and a cycle of reference-counted pointers also leak. So unsafe code must never depend on a destructor for memory safety. The [smart pointers](/systems/ownership/smart-pointers) lesson builds such a cycle.
+
+## What this means for your code
+
+| Language | Who frees a heap value | What checks it |
+|---|---|---|
+| C | your code, with `free` | nothing; sanitizers at run time |
+| Zig | your code, often with `defer allocator.free(x)` | `std.heap.DebugAllocator` reports leaks and double frees at run time |
+| C++ | the destructor, at a point that the scope fixes | nothing stops a use after a move |
+| Rust | the inserted drop, at a point that the scope fixes | the compiler rejects use after move |
+| Go | the garbage collector, at some later time | the collector |
+
+In Rust, read a signature as an ownership contract. `fn f(v: Vec<u8>)` takes the buffer, and `fn f(v: &[u8])` only looks at it. Prefer borrowing parameters, and take ownership only when the function keeps the value or frees it. When a struct must own a value of unknown lifetime, store an owned type such as `String` or `Box<T>`, not a reference.
+
+## Connect
+
+- [Borrowing and the borrow checker](/systems/ownership/borrowing-and-the-borrow-checker): how the compiler proves that a reference never outlives its owner.
+- [Move semantics](/systems/ownership/move-semantics): C++ moves, which run code and leave the source alive.
+- [RAII in C++](/systems/ownership/raii-in-c): the same idea of scope-based cleanup, without the compiler's move checks.
+- [Stack and heap](/systems/memory/stack-and-heap) and [arena allocators](/systems/allocators/arena-allocators): another way to answer "who frees", for many objects at once.
+- [defer and errdefer](/systems/explicit/defer-and-errdefer): Zig's explicit cleanup.
+
+<Recall cards={[
+  { q: "What does let t = s; do at run time for a String in Rust?", a: "It copies the 24 bytes of s (pointer, capacity, length) into t. It makes no heap call. The compiler then treats s as uninitialized." },
+  { q: "Which error does a use after a move give, and why does the program not double free?", a: "E0382. The compiler drops only the current owner, so the buffer is freed once." },
+  { q: "In which order do local variables drop, and in which order do struct fields drop?", a: "Locals drop in reverse order of declaration. Fields drop in declaration order." },
+  { q: "Why does let _ = Noisy(\"t\") drop at once, but let _t = Noisy(\"t\") does not?", a: "The wildcard pattern binds nothing, so the value is a temporary that drops at the end of the statement. The name _t is a real binding that lives to the end of the scope." },
+  { q: "What is a drop flag?", a: "A hidden boolean on the stack that records whether a conditionally moved variable still owns its value. The scope end tests it before it calls the destructor." },
+  { q: "Why is std::mem::forget a safe function?", a: "Rust's safety guarantees do not include that destructors always run. A leak is not undefined behavior." },
+]} />

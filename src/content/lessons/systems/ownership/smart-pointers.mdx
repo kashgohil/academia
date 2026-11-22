@@ -1,0 +1,102 @@
+---
+summary: "unique_ptr and Box cost one pointer; shared_ptr, Rc and Arc add a count block. The bytes of each handle and allocation, make_shared, Weak and the cycles it breaks, and RefCell's borrow check at run time."
+---
+import { SizesDemo, RcCycleDemo, RefCellDemo } from "@/demos/sys/SysOwnPtrDemos";
+
+A **smart pointer** is an object that holds a pointer and owns what it points to. Its destructor releases the target, so it applies [RAII](/systems/ownership/raii-in-c) to heap memory. There are two families. A **unique** owner (`std::unique_ptr`, `Box<T>`) is the only owner, and it frees the target when it dies. A **shared** owner (`std::shared_ptr`, `Rc<T>`, `Arc<T>`) keeps a count of owners next to the target, and the last owner frees it.
+
+Reference counting is also a strategy for garbage collection, with its own problems: cycle collection, deferred counts, and ARC in Swift. The [reference counting](/systems/gc/reference-counting) lesson covers those. This lesson looks at the library types, their bytes, and their costs.
+
+## What each pointer costs
+
+The sizes below were measured on a 64-bit target with clang++ 21 and libc++, and with rustc 1.96. The heap sizes are the requests that reached `operator new` or Rust's global allocator, for a 16-byte `Widget`.
+
+<SizesDemo />
+
+Things to try:
+
+1. Select `std::unique_ptr<Widget>`. The handle is one pointer, 8 bytes, and the allocation is the object only. The default deleter is an empty class, so it takes no space.
+2. Select the `unique_ptr` with a function-pointer deleter. The deleter is now data, so the handle grows to 16 bytes.
+3. Compare `make_shared` with `shared_ptr(new Widget)`. The first makes one 40-byte allocation. The second makes two: 16 bytes for the object, then a 32-byte control block that points to it.
+4. Select `Rc<Widget>`. The handle is 8 bytes, and one 32-byte allocation holds the two counts and the value.
+5. Select `Box<dyn Shape>`. A trait object needs a vtable pointer next to the data pointer: 16 bytes.
+
+A `shared_ptr` is two pointers: one to the object and one to the **control block**. The control block holds the shared count and the weak count. In libc++ it also holds a vtable pointer, for the code that destroys the object and the block. The count updates are atomic, so copying a `shared_ptr` costs an atomic read-modify-write.
+
+The standard says that `make_shared` "should perform no more than one memory allocation", and all known implementations do. One allocation means one call to the allocator and better locality. The cost is that a `weak_ptr` keeps the whole block alive, object bytes included, until the last `weak_ptr` dies.
+
+Rust splits the two cases into two types. `Rc<T>` uses plain counts and is not `Send`, so the compiler rejects any attempt to move it to another thread. `Arc<T>` uses atomic counts and can cross threads. A single-threaded program that uses `Rc` pays nothing for atomics, and the type system makes sure that this stays correct. In the Rust 1.96 standard library (`library/alloc/src/rc.rs`), the allocation is `RcInner`. It is a `#[repr(C, align(2))]` struct with the fields `strong`, `weak` and `value`, in that order.
+
+The handles also get the null-pointer optimization. The `std::option` documentation guarantees that `Option<Box<T>>` has the same size as `Box<T>` for a sized `T`. `None` is the null pointer, which a `Box` never holds. So an optional owning pointer costs 8 bytes, the same as a C pointer that may be null.
+
+## Weak references and cycles
+
+A count frees an object when no owner is left. A cycle of owners never reaches zero.
+
+<Predict
+  id="cycle"
+  question="Node a holds an Rc to node b, and b holds an Rc to a. Then main calls drop(a) and drop(b). Each Node prints in its Drop impl. What does the program print?"
+  options={["drop a, then drop b", "drop b, then drop a", "Nothing: neither node is dropped"]}
+  answer={2}
+  explain="drop(a) takes a's strong count from 2 to 1, because b still holds a. The same happens to b. Both counts stay at 1, so no value is ever dropped and both blocks leak. This is safe Rust: a leak is not undefined behavior."
+>
+<RcCycleDemo />
+</Predict>
+
+Things to try:
+
+1. Step through **Rc** and **Rc**. After the links, both strong counts are 2. After both drops they are 1, and at exit LeakSanitizer reports two leaked blocks.
+2. Set **b.next → a** to **Weak**. Now a's strong count is 1 and its weak count is 1. `drop(a)` drops Node a at once, and that drop releases a's link to b.
+3. Watch block `a` after `drop(a)` in the Weak case. The value is dropped, but the block stays allocated, because b's `Weak` still points to it. The block is freed when the last `Weak` goes.
+4. Set both links to **None**. Each node drops at its own `drop` call.
+
+The rule for an ownership graph is that strong edges must form a tree or a DAG. A back edge, such as a child's pointer to its parent or an observer's pointer to its subject, must be weak. `Weak::upgrade()` returns `Some(Rc)` while the value is alive and `None` after it is dropped. C++ has the same split: `weak_ptr::lock()` returns an empty `shared_ptr` after the object is gone.
+
+The counts in the demo are the ones that `Rc::strong_count` and `Rc::weak_count` print. Internally, the weak count starts at 1, not 0. The standard library comments call this the implicit weak pointer that all strong pointers share. It keeps the allocation alive while a destructor runs, even when that destructor drops the last `Weak`.
+
+## Shared and mutable: RefCell
+
+An `Rc<T>` gives only shared access, `&T`, because many owners can reach the value. To change it, you move the borrow check to run time with `RefCell<T>`. A `RefCell` stores a borrow counter next to the value. In the standard library source it is an `isize`. Zero means unused, a positive value counts the live `Ref` guards, and a negative value means that a `RefMut` is live.
+
+<RefCellDemo />
+
+Things to try:
+
+1. Click **c.borrow()** twice. The counter goes to 2. Many readers are fine.
+2. Click **c.borrow_mut()**. The program panics with "RefCell already borrowed", the message of the rustc 1.96 standard library.
+3. Drop both guards, then take `borrow_mut`. The counter is now -1. A `borrow()` now panics with "RefCell already mutably borrowed".
+
+The rule is the same aliasing XOR mutation rule as in the [borrow checker](/systems/ownership/borrowing-and-the-borrow-checker). The difference is the time of the check: a compile error becomes a panic at run time. `try_borrow` and `try_borrow_mut` return an error instead of a panic.
+
+`Cell<T>` is cheaper still: it has no counter. Through a shared `&Cell<T>`, it never gives a reference into the value. It moves whole values in and out instead, with `set`, `replace`, `swap` and `take`, and `get` for a `Copy` type. Across threads, `Mutex<T>` and `RwLock<T>` play the role of `RefCell`.
+
+## What this means for your code
+
+| Need | C++ | Rust |
+|---|---|---|
+| one owner on the heap | `std::unique_ptr<T>` (8 bytes) | `Box<T>` (8 bytes) |
+| shared owners, one thread | `std::shared_ptr<T>` (atomic anyway) | `Rc<T>` |
+| shared owners, many threads | `std::shared_ptr<T>` | `Arc<T>` |
+| a back edge | `std::weak_ptr<T>` | `Weak<T>` |
+| shared and mutable | a mutex, or discipline | `Rc<RefCell<T>>`, `Arc<Mutex<T>>` |
+
+- Start with a unique owner. Shared ownership hides who frees and when, and every copy costs a count update.
+- In C++, create with `std::make_unique` and `std::make_shared`. Pass `const T&` or `T*` to functions that only use the object, and pass a `shared_ptr` only when the callee keeps a copy.
+- In Rust, `Rc<RefCell<T>>` is a sign that the data has no clear owner. An arena with indices is often simpler and faster. See [arena allocators](/systems/allocators/arena-allocators).
+- Zig and Odin have no smart pointers in the language. Code passes an allocator and frees by hand, or frees a whole arena at once.
+
+## Connect
+
+- [Reference counting](/systems/gc/reference-counting): counts as a collection strategy, and how collectors find cycles.
+- [Ownership in Rust](/systems/ownership/ownership-in-rust): why a leak is not undefined behavior.
+- [Hazard pointers](/concurrency/lock-free/hazard-pointers) and [epoch-based reclamation](/concurrency/lock-free/epoch-based-reclamation): freeing shared nodes without a count on every access.
+- [Move semantics](/systems/ownership/move-semantics): why `unique_ptr` can move but not copy.
+
+<Recall cards={[
+  { q: "Why is std::unique_ptr<T> with the default deleter 8 bytes?", a: "The default deleter is an empty class, so it takes no space. Only the pointer is stored." },
+  { q: "What does make_shared save compared with shared_ptr<T>(new T)?", a: "One allocation. The control block and the object share one block: 40 bytes instead of 16 plus 32 for a 16-byte object with libc++." },
+  { q: "What is the difference between Rc and Arc?", a: "Arc updates its counts with atomic operations and can cross threads. Rc uses plain counts and is not Send, so the compiler keeps it on one thread." },
+  { q: "Why does a cycle of Rc pointers leak, and how do you break it?", a: "Each node holds a strong count of the other, so no count reaches zero after the outside owners are gone. Make one edge a Weak." },
+  { q: "After the last Rc is dropped but a Weak remains, what happens to the allocation?", a: "The value is dropped, but the block stays allocated until the last Weak is dropped." },
+  { q: "What does RefCell's borrow counter hold, and what happens on a conflict?", a: "Zero when unused, the number of live Refs when positive, a negative value while a RefMut is live. A conflicting borrow panics." },
+]} />

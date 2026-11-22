@@ -1,0 +1,95 @@
+---
+summary: "C++ moves run code and leave a live, moved-from object; Rust moves copy bytes and forget the source. Rvalue references, std::move as a cast, noexcept and std::vector, guaranteed copy elision, NRVO and the implicit move."
+---
+import { VectorGrowthDemo, MoveCompareDemo, ReturnElisionDemo } from "@/demos/sys/SysOwnCppDemos";
+
+A copy of an object that owns a heap buffer must allocate a new buffer and copy the bytes. Often the source object is about to die anyway, so the copy wastes work. A **move** transfers the buffer instead: the new object takes the pointer, and the old object gives it up. C++ and Rust both have moves, but they mean different things. A C++ move is a function that you can write, and the source object stays alive. A Rust move is a byte copy, and the compiler forgets the source.
+
+## Moves in C++
+
+C++11 added a new kind of reference. An **rvalue reference** `T&&` binds to an object that the caller will not use again. That is a temporary, or an object that the code marks as such. A **move constructor** `T(T&& other)` takes the resources of `other` and leaves it in some state that its destructor can handle.
+
+`std::move` does not move anything. It is a cast: `std::move(x)` is exactly `static_cast<std::remove_reference_t<T>&&>(x)`. The cast makes overload resolution pick the `T&&` overload. Only that overload, the move constructor or move assignment, does the work.
+
+A moved-from object is still alive, and its destructor still runs. The standard library promises only that its types are left in a "valid but unspecified state" ([lib.types.movedfrom]). You may assign to a moved-from `std::string` or call `clear()` on it. You should not depend on its value. With libc++, a moved-from string is empty.
+
+## Who calls the move constructor?
+
+Moves matter most inside containers. A `std::vector` keeps its elements in one buffer. When a `push_back` finds the buffer full, the vector allocates a larger one and relocates every element. The libc++ library makes the new capacity the larger of twice the old capacity and the new size.
+
+<Predict
+  id="vecgrow"
+  question="A type has a copy constructor and a move constructor that is not marked noexcept. You push_back 17 temporaries into an empty std::vector. How does the vector relocate the old elements when it grows?"
+  options={["It moves them: the move constructor exists, so it is used", "It copies them, to keep its strong exception guarantee", "It calls memcpy, because the elements are only bytes"]}
+  answer={1}
+  explain="push_back promises that a failed insert leaves the vector unchanged. A move that throws halfway would destroy the old buffer's contents. So the vector uses std::move_if_noexcept: it moves only when the move constructor cannot throw, and otherwise it copies. Here that is 31 copies."
+>
+<VectorGrowthDemo />
+</Predict>
+
+Things to try:
+
+1. Clear **Move constructor is noexcept**. Every relocation becomes a copy. For a type that owns a buffer, each copy is an allocation.
+2. Move **push_back calls** to 100. The vector grows 8 times, to a capacity of 128. It relocates 127 elements in total. That total stays below the final capacity, because the capacity doubles. So each element is relocated fewer than two times on average.
+3. Select **emplace_back instead**. The element is built in place, so the temporary and its move disappear. Only the relocations are left.
+4. Select **reserve(n) first**. One allocation, no relocation at all.
+
+The counts are a model of libc++, and a real program compiled with clang++ 21 printed the same numbers. For 1000 calls of `push_back` with a `noexcept` move, the vector reallocates 11 times, relocates 1023 elements and calls the move constructor 2023 times. Without `noexcept`, the same run makes 1023 copies and 1000 moves. So mark a move constructor `noexcept` whenever it cannot fail. A compiler-generated move constructor is `noexcept` when every member's move constructor is.
+
+## Moves in Rust
+
+A Rust move has no user code. It is a copy of the value's bytes. After it, the source is uninitialized as far as the compiler knows, and it does not run a destructor for it.
+
+<MoveCompareDemo />
+
+Things to try:
+
+1. Step through **C++ std::move** to line 3. The move constructor copies three words into `b` and writes an empty state into `a`. Two objects are alive.
+2. Step to the end. Two destructors run, but only `b` frees a block.
+3. Select **Rust move**. Line 3 copies three words and writes nothing into `a`. One drop runs at the end.
+
+The difference has consequences:
+
+- **No moved-from state.** In Rust, a use after a move does not compile (E0382). In C++, it compiles, and it reads whatever the move constructor left.
+- **No move constructor to get wrong.** A C++ move constructor can forget to clear the source, which gives a double free, or it can throw. A Rust type cannot customize a move at all.
+- **Self-referential types are hard in Rust.** A byte copy would break a pointer into the same object. Rust handles this with `Pin`, which promises that a value no longer moves. C++ can fix up such a pointer inside a move constructor.
+- **Small objects copy their bytes in both languages.** A libc++ `std::string` is 24 bytes and keeps up to 22 characters inside itself (the short string optimization). A move of such a string copies those bytes.
+
+## Returns: copy elision and the implicit move
+
+Returning a local object by value looks like a copy. In practice it is often free.
+
+<ReturnElisionDemo />
+
+Things to try:
+
+1. Select **return T()**. Since C++17, a prvalue initializes the caller's object directly: **guaranteed copy elision**. Even `-fno-elide-constructors` cannot add a move.
+2. Select **return local**. The compiler builds `t` directly in the caller's slot: the **named return value optimization** (NRVO). The standard permits it but does not require it. With `-fno-elide-constructors`, clang makes one move instead.
+3. Select **return std::move(local)**. The cast stops NRVO, so the code pays one move and one more destructor. Clang warns with `-Wpessimizing-move`.
+4. Select **return c ? a : b**. The result is a copy, not a move. The implicit move applies only when the return expression is a plain name.
+
+The **implicit move** is the rule behind the moves in the cases **return local** (without NRVO), **return a or b** and **return parameter**. When a return statement names a local variable or a parameter, the compiler first treats the name as an rvalue. C++20 and C++23 widened the cases where this applies. So write `return x;`, never `return std::move(x);`.
+
+## What this means for your code
+
+- In C++, follow the [rule of zero](/systems/ownership/raii-in-c). The compiler's move members are correct and `noexcept` when your members are.
+- If you write a move constructor, mark it `noexcept`, or the containers will copy.
+- Do not read a moved-from object, except to assign to it or destroy it.
+- Return local objects by name. Use `emplace_back` or `reserve` in hot loops.
+- In Rust, a move is cheap for small headers such as `String` or `Vec` (24 bytes). A large array in a struct is copied byte by byte on each move, so put it in a `Box`.
+
+## Connect
+
+- [Ownership in Rust](/systems/ownership/ownership-in-rust): why a Rust move needs no source state.
+- [RAII in C++](/systems/ownership/raii-in-c): the five special members and when the compiler declares them.
+- [Smart pointers](/systems/ownership/smart-pointers): `unique_ptr` is move-only, and `shared_ptr` copies cost atomic operations.
+- [Calling conventions](/architecture/isa/calling-conventions): how a large return value travels through a hidden pointer.
+
+<Recall cards={[
+  { q: "What does std::move do at run time?", a: "Nothing. It is a cast to an rvalue reference. The move constructor or move assignment that overload resolution then picks does the work." },
+  { q: "What state does the standard library promise for a moved-from object?", a: "A valid but unspecified state. You can assign to it or destroy it, but you should not depend on its value." },
+  { q: "Why does std::vector copy elements during growth when the move constructor is not noexcept?", a: "push_back gives the strong exception guarantee. A throwing move could leave both buffers broken, so std::move_if_noexcept picks the copy." },
+  { q: "How many elements does libc++ relocate for 1000 push_back calls on an empty vector, and why so few?", a: "1023, in 11 reallocations. The capacity doubles, so the total relocated stays below the final capacity of 1024." },
+  { q: "Why is return std::move(local); worse than return local;?", a: "The cast is not a plain name, so NRVO cannot apply. The code pays one move and one extra destructor." },
+  { q: "Name two differences between a C++ move and a Rust move.", a: "A Rust move is always a byte copy with no user code, and the source is unusable afterwards. A C++ move runs a constructor, and the source stays alive and is destroyed later." },
+]} />

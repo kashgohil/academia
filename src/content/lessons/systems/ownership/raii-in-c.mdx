@@ -1,0 +1,125 @@
+---
+summary: "Tie each resource to an object whose destructor releases it. Destruction order, stack unwinding through exceptions, partly built objects, why destructors must not throw, and the rule of zero, three and five."
+---
+import { UnwindDemo, RuleOfFiveDemo } from "@/demos/sys/SysOwnCppDemos";
+
+**RAII** (resource acquisition is initialization) is the C++ name for one idea. A constructor acquires a resource, and the matching destructor releases it. You then put the object in a scope: a local variable, a member, or an element of a container. The compiler calls the destructor when that scope ends. So the release happens on every normal path out of the scope: a return, a `break`, or an exception that a `catch` handles.
+
+Some exits skip all destructors. If no handler catches an exception, the implementation may call `std::terminate` without unwinding, and the Itanium unwinder does so. `std::exit`, `std::abort` and `longjmp` also skip the destructors of local objects.
+
+The resource can be anything with a release step: heap memory (`std::unique_ptr`), a lock (`std::lock_guard`), a file (`std::ofstream`), a socket, or a transaction. The [mutexes](/concurrency/locks/mutexes) lesson shows RAII guards for locks. This lesson looks at the language rules that make RAII work, and at what breaks without them.
+
+## Every exit path, including the hidden one
+
+A function that does cleanup by hand must write the cleanup on each exit path. An exception adds an exit path that the source does not show. Any call can throw, so any call is a possible early exit.
+
+<Predict
+  id="unwind"
+  question="save() locks a mutex, allocates a 4096-byte buffer with new and opens a file with fopen. Then fill() throws. The cleanup lines (fclose, delete[], unlock) are at the end of save. What does the caller hold after its catch block runs?"
+  options={["Nothing: the runtime releases resources during unwinding", "The locked mutex, the buffer and the open file", "Only the buffer, because the OS closes files"]}
+  answer={1}
+  explain="Unwinding runs destructors, and only destructors. Raw pointers, FILE handles and a manual lock have no destructor that releases anything, so all three stay held. Switch to RAII: the three destructors run in reverse order during the unwind."
+>
+<UnwindDemo />
+</Predict>
+
+Things to try:
+
+1. Step through **Manual** with **In fill**. At the catch, the frame of `save` is gone, and with it the only pointer to the buffer. At exit, LeakSanitizer reports the buffer. It does not report the FILE, because glibc's list of open streams still points to it. The file and its descriptor stay open.
+2. Select **RAII** with **In fill**. The destructors run during the unwind: the file closes, the buffer is freed, the mutex unlocks. The order is the reverse of the acquisition.
+3. Select **In new** for both styles. Manual code still holds the mutex, so the next call to `save` waits forever. A deadlock is worse than a leak.
+4. Select **None**. Both styles release everything. Manual cleanup works only when nothing throws.
+
+## How unwinding works
+
+When code throws, the C++ runtime finds a matching `catch`. Then it runs the cleanup code of each frame between the throw and the catch. On Linux and macOS this follows the Itanium C++ ABI.
+
+The Itanium unwinder makes two passes over the stack. The **search phase** finds the handler without changing anything. The **cleanup phase** then jumps to the landing pad of each frame. There the compiler put the destructor calls for the objects that were alive at the call.
+
+The binary holds tables for this work. `.eh_frame` describes how to unwind each frame (macOS uses `__unwind_info`). The language-specific data area in `.gcc_except_table` lists the landing pads. So the normal path pays no cost at run time.
+
+Destruction order follows construction order in reverse, at every level:
+
+- Locals of a scope: reverse order of construction.
+- Members of an object: reverse order of declaration, after the body of the destructor runs.
+- Base classes: after the members, in reverse order of declaration.
+
+A constructor that throws is a special case. The object never existed, so its destructor does not run. But the members and bases that were already built are destroyed. This is the full output of a test compiled with clang++ 21. A function builds a local `a`, then a `Pair` with the members `first` and `second`, then a local `b`. Then it builds a `Bad`, whose constructor throws after its members `member a` and `member b` are built:
+
+```text
+construct a
+construct first
+construct second
+Pair body
+construct b
+construct member a
+construct member b
+Bad body throws
+destroy member b
+destroy member a
+destroy b
+~Pair body
+destroy second
+destroy first
+destroy a
+caught ctor
+```
+
+The line `~Bad body` never appears. So a class that owns two raw pointers and allocates both in its constructor leaks the first one if the second `new` throws. If each pointer is a `std::unique_ptr` member, the built member cleans itself up.
+
+## Destructors must not throw
+
+Since C++11, a destructor without an exception specification is implicitly `noexcept`. It becomes potentially-throwing only if the destructor of a base or a member is. If an exception leaves a `noexcept` function, the runtime calls `std::terminate`. Clang 21 warns about a `throw` in a destructor. The program then stops with "libc++abi: terminating due to uncaught exception".
+
+The rule has a reason beyond the language. Unwinding calls destructors while an exception is already in flight. If one of those destructors exits with a second exception, the runtime calls `std::terminate`. So a destructor must report failure in another way. One way is an explicit `close()` method that the caller can check before the destructor runs. `std::ofstream` works in this way: `close()` sets the stream's fail bit, and the destructor ignores errors.
+
+## The rule of zero, three and five
+
+C++ has six special members. The default constructor is one. The other five control copies, moves and destruction: the destructor, the copy constructor, copy assignment, the move constructor and move assignment. The compiler generates them when you do not declare them, and the rules interact in a way that surprises most people.
+
+<RuleOfFiveDemo />
+
+Things to try:
+
+1. Click **Destructor only**. The moves are not declared, so `std::move(a)` calls the copy constructor. A class that logs in its destructor is now silently slower.
+2. Click **Rule of three**. You wrote the copy members and the destructor, so again there are no implicit moves.
+3. Click **Move only**. The copy members are deleted, as for `std::unique_ptr`.
+4. Toggle only the move assignment operator. `T b = std::move(a)` no longer compiles: the move constructor is not declared, and the copy constructor that overload resolution finds is deleted.
+
+The rules, from the C++ draft ([class.copy.ctor] and [class.copy.assign]):
+
+| You declare | Copy members | Move members |
+|---|---|---|
+| nothing | defaulted | defaulted |
+| a destructor | defaulted, deprecated | not declared: an rvalue copies |
+| a copy member | the other one defaulted, deprecated | not declared |
+| a move member | deleted | the other one not declared |
+
+Clang 21 gave the same result for all 32 combinations of the five members. From these rules come three guidelines:
+
+- **Rule of zero.** Most classes should declare none of the five. Use members that already manage themselves, such as `std::string`, `std::vector` and `std::unique_ptr`. Then the compiler's members are correct.
+- **Rule of three.** A class that must declare one of the destructor, the copy constructor or copy assignment usually needs all three. This was the rule before C++11.
+- **Rule of five.** Since C++11, such a class should also declare both move members, or it silently copies where a move would do.
+
+## The same idea in other languages
+
+- **Rust** has one special member: `Drop::drop`. A move is always a byte copy, so there is no move constructor to write. A copy is an explicit `clone()`. See [ownership in Rust](/systems/ownership/ownership-in-rust).
+- **Zig** and **Odin** have no destructors. They use `defer` at the point of acquisition, and Zig adds `errdefer` for the error path. See [defer and errdefer](/systems/explicit/defer-and-errdefer).
+- **Go** has `defer` too, but it runs at function return, not at the end of a block. A `defer` inside a loop holds every resource until the function ends.
+- **C** has none of these. Code uses a `goto cleanup` chain, or the GCC and Clang extension `__attribute__((cleanup(f)))` on a local variable.
+
+## Connect
+
+- [Mutexes](/concurrency/locks/mutexes): `lock_guard`, `unique_lock` and `scoped_lock` as RAII guards.
+- [Move semantics](/systems/ownership/move-semantics): what the move members do, and when the compiler skips them.
+- [Smart pointers](/systems/ownership/smart-pointers): `unique_ptr` and `shared_ptr` as RAII for heap memory.
+- [Stack and heap](/systems/memory/stack-and-heap): why a frame's locals die at return.
+
+<Recall cards={[
+  { q: "What does RAII tie together?", a: "A resource and an object: the constructor acquires the resource and the destructor releases it. The scope of the object then decides when the release happens." },
+  { q: "In which order are the locals of a scope, the members of an object and its bases destroyed?", a: "Locals in reverse order of construction. Members in reverse order of declaration, after the destructor body. Bases after the members, in reverse order." },
+  { q: "A constructor throws after two of its members are built. What runs?", a: "The destructors of the two built members, in reverse order. The class's own destructor does not run, because the object never existed." },
+  { q: "What happens if an exception leaves a destructor in C++11 and later?", a: "Destructors are implicitly noexcept, so the runtime calls std::terminate." },
+  { q: "You add only a destructor to a class. What does std::move(a) do now?", a: "It calls the copy constructor. A user-declared destructor stops the implicit move members from being declared." },
+  { q: "How is Go's defer different from a C++ destructor?", a: "Go's defer runs when the function returns, not at the end of the block. A C++ destructor runs at the end of the object's scope." },
+]} />

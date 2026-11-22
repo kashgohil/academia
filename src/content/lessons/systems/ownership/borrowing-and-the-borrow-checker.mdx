@@ -1,0 +1,116 @@
+---
+summary: "Shared XOR mutable, checked at compile time: loans, liveness and non-lexical lifetimes (RFC 2094), two-phase borrows for v.push(v.len()), each borrow error code, and the programs that the checker still rejects."
+---
+import { BorrowTimelineDemo, BorrowStepDemo, InvalidationDemo } from "@/demos/sys/SysOwnBorrowDemos";
+
+Ownership alone would make every function take its arguments by value and give them back. A **borrow** is the alternative: a reference that lets code use a value without owning it. Rust has two kinds. A **shared reference** `&T` lets many readers look at a value at the same time. A **mutable reference** `&mut T` gives one writer exclusive access.
+
+The rule that connects them is **aliasing XOR mutation**. At any point, a value can have many shared references or one mutable reference, but not both. The **borrow checker** is the compiler pass that proves this rule for every function. It runs on MIR, the compiler's control-flow graph of each function, after type checking.
+
+## A borrow lasts until its last use
+
+The checker calls each borrow a **loan**. A loan starts at the `&` or `&mut` expression. It stays **live** while some reference that holds it can still be used later. An access to the borrowed variable is an error if it conflicts with a live loan.
+
+<Predict
+  id="nll"
+  question="The program makes v = vec![1, 2, 3], takes r = &v, prints r[0], and then calls v.push(4). It never uses r again. Does rustc 1.96 accept the push?"
+  options={["No: r is still in scope, so v is still borrowed", "Yes: the loan of v ends at the last use of r", "Only if r is dropped first with drop(r)"]}
+  answer={1}
+  explain="Since non-lexical lifetimes (RFC 2094), a loan is live only up to the last use of the reference, not to the end of its scope. Switch the demo to the lexical model to see the error that the 2015 checker gave."
+>
+<BorrowTimelineDemo />
+</Predict>
+
+Things to try:
+
+1. With **A borrow ends at its last use (NLL)**, switch **Checker** to **Lexical**. The loan bar now runs to the end of the program, and the push becomes E0502.
+2. Select **Push while a reference is live**. The loan of `first` overlaps the push, so the checker rejects it. Click **Edit the code** and move the `println!` above the push. The error goes away.
+3. Select **Two mutable borrows**. Two orange bars overlap: E0499.
+4. Select **Move out while borrowed** and **Assign while borrowed**. A move gives E0505 and an assignment gives E0506.
+5. Write your own program. The toy language has `let`, blocks, `&`, `&mut`, `vec!`, `String::from`, `push`, `len`, `clear`, `drop` and `println!`.
+
+## From lexical scopes to liveness
+
+The first borrow checker tied a loan to a lexical scope: the block of the variable that held the reference. That rule was simple, but it rejected many correct programs. RFC 2094, "non-lexical lifetimes" (NLL), changed the rule to **liveness**. A reference variable is live at a point if a later point can read it before it gets a new value. A loan is live if a live variable holds it. Rust 1.31 shipped NLL for the 2018 edition in December 2018, and Rust 1.36 enabled it for the 2015 edition.
+
+The check itself compares each access with the live loans of the same place:
+
+| Access to `v` | Conflicts with a live loan that is | Error |
+|---|---|---|
+| shared borrow, or a read through a temporary borrow | mutable | E0502 |
+| copy out of `v` (a Copy value) | mutable | E0503 |
+| mutable borrow | mutable / shared | E0499 / E0502 |
+| move out of `v` | any | E0505 |
+| assignment to `v` | any | E0506 |
+| `v` goes out of scope | any | E0597 |
+
+Two more checks need no loan. A mutable borrow of a variable without `mut` is E0596. A use after a move is E0382, from the move analysis of the [ownership](/systems/ownership/ownership-in-rust) lesson.
+
+## Two-phase borrows
+
+`v.push(v.len())` looks like a conflict. The method call needs `&mut v` for the receiver, and the argument needs `&v`. Rust evaluates the receiver first, so a naive checker would see a shared borrow inside a live mutable one.
+
+RFC 2025, "nested method calls", fixed this with a **two-phase borrow**. The autoref of the receiver first makes a **reservation**, which acts like a shared borrow. The arguments are evaluated next. The borrow is **activated** only at the call, and from then on it is mutable.
+
+<BorrowStepDemo />
+
+Things to try:
+
+1. Step through **v.push(v.len())**. The reservation L0 is live during the read of `v`, but a reservation conflicts only with mutable loans. At activation, the read's temporary loan is already dead.
+2. Select **The argument needs v mutably**. Here `m` holds a mutable loan of `v`, and the argument `m.len()` uses `m` after the reservation. The reservation conflicts with that live mutable loan: E0499.
+3. Select **Push while a reference is live**. The reservation passes, because `first` is a shared loan. The activation fails, because `first` is still live: E0502.
+4. Select **Mutate through a reference, then read**. After the last use of `m`, its loan is dead, so the read of `v` is fine.
+
+## What the rule prevents
+
+Why must a shared reference block a push? A `Vec` keeps its elements in one heap block. When a push needs more room, the vector allocates a larger block, moves the elements and frees the old block. A reference into the old block now points at freed memory. In C++ this bug is called **iterator invalidation**, and the compiler accepts it.
+
+<InvalidationDemo />
+
+Things to try:
+
+1. Step to line 5 with no reserve. The reference still holds the old address, and the read is a heap use after free. The hardware returns the old value 1, so a test can pass while the program is wrong.
+2. Select **reserve(4) first** and step again. The push fits, nothing moves, and the read is correct. The program depends on the capacity, which a later change can break.
+3. Compare this with the Rust preset **Push while a reference is live**. Rust rejects the program in both cases, because the checker reasons about loans, not about capacities.
+
+The same rule also removes data races. A data race needs two accesses to the same memory, with at least one write. Aliasing XOR mutation forbids that at compile time, and the `Send` and `Sync` traits extend it to threads. The [race conditions](/concurrency/foundations/race-conditions) lesson covers what the rule does not prevent.
+
+## What the checker still rejects
+
+The checker is sound, so it rejects some correct programs. These are the common cases, with the usual fix:
+
+- **Disjoint fields through a method.** `&mut p.x` and `&mut p.y` at the same time compile, because the checker tracks fields of a local separately. A method `p.x_mut()` borrows all of `p`, so two such calls conflict. Borrow the fields directly, or split the struct.
+- **Two parts of one slice.** `&mut v[0]` and `&mut v[1]` conflict, because indexing borrows the whole vector. `split_at_mut` returns two disjoint mutable slices.
+- **A conditional return of a borrow.** This function is correct, but rustc 1.96 rejects it with E0499 twice:
+
+```rust
+fn get_default<'r>(map: &'r mut HashMap<u32, String>, key: u32) -> &'r mut String {
+    match map.get_mut(&key) {
+        Some(value) => value, // the loan must last for 'r on this path
+        None => {
+            map.insert(key, String::new()); // E0499: map is still borrowed
+            map.get_mut(&key).unwrap()
+        }
+    }
+}
+```
+
+NLL extends the loan of `map.get_mut` to the whole function, because one path returns it. This is "problem case #3" in RFC 2094. **Polonius** is a new formulation of the borrow checker that reasons about where each loan can flow. On nightly, `-Zpolonius=next` accepts this function. Stable rustc 1.96 still rejects it, and the Rust project goals aim to stabilize the Polonius alpha. Today the fix is the entry API: `map.entry(key).or_default()`.
+
+When the checker rejects your design, you have four usual options. Shorten the borrow, clone a small value, or use indices instead of references. Or move the check to run time with `RefCell` (see [smart pointers](/systems/ownership/smart-pointers)).
+
+## Connect
+
+- [Lifetimes](/systems/ownership/lifetimes): how loans cross function boundaries through signatures.
+- [Race conditions](/concurrency/foundations/race-conditions): what Send and Sync guarantee, and what they do not.
+- [Mutexes](/concurrency/locks/mutexes): `Mutex<T>` gives `&mut T` access at run time through a guard.
+- [Pointers and references](/systems/memory/pointers-and-references): what a reference is in memory.
+
+<Recall cards={[
+  { q: "State the aliasing XOR mutation rule.", a: "At any point, a value can have many shared references or one mutable reference, but not both at the same time." },
+  { q: "With NLL, when does a loan end?", a: "After the last use of every reference that holds it. It does not last to the end of the reference's scope." },
+  { q: "Which codes do these get while a loan is live: a second mutable borrow, a move, an assignment?", a: "E0499, E0505 and E0506." },
+  { q: "Why does v.push(v.len()) compile?", a: "The receiver's &mut v is a two-phase borrow. It starts as a reservation that acts like a shared borrow. It becomes mutable only at the call, after v.len() has finished." },
+  { q: "What C++ bug does E0502 on a push prevent?", a: "Iterator invalidation: the push can move the elements to a new block, so a reference into the old block dangles." },
+  { q: "Name a correct program that NLL rejects, and the tool that is meant to accept it.", a: "A function that returns a borrow from a map on one path and inserts into the map on another. Polonius, still on nightly, accepts it." },
+]} />

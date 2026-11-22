@@ -32,6 +32,12 @@ export const LEVELS: Record<Level, string> = {
 
 /** Lessons with a written MDX page. Paths must match `src/content/lessons/<path>.mdx`. */
 export const LIVE = new Set<string>([
+  "systems/ownership/borrowing-and-the-borrow-checker",
+  "systems/ownership/lifetimes",
+  "systems/ownership/move-semantics",
+  "systems/ownership/ownership-in-rust",
+  "systems/ownership/raii-in-c",
+  "systems/ownership/smart-pointers",
   "systems/gc/concurrent-gc-and-write-barriers",
   "systems/gc/copying-collectors",
   "systems/gc/generational-gc",

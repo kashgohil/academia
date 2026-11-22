@@ -1,0 +1,95 @@
+---
+summary: "A lifetime is a region of code where a borrow must stay valid. Lifetime parameters as constraints in a signature, the three elision rules, 'static, structs that hold references, and variance in one paragraph."
+---
+import { ElisionDemo, RegionDemo } from "@/demos/sys/SysOwnLifetimeDemos";
+
+Inside one function, the borrow checker sees every use of every reference. It can compute where each loan is live, as the [borrowing](/systems/ownership/borrowing-and-the-borrow-checker) lesson showed. A call to another function hides that information. The caller does not read the callee's body, and the callee does not know its callers. A **lifetime** carries the missing facts across the boundary.
+
+A lifetime, written `'a`, names a region of the program: a set of points where a reference must be valid. A lifetime is not a time and not a run-time value. The compiler erases all lifetimes before it generates code. They exist only to state constraints that the checker must solve.
+
+## Constraints, not durations
+
+```rust
+fn longest<'a>(x: &'a str, y: &'a str) -> &'a str {
+    if x.len() > y.len() { x } else { y }
+}
+```
+
+Read this signature as a contract with three parts. The caller picks one region `'a`. Both arguments must be valid for all of `'a`. The result is valid for `'a` and no longer. So at a call site, the result holds the loans of both arguments. A use of the result keeps both loans live.
+
+The caller checks the contract with the signature only. The body of `longest` could return `x` every time, and the caller would still assume that the result borrows from `y`. This rule keeps each function independent: you can change a body without breaking any caller, as long as the signature stays the same.
+
+<Predict
+  id="longest"
+  question="s1 lives in main. s2 lives in an inner block. Inside the block, result = longest(&s1, &s2). The program prints result after the block ends. Does it compile?"
+  options={["Yes: longest returned s1, the longer string", "No: the result holds the loan of s2, which dies at the end of the block", "Yes, but only in release builds"]}
+  answer={1}
+  explain="The signature ties the result to both inputs through 'a. The checker does not run longest, so it does not know that the result is s1. The loan of s2 is still live at the println, after s2 is dropped: E0597."
+>
+<RegionDemo />
+</Predict>
+
+Things to try:
+
+1. In **longest: use after the block**, compare the green scope bar of `s2` with the loan bars. The loan of `s2` continues after the scope of `s2` ends. That overlap is E0597.
+2. Select **longest: use inside the block**. Both loans end at the `println!`, inside the block, so the program compiles.
+3. Select **Two lifetimes: the result needs only x**. The signature `first<'a, 'b>` ties the result to `x` only. The loan of `s2` ends at the call.
+4. Select **A reference outlives its value**. This is the smallest form of the error: `r = &x` in a block, then a use of `r` after it.
+5. Select **Elision ties the result to s**. The signature names no lifetime, but the result still borrows from `s`, so `s.clear()` is E0502.
+
+## Elision: the lifetimes you do not write
+
+Most signatures name no lifetime. The compiler fills them in with three **elision rules**, from the Rust Reference ("Lifetime elision in functions"):
+
+1. Each elided lifetime in the parameters becomes a distinct lifetime parameter.
+2. If the parameters use exactly one lifetime, elided or not, it goes to all elided output lifetimes.
+3. If the receiver has type `&self` or `&mut self`, the lifetime of that reference goes to all elided output lifetimes.
+
+If none of the rules gives the output a lifetime, the signature is an error: E0106, "missing lifetime specifier". The rules do not look at the body. They are a convention that matches most functions, and they never guess between two inputs.
+
+<ElisionDemo />
+
+Things to try:
+
+1. Select `longest(x: &str, y: &str) -> &str`. Rule 1 gives two lifetimes, so rule 2 does not apply. The help text is the one that rustc 1.96 prints.
+2. Select `get(&self, key: &str) -> &str`. Rule 3 wins: the result borrows from `self`, not from `key`. A method that returns a part of `key` needs an explicit lifetime.
+3. Select `top(v: &Vec<&str>) -> &str`. One parameter can hold two lifetimes. The error names "2 lifetimes" of `v`.
+4. Select `split(s: &str, at: usize) -> (&str, &str)`. Both outputs get the lifetime of `s`.
+5. Type your own signature. Try `fn f<'a>(x: &'a str, y: &str) -> &'a str`, where you name only the lifetime that matters.
+
+## The rest of the lifetime vocabulary
+
+**Returning a borrow of a local.** A function cannot return a reference to its own local variable. The local dies when the function returns. rustc 1.96 reports E0515, "cannot return reference to local variable `s`". The fix is to return the owned value.
+
+**`'static`.** The region `'static` covers the whole program. A string literal has type `&'static str`, because its bytes are in the read-only data of the binary. A bound `T: 'static` means something different: the type `T` holds no reference with a shorter lifetime. An owned `String` meets `T: 'static`.
+
+That is why `std::thread::spawn` accepts a closure that owns its data, and rejects a closure that borrows a local. In rustc 1.96, a plain closure that borrows a local `v` gives E0373: "closure may outlive the current function, but it borrows `v`". A `move` closure that captures a reference `r = &v` gives E0597, "`v` does not live long enough". The fix in both cases is a `move` closure that owns the data.
+
+**Structs that hold references.** A struct that holds a reference must name the lifetime: `struct Parser<'a> { input: &'a str }`. Each `Parser` value is then tied to the string that it reads, and it cannot outlive it. This is a good design for short-lived views, such as a parser or an iterator. It is a bad design for long-lived state, because the borrow spreads to every holder of the struct. For long-lived data, store an owned `String`, an index, or an `Rc`.
+
+**Variance.** A longer lifetime can stand in for a shorter one. A `&'static str` can be passed where a `&'a str` is expected.
+
+The Rust Reference ("Subtyping and Variance") gives the rule for each type constructor. `&'a T` is covariant in both `'a` and `T`. `&'a mut T` is covariant in `'a` but invariant in `T`. If a `&mut &'static str` could be used as a `&mut &'a str`, code could write a short-lived reference into a slot that the caller reads as `'static`.
+
+## What this means for your code
+
+- Let elision work. Name a lifetime only when the output borrows from a specific input that the rules do not pick.
+- Give two inputs different lifetimes when the output depends on only one of them. The caller then gets a shorter loan.
+- An error such as E0597 or E0515 tells you about ownership, not about syntax. Usually some data must be owned by a longer-lived place, or returned by value.
+- C and C++ have the same rules, but no checker. Zig and Odin also leave them to you: a slice that outlives its buffer compiles and reads freed memory.
+
+## Connect
+
+- [Borrowing and the borrow checker](/systems/ownership/borrowing-and-the-borrow-checker): loans and liveness inside one function.
+- [Smart pointers](/systems/ownership/smart-pointers): `Rc` and `Arc` when no single scope can own the data.
+- [Rust generics and traits](/systems/comptime/rust-generics-and-traits): lifetime parameters are generic parameters too.
+- [Stack and heap](/systems/memory/stack-and-heap): why a local dies when its frame returns.
+
+<Recall cards={[
+  { q: "What does fn longest<'a>(x: &'a str, y: &'a str) -> &'a str promise to a caller?", a: "The result is valid only while both arguments are valid. At the call site, the result holds the loans of both arguments." },
+  { q: "Does the borrow checker read the body of a function at a call site?", a: "No. It uses only the signature, so a body can change without breaking callers." },
+  { q: "State the three lifetime elision rules.", a: "Each elided input lifetime gets its own parameter. If the inputs use exactly one lifetime, the outputs get it. If there is &self or &mut self, the outputs get its lifetime." },
+  { q: "Why is fn longest(x: &str, y: &str) -> &str an error?", a: "Rule 1 gives two input lifetimes and there is no self, so no rule gives the output a lifetime: E0106, missing lifetime specifier." },
+  { q: "What does T: 'static mean for an owned String?", a: "It holds: the type contains no reference with a shorter lifetime. It does not mean that the value lives for the whole program." },
+  { q: "Why is &'a mut T invariant in T?", a: "Otherwise a function could store a short-lived reference through it into a place that the caller treats as long-lived." },
+]} />
